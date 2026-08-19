@@ -138,6 +138,21 @@ class TradeJournal:
         if not self._enabled:
             return
 
+        # Resolve the option leg (FC-067). Opportunity dicts from the scanner
+        # carry the leg under 'type' ('put'|'call'), NOT 'option_type', and carry
+        # no 'strategy' key at all. The old code read 'option_type'/'strategy'
+        # directly and so defaulted EVERY trade — puts and calls alike — to
+        # option_type='put'/strategy='sell_put'. Puts were right by accident;
+        # covered calls were mislabeled. Read the real source-of-truth key and
+        # derive the strategy from it; do not guess a leg when the trade genuinely
+        # carries none (write null rather than a wrong 'put').
+        option_type = trade_data.get("option_type") or trade_data.get("type")
+        strategy = trade_data.get("strategy") or (
+            "sell_call" if option_type == "call"
+            else "sell_put" if option_type == "put"
+            else None
+        )
+
         # Build a row that matches the schema exactly.
         now = datetime.now(timezone.utc).isoformat()
         row = {
@@ -145,7 +160,7 @@ class TradeJournal:
             "client_order_id": _str_or_none(trade_data.get("client_order_id")),
             "symbol": trade_data.get("option_symbol") or trade_data.get("symbol"),
             "underlying": trade_data.get("underlying") or trade_data.get("symbol"),
-            "option_type": trade_data.get("option_type", "put"),
+            "option_type": option_type,
             "side": trade_data.get("side", "sell"),
             "qty": trade_data.get("contracts") or trade_data.get("qty"),
             "strike_price": trade_data.get("strike_price"),
@@ -158,7 +173,7 @@ class TradeJournal:
             "total_premium": _calc_total_premium(trade_data),
             "collateral": _calc_collateral(trade_data),
             "status": trade_data.get("status", "submitted"),
-            "strategy": trade_data.get("strategy", "sell_put"),
+            "strategy": strategy,
             "expiration": trade_data.get("expiration"),
             "dte": trade_data.get("dte"),
             "roi": trade_data.get("roi"),
