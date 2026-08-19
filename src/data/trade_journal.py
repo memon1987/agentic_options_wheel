@@ -12,6 +12,8 @@ import structlog
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
+from ..utils.option_symbols import strict_option_type
+
 logger = structlog.get_logger(__name__)
 
 try:
@@ -138,6 +140,36 @@ class TradeJournal:
         if not self._enabled:
             return
 
+        # Resolve the option leg (FC-067). The audit row must record the leg that
+        # was ACTUALLY TRADED, so resolve the OCC ``option_symbol`` FIRST — that
+        # is what ``execute_batch`` routes on, and when a producer's declared
+        # ``type`` contradicts the symbol the engine trades by the symbol and logs
+        # ``opportunity_type_mismatch`` (FC-048). Labelling from the declared key
+        # would journal a leg the engine did not trade, which is the very
+        # label-vs-contract drift FC-067 exists to end. Resolution order:
+        #   OCC symbol → explicit option_type → scanner 'type' → infer from strategy.
+        # Old code read 'option_type'/'strategy' directly; the scanner supplies
+        # neither (it uses 'type'), so EVERY row defaulted to put/sell_put —
+        # covered calls were silently mislabeled. Write null rather than guess a
+        # leg when nothing resolves (the silent 'put' default was the bug).
+        option_type = (
+            strict_option_type(trade_data.get("option_symbol"))
+            or trade_data.get("option_type")
+            or trade_data.get("type")
+            or ("call" if trade_data.get("strategy") == "sell_call"
+                else "put" if trade_data.get("strategy") == "sell_put"
+                else None)
+        )
+        # Strategy follows the resolved leg. This system only ever *sells* the
+        # leg (side='sell'), so a declared strategy that contradicts the leg
+        # actually traded is wrong by construction — the contract wins (FC-048).
+        # Only when the leg is unresolved do we keep whatever strategy was declared.
+        strategy = (
+            "sell_call" if option_type == "call"
+            else "sell_put" if option_type == "put"
+            else trade_data.get("strategy")
+        )
+
         # Build a row that matches the schema exactly.
         now = datetime.now(timezone.utc).isoformat()
         row = {
@@ -145,7 +177,7 @@ class TradeJournal:
             "client_order_id": _str_or_none(trade_data.get("client_order_id")),
             "symbol": trade_data.get("option_symbol") or trade_data.get("symbol"),
             "underlying": trade_data.get("underlying") or trade_data.get("symbol"),
-            "option_type": trade_data.get("option_type", "put"),
+            "option_type": option_type,
             "side": trade_data.get("side", "sell"),
             "qty": trade_data.get("contracts") or trade_data.get("qty"),
             "strike_price": trade_data.get("strike_price"),
@@ -158,7 +190,7 @@ class TradeJournal:
             "total_premium": _calc_total_premium(trade_data),
             "collateral": _calc_collateral(trade_data),
             "status": trade_data.get("status", "submitted"),
-            "strategy": trade_data.get("strategy", "sell_put"),
+            "strategy": strategy,
             "expiration": trade_data.get("expiration"),
             "dte": trade_data.get("dte"),
             "roi": trade_data.get("roi"),
