@@ -52,6 +52,29 @@ def test_put_opportunity_still_labeled_as_put():
     assert row["strategy"] == "sell_put"
 
 
+def test_occ_symbol_wins_over_contradictory_declared_type():
+    # The label-vs-contract drift path (FC-048): execute_batch routes on the OCC
+    # symbol and, on a declared/symbol mismatch, trades by the symbol. The audit
+    # row must match what was traded — a C-contract must journal a call even if
+    # the declared 'type' says put.
+    tj = _journal()
+    tj.record_trade({"type": "put", "strategy": "sell_put",
+                     "option_symbol": "META260220C00600000"})
+    row = _recorded_row(tj)
+    assert row["option_type"] == "call"
+    assert row["strategy"] == "sell_call"
+
+
+def test_seller_shaped_dict_strategy_only_stays_consistent():
+    # A dict carrying only 'strategy' (seller-shaped, no 'type'/symbol) must not
+    # produce an inconsistent row (strategy=sell_call, option_type=null).
+    tj = _journal()
+    tj.record_trade({"symbol": "X", "strategy": "sell_call"})
+    row = _recorded_row(tj)
+    assert row["option_type"] == "call"
+    assert row["strategy"] == "sell_call"
+
+
 def test_explicit_option_type_and_strategy_win():
     tj = _journal()
     tj.record_trade({"symbol": "X", "type": "put",

@@ -12,6 +12,8 @@ import structlog
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
+from ..utils.option_symbols import strict_option_type
+
 logger = structlog.get_logger(__name__)
 
 try:
@@ -138,19 +140,34 @@ class TradeJournal:
         if not self._enabled:
             return
 
-        # Resolve the option leg (FC-067). Opportunity dicts from the scanner
-        # carry the leg under 'type' ('put'|'call'), NOT 'option_type', and carry
-        # no 'strategy' key at all. The old code read 'option_type'/'strategy'
-        # directly and so defaulted EVERY trade — puts and calls alike — to
-        # option_type='put'/strategy='sell_put'. Puts were right by accident;
-        # covered calls were mislabeled. Read the real source-of-truth key and
-        # derive the strategy from it; do not guess a leg when the trade genuinely
-        # carries none (write null rather than a wrong 'put').
-        option_type = trade_data.get("option_type") or trade_data.get("type")
-        strategy = trade_data.get("strategy") or (
+        # Resolve the option leg (FC-067). The audit row must record the leg that
+        # was ACTUALLY TRADED, so resolve the OCC ``option_symbol`` FIRST — that
+        # is what ``execute_batch`` routes on, and when a producer's declared
+        # ``type`` contradicts the symbol the engine trades by the symbol and logs
+        # ``opportunity_type_mismatch`` (FC-048). Labelling from the declared key
+        # would journal a leg the engine did not trade, which is the very
+        # label-vs-contract drift FC-067 exists to end. Resolution order:
+        #   OCC symbol → explicit option_type → scanner 'type' → infer from strategy.
+        # Old code read 'option_type'/'strategy' directly; the scanner supplies
+        # neither (it uses 'type'), so EVERY row defaulted to put/sell_put —
+        # covered calls were silently mislabeled. Write null rather than guess a
+        # leg when nothing resolves (the silent 'put' default was the bug).
+        option_type = (
+            strict_option_type(trade_data.get("option_symbol"))
+            or trade_data.get("option_type")
+            or trade_data.get("type")
+            or ("call" if trade_data.get("strategy") == "sell_call"
+                else "put" if trade_data.get("strategy") == "sell_put"
+                else None)
+        )
+        # Strategy follows the resolved leg. This system only ever *sells* the
+        # leg (side='sell'), so a declared strategy that contradicts the leg
+        # actually traded is wrong by construction — the contract wins (FC-048).
+        # Only when the leg is unresolved do we keep whatever strategy was declared.
+        strategy = (
             "sell_call" if option_type == "call"
             else "sell_put" if option_type == "put"
-            else None
+            else trade_data.get("strategy")
         )
 
         # Build a row that matches the schema exactly.
