@@ -224,16 +224,18 @@ def strategy_config():
     """
     global _CONFIG_CACHE
     if _CONFIG_CACHE is None:
-        _CONFIG_CACHE = Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
         # FC-075 Seam 4: hand this process's profile to the AnalyticsWriter
-        # singleton, which has no config in scope of its own. Every route
-        # resolves config through the decorators before a handler writes, so
-        # the singleton is configured before its first use on any request path.
+        # singleton, which has no config in scope of its own. Configure BEFORE
+        # publishing the cache: a concurrent cold-start request that observes a
+        # non-None cache must never proceed with the singleton unconfigured
+        # (it would get the disabled sentinel and silently drop its rows).
+        config = Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
         from src.data.analytics_writer import configure_analytics_writer
         configure_analytics_writer(
-            dataset_id=_CONFIG_CACHE.bigquery_dataset,
-            strategy_id=_CONFIG_CACHE.strategy_id,
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
         )
+        _CONFIG_CACHE = config
     return _CONFIG_CACHE
 
 
