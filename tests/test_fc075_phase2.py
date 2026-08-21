@@ -321,18 +321,19 @@ class TestCallOnlyFilter:
             ["META260220C00600000", "NVDA260220C00500000"]
         assert events == ["non_call_opportunity_refused"]  # one per dropped put
 
-    def test_refused_put_not_mislabeled_previously_failed(self, server):
-        # The MEDIUM fix: applying the filter to BOTH lists means the refused
-        # put's underlying is not flagged previously_failed by _underlyings_removed.
-        blob = [self._call(), self._put()]
-        kept = server._call_only_opportunities(blob, "covered_call", Mock())
-        # handler sets both opportunities and blob_opportunities to `kept`
-        assert server._underlyings_removed(kept, kept) == set()
-        # sanity: had the blob NOT been filtered, the put's underlying WOULD show
-        # (proves the assertion is meaningful) — puts aren't call-opps though, so
-        # _underlyings_removed only tracks calls; the real guarantee is no crash +
-        # empty diff on the filtered lists.
-        assert "AAPL" not in server._underlyings_removed(kept, kept)
+    def test_refused_put_never_enters_previously_failed(self, server):
+        # The no-mislabel guarantee: a dropped put can never be flagged
+        # `previously_failed`, because _underlyings_removed only tracks CALL
+        # opportunities (is_call_opportunity → strict OCC). Assert that directly,
+        # with a positive control so it isn't vacuous.
+        meta_call = self._call()                        # symbol META
+        nvda_call = self._call("NVDA260220C00500000")   # symbol NVDA
+        aapl_put = self._put()                          # symbol AAPL
+        nvda_call["symbol"] = "NVDA"
+        # Positive control: a genuinely-dropped CALL IS flagged.
+        assert server._underlyings_removed([meta_call, nvda_call], [meta_call]) == {"NVDA"}
+        # A put present in `before` but absent from `after` is NOT flagged.
+        assert server._underlyings_removed([meta_call, aapl_put], [meta_call]) == set()
 
 
 # --------------------------------------------------------------------------- #
