@@ -22,6 +22,7 @@ from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
 from .decision_record import (
     OUTCOME_BLOCKED,
     OUTCOME_NOT_ELIGIBLE,
+    REASON_EXCLUDED_BY_CONFIG,
     OUTCOME_NO_CANDIDATES,
     REASON_EARNINGS_BLACKOUT,
     REASON_EARNINGS_UNKNOWN,
@@ -106,7 +107,8 @@ class OptionsScanner:
         # query per scan for every held symbol, behind its own patchable
         # chokepoint (see tests/conftest.py).
         self.uncovered_days_resolver = UncoveredDaysResolver(
-            allow_bigquery=allow_bigquery
+            allow_bigquery=allow_bigquery,
+            dataset_id=config.bigquery_dataset,  # FC-075 Phase 2 (DD-4): strategy-scoped read
         )
         # FC-013: resolved once, here, so every gate site downstream is a
         # single `if self.earnings_calendar is None` — there is no second place
@@ -128,6 +130,18 @@ class OptionsScanner:
         Returns:
             List of put opportunities sorted by attractiveness
         """
+        # FC-075 Phase 2 (DD-2): only the wheel sells puts. Gate at this
+        # chokepoint so /scan, the main.py CLI scan, and any future caller are
+        # covered. This also avoids touching self.config.stock_symbols below —
+        # absent on the covered-call profile, it would raise KeyError, get
+        # swallowed by the except, and emit a spurious scan_failure every scan.
+        if self.config.strategy_id != 'wheel':
+            logger.info("Put scan skipped for non-wheel profile",
+                        event_category="system",
+                        event_type="put_scan_skipped_non_wheel_profile",
+                        strategy_id=self.config.strategy_id)
+            return []
+
         try:
             logger.info("Scanning for put opportunities", event_category="system", event_type="put_scan_started", symbol_count=len(self.config.stock_symbols))
             
@@ -251,6 +265,16 @@ class OptionsScanner:
                     'current_price': mark_price,
                     'uncovered_days': uncovered_days.get(symbol),
                 }
+
+                # FC-075 Phase 2 (DD-3): operator opt-out. An excluded holding
+                # reports as excluded (not under-lotted) and spends zero further
+                # work — deliberately before the lot-size check. excluded_symbols
+                # is normalized (upper/stripped) in Config.
+                if symbol.strip().upper() in self.config.excluded_symbols:
+                    recorder.record(symbol, OUTCOME_NOT_ELIGIBLE,
+                                    REASON_EXCLUDED_BY_CONFIG, **labels)
+                    recorded_symbols.append(symbol)
+                    continue
 
                 # Only consider positions with at least 100 shares
                 if shares < 100:

@@ -497,6 +497,12 @@ class MarketDataManager:
             'premium_too_low': 0,
             'delta_out_of_range': 0,
             'no_liquidity': 0,
+            # FC-075 Phase 2 (DD-3): inventory-validator chain criteria. Only
+            # non-zero when the covered-call profile sets universe.min_open_interest
+            # / universe.max_spread_pct; must be pre-initialized here because
+            # `rejection_stats[reason] += 1` below KeyErrors on an unknown key.
+            'open_interest_too_low': 0,
+            'spread_too_wide': 0,
             # FC-013: counted LAST in the chain, so it means "a strike that
             # otherwise qualified was removed because it expires into
             # earnings" — not "some contract in the chain happens to span".
@@ -819,6 +825,27 @@ class MarketDataManager:
         # Liquidity criteria (basic)
         if call_option['volume'] == 0 and call_option['open_interest'] < 10:
             return 'no_liquidity'
+
+        # FC-075 Phase 2 (DD-3): inventory-validator chain criteria. Both inert
+        # unless the covered-call profile sets the thresholds (wheel: None →
+        # skipped → byte-identical). Fail closed — a threshold set against a
+        # missing/None field (or a non-positive mid) rejects the strike rather
+        # than passing it unverified.
+        min_oi = self.config.min_open_interest
+        if min_oi is not None:
+            oi = call_option.get('open_interest')
+            if oi is None or oi < min_oi:
+                return 'open_interest_too_low'
+
+        max_spread = self.config.max_spread_pct
+        if max_spread is not None:
+            bid = call_option.get('bid')
+            ask = call_option.get('ask')
+            mid = call_option.get('mid_price')
+            if bid is None or ask is None or mid is None or mid <= 0:
+                return 'spread_too_wide'
+            if (ask - bid) / mid > max_spread:
+                return 'spread_too_wide'
 
         return None  # Passes all criteria
 
