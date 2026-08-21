@@ -199,3 +199,61 @@ Order is load-bearing; R1 before R3 is the only dangerous inversion (see DD-4).
 - **OQ-1 (non-blocking, operator):** after a stable week of `strategy_id='wheel'` rows, backfill historical wheel rows anyway for query simplicity? Default stays no (parent OQ-5); `IFNULL` covers it.
 - **OQ-2 (non-blocking):** FC-067's `expiration`/`dte` NULL-normalization on old journal rows — deferred; file under FC-067's entry if ever needed by a real consumer.
 - No blocking open questions. An unflagged ambiguity found during the build is a plan defect — surface it, don't improvise.
+
+---
+
+## Review disposition (2026-08-21) — authoritative amendments
+
+Two adversarial plan reviews (Fable, fresh contexts: senior BigQuery/DW DBA with live-data access; production systems engineer hunting fail-open paths). **Both REQUEST_CHANGES; both affirmed the architecture** ("fundamentally sound and unusually well-verified" / "unusually well-grounded" — every live-data claim survived attack: 62 rows all-sell, complete decoration inventory, complete 7-table writer census, no downstream `SELECT *` breakage, deploy gap confirmed). The two HIGHs were found **independently by both reviewers**. Every finding is a plan-text fix; none reopens the design. This section is authoritative where it amends anything above; the builder follows it.
+
+### HIGH-A — the unconfigured "disabled writer" must be constructible with zero BQ side effects (both reviewers, independently)
+
+DD-2 said "return a disabled writer" without naming the mechanism. The naive build — `AnalyticsWriter(dataset_id="unconfigured", ...)` — runs `_ensure_all_tables()`, which under real credentials **creates a junk `unconfigured` dataset + three tables in the prod project and comes up `_enabled=True`**: the exact fail-open DD-2 prohibits, and invisible to tests (conftest's `_no_production_bigquery` guard makes client init fail in-suite, so the wrong build passes T2). Amendments:
+
+- The unconfigured path returns a **module-level `_DisabledAnalyticsWriter` sentinel** — a tiny subclass whose `__init__` sets `_enabled = False`, `_tables = {}` and touches nothing else (no client, no ensure, no env reads). Structurally incapable of the failure, not test-pinned against it.
+- **T2 strengthened:** patch `bigquery.Client` and assert it is **never constructed** on the unconfigured path — `_enabled is False` alone is not the assertion.
+
+### HIGH-B — the singleton needs a test-reset seam, and the reconfigure-raises rule must not fight the suite (both reviewers, independently)
+
+`configure_analytics_writer` adds process-global state (configured defaults, warn-once flag) atop the cached `_instance`; nothing in the suite resets any of it, and `tests/test_fc075_phase2.py` flips `STRATEGY_CONFIG` between profiles within one pytest process via `server.reset_strategy_state()` (~26 uses). As drafted, the first test to construct the singleton makes every later profile flip raise `RuntimeError` — T2/T5/T6 cannot coexist. Amendments:
+
+- New `analytics_writer._reset_for_tests()` clearing `_instance`, the configured defaults, and the warn-once flag. **Wire it into `server.reset_strategy_state()`** (which profile-flipping tests already call) and the autouse conftest reset. Underscore-named and documented test-only: it must never become a prod re-pointing seam.
+- **Semantics stated:** `configure_analytics_writer` with different values raises only **after** the singleton exists; before first construction it silently re-points (harmless in prod — one env/`--config` per process; noted so the builder doesn't "fix" it).
+- **Double-checked lock** on lazy construction (`get_analytics_writer` is unlocked under Flask `threaded=True`; the one-process-one-profile invariant now attaches to `_instance` identity, so make it honest — two lines).
+
+### MEDIUM-A — writers stop creating datasets (adopts the DBA's stricter alternative; closes the pre-provisioning overclaim)
+
+Both reviewers flagged the Behavior contract's "safe no-op toward BigQuery" as overclaimed: every writer calls `create_dataset(exists_ok=True)` before `create_table`, so under dataset-create-capable credentials (operator ADC, claude-operator) a post-merge CC-profile CLI scan would **silently create the `covered_call` dataset itself**, side-stepping Phase 3 provisioning/IAM. Amendment — adopt the structural fix rather than reword the claim:
+
+- **Delete the `create_dataset` call from all five writers' ensure paths; keep `create_table(..., exists_ok=True)`.** "Datasets are provisioned by an operator" becomes a code property. Wheel-neutral: `options_wheel` exists, so its init path never needed the call. Pre-provisioning CC behavior is now NotFound → disabled no-op **under any credentials**, and the Behavior contract's claim becomes true as written.
+- **T5b extended:** cover both the exception path and the missing-dataset path; assert no `create_dataset` call exists in any writer (grep-level or mock-level).
+- Phase 3 checklist consequence (parent plan): dataset creation is now unconditionally the operator's provisioning step — which it already was on paper (runtime SA lacks `datasets.create`); the code now agrees under every identity.
+
+### MEDIUM-B — completeness fixes to the touch/scope lists
+
+- **`scripts/backfill_analytics.py:29`** constructs `AnalyticsWriter(project_id=...)` — a seventh construction site the plan missed; post-DD-1 it's a `TypeError`. Disposition: **delete the script** (one-shot historical migration, hardcoded window 2025-10-15→2026-04-06, long since run). Added to touch list.
+- **`src/data/decision_record.py:498`** — `UncoveredDaysResolver.__init__`'s dormant `dataset_id="options_wheel"` default contradicted T7 as written (its only caller passes `config.bigquery_dataset` explicitly — verified). Disposition: **remove the default** (read-side, one line, caller-verified) rather than carve T7 around it. Added to touch list.
+- **T7 rescoped repo-wide** (`src/ deploy/ tools/ scripts/`), allowlisting only `src/backtesting/reporting/bq_writer.py` (deliberately cross-strategy, out of scope) — a future writer added outside `src/data/` must not escape the gate.
+- **Four existing test files** build writer fixtures via `object.__new__` + hand-set attributes and will `AttributeError` on the stamp: `tests/test_trade_journal_labeling.py` (:20, :98), `tests/test_activities_ingestor.py` (:255, :394), `tests/test_portfolio_history_ingestor.py` (:26, :70), `tests/test_stock_history_ingestor.py` (:25). Added to touch list — fixtures gain `_strategy_id`, and the builder extends the same pattern, not a patch-around.
+
+### MEDIUM-C — the dangling "V6" citation
+
+DD-4 cited "Verification item V6", a leftover from a cut section; no V-list exists. Disposition: the citation is **withdrawn**; the downstream-reader survey it promised was **executed by both reviewers during this review** — findings: the only `SELECT *` sites are `trades_with_outcomes`'s single-table head, closed CTE chains in `wheel_cycles_from_activities`, a named-projection CTE at `dashboard/backend/services/bigquery.py:63`, and dict-consumed reads in `regression_monitor.py`; the dataset's three `UNION ALL`s use fully named columns. A NULLABLE column breaks none of them. **R4 additionally verifies post-deploy:** dashboard endpoints healthy and `/regression` status unchanged.
+
+### LOW batch (all adopted)
+
+- **UPDATE predicate hardened:** add `AND side = 'sell'` and IFNULL-wrap the label tests — `WHERE REGEXP_CONTAINS(symbol, r'^[A-Z]+[0-9]{6}C[0-9]{8}$') AND side = 'sell' AND (IFNULL(option_type,'') != 'call' OR IFNULL(strategy,'') != 'sell_call')` — audit query identically. R5 pre-flight adds `COUNTIF(side='sell') = COUNT(*)` over the predicate's regex match (62/62 today).
+- **Snapshot is a BQ table, not markdown:** `CREATE TABLE options_wheel.fc067_label_snapshot_YYYYMMDD AS SELECT order_id, option_type, strategy FROM trades WHERE <predicate>` — machine-restorable rollback (`UPDATE ... FROM` the snapshot), permanent in-dataset audit artifact, 7-day time travel as backstop only. The investigation doc stays as narrative; the table is the rollback.
+- **R4 verification windows made explicit:** `executions`/`errors`/`decision_events`/`trades_from_activities` verify on the next scan/run/ingest cycle; `equity_history_from_alpaca`/`stock_history_from_alpaca` only after the 16:30/17:00 ET daily jobs; `trades` on the **next fill**, whenever that is. R5 runs after the full 7-table verify completes (spans at least one trading day) — do not start it on a partial verify.
+- **R1-is-pre-MERGE, second reason recorded:** between merge and deploy (indefinite while FC-081 stands), local wheel-profile CLI runs on main already write stamped rows — harmless only because R1 ran first. A future re-sequencer must not "optimize" R1 to pre-deploy.
+- **Warn-once flag** for `analytics_writer_unconfigured` (uncached path must not re-warn per call); flag covered by the HIGH-B reset seam.
+
+### Critique carried forward (recorded, no code)
+
+- **DD-7's replacement is an emergent property, not a single control.** Post-deletion, "CC cannot write the wheel dataset" = required-kwargs + no-defaults (T1/T7) + the configure hand-off — **T1 and T7 are the only standing guards**; weakening either re-opens the hole. A mismatched pair (`dataset_id="options_wheel", strategy_id="covered_call"`) remains representable; a frozen identity object passed as one value would make it unrepresentable but is heavier than this seam warrants. Accepted; FC-076 (structural interlock) remains the eventual home for a stronger invariant.
+- **The `strategy_id` column buys nothing today** — separate datasets already attribute rows, and NULL-means-wheel taxes every future query with `IFNULL`. It earns its keep as cheap insurance against exactly the cross-dataset contamination class this project keeps hitting (six OCC-substring instances, DD-4 of Phase 2, FC-067 itself), and fresh CC tables get it free. The tension is real and the trade was made knowingly.
+- **Pre-existing defect found during review (not this plan's):** `tools/testing/regression_monitor.py:265-268` filters `trades` on `timestamp_iso`, a column that does not exist — the trade-execution check group has been warn-degrading on every hourly run. Filed as **FC-082**.
+
+### Net verdict
+
+Both reviews approve-with-changes; amendments above are plan-text plus three small spec upgrades (sentinel class, dataset-creation removal, reset seam). With these folded in, the plan is build-ready — proceed to the Opus build, then two adversarial code reviews + confirmation pass per house rules.

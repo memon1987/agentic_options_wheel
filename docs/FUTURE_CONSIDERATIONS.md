@@ -1601,6 +1601,21 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-082: regression monitor's trade-execution check queries a nonexistent column — warn-degrading every hourly run
+
+**Status:** Filed 2026-08-21 (found by the FC-075 Seam 4 plan review's live-schema sweep)
+**Size estimate:** XS (one column name + a test)
+**Owner:** unassigned
+**Plan file:** not needed (single-file fix; add a regression test)
+
+**Problem:** `tools/testing/regression_monitor.py:265-268` filters `options_wheel.trades` on `timestamp_iso` — a column that does not exist in the live schema (the field is `timestamp`). The trade-execution check group has therefore been silently warn-degrading on every hourly `/regression` run rather than verifying anything. Same defect class as the FC-069 S1 findings: an alarm layer that doesn't actually alarm gets muted by habit. The `/regression` endpoint's other check groups are unaffected.
+
+**Fix direction:** correct the column reference; add a test that runs the check's SQL against the code-defined `_TABLE_SCHEMA` field names (or a fake BQ fixture) so a schema/monitor drift fails the suite, not production. While there, sweep `regression_monitor.py` for other references to columns absent from the code-defined schemas.
+
+**Links:** `docs/plans/fc-075-seam-4.md` §Review disposition (discovery context), FC-069 S1 (the check-group sync precedent), `docs/CLAUDE.md` §The detective layer.
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
