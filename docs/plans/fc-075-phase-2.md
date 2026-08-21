@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-075
 **Parent plan:** `docs/plans/fc-075.md` (architecture, isolation seams, policy decisions — all carried forward, not restated)
 **Plan file:** `docs/plans/fc-075-phase-2.md`
-**Status:** Build-ready (2 adversarial plan reviews dispositioned 2026-08-21 — see Review disposition)
+**Status:** DONE — merged 2026-08-21 (PR #89, squash `2e08d0a`)
 **Size:** M (~200 net production lines across 7 existing files; no new source file)
 **Author:** Claude (Fable), design pass 2026-08-19 against `main` @ `f84b50a`
 **Builder:** Opus. **Reviews:** two adversarial (Fable, fresh contexts); production trading logic, so at least one reviewer gets live-data access per the stakes calibration.
@@ -234,3 +234,11 @@ On the CC book the FC-065 divergence check is structurally dead forever (`covere
 
 ### Net verdict
 Both reviews approve-with-changes; all amendments above are plan-text/spec fixes plus one small new code requirement (Design decision 7, the write interlock). No architecture change. With these folded in, the plan is build-ready — proceed to the Opus build, then two Fable code reviews + confirmation.
+
+
+## Execution (as-merged 2026-08-21)
+
+- **PR:** #89 (squash `2e08d0a`). Depends on FC-067 (#88, `b02f48d`). Blocks Seam 4.
+- **Process:** design pass (Fable) → 2 adversarial plan reviews → Opus build (4 commits) → 2 adversarial code reviews (both REQUEST_CHANGES, both affirmed the code correct + wheel-neutral; findings were an under-delivered test contract + an overclaiming docstring) → dispositioned (11 added tests, 2 helpers extracted for testability) → scoped confirmation pass CONFIRMED-CLEAN. Suite 1269 → 1301.
+- **As-built:** no new engine — `strategy_id`-keyed gating of the existing pipeline exactly as the design pass predicted. DD-4 fixed a live cross-account cost-basis blocker. DD-7 (`config.writes_isolated`) fails a non-wheel profile closed on every write path + the CLI until Seam 4.
+- **Next:** Seam 4 (threads `config.bigquery_dataset` through the 5 writers + `strategy_id` column + live-table ALTER; **removes the DD-7 guard** as its final step) → Phase 3 provisioning + deploy → shadow week → first paper trade.
