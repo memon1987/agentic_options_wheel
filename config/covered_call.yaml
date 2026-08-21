@@ -46,16 +46,18 @@ strategy:
   call_delta_range: [0.15, 0.25]
   # Minimum acceptable call premium (per share).
   min_call_premium: 0.30
-  # Strike-floor policy. Only 'avg_entry_price' is supported today (hard floor:
-  # never write a strike below the shares' average entry price). The key is
-  # explicit so the mode is auditable, not to invite alternatives. Reuses the
-  # shared CostBasisResolver (FC-050). Consumed in Phase 2.
-  floor_mode: avg_entry_price
+  # Strike floor: the hard `strike >= avg_entry_price` rule is enforced by the
+  # shared CostBasisResolver (FC-050/FC-065) on the execute path — there is no
+  # config knob for it (a `floor_mode` key was removed here: it had no consumer,
+  # and avg_entry_price is the only supported mode).
   # FC-069 S1 deleted the breadth/exposure knobs that were mirrored here from
   # the wheel (`max_positions_per_stock`, `max_total_positions`,
   # `max_exposure_per_ticker`) along with their Config properties and
-  # validation. They had no consumer on either profile's live path. Phase 2
-  # sizing is bounded by `max_position_size` and the 4x-margin discipline below.
+  # validation. Covered-call sizing is `floor(uncommitted_shares / 100)` per
+  # underlying — it never touches dollars. `max_position_size` below has no
+  # consumer on this profile (it sizes PUTS, of which there are none); it is
+  # kept only to satisfy the shared risk-section validation. The real 4x-margin
+  # discipline is the equity-basis exposure alert (risk block below).
 
 # Holdings-derived universe (requirement: no configured stock list). The engine
 # writes calls against whatever equity it finds in the account. These controls
@@ -69,7 +71,19 @@ universe:
   # + logged, never traded.
   min_open_interest: 500
   max_spread_pct: 0.10          # reject chains wider than 10% bid/ask
-  earnings_exclusion_days: 5    # no new calls within N days of earnings
+  # (earnings_exclusion_days removed: no consumer, and a symbol-level N-day
+  #  blackout is the design FC-013 rev 2.2 rejected for the call leg — the span
+  #  predicate below is the real gate. See the `earnings:` block.)
+
+# Earnings gate (FC-013), enabled for this profile. A symbol with unknown
+# earnings fails closed (no call written); the per-candidate span predicate
+# refuses only strikes that expire INTO an earnings event. Requires
+# FINNHUB_API_KEY bound on the covered-call service (Phase 3) — without it every
+# symbol resolves UNKNOWN and the engine writes nothing (safe, loud, useless).
+earnings:
+  enabled: true
+  cache_ttl_hours: 24
+  lookahead_days: 90
 
 risk:
   # `max_portfolio_allocation` and `min_cash_reserve` deleted by FC-069 S1
@@ -95,7 +109,26 @@ risk:
     min_profit_target: 0.30
     max_profit_target: 0.80
     default_long_dte_target: 0.50
-    dte_bands: []
+    # DTE-band profit targets for /monitor early-close. Copied from the wheel's
+    # call side as a starting point (operator-tunable, OQ-1). An empty list made
+    # every close-evaluation fall through to the static-fallback warning.
+    dte_bands:
+      - dte: 7
+        profit_target: 0.35
+      - dte: 6
+        profit_target: 0.40
+      - dte: 5
+        profit_target: 0.35
+      - dte: 4
+        profit_target: 0.45
+      - dte: 3
+        profit_target: 0.50
+      - dte: 2
+        profit_target: 0.60
+      - dte: 1
+        profit_target: 0.70
+      - dte: 0
+        profit_target: 0.80
 
 # The `monitoring:` block was deleted by FC-069 S1 (card 17) on both profiles:
 # zero consumers, and `check_interval_minutes` misrepresented Cloud Scheduler's

@@ -20,6 +20,11 @@ class TestOptionsScannerPutScan:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.stock_symbols = ['AAPL', 'MSFT', 'GOOGL']
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
@@ -172,6 +177,11 @@ class TestOptionsScannerScoring:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
 
@@ -259,6 +269,11 @@ class TestOptionsScannerCallScan:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
 
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data, self.mock_config)
@@ -390,6 +405,11 @@ class TestCallScanFailsClosedOnUnresolvedCostBasis:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
                                       self.mock_config)
@@ -483,6 +503,11 @@ class TestCallScanFloorIsTheBrokerBasisCrossCheckedAgainstBigQuery:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
                                       self.mock_config)
@@ -621,6 +646,11 @@ class TestAtFloorStrikesAreFlaggedTheWayTheGatesTreatThem:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
                                       self.mock_config)
@@ -704,6 +734,11 @@ class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
                                       self.mock_config)
@@ -819,6 +854,11 @@ class TestCallScanFailsClosedOnAnUnusableQuote:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
                                       self.mock_config)
@@ -870,6 +910,11 @@ class TestOptionsScannerScanAll:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.stock_symbols = ['AAPL']
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
@@ -913,6 +958,11 @@ class TestScanStageDecisionRecords:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 7
 
         self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
@@ -1261,6 +1311,11 @@ class TestPutLegEarningsGate:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.stock_symbols = ['AAPL', 'MSFT']
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
@@ -1337,6 +1392,11 @@ class TestCallLegEarningsSpanGate:
 
         self.mock_alpaca = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 45
         self.mock_config.call_delta_range = [0.10, 0.25]
         self.mock_config.min_call_premium = 0.30
@@ -1511,6 +1571,11 @@ class TestEarningsGateFailureSemantics:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.stock_symbols = ['AAPL']
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
@@ -1697,6 +1762,11 @@ class TestTheDayAfterEarningsIsTradeable:
 
         self.mock_alpaca = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.call_target_dte = 45
         self.mock_config.call_delta_range = [0.10, 0.25]
         self.mock_config.min_call_premium = 0.30
@@ -1830,6 +1900,11 @@ class TestPutSideExistingPositionSkip:
         self.mock_alpaca = Mock()
         self.mock_market_data = Mock()
         self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'  # FC-075 Phase 2: wheel-profile defaults
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
         self.mock_config.stock_symbols = ['F', 'MSFT']
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7

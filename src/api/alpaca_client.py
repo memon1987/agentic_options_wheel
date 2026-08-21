@@ -231,6 +231,7 @@ class AlpacaClient:
                 'cash': float(account.cash),
                 'portfolio_value': float(account.portfolio_value),
                 'equity': float(account.equity),
+                'long_market_value': float(getattr(account, 'long_market_value', 0.0) or 0.0),
                 'options_buying_power': float(account.options_buying_power) if hasattr(account, 'options_buying_power') else 0.0,
                 'options_approved_level': getattr(account, 'options_approved_level', 0)
             }

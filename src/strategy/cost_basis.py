@@ -363,15 +363,21 @@ class CostBasisResolver:
             # the LAST sell-to-open fill of that same contract before the
             # assignment — the roll/re-sell ambiguity is resolved as "last
             # fill" per the plan.
-            query = """
+            # FC-075 Phase 2 (DD-4): dataset from config, not hardcoded. On the
+            # covered-call service this must query the covered_call dataset — the
+            # wheel's assignment history is a different account's lots and would
+            # falsely diverge the cross-check, permanently blocking any shared
+            # underlying. Defaults to options_wheel for the wheel.
+            dataset = self.config.bigquery_dataset
+            query = f"""
             SELECT
               a.symbol AS occ_symbol,
               a.strike_price AS strike_price,
               ABS(COALESCE(a.qty, 0)) * 100 AS shares,
               a.transaction_time AS assigned_at,
               f.price AS put_premium
-            FROM `options_wheel.trades_from_activities` a
-            LEFT JOIN `options_wheel.trades_from_activities` f
+            FROM `{dataset}.trades_from_activities` a
+            LEFT JOIN `{dataset}.trades_from_activities` f
               ON f.activity_type = 'FILL'
              AND f.symbol = a.symbol
              AND f.option_type = 'put'

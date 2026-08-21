@@ -103,6 +103,7 @@ REASON_EARNINGS_BLACKOUT = "earnings_blackout"
 REASON_EARNINGS_UNKNOWN = "earnings_unknown"
 # not_eligible{...}
 REASON_INSUFFICIENT_SHARES = "insufficient_shares"
+REASON_EXCLUDED_BY_CONFIG = "excluded_by_config"  # FC-075 Phase 2: universe.excluded_symbols opt-out
 # no_candidates{...}
 REASON_NO_QUALIFYING_STRIKES = "no_qualifying_strikes"
 REASON_QUOTE_UNAVAILABLE = "quote_unavailable"
@@ -129,7 +130,7 @@ ALLOWED_REASONS: Dict[str, frozenset] = {
     OUTCOME_BLOCKED: frozenset(
         {REASON_FLOOR_UNRESOLVED, REASON_FLOOR_DIVERGENT,
          REASON_EARNINGS_BLACKOUT, REASON_EARNINGS_UNKNOWN}),
-    OUTCOME_NOT_ELIGIBLE: frozenset({REASON_INSUFFICIENT_SHARES}),
+    OUTCOME_NOT_ELIGIBLE: frozenset({REASON_INSUFFICIENT_SHARES, REASON_EXCLUDED_BY_CONFIG}),
 }
 
 

@@ -48,6 +48,8 @@ def _call(option_symbol, expiry, strike=200.0, delta=0.17, mid=1.50, dte=7):
 class _SpanFixture:
     def setup_method(self):
         self.config = Mock(spec=Config)
+        self.config.min_open_interest = None  # FC-075 Phase 2: inert for the wheel
+        self.config.max_spread_pct = None
         self.config.call_target_dte = 45
         self.config.call_delta_range = [0.10, 0.25]
         self.config.min_call_premium = 0.30
@@ -262,6 +264,8 @@ class TestExpiryCoercion(_SpanFixture):
 class _RollProfileFixture:
     def setup_method(self):
         self.config = Mock(spec=Config)
+        self.config.min_open_interest = None  # FC-075 Phase 2: inert for the wheel
+        self.config.max_spread_pct = None
         self.config.call_target_dte = 7
         self.config.call_delta_range = [0.15, 0.25]
         self.config.min_call_premium = 0.30
