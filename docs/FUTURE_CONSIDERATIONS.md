@@ -1586,18 +1586,25 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
 
-**Status:** Filed 2026-08-21 — **blocks FC-075 Seam 4 rollout (R3) and everything behind it**
-**Size estimate:** S (likely a connection/webhook repair, not code)
-**Owner:** zeshan (needs GitHub App / Cloud Build console access)
-**Plan file:** not needed (infra repair; document the fix in this entry)
+**Status:** RESOLVED 2026-08-21 (same day) — root cause: **the GitHub repo was renamed `options_wheel` → `agentic_options_wheel`**; trigger rebound + repo re-connected. One follow-up open: the merged-vs-deployed freshness alert (below).
+**Size estimate:** S
+**Owner:** zeshan + Claude
+**Plan file:** not needed (infra repair; documented here)
 
-**Problem:** the wheel service is running revision `options-wheel-strategy-00498-qen`, built 2026-08-05 from `f84b50a`. Four commits merged to main on 2026-08-21 — **including FC-067 (#88) and FC-075 Phase 2 (#89), production code** — produced **no Cloud Build at all**: `gcloud builds list` shows nothing after 2026-08-05 03:52 UTC. The trigger `deploy-options-wheel-strategy` (`^main$`, `cloudbuild.yaml`) is present, enabled, and has no path filters — so the push events are not reaching it (GitHub App connection / webhook delivery is the likely layer). This is the FC-031 failure class escalated: FC-031 was a red build nobody saw and got build-failure alerting as its fix; **a build that never starts fires no failure alert**, so the existing channel is structurally blind to this mode.
+**Problem:** the wheel service was running revision `options-wheel-strategy-00498-qen`, built 2026-08-05 from `f84b50a`. Four commits merged to main on 2026-08-21 — **including FC-067 (#88) and FC-075 Phase 2 (#89), production code** — produced **no Cloud Build at all**. The trigger `deploy-options-wheel-strategy` (`^main$`, `cloudbuild.yaml`) was present, enabled, unfiltered. This is the FC-031 failure class escalated: FC-031 was a red build nobody saw and got build-failure alerting as its fix; **a build that never starts fires no failure alert**, so the existing channel is structurally blind to this mode.
 
-**Consequences right now:** production journal rows are still being written with FC-067's poisoned put-labels (mislabeled call rows grew 29 → 62 between the FC-067 investigation and 2026-08-21 for exactly this reason); Phase 2's wheel-side hardening is not live; FC-075 Seam 4's rollout sequence gates on a working deploy path.
+**Root cause (diagnosed 2026-08-21):** the repo was renamed on GitHub. Git pushes, PRs, `gh` API calls all follow GitHub's automatic old-name redirect — so nothing *looked* broken — but Cloud Build 1st-gen triggers match the literal `github.owner/name` pair in the trigger config, and webhook events arrive stamped with the **new** name. They matched no trigger and were dropped with zero errors anywhere: zero `CreateBuild` audit-log entries after 08-05 04:02 UTC, zero check-runs on post-rename commits (every built commit has one from the `google-cloud-build` app — that asymmetry was the conclusive evidence). The GitHub App connection itself was intact the whole time.
 
-**Fix direction:** verify webhook delivery (GitHub repo settings → GitHub App → recent deliveries) and the Cloud Build GitHub connection; re-trigger manually (`gcloud builds triggers run deploy-options-wheel-strategy --branch=main`) to clear the backlog once diagnosed. Then close the alerting gap: a scheduled freshness check comparing `origin/main` HEAD against the deployed revision's commit (or simply latest build age vs. latest push age) that alerts on drift > N hours — the control FC-031 should have included and this recurrence proves is needed.
+**Fix applied (2026-08-21):** (1) operator re-ran the console "Connect repository" flow for `memon1987/agentic_options_wheel` (1st-gen mapping is keyed by repo name and console-only; until it existed, both trigger update and create returned bare `INVALID_ARGUMENT`/`FAILED_PRECONDITION`); (2) trigger rebound to the new name via `gcloud beta builds triggers export`/`import` (same trigger id `5f4caa43`, history preserved); (3) local git remote repointed. End-to-end verification: the commit recording this entry auto-fired a build on push (see below for result).
 
-**Links:** FC-031 (the 11-days-undeployed precedent + build-failure alerting), FC-030 (the notification channel to reuse), `docs/plans/fc-075-seam-4.md` (gated rollout steps R3–R5).
+**Consequences while broken:** production journal rows were written with FC-067's poisoned put-labels for 16 extra days (mislabeled call rows grew 29 → 62 — the count in `docs/plans/fc-075-seam-4.md` DD-5); Phase 2's wheel-side changes sat unverified in prod.
+
+**Lessons / follow-ups:**
+- **[OPEN — the durable fix] Merged-vs-deployed freshness alert:** a scheduled check comparing latest-push age vs. latest-build age (or `origin/main` HEAD vs. the serving revision's commit), alerting on drift > N hours via the FC-030 channel. FC-031's build-failure alert watches builds that *start*; this failure mode needs a check that watches for builds that *don't*. A rename like this would have been caught in hours, not 16 days.
+- **Redirect-masking:** GitHub's old-name redirects are exactly what made this silent. The old name is also now squattable — sweep docs/scripts/configs for hardcoded `github.com/memon1987/options_wheel` URLs to the new name (low urgency; redirects hold until the old name is reused).
+- **Rename checklist:** any future repo rename must same-day update: Cloud Build repo connection + trigger, local remotes, and any webhook-keyed integration.
+
+**Links:** FC-031 (the 11-days-undeployed precedent + build-failure alerting), FC-030 (the notification channel to reuse), `docs/plans/fc-075-seam-4.md` (rollout steps R3–R5 that this gated).
 
 ---
 
