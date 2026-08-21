@@ -449,6 +449,18 @@ deltas for the same kind of reason.
   - Cloud Run dashboard endpoints
 - This ensures analysis reflects production-ready, persistent, centralized data.
 
+**Reading `strategy_id` (FC-075 Seam 4).** Every row written by the five BigQuery
+writers — `trades`, `errors`, `executions`, `decision_events`,
+`trades_from_activities`, `equity_history_from_alpaca`,
+`stock_history_from_alpaca` — carries a `strategy_id` naming the profile that
+wrote it. The column is NULLABLE and was **not backfilled**: rows written before
+Seam 4 deployed have `strategy_id IS NULL`, and every one of them is a wheel row.
+Any query that segments by strategy must therefore read
+`IFNULL(strategy_id, 'wheel')`, never bare `strategy_id` — a bare
+`WHERE strategy_id = 'wheel'` silently drops the entire pre-Seam-4 history.
+Each strategy also has its own dataset (`options_wheel`, `covered_call`), so
+within one dataset the column is a cross-check, not the primary filter.
+
 **Backtests are the exception, and the distinction matters.** The old
 `/backtest`, `/backtest/results`, `/backtest/history` and `/cache/*` endpoints
 were **deleted in FC-032** — the engine behind them had never produced a single
