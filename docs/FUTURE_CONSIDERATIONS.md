@@ -1229,7 +1229,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-067: the trade journal labels every covered call as a put
 
-**Status:** Consideration
+**Status:** CLOSED 2026-08-21 — fixed by PR #88 (`b02f48d`), hardened by its adversarial review to derive the leg **OCC-symbol-first** (`strict_option_type(option_symbol)` → `option_type` → `type` → infer-from-strategy; strategy follows the resolved leg; absent leg → null, never a guessed 'put'), because `execute_batch` routes by the symbol on declared/type drift (FC-048) and the audit row must record the leg actually traded. Root cause: scanner opps carry `type`, not `option_type`/`strategy`, so `record_trade`'s defaults fired on EVERY row. Forward-only — **the 29 historical mislabeled rows still need a corrective UPDATE** (synthetic/corrective-write discipline; natural rider on the Seam 4 plan). Tests: `tests/test_trade_journal_labeling.py` (7). Was the hard prerequisite for FC-075 Phase 2.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1504,7 +1504,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-075: Standalone covered-call strategy — separate account, shared machinery
 
-**Status:** Plan published
+**Status:** Executing — Phases 0–2 DONE (engine merged 2026-08-21, PR #89 `2e08d0a`; Phase 1 isolation PR #77; prereq FC-067 PR #88). Covered-call service is code-complete but **inert until Seam 4** (DD-7 write interlock fails non-wheel profiles closed). Remaining: Seam 4 → Phase 3 deploy → shadow week → first paper trade on `PA37XLNWDLB3`. See `docs/plans/fc-075-phase-2.md` §Execution + `docs/releases/RELEASE_2026-08-21.md`.
 **Size estimate:** L
 **Owner:** zeshan
 **Plan file:** `docs/plans/fc-075.md`

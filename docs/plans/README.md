@@ -76,3 +76,5 @@ _List active plans here as they are added._
 - [fc-038.md](fc-038.md) — FC-038: Two-pool execution selection (covered-call phantom-collateral fix), status: done
 - [fc-050.md](fc-050.md) — FC-050: Restore the covered-call below-basis floor on the production path, status: done
 - [fc-065.md](fc-065.md) — FC-065: One floor, one path, one decision record (covered-call gating layer), status: draft — awaiting review
+- [fc-075.md](fc-075.md) — FC-075: Standalone covered-call strategy (separate account, shared machinery), status: executing — Phases 0–2 done, Seam 4 next
+- [fc-075-phase-2.md](fc-075-phase-2.md) — FC-075 Phase 2: the covered-call engine (call-only gating of the shared pipeline), status: done (PR #89)
