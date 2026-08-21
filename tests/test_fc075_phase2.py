@@ -479,3 +479,36 @@ class TestCliWriteInterlock:
                 main.main()
         assert exc.value.code == 2          # writes_isolated False → refused
         scan_fn.assert_not_called()          # never scanned
+
+
+# --------------------------------------------------------------------------- #
+# Req 7 — a covered-call execution journals as a call (post-FC-067)
+# --------------------------------------------------------------------------- #
+
+class TestJournalLabelingThroughExecute:
+    def test_scanner_call_opportunity_journals_as_call(self):
+        # execution_engine.execute_batch persists a filled trade via
+        # `record_trade({**opp, <order fields>})` (execution_engine.py:824). This
+        # pins the effective outcome for a scanner-shaped covered-call
+        # opportunity through that exact composition: FC-067's OCC-first
+        # derivation labels it call/sell_call even though the scanner opp carries
+        # only `type`, not `option_type`/`strategy`.
+        from src.data.trade_journal import TradeJournal
+        tj = TradeJournal.__new__(TradeJournal)
+        tj._enabled = True
+        tj._client = Mock()
+        tj._client.insert_rows_json.return_value = []
+        tj._table_ref = "proj.covered_call.trades"
+
+        scanner_call_opp = {
+            "symbol": "META", "type": "call",
+            "option_symbol": "META260220C00600000",
+            "strike_price": 600.0, "contracts": 1, "premium": 3.10,
+        }
+        # exactly what execute_batch spreads for a filled order:
+        tj.record_trade({**scanner_call_opp, "order_id": "x",
+                         "status": "submitted", "fill_price": 3.10})
+
+        row = tj._client.insert_rows_json.call_args[0][1][0]
+        assert row["option_type"] == "call"
+        assert row["strategy"] == "sell_call"
