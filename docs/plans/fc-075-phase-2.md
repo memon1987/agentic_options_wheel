@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-075
 **Parent plan:** `docs/plans/fc-075.md` (architecture, isolation seams, policy decisions — all carried forward, not restated)
 **Plan file:** `docs/plans/fc-075-phase-2.md`
-**Status:** Draft
+**Status:** Build-ready (2 adversarial plan reviews dispositioned 2026-08-21 — see Review disposition)
 **Size:** M (~200 net production lines across 7 existing files; no new source file)
 **Author:** Claude (Fable), design pass 2026-08-19 against `main` @ `f84b50a`
 **Builder:** Opus. **Reviews:** two adversarial (Fable, fresh contexts); production trading logic, so at least one reviewer gets live-data access per the stakes calibration.
@@ -186,3 +186,51 @@ Recorded so the parent plan's staleness doesn't mislead a future reader; update 
 - Seam 4 gate wording: `/scan`//`/run`//`/monitor` are themselves analytics writers (decision events, executions, errors, trades) — the deploy gate, not merely an ingest-job gate.
 - The repo-wide OCC grep gate promised in the parent plan's Verification does not exist yet; it ships here (test requirement 10).
 - The cost-basis cross-check is not merely wheel-scoped telemetry: unthreaded, it is a covered-call trading blocker for shared underlyings (Design decision 4).
+
+---
+
+## Review disposition (2026-08-21) — authoritative amendments
+
+Two adversarial plan reviews (Fable, fresh contexts: senior options trader; production reliability/data engineer). **Both REQUEST_CHANGES; both affirmed the architecture** ("sound and unusually well-verified"; a hand-walk of all three handlers found no fifth wheel-specific branch). Every finding is a plan-text fix — none reopen the design. This section is authoritative where it amends anything above; the builder follows it.
+
+### HIGH-1 — DD-5 exposure alert is unbuildable as written and would brick the CC scan (both reviewers)
+`AlpacaClient.get_account()` (`src/api/alpaca_client.py:224-236`) returns no `long_market_value`; built literally, `float(None)` throws inside `trigger_scan`'s try → every CC scan aborts as `scan_failure`. Amendments:
+- **Add `long_market_value` to `get_account()`** — `float(getattr(account, 'long_market_value', 0.0) or 0.0)`. Additive, wheel-neutral. **Add `src/api/alpaca_client.py` to the touch table.**
+- **Exception-isolate the alert:** wrap the `get_account()` fetch + comparison in its own try/except (mirror the analytics-write isolation at `cloud_run_server.py:385-396`); on any failure log one event and **let the scan proceed** — the alert must never block a scan.
+- **Test 8 gains a case:** `get_account` raises → scan completes and stores the blob, no alert; also assert the wheel profile never fetches the account for this check.
+
+### HIGH-2 — the Seam-4 "deploy gate" is a doc promise, not a control; enforce it in code (reliability reviewer)
+`/scan` and `/run` write `decision_events` (via the `get_analytics_writer()` singleton, default `options_wheel`) and `trades` (via `TradeJournal()`, default `options_wheel`) **today**. `main.py --command scan` with `STRATEGY_CONFIG=config/covered_call.yaml` and ambient GCP creds therefore writes covered-call rows into the **wheel's** dataset with no deploy and nothing refusing it. "Don't deploy until Seam 4" is exactly the FC-031-class promise-not-a-control this project has been burned by. Amendment — **Design decision 7 (new): pre-Seam-4 write interlock.**
+- Add a shared guard `_writes_are_isolated(config)` → `True` only when `config.strategy_id == 'wheel'` **or** the BQ writers honor `config.bigquery_dataset` (the flag Seam 4 flips). Until Seam 4, a non-wheel profile returns `False`.
+- On `False`, the write-producing paths **fail closed**: `/scan`, `/run`, `/monitor` (and the `main.py` scan/run CLI entry, so the decorator-bypass path is covered too) refuse with one `write_isolation_unavailable` error event and do no work. This makes "the CC service cannot contaminate the wheel dataset before Seam 4" a **code property**, not a sequencing note.
+- **Seam 4 removes this guard** as its final step (once writers are dataset-correct). Record that hand-off explicitly in the Seam 4 plan.
+- Tests: non-wheel profile pre-Seam-4 → `/scan` and CLI scan refuse + emit the event, write nothing; wheel profile → unaffected.
+- Consequence for the rollout: the CC shadow week necessarily follows Seam 4 (the service is inert before it) — which already matches the FC-067 → Phase 2 → Seam 4 → Phase 3 ordering. Update the rollout to state the shadow week is post-Seam-4.
+
+### MEDIUM — OCC grep-gate allowlist is incomplete + comment handling unspecified (both; independently re-verified)
+Live `'P' in`/`'C' in` code sites over option symbols are **four** files, not two: `wheel_engine.py:304/:306/:408`, `regression_monitor.py:628`, **and** `tools/testing/debug_expired_put_analysis.py:23/:26` and `tools/testing/detailed_expired_options_analysis.py:183/:186`. Amendments: allowlist all four; the gate matches **code only** (strip comments/docstrings — there are 7 comment mentions in `option_symbols.py`, `execution_engine.py`, `cloud_run_server.py`, `regression_monitor.py` that must not trip it); gate scope stays `src/ tools/ deploy/`.
+
+### MEDIUM — `/run` call-only filter corrupts decision-row attribution (reliability reviewer)
+The filter drops non-calls after `blob_opportunities[:] = list(opportunities)` (`:541`), but `_underlyings_removed(blob_opportunities, opportunities)` (`:571`) then diffs against the blob → an underlying whose only opp was a refused put is mislabeled `previously_failed`. Amendment: drop refused opportunities from **both** lists (or exclude filter-dropped underlyings from the diff) so the refusal telemetry isn't corrupted; **extend test 2** to assert no `previously_failed` mislabel on the refused put.
+
+### MEDIUM — DD-4 post-provisioning mechanism mis-stated; Phase 3 must provision the read tables (reliability reviewer)
+The "cross-check → `no_assignment_history`" story assumes `covered_call.trades_from_activities` **exists**; nothing in Phase 2/3 creates it (it's ingestor-written, Seam-4-gated). Actual pre-provision behavior: BQ NotFound → `cost_basis_cross_check_lookup_failed` **WARNING per held symbol per scan** + `uncovered_days_lookup_failed` per scan (whose SQL also needs `stock_history_from_alpaca`). Safe (floor kept) but permanent per-scan warning noise on a service whose alerting reads Cloud Logging. Amendments: correct DD-4's post-provisioning paragraph to the NotFound-degradation mechanism; **Phase 3 checklist**: create + ingest `trades_from_activities` and `stock_history_from_alpaca` in the `covered_call` dataset, or the plan explicitly accepts the per-scan warnings as steady state.
+
+### MEDIUM — ex-dividend early assignment unaddressed (options-trader reviewer)
+The classic covered-call event, likelier here (manual entry into a 4× margin account invites dividend payers; `/monitor` only closes at profit so an ITM call rides; no roller). The hard floor bounds it — assignment realizes `strike ≥ avg_entry_price` + premium, so it's forfeited upside/dividend and early cycle-end, not a loss — but the plan must own it. Amendments: add an **accepted-risk** entry with the floor-bounds-it reasoning; add an early-assignment **monitoring line** to the shadow-week/first-trades list; operator note that high-yield tickers belong in `excluded_symbols` or are accepted-forfeit.
+
+### MEDIUM — reframe the permanently-dead cross-check as an accepted risk (options-trader reviewer)
+On the CC book the FC-065 divergence check is structurally dead forever (`covered_call.trades_from_activities` never holds put assignments), so a broker mis-adjustment (split/corporate action) on a manually-entered lot sets a wrong floor with nothing watching. Amendment: move the "precisely the FC-065 design" framing in DD-4 to an **accepted risk** with named mitigations (fail-closed on zero basis; strict OCC parse refuses adjusted `1AAPL` roots; broker `avg_entry_price` is genuinely authoritative for plain manual purchases).
+
+### LOW (batch)
+- **FC-067 section + dependency row are stale** — #88 (`b02f48d`) is merged **beneath this plan commit**; `record_trade` already derives the leg from the OCC symbol. Rewrite "Journal labeling" to past tense (FC-067 merged; Phase 2 only pins the outcome with test 7, unconditionally buildable) and set the Dependencies row to "merged (#88)". Remove the xfail contingency.
+- **New chain-criteria missing-field semantics:** OI/`bid`/`ask` absent or `None` with a threshold set → **fail closed** (reject the strike), never `KeyError` out of `_check_call_criteria_detailed`; note the spread check's fail-open-on-`mid<=0` is shielded only by `min_call_premium` running earlier — state that coupling. Add a fixture case.
+- **Dead-knob consistency:** apply the same "no-consumer knob is a defect" rule used to delete `earnings_exclusion_days` to `floor_mode`, `max_position_size`, `use_put_stop_loss` in `covered_call.yaml` — either validate `floor_mode == 'avg_entry_price'` (give it a consumer) or delete/re-comment the three; fix the false "Consumed in Phase 2" comments.
+- **`excluded_symbols` normalization:** compare `symbol.upper().strip()` against a normalized set; add a test (`aapl` excludes AAPL).
+- **`stock_symbols` stragglers:** `/config` (`cloud_run_server.py:1290`), `/backtest/screen` (`:1411`), `main.py:112 get_market_overview` use `getattr(config, 'stock_symbols', [])`, which does **not** swallow the property's `KeyError` → 500 on the CC profile. Pre-existing, but Phase 2 claims to cover every `stock_symbols` caller — fix all three (guard the profile) or explicitly defer with a one-line note.
+
+### Critique carried forward (no code, record in the plan)
+- **Reverse-neutrality burden:** after this merges, every future *wheel* PR must also prove it didn't change *covered-call* behavior; only tests 5/11 partially encode that. Add a one-line note to the neutrality contract making the two-way burden explicit.
+
+### Net verdict
+Both reviews approve-with-changes; all amendments above are plan-text/spec fixes plus one small new code requirement (Design decision 7, the write interlock). No architecture change. With these folded in, the plan is build-ready — proceed to the Opus build, then two Fable code reviews + confirmation.
