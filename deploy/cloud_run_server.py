@@ -241,6 +241,43 @@ def require_account_match(f):
     return wrapper
 
 
+def require_write_isolation(f):
+    """Refuse write-producing endpoints whose BQ writes would hit the wrong dataset.
+
+    FC-075 Phase 2 (DD-7): until Seam 4 threads ``config.bigquery_dataset`` through
+    the BigQuery writers, they all hardcode ``options_wheel``. A non-wheel profile
+    therefore cannot run /scan, /run, /monitor, /roll or /ingest-* — each of which
+    writes decision_events / executions / errors / trades — without contaminating
+    the wheel's dataset. This makes "the covered-call service cannot write wheel
+    data before Seam 4" a code property rather than a deploy-time promise, and it
+    covers the main.py CLI bypass too (see main.py). Inert for the wheel, which
+    owns that dataset (``config.writes_isolated`` is True). Seam 4 removes it.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        config = strategy_config()
+        if not config.writes_isolated:
+            log_error_event(
+                logger,
+                error_type="write_isolation_unavailable",
+                error_message=(
+                    f"strategy_id={config.strategy_id!r} cannot write to BigQuery "
+                    "until Seam 4 threads bigquery_dataset through the writers; "
+                    "refusing the write-producing request"),
+                component="cloud_run_server",
+                recoverable=False,
+                strategy_id=config.strategy_id,
+            )
+            return jsonify({
+                'status': 'error',
+                'error': 'write_isolation_unavailable',
+                'message': ("BigQuery write isolation is not yet in place for this "
+                            "strategy (Seam 4 pending); refusing to run."),
+            }), 503
+        return f(*args, **kwargs)
+    return wrapper
+
+
 def interlock_status():
     """Report the cached interlock verdict WITHOUT triggering a network check.
 
@@ -284,6 +321,7 @@ def get_status():
 @app.route('/scan', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def trigger_scan():
     """Trigger a market scan for opportunities."""
     with strategy_lock:
@@ -336,6 +374,38 @@ def trigger_scan():
                        event_category="system",
                        event_type="call_scan_completed",
                        count=len(call_opportunities))
+
+            # FC-075 Phase 2 (DD-5): 4x-margin discipline for a manual-entry book.
+            # ALERT-ONLY (never blocks the scan) when long exposure exceeds
+            # equity * threshold. Fully exception-isolated — a get_account() blip
+            # must not turn an alert into a scan-killer. Inert on the wheel
+            # (sizing_basis defaults to 'buying_power').
+            if config.sizing_basis == 'equity':
+                try:
+                    acct = alpaca_client.get_account()
+                    lmv = float(acct.get('long_market_value') or 0.0)
+                    equity = float(acct.get('equity') or 0.0)
+                    threshold = config.max_long_market_value_pct_of_equity
+                    if equity > 0 and lmv > equity * threshold:
+                        log_error_event(
+                            logger,
+                            error_type="long_exposure_exceeds_equity",
+                            error_message=(f"long_market_value {lmv:.2f} exceeds "
+                                           f"equity {equity:.2f} x {threshold}"),
+                            component="cloud_run_server",
+                            recoverable=True,
+                            long_market_value=lmv,
+                            equity=equity,
+                            threshold=threshold,
+                        )
+                except Exception as e:
+                    log_error_event(
+                        logger,
+                        error_type="long_exposure_check_failed",
+                        error_message=str(e),
+                        component="cloud_run_server",
+                        recoverable=True,
+                    )
 
             # Store opportunities for execution
             from src.data.opportunity_store import OpportunityStore
@@ -443,6 +513,7 @@ def trigger_scan():
 @app.route('/run', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
@@ -482,31 +553,47 @@ def trigger_strategy():
             alpaca_client = AlpacaClient(config)
             opportunity_store = OpportunityStore(config)
 
-            # --- Pre-trade housekeeping ---
+            # --- Pre-trade housekeeping (wheel only) ---
             # Reconcile positions so wheel state matches Alpaca reality before
             # new trades. (The order-status poll that used to run here was
             # deleted in FC-035: it ran every cycle for ~4 months but never
             # produced a single event or row, and the authoritative
             # fill/expiration record comes from the activities ingestor.)
-            try:
-                engine = WheelEngine(config)
+            #
+            # FC-075 Phase 2 (DD-6): gated to the wheel profile. reconcile_positions()
+            # feeds a per-request, ephemeral WheelStateManager that nothing on the
+            # /run trading path reads (opportunities come from the blob; sizing and
+            # idempotency from the positions snapshot). On a covered-call book it is
+            # pure liability: it traverses the live FC-054/079 OCC-substring sites in
+            # wheel_engine (miscounting P-ticker calls) and emits wheel-shaped trade
+            # events from the covered-call account into shared telemetry.
+            if config.strategy_id == 'wheel':
+                try:
+                    engine = WheelEngine(config)
 
-                reconcile_stats = engine.reconcile_positions()
+                    reconcile_stats = engine.reconcile_positions()
+                    log_system_event(
+                        logger,
+                        event_type="pre_trade_reconciliation_completed",
+                        status="completed",
+                        discrepancies_found=reconcile_stats.get('discrepancies_found', 0),
+                        state_updates=reconcile_stats.get('state_updates', 0),
+                    )
+                except Exception as e:
+                    # Housekeeping failures should not block trade execution
+                    log_error_event(
+                        logger,
+                        error_type="pre_trade_housekeeping_failed",
+                        error_message=str(e),
+                        component="cloud_run_server",
+                        recoverable=True
+                    )
+            else:
                 log_system_event(
                     logger,
-                    event_type="pre_trade_reconciliation_completed",
-                    status="completed",
-                    discrepancies_found=reconcile_stats.get('discrepancies_found', 0),
-                    state_updates=reconcile_stats.get('state_updates', 0),
-                )
-            except Exception as e:
-                # Housekeeping failures should not block trade execution
-                log_error_event(
-                    logger,
-                    error_type="pre_trade_housekeeping_failed",
-                    error_message=str(e),
-                    component="cloud_run_server",
-                    recoverable=True
+                    event_type="reconcile_skipped_non_wheel_profile",
+                    status="skipped",
+                    strategy_id=config.strategy_id,
                 )
 
             # Retrieve pending opportunities from Cloud Storage
@@ -539,6 +626,32 @@ def trigger_strategy():
             # A blob written before this shipped carries none — mint an orphan
             # id and say so, rather than dropping the cycle's telemetry.
             blob_opportunities[:] = list(opportunities)
+
+            # FC-075 Phase 2 (DD-2): defense in depth — a covered-call (non-wheel)
+            # service must NEVER execute a put. The put scan is gated and the blob
+            # is strategy-keyed, so this can only fire on a hand-written/corrupted
+            # blob (expected live count: 0). Drop non-calls from BOTH the working
+            # list and the blob snapshot, so a refused put is not then mislabeled
+            # `previously_failed` by the _underlyings_removed diff below.
+            if config.strategy_id != 'wheel':
+                call_only = []
+                for opp in opportunities:
+                    if strict_option_type(opp.get('option_symbol') or '') == 'call':
+                        call_only.append(opp)
+                    else:
+                        log_error_event(
+                            logger,
+                            error_type="non_call_opportunity_refused",
+                            error_message=("Non-call opportunity refused on "
+                                           f"{config.strategy_id} profile"),
+                            component="cloud_run_server",
+                            recoverable=True,
+                            option_symbol=opp.get('option_symbol'),
+                            symbol=opp.get('symbol'),
+                        )
+                opportunities = call_only
+                blob_opportunities[:] = call_only
+
             run_id = run_id_from_opportunities(blob_opportunities)
             if not run_id:
                 run_id = mint_run_id(start_time)
@@ -861,6 +974,7 @@ def _is_market_open() -> bool:
 @app.route('/monitor', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def monitor_positions():
     """Monitor existing positions and close profitable ones."""
     with strategy_lock:
@@ -1168,6 +1282,7 @@ def monitor_positions():
 @app.route('/roll', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def trigger_roll():
     """Daily credit-only call rolling cycle (FC-006, revived by FC-078).
 
@@ -1496,6 +1611,7 @@ def backtest_screen():
 @app.route('/ingest-activities', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def ingest_activities():
     """Pull Alpaca account activities and append to BigQuery (FC-012 §2.1).
 
@@ -1554,6 +1670,7 @@ def ingest_activities():
 @app.route('/ingest-portfolio-history', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def ingest_portfolio_history():
     """Pull Alpaca portfolio/history and append finalized days to BigQuery (FC-012 §2.5).
 
@@ -1605,6 +1722,7 @@ def ingest_portfolio_history():
 @app.route('/ingest-stock-history', methods=['POST'])
 @require_api_key
 @require_account_match
+@require_write_isolation
 def ingest_stock_history():
     """Pull daily Alpaca stock bars for the traded universe and append to BQ (FC-018 PR B).
 
