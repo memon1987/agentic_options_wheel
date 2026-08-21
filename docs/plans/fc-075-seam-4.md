@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-075 (also closes out FC-067's corrective-UPDATE rider)
 **Parent plan:** `docs/plans/fc-075.md` §Seam 4 (deferral rationale); `docs/plans/fc-075-phase-2.md` DD-7 + HIGH-2 (the interlock this seam removes)
 **Plan file:** `docs/plans/fc-075-seam-4.md`
-**Status:** Draft
+**Status:** Executing — PR [#90](https://github.com/memon1987/agentic_options_wheel/pull/90) open; **R1 (the 7 live-table ALTERs) is PENDING and gates merge** — see §Execution
 **Size:** S–M (~150 net production lines across 9 files + tests; plus 7 idempotent DDLs and one corrective DML run outside the PR)
 **Author:** Claude (Fable), 2026-08-21, against `main` @ `b034b93`
 **Builder:** Opus. **Reviews:** two adversarial (Fable, fresh contexts, different personas). Stakes calibration: this PR touches every canonical BigQuery table the dashboard and analytics read — at least one reviewer gets live BQ access and must verify schema/row claims against the real dataset, not the diff.
@@ -257,3 +257,26 @@ DD-4 cited "Verification item V6", a leftover from a cut section; no V-list exis
 ### Net verdict
 
 Both reviews approve-with-changes; amendments above are plan-text plus three small spec upgrades (sentinel class, dataset-creation removal, reset seam). With these folded in, the plan is build-ready — proceed to the Opus build, then two adversarial code reviews + confirmation pass per house rules.
+
+---
+
+## Code-review disposition (2026-08-21) — PR #90
+
+Opus build landed as `a487722` (DD-1/2/3) + `50982c8` (tests/docs) + `aab1ed7` (DD-6, isolated final commit); suite 1301 → 1341. Two adversarial code reviews (fresh Fable contexts: senior options trader/Python dev; production data-reliability engineer with live BQ access). **Both REQUEST_CHANGES; both explicitly found ZERO code defects** — each independently re-ran the full suite (1341 green), walked the neutrality contract end-to-end, verified field-by-field schema parity for all seven tables against live BQ, confirmed the sentinel is structurally inert and the DD-7 deletion total, and verified both declared build deviations with no undeclared ones. The union of findings and their dispositions:
+
+- **BLOCKER (both, sequencing not code): R1 has not run** — verified live, all 7 tables lack `strategy_id`; merging first arms a *silent* 7-table row-dropping incident (`insert_rows_json` defaults `ignoreUnknownValues=false`; `_write`/`record_trade` log-and-swallow; ActivitiesIngestor deliberately returns 200 "partial"). **Disposition: this is the plan's own R1 gate, now recorded in-tree (Status line + §Execution below). ALTERs run next, verification pasted before merge.**
+- **Recommended code fix (reviewer 1, LOW): configure-then-cache ordering race in `strategy_config()`** — a concurrent cold-start request could observe the cache non-None before the singleton was configured and silently drop its rows via the sentinel. **Fixed in `08460b5`** (configure before publishing the cache); full suite re-run green. Scoped confirmation pass follows per house rules.
+- **MEDIUM (reviewer 2): singleton disabled-cache asymmetry** — pre-provisioning, the CC AnalyticsWriter singleton caches `_enabled=False` for the process lifetime (per-request writers self-heal post-provisioning; the singleton needs a restart). **Disposition: Phase 3 checklist note added to the parent plan** (provision the dataset before the CC service's first start, or bounce it after).
+- **LOW (reviewer 2): `regression_monitor.py:51` `BQ_DATASET` env default** is a surviving read-side dataset default outside T7's pattern. **Disposition: folded into FC-082** (that file is already open there).
+- **LOW (both, gate-hardening):** T7's regexes are pattern-bound (constant-indirection defaults, renamed params, or a differently-named interlock would pass). **Disposition: accepted as recorded in this plan's Critique-carried-forward — T1+T7 are the standing guards; FC-076 is the structural home.**
+- **LOW (reviewer 2, pre-existing): `stock_history_from_alpaca` drift** — code declares `date`/`symbol` REQUIRED, live table has both NULLABLE. Predates this PR; harmless for inserts and the ALTER; matters only cosmetically for a fresh Phase-3 CC table. **Disposition: recorded here, no action.**
+- **LOW (reviewer 2, pre-existing): `_reset_for_tests` doesn't clear the thread-local `set_analytics_writer` override.** Same exposure predates the PR; the simulator restores in `finally`. **Disposition: noted, no action.**
+- **LOW (reviewer 1, cosmetic): sentinel's `dataset_id`/`strategy_id` return `None` against `-> str` annotations.** No caller string-ops them. **Disposition: accepted; tidy opportunistically in a future touch.**
+- **Reviewer 1's PR-body "auto-deploy vs FC-081" flag is moot on stale premises:** FC-081 was resolved earlier the same evening (trigger rebound + three auto-builds verified); the reviewer read the plan text written before the fix.
+
+## Execution
+
+- **PR:** https://github.com/memon1987/agentic_options_wheel/pull/90 (branch `claude/fc-075-seam-4`: `a487722`, `50982c8`, `aab1ed7`, review fix `08460b5`)
+- **R1 (7 live-table ALTERs): PENDING — gates merge.** `bq show` verification output to be pasted here when run.
+- **Confirmation pass (scoped, on `08460b5`): pending.**
+- Remaining after merge: R3 deploy (FC-081 fixed — trigger live), R4 per-table verify (windows per LOW batch), R5 FC-067 UPDATE (62 rows re-verified by reviewer 2 with the hardened predicate), R6 bookkeeping.

@@ -1621,6 +1621,8 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 **Fix direction:** correct the column reference; add a test that runs the check's SQL against the code-defined `_TABLE_SCHEMA` field names (or a fake BQ fixture) so a schema/monitor drift fails the suite, not production. While there, sweep `regression_monitor.py` for other references to columns absent from the code-defined schemas.
 
+**Fold-in (2026-08-21, Seam 4 code review):** the same file's `BQ_DATASET = os.environ.get("BQ_DATASET", "options_wheel")` (:51) is a surviving read-side dataset default that escapes Seam 4's T7 grep gate (env-wrapped, different name) — a covered-call service's `/regression` would silently validate the *wheel's* tables. Fix alongside: derive the dataset from the service's strategy profile (or require the env var per-service, no default).
+
 **Links:** `docs/plans/fc-075-seam-4.md` §Review disposition (discovery context), FC-069 S1 (the check-group sync precedent), `docs/CLAUDE.md` §The detective layer.
 
 ---
