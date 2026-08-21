@@ -327,6 +327,22 @@ class Config:
         # `check_interval_minutes` validation — the real cadence is Cloud
         # Scheduler, and no code ever read the key.
 
+        # FC-075 Phase 2 — covered-call profile tunables (presence-gated so the
+        # wheel, which sets none of these, is unaffected).
+        universe = self._config.get('universe', {})
+        excluded = universe.get('excluded_symbols')
+        if excluded is not None and not isinstance(excluded, list):
+            errors.append(f"universe.excluded_symbols must be a list (got {type(excluded).__name__})")
+        min_oi = universe.get('min_open_interest')
+        if min_oi is not None and (isinstance(min_oi, bool) or not isinstance(min_oi, int) or min_oi < 0):
+            errors.append(f"universe.min_open_interest must be a non-negative int (got {min_oi!r})")
+        max_spread = universe.get('max_spread_pct')
+        if max_spread is not None and not (isinstance(max_spread, (int, float)) and not isinstance(max_spread, bool) and 0 < max_spread <= 1):
+            errors.append(f"universe.max_spread_pct must be in (0, 1] (got {max_spread!r})")
+        sizing_basis = self._config.get('risk', {}).get('sizing_basis')
+        if sizing_basis is not None and sizing_basis not in ('buying_power', 'equity'):
+            errors.append(f"risk.sizing_basis must be 'buying_power' or 'equity' (got {sizing_basis!r})")
+
         # Report errors
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -390,17 +406,59 @@ class Config:
 
     @property
     def bigquery_dataset(self) -> str:
-        """BigQuery dataset for this strategy's analytics (Seam 4).
+        """BigQuery dataset for this strategy's analytics/reads.
 
-        Defaults to ``options_wheel`` so the wheel's writers are unchanged when
-        the key is absent.
-
-        NOTE: as of FC-075 Phase 1 this property is NOT yet consumed — Seam 4
-        (threading the dataset through the five BQ writers + a strategy_id
-        column) is deferred to Phase 3 because it needs an ALTER on the live
-        wheel tables. The property exists so Phase 3 has the config surface ready.
+        Defaults to ``options_wheel`` so the wheel is unchanged when the key is
+        absent. FC-075 Phase 2 consumes this on the READ side (CostBasisResolver
+        + UncoveredDaysResolver, Design decision 4). The WRITE side (the five BQ
+        writers + a strategy_id column) is Seam 4, still deferred — see
+        ``writes_isolated`` for the interim interlock.
         """
         return self._config.get("bigquery", {}).get("dataset", "options_wheel")
+
+    @property
+    def writes_isolated(self) -> bool:
+        """Whether this profile's BigQuery WRITES land in the right dataset (DD-7).
+
+        Until Seam 4 threads ``bigquery_dataset`` through the writers, they all
+        hardcode ``options_wheel``. A non-wheel profile therefore cannot write
+        without contaminating the wheel's dataset, so its write-producing paths
+        must fail closed. The wheel profile is always isolated (it owns that
+        dataset). Seam 4 will replace this with a real writer-vs-config dataset
+        check and drop the guard.
+        """
+        return self.strategy_id == "wheel"
+
+    # --- Covered-call profile tunables (FC-075 Phase 2) ---
+    @property
+    def excluded_symbols(self) -> set:
+        """Symbols the bot must never write calls against (operator opt-out).
+
+        Normalized to upper/stripped so an operator writing ``aapl`` still
+        excludes AAPL. Empty (no exclusions) for the wheel.
+        """
+        raw = self._config.get("universe", {}).get("excluded_symbols", []) or []
+        return {str(s).strip().upper() for s in raw}
+
+    @property
+    def min_open_interest(self):
+        """Minimum call open interest (inventory validator); None = check skipped."""
+        return self._config.get("universe", {}).get("min_open_interest")
+
+    @property
+    def max_spread_pct(self):
+        """Maximum call bid/ask spread as a fraction of mid; None = check skipped."""
+        return self._config.get("universe", {}).get("max_spread_pct")
+
+    @property
+    def sizing_basis(self) -> str:
+        """'buying_power' (wheel default) | 'equity' (covered-call 4x-margin discipline)."""
+        return self._config.get("risk", {}).get("sizing_basis", "buying_power")
+
+    @property
+    def max_long_market_value_pct_of_equity(self) -> float:
+        """Exposure-alert threshold: alert when long_market_value > equity * this."""
+        return self._config.get("risk", {}).get("max_long_market_value_pct_of_equity", 1.0)
 
     # Strategy Parameters
     @property
