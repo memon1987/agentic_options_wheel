@@ -1,0 +1,26 @@
+{
+  "displayName": "Cloud Build failure — options-wheel",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "Cloud Build reported an error",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"build\" AND severity>=ERROR AND NOT protoPayload.methodName:\"BuildTrigger\" AND NOT protoPayload.methodName:\"GitHubInstallation\" AND NOT protoPayload.methodName:\"GlobalTriggerSettings\""
+      }
+    }
+  ],
+  "documentation": {
+    "content": "A Cloud Build run FAILED. Deploys do not happen on a red build, so the merged code is NOT live until this is fixed.\n\nThis alert exists because the FC-031 dashboard overhaul sat undeployed for 11 days (2026-07-07 -> 2026-07-18) after a red build went unnoticed.\n\nTriage:\n  gcloud builds list --limit=5\n  gcloud builds log <BUILD_ID>\n\nThen check whether the live revision matches the intended commit:\n  gcloud run revisions list --service=options-wheel-dashboard --region=us-central1 --limit=1\n  gcloud run revisions list --service=options-wheel-strategy --region=us-central1 --limit=1",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    },
+    "autoClose": "86400s"
+  }
+}
