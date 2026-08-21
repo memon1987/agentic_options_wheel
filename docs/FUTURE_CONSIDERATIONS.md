@@ -1586,7 +1586,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
 
-**Status:** RESOLVED 2026-08-21 (same day) — root cause: **the GitHub repo was renamed `options_wheel` → `agentic_options_wheel`**; trigger rebound + repo re-connected. One follow-up open: the merged-vs-deployed freshness alert (below).
+**Status:** RESOLVED 2026-08-21 (same day) — root cause: **the GitHub repo was renamed `options_wheel` → `agentic_options_wheel`**; trigger rebound + repo re-connected. **Closure verified end-to-end:** the push recording this entry (`dd9e56a`) auto-fired build `6be2cfe7` → SUCCESS → strategy revision `00500-waw` (image digest matched to the commit's tag) + dashboard `00443-vaw` both serving, `/health` 200/healthy, zero WARNING+ logs on the new revision. The 16-day backlog (#88 FC-067, #89 FC-075 Phase 2) is now deployed. One follow-up open: the merged-vs-deployed freshness alert (below).
 **Size estimate:** S
 **Owner:** zeshan + Claude
 **Plan file:** not needed (infra repair; documented here)
