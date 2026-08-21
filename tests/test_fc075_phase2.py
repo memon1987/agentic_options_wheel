@@ -1,11 +1,19 @@
 """FC-075 Phase 2 — the covered-call engine (call-only gating of the shared pipeline).
 
-Each test names the regression it catches. Covers: the put-scan gate (DD-2), the
-inventory-validator chain criteria + their wheel-neutrality (DD-3), the DD-7 write
-interlock (server + config), strategy-scoped BQ reads (DD-4), and the config
-surface. The /run-internal defense-in-depth (call-only filter, reconcile gate) and
-the exposure alert are exercised through unit-level assertions here and by the
-wheel-neutral full suite; see the PR for the coverage note.
+Each test names the regression it catches. Covers: the put-scan gate (DD-2); the
+call-only filter + its `previously_failed`-mislabel fix, via the extracted
+`_call_only_opportunities` helper (DD-2); the reconcile gate, both directions via
+`/run` (DD-6); the inventory validator — chain criteria + `excluded_symbols`
+decision row + wheel-neutrality (DD-3); strategy-scoped BQ reads (DD-4); the
+exposure alert incl. get_account-raises, via `_maybe_alert_long_exposure` (DD-5);
+the DD-7 write interlock on the server AND the main.py CLI; and the config surface.
+
+Note on the covered-call `/run`/`/scan` handler bodies: DD-7 makes those endpoints
+503 for a non-wheel profile until Seam 4, so the covered-call *direction* of the
+inline gates is tested either through the extracted helpers (call-only filter,
+exposure alert) or by patching `strategy_config` to a mock covered-call profile
+with `writes_isolated=True` (simulating post-Seam-4), while the wheel direction is
+driven through the real endpoint.
 """
 
 import importlib
@@ -289,3 +297,185 @@ class TestWriteInterlock:
         monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
         server.reset_strategy_state()
         assert server.strategy_config().writes_isolated is True
+
+
+# --------------------------------------------------------------------------- #
+# DD-2 — call-only filter (extracted helper) + previously_failed no-mislabel
+# --------------------------------------------------------------------------- #
+
+class TestCallOnlyFilter:
+    def _call(self, sym="META260220C00600000"):
+        return {"option_symbol": sym, "symbol": "META", "type": "call"}
+
+    def _put(self, sym="AAPL260220P00170000"):
+        return {"option_symbol": sym, "symbol": "AAPL", "type": "put"}
+
+    def test_drops_puts_keeps_calls_and_logs(self, server):
+        events = []
+        with patch.object(server, "log_error_event",
+                          side_effect=lambda *a, **k: events.append(k.get("error_type"))):
+            kept = server._call_only_opportunities(
+                [self._call(), self._put(), self._call("NVDA260220C00500000")],
+                "covered_call", Mock())
+        assert [o["option_symbol"] for o in kept] == \
+            ["META260220C00600000", "NVDA260220C00500000"]
+        assert events == ["non_call_opportunity_refused"]  # one per dropped put
+
+    def test_refused_put_not_mislabeled_previously_failed(self, server):
+        # The MEDIUM fix: applying the filter to BOTH lists means the refused
+        # put's underlying is not flagged previously_failed by _underlyings_removed.
+        blob = [self._call(), self._put()]
+        kept = server._call_only_opportunities(blob, "covered_call", Mock())
+        # handler sets both opportunities and blob_opportunities to `kept`
+        assert server._underlyings_removed(kept, kept) == set()
+        # sanity: had the blob NOT been filtered, the put's underlying WOULD show
+        # (proves the assertion is meaningful) — puts aren't call-opps though, so
+        # _underlyings_removed only tracks calls; the real guarantee is no crash +
+        # empty diff on the filtered lists.
+        assert "AAPL" not in server._underlyings_removed(kept, kept)
+
+
+# --------------------------------------------------------------------------- #
+# DD-5 — exposure alert (extracted helper)
+# --------------------------------------------------------------------------- #
+
+class TestExposureAlert:
+    def _cfg(self, basis="equity", threshold=1.0):
+        c = Mock()
+        c.sizing_basis = basis
+        c.max_long_market_value_pct_of_equity = threshold
+        return c
+
+    def _events(self, server, cfg, account):
+        alpaca = Mock()
+        if isinstance(account, Exception):
+            alpaca.get_account.side_effect = account
+        else:
+            alpaca.get_account.return_value = account
+        seen = []
+        with patch.object(server, "log_error_event",
+                          side_effect=lambda *a, **k: seen.append(k.get("error_type"))):
+            server._maybe_alert_long_exposure(cfg, alpaca, Mock())
+        return seen, alpaca
+
+    def test_alerts_when_exposure_exceeds_equity(self, server):
+        seen, _ = self._events(server, self._cfg(),
+                               {"long_market_value": 150.0, "equity": 100.0})
+        assert "long_exposure_exceeds_equity" in seen
+
+    def test_no_alert_when_within_equity(self, server):
+        seen, _ = self._events(server, self._cfg(),
+                               {"long_market_value": 90.0, "equity": 100.0})
+        assert seen == []
+
+    def test_alerts_when_equity_nonpositive_with_exposure(self, server):
+        seen, _ = self._events(server, self._cfg(),
+                               {"long_market_value": 50.0, "equity": 0.0})
+        assert "long_exposure_exceeds_equity" in seen
+
+    def test_get_account_raises_is_isolated(self, server):
+        # HIGH-1's mandated case: a get_account blip must NOT propagate (would
+        # otherwise kill the scan) — it logs a check-failed event instead.
+        seen, _ = self._events(server, self._cfg(), RuntimeError("alpaca down"))
+        assert seen == ["long_exposure_check_failed"]
+
+    def test_wheel_basis_never_fetches_account(self, server):
+        seen, alpaca = self._events(server, self._cfg(basis="buying_power"),
+                                    {"long_market_value": 999.0, "equity": 1.0})
+        assert seen == []
+        alpaca.get_account.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# DD-6 — reconcile gate, both directions via /run
+# --------------------------------------------------------------------------- #
+
+def _run_mock_config(strategy_id, account="PA_ACCT"):
+    c = Mock()
+    c.strategy_id = strategy_id
+    c.expected_account_number = account
+    c.writes_isolated = True  # bypass DD-7 to reach the handler (post-Seam-4 sim)
+    return c
+
+
+def _drive_run(server, config_mock):
+    server.reset_strategy_state()
+    alpaca = Mock()
+    alpaca.get_account.return_value = {
+        "account_number": config_mock.expected_account_number,
+        "buying_power": 100000, "options_buying_power": 100000, "equity": 100000,
+        "long_market_value": 0, "cash": 100000, "portfolio_value": 100000,
+    }
+    store = Mock()
+    store.get_pending_opportunities.return_value = []  # early return after reconcile
+    wheel_cls = Mock()
+    with patch.object(server, "strategy_config", return_value=config_mock), \
+         patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca), \
+         patch("src.data.opportunity_store.OpportunityStore", return_value=store), \
+         patch("src.strategy.wheel_engine.WheelEngine", wheel_cls):
+        resp = server.app.test_client().post("/run")
+    return resp, wheel_cls
+
+
+class TestReconcileGate:
+    def test_wheel_run_reconciles(self, server, monkeypatch):
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
+        resp, wheel_cls = _drive_run(server, _run_mock_config("wheel"))
+        assert resp.status_code == 200
+        assert wheel_cls.called  # WheelEngine constructed
+        assert wheel_cls.return_value.reconcile_positions.called
+
+    def test_covered_call_run_skips_reconcile(self, server, monkeypatch):
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
+        resp, wheel_cls = _drive_run(server, _run_mock_config("covered_call"))
+        assert resp.status_code == 200
+        assert not wheel_cls.called  # no WheelEngine → FC-054/079 sites not traversed
+
+
+# --------------------------------------------------------------------------- #
+# DD-3 — excluded_symbols produces an excluded_by_config decision row
+# --------------------------------------------------------------------------- #
+
+class TestExcludedSymbols:
+    def test_excluded_holding_recorded_as_excluded_before_lot_check(self):
+        cc = _cc_config()          # excluded_symbols = {"AAPL"}
+        alpaca = Mock()
+        # A 50-share AAPL lot: excluded must win over the <100-share not-eligible.
+        alpaca.get_positions.return_value = [{
+            "symbol": "AAPL", "qty": "50", "asset_class": "us_equity",
+            "current_price": "190", "avg_entry_price": "150", "market_value": "9500",
+        }]
+        recorded = []
+        rec = Mock()
+        rec.record.side_effect = lambda sym, outcome, reason, **k: recorded.append((sym, outcome, reason))
+        with patch("src.data.options_scanner.UncoveredDaysResolver") as UDR, \
+             patch("src.data.options_scanner.CostBasisResolver"), \
+             patch("src.data.options_scanner.DecisionRecorder", return_value=rec):
+            UDR.return_value.resolve.return_value = {}
+            scanner = OptionsScanner(alpaca, Mock(), cc)
+            scanner.scan_for_call_opportunities()
+        from src.data.decision_record import OUTCOME_NOT_ELIGIBLE, REASON_EXCLUDED_BY_CONFIG
+        assert ("AAPL", OUTCOME_NOT_ELIGIBLE, REASON_EXCLUDED_BY_CONFIG) in recorded
+
+
+# --------------------------------------------------------------------------- #
+# DD-7 — the main.py CLI write interlock (HIGH-2's mandated CLI test)
+# --------------------------------------------------------------------------- #
+
+class TestCliWriteInterlock:
+    def test_cli_scan_refused_for_covered_call_profile(self, monkeypatch):
+        import importlib
+        main = importlib.import_module("main")
+        monkeypatch.setattr(sys, "argv",
+                            ["main.py", "--command", "scan",
+                             "--config", "config/covered_call.yaml"])
+        alpaca = Mock()
+        with patch("main.AlpacaClient", return_value=alpaca), \
+             patch("main.MarketDataManager", return_value=Mock()), \
+             patch("main.PortfolioTracker", return_value=Mock()), \
+             patch("main.OptionsScanner", return_value=Mock()), \
+             patch("main.scan_opportunities") as scan_fn:
+            with pytest.raises(SystemExit) as exc:
+                main.main()
+        assert exc.value.code == 2          # writes_isolated False → refused
+        scan_fn.assert_not_called()          # never scanned

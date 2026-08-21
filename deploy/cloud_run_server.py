@@ -43,6 +43,76 @@ def _underlyings_removed(before, after):
         and o.get('option_symbol') not in remaining and o.get('symbol')
     }
 
+
+def _call_only_opportunities(opportunities, strategy_id, log):
+    """Drop non-call opportunities (FC-075 Phase 2 DD-2, defense in depth).
+
+    A covered-call (non-wheel) service must NEVER execute a put. The put scan is
+    gated and the blob is strategy-keyed, so this only fires on a hand-written or
+    corrupted blob (expected live count: 0). Returns the call-only subset and
+    logs each refusal. The caller applies the result to BOTH the working list and
+    the blob snapshot, so a refused put is not then mislabeled `previously_failed`
+    by the ``_underlyings_removed`` diff. Extracted so both directions are unit-
+    testable (the covered-call service's ``/run`` is otherwise write-isolated off
+    until Seam 4).
+    """
+    kept = []
+    for opp in opportunities:
+        if strict_option_type(opp.get('option_symbol') or '') == 'call':
+            kept.append(opp)
+        else:
+            log_error_event(
+                log,
+                error_type="non_call_opportunity_refused",
+                error_message=f"Non-call opportunity refused on {strategy_id} profile",
+                component="cloud_run_server",
+                recoverable=True,
+                option_symbol=opp.get('option_symbol'),
+                symbol=opp.get('symbol'),
+            )
+    return kept
+
+
+def _maybe_alert_long_exposure(config, alpaca_client, log):
+    """Alert (never block) when long exposure exceeds equity (FC-075 Phase 2 DD-5).
+
+    4x-margin discipline for a manual-entry book. Only runs when
+    ``sizing_basis == 'equity'`` (the wheel defaults to 'buying_power', so this is
+    inert for it and never fetches the account). Fully exception-isolated — a
+    get_account() blip must not turn an alert into a scan-killer. Extracted so the
+    alert and its get_account-raises path are unit-testable.
+    """
+    if config.sizing_basis != 'equity':
+        return
+    try:
+        acct = alpaca_client.get_account()
+        lmv = float(acct.get('long_market_value') or 0.0)
+        equity = float(acct.get('equity') or 0.0)
+        threshold = config.max_long_market_value_pct_of_equity
+        # equity <= 0 with any long exposure is the worst case on a 4x-margin
+        # account — alert, don't let the guard fall silent at the extreme.
+        over = (lmv > equity * threshold) if equity > 0 else (lmv > 0)
+        if over:
+            log_error_event(
+                log,
+                error_type="long_exposure_exceeds_equity",
+                error_message=(f"long_market_value {lmv:.2f} exceeds "
+                               f"equity {equity:.2f} x {threshold}"),
+                component="cloud_run_server",
+                recoverable=True,
+                long_market_value=lmv,
+                equity=equity,
+                threshold=threshold,
+            )
+    except Exception as e:
+        log_error_event(
+            log,
+            error_type="long_exposure_check_failed",
+            error_message=str(e),
+            component="cloud_run_server",
+            recoverable=True,
+        )
+
 app = Flask(__name__)
 
 
@@ -375,37 +445,8 @@ def trigger_scan():
                        event_type="call_scan_completed",
                        count=len(call_opportunities))
 
-            # FC-075 Phase 2 (DD-5): 4x-margin discipline for a manual-entry book.
-            # ALERT-ONLY (never blocks the scan) when long exposure exceeds
-            # equity * threshold. Fully exception-isolated — a get_account() blip
-            # must not turn an alert into a scan-killer. Inert on the wheel
-            # (sizing_basis defaults to 'buying_power').
-            if config.sizing_basis == 'equity':
-                try:
-                    acct = alpaca_client.get_account()
-                    lmv = float(acct.get('long_market_value') or 0.0)
-                    equity = float(acct.get('equity') or 0.0)
-                    threshold = config.max_long_market_value_pct_of_equity
-                    if equity > 0 and lmv > equity * threshold:
-                        log_error_event(
-                            logger,
-                            error_type="long_exposure_exceeds_equity",
-                            error_message=(f"long_market_value {lmv:.2f} exceeds "
-                                           f"equity {equity:.2f} x {threshold}"),
-                            component="cloud_run_server",
-                            recoverable=True,
-                            long_market_value=lmv,
-                            equity=equity,
-                            threshold=threshold,
-                        )
-                except Exception as e:
-                    log_error_event(
-                        logger,
-                        error_type="long_exposure_check_failed",
-                        error_message=str(e),
-                        component="cloud_run_server",
-                        recoverable=True,
-                    )
+            # FC-075 Phase 2 (DD-5): 4x-margin exposure alert (alert-only, isolated).
+            _maybe_alert_long_exposure(config, alpaca_client, logger)
 
             # Store opportunities for execution
             from src.data.opportunity_store import OpportunityStore
@@ -634,23 +675,9 @@ def trigger_strategy():
             # list and the blob snapshot, so a refused put is not then mislabeled
             # `previously_failed` by the _underlyings_removed diff below.
             if config.strategy_id != 'wheel':
-                call_only = []
-                for opp in opportunities:
-                    if strict_option_type(opp.get('option_symbol') or '') == 'call':
-                        call_only.append(opp)
-                    else:
-                        log_error_event(
-                            logger,
-                            error_type="non_call_opportunity_refused",
-                            error_message=("Non-call opportunity refused on "
-                                           f"{config.strategy_id} profile"),
-                            component="cloud_run_server",
-                            recoverable=True,
-                            option_symbol=opp.get('option_symbol'),
-                            symbol=opp.get('symbol'),
-                        )
-                opportunities = call_only
-                blob_opportunities[:] = call_only
+                opportunities = _call_only_opportunities(
+                    opportunities, config.strategy_id, logger)
+                blob_opportunities[:] = opportunities
 
             run_id = run_id_from_opportunities(blob_opportunities)
             if not run_id:

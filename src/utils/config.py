@@ -616,8 +616,16 @@ class Config:
     # Stock Universe
     @property
     def stock_symbols(self) -> List[str]:
-        """List of stock symbols to trade."""
-        return self._config["stocks"]["symbols"]
+        """List of configured stock symbols to trade.
+
+        FC-075 Phase 2: returns [] when there is no ``stocks`` section (the
+        covered-call profile, whose universe is holdings-derived) rather than
+        raising KeyError. The wheel is unchanged — it always has the section, and
+        validation still requires it non-empty for the wheel profile. This makes
+        the read-only callers (`/config`, `/backtest/screen`, `get_market_overview`)
+        safe on a non-wheel profile.
+        """
+        return self._config.get("stocks", {}).get("symbols", [])
     
     # FC-069 S1 deleted the `monitoring:` accessor (card 17) and the whole
     # gap-risk accessor block (item 5) together with

@@ -56,7 +56,14 @@ def test_no_undefined_names_in_production_code():
 # where `'C'`, `in`, and the option-symbol name are separate tokens, does.
 
 # Legacy files still carrying the pattern in live code, pending FC-079's sweep.
-# A NEW site in any other file (e.g. a covered-call engine) must fail this gate.
+#
+# SCOPE (honest): this gate catches the bareword substring form
+# `'C'|'P' in <name>` where <name> is one of _OPTION_VARS — the exact shape every
+# historical member of the family (FC-041/043/045/048/052/054) used. It does NOT
+# catch attribute/subscript shapes (`'C' in opp.option_symbol`,
+# `'C' in opp['option_symbol']`) or a variable named outside _OPTION_VARS. It is a
+# tripwire for the common form, not a proof of absence; the real defense is that
+# all new option-type routing goes through `strict_option_type`.
 _OCC_SUBSTRING_ALLOWLIST = {
     # The canonical parser itself: its documented last-resort tolerant heuristic
     # (`'C' if 'C' in symbol ...`) is the ONE intentional home of the pattern.

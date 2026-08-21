@@ -53,8 +53,11 @@ strategy:
   # FC-069 S1 deleted the breadth/exposure knobs that were mirrored here from
   # the wheel (`max_positions_per_stock`, `max_total_positions`,
   # `max_exposure_per_ticker`) along with their Config properties and
-  # validation. They had no consumer on either profile's live path. Phase 2
-  # sizing is bounded by `max_position_size` and the 4x-margin discipline below.
+  # validation. Covered-call sizing is `floor(uncommitted_shares / 100)` per
+  # underlying — it never touches dollars. `max_position_size` below has no
+  # consumer on this profile (it sizes PUTS, of which there are none); it is
+  # kept only to satisfy the shared risk-section validation. The real 4x-margin
+  # discipline is the equity-basis exposure alert (risk block below).
 
 # Holdings-derived universe (requirement: no configured stock list). The engine
 # writes calls against whatever equity it finds in the account. These controls
