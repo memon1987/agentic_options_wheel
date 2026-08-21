@@ -26,13 +26,12 @@ alpaca:
 gcs:
   opportunity_bucket: "covered-call-opportunities"
 
-# Analytics dataset, strategy-scoped (Seam 4).
-# NOT YET WIRED: Seam 4 (threading this dataset through the five BQ writers +
-# adding a strategy_id column) is deferred to Phase 3. Until it lands, the
-# writers still target "options_wheel", so THIS SERVICE MUST NOT RUN ingest or
-# analytics-writing jobs before Phase 3 — it would write covered-call rows into
-# the wheel's dataset. Dataset provisioned + IAM-granted in Phase 3 (the runtime
-# SA cannot create datasets).
+# Analytics dataset, strategy-scoped. LIVE-WIRED by Seam 4: all five BigQuery
+# writers take this dataset as a required constructor argument and stamp
+# strategy_id on every row, so this profile cannot write the wheel's tables.
+# The dataset itself is still provisioned + IAM-granted by an operator in
+# Phase 3 — the writers deliberately do not create datasets, so until then this
+# profile's writers come up disabled (NotFound) and write nothing anywhere.
 bigquery:
   dataset: "covered_call"
 

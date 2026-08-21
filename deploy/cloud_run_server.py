@@ -320,43 +320,6 @@ def require_account_match(f):
     return wrapper
 
 
-def require_write_isolation(f):
-    """Refuse write-producing endpoints whose BQ writes would hit the wrong dataset.
-
-    FC-075 Phase 2 (DD-7): until Seam 4 threads ``config.bigquery_dataset`` through
-    the BigQuery writers, they all hardcode ``options_wheel``. A non-wheel profile
-    therefore cannot run /scan, /run, /monitor, /roll or /ingest-* — each of which
-    writes decision_events / executions / errors / trades — without contaminating
-    the wheel's dataset. This makes "the covered-call service cannot write wheel
-    data before Seam 4" a code property rather than a deploy-time promise, and it
-    covers the main.py CLI bypass too (see main.py). Inert for the wheel, which
-    owns that dataset (``config.writes_isolated`` is True). Seam 4 removes it.
-    """
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        config = strategy_config()
-        if not config.writes_isolated:
-            log_error_event(
-                logger,
-                error_type="write_isolation_unavailable",
-                error_message=(
-                    f"strategy_id={config.strategy_id!r} cannot write to BigQuery "
-                    "until Seam 4 threads bigquery_dataset through the writers; "
-                    "refusing the write-producing request"),
-                component="cloud_run_server",
-                recoverable=False,
-                strategy_id=config.strategy_id,
-            )
-            return jsonify({
-                'status': 'error',
-                'error': 'write_isolation_unavailable',
-                'message': ("BigQuery write isolation is not yet in place for this "
-                            "strategy (Seam 4 pending); refusing to run."),
-            }), 503
-        return f(*args, **kwargs)
-    return wrapper
-
-
 def interlock_status():
     """Report the cached interlock verdict WITHOUT triggering a network check.
 
@@ -405,7 +368,6 @@ def get_status():
 @app.route('/scan', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def trigger_scan():
     """Trigger a market scan for opportunities."""
     with strategy_lock:
@@ -568,7 +530,6 @@ def trigger_scan():
 @app.route('/run', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
@@ -1015,7 +976,6 @@ def _is_market_open() -> bool:
 @app.route('/monitor', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def monitor_positions():
     """Monitor existing positions and close profitable ones."""
     with strategy_lock:
@@ -1323,7 +1283,6 @@ def monitor_positions():
 @app.route('/roll', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def trigger_roll():
     """Daily credit-only call rolling cycle (FC-006, revived by FC-078).
 
@@ -1652,7 +1611,6 @@ def backtest_screen():
 @app.route('/ingest-activities', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def ingest_activities():
     """Pull Alpaca account activities and append to BigQuery (FC-012 §2.1).
 
@@ -1715,7 +1673,6 @@ def ingest_activities():
 @app.route('/ingest-portfolio-history', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def ingest_portfolio_history():
     """Pull Alpaca portfolio/history and append finalized days to BigQuery (FC-012 §2.5).
 
@@ -1771,7 +1728,6 @@ def ingest_portfolio_history():
 @app.route('/ingest-stock-history', methods=['POST'])
 @require_api_key
 @require_account_match
-@require_write_isolation
 def ingest_stock_history():
     """Pull daily Alpaca stock bars for the traded universe and append to BQ (FC-018 PR B).
 

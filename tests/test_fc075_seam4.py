@@ -526,6 +526,16 @@ class TestLintGate:
             "writes the wheel's tables (FC-075 Seam 4, DD-1):\n"
             + "\n".join(offenders))
 
+    def test_no_dd7_interlock_references_remain_in_code(self):
+        offenders = []
+        for path, rel in _python_sources():
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if _DD7_SYMBOL.search(line):
+                    offenders.append(f"{rel}:{lineno}: {line.strip()}")
+        assert offenders == [], (
+            "the DD-7 write interlock is deleted by Seam 4, not disabled; a "
+            "surviving reference means a partial removal:\n" + "\n".join(offenders))
+
     def test_the_allowlist_entry_is_real(self):
         # A stale allowlist would silently widen the gate.
         for rel in T7_DATASET_DEFAULT_ALLOWLIST:

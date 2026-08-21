@@ -406,28 +406,16 @@ class Config:
 
     @property
     def bigquery_dataset(self) -> str:
-        """BigQuery dataset for this strategy's analytics/reads.
+        """BigQuery dataset for this strategy's analytics — reads AND writes.
 
         Defaults to ``options_wheel`` so the wheel is unchanged when the key is
-        absent. FC-075 Phase 2 consumes this on the READ side (CostBasisResolver
-        + UncoveredDaysResolver, Design decision 4). The WRITE side (the five BQ
-        writers + a strategy_id column) is Seam 4, still deferred — see
-        ``writes_isolated`` for the interim interlock.
+        absent. Read side: CostBasisResolver + UncoveredDaysResolver (FC-075
+        Phase 2, DD-4). Write side: all five BigQuery writers take it as a
+        required constructor argument (Seam 4), which is what makes a
+        cross-profile write impossible rather than merely forbidden. The
+        interim Phase 2 write interlock was deleted when Seam 4 landed.
         """
         return self._config.get("bigquery", {}).get("dataset", "options_wheel")
-
-    @property
-    def writes_isolated(self) -> bool:
-        """Whether this profile's BigQuery WRITES land in the right dataset (DD-7).
-
-        Until Seam 4 threads ``bigquery_dataset`` through the writers, they all
-        hardcode ``options_wheel``. A non-wheel profile therefore cannot write
-        without contaminating the wheel's dataset, so its write-producing paths
-        must fail closed. The wheel profile is always isolated (it owns that
-        dataset). Seam 4 will replace this with a real writer-vs-config dataset
-        check and drop the guard.
-        """
-        return self.strategy_id == "wheel"
 
     # --- Covered-call profile tunables (FC-075 Phase 2) ---
     @property
