@@ -1584,6 +1584,23 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
+
+**Status:** Filed 2026-08-21 — **blocks FC-075 Seam 4 rollout (R3) and everything behind it**
+**Size estimate:** S (likely a connection/webhook repair, not code)
+**Owner:** zeshan (needs GitHub App / Cloud Build console access)
+**Plan file:** not needed (infra repair; document the fix in this entry)
+
+**Problem:** the wheel service is running revision `options-wheel-strategy-00498-qen`, built 2026-08-05 from `f84b50a`. Four commits merged to main on 2026-08-21 — **including FC-067 (#88) and FC-075 Phase 2 (#89), production code** — produced **no Cloud Build at all**: `gcloud builds list` shows nothing after 2026-08-05 03:52 UTC. The trigger `deploy-options-wheel-strategy` (`^main$`, `cloudbuild.yaml`) is present, enabled, and has no path filters — so the push events are not reaching it (GitHub App connection / webhook delivery is the likely layer). This is the FC-031 failure class escalated: FC-031 was a red build nobody saw and got build-failure alerting as its fix; **a build that never starts fires no failure alert**, so the existing channel is structurally blind to this mode.
+
+**Consequences right now:** production journal rows are still being written with FC-067's poisoned put-labels (mislabeled call rows grew 29 → 62 between the FC-067 investigation and 2026-08-21 for exactly this reason); Phase 2's wheel-side hardening is not live; FC-075 Seam 4's rollout sequence gates on a working deploy path.
+
+**Fix direction:** verify webhook delivery (GitHub repo settings → GitHub App → recent deliveries) and the Cloud Build GitHub connection; re-trigger manually (`gcloud builds triggers run deploy-options-wheel-strategy --branch=main`) to clear the backlog once diagnosed. Then close the alerting gap: a scheduled freshness check comparing `origin/main` HEAD against the deployed revision's commit (or simply latest build age vs. latest push age) that alerts on drift > N hours — the control FC-031 should have included and this recurrence proves is needed.
+
+**Links:** FC-031 (the 11-days-undeployed precedent + build-failure alerting), FC-030 (the notification channel to reuse), `docs/plans/fc-075-seam-4.md` (gated rollout steps R3–R5).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
