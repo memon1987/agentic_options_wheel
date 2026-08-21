@@ -149,6 +149,7 @@ class TestDedup:
         writer = AnalyticsWriter.__new__(AnalyticsWriter)
         writer._enabled = True
         writer._tables = {"decision_events": "TABLEREF"}
+        writer._strategy_id = "wheel"   # FC-075 Seam 4: stamped onto every row
         captured = {}
 
         class _Client:
@@ -302,7 +303,7 @@ class TestCoveredUnderlyings:
 
 class TestUncoveredDaysResolver:
     def test_a_covered_symbol_is_zero_without_touching_bigquery(self):
-        resolver = UncoveredDaysResolver()
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
 
         def _explode(symbols):
             raise AssertionError("must not query for a symbol we know is covered")
@@ -311,25 +312,25 @@ class TestUncoveredDaysResolver:
         assert resolver.resolve(["NVDA"], covered={"NVDA"}) == {"NVDA": 0}
 
     def test_uncovered_symbols_take_the_looked_up_day_count(self):
-        resolver = UncoveredDaysResolver()
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
         resolver._lookup_uncovered_days = lambda symbols: {"NVDA": 9, "AMZN": 2}
         out = resolver.resolve(["NVDA", "AMZN", "AAPL"], covered={"AAPL"})
         assert out == {"AAPL": 0, "NVDA": 9, "AMZN": 2}
 
     def test_lookup_failure_is_none_not_zero(self):
         # "We could not tell" must never render as "covered today".
-        resolver = UncoveredDaysResolver()
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
         resolver._lookup_uncovered_days = lambda symbols: None
         assert resolver.resolve(["NVDA"]) == {"NVDA": None}
 
     def test_symbol_with_no_history_is_none(self):
-        resolver = UncoveredDaysResolver()
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
         resolver._lookup_uncovered_days = lambda symbols: {"AMZN": 4}
         assert resolver.resolve(["NVDA", "AMZN"]) == {"NVDA": None, "AMZN": 4}
 
     def test_batches_one_query_for_all_uncovered_symbols(self):
         calls = []
-        resolver = UncoveredDaysResolver()
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
 
         def _lookup(symbols):
             calls.append(list(symbols))
@@ -341,7 +342,7 @@ class TestUncoveredDaysResolver:
         assert sorted(calls[0]) == ["AMZN", "GOOGL", "NVDA"]
 
     def test_bigquery_gate_off_returns_no_comparison(self):
-        assert UncoveredDaysResolver(allow_bigquery=False).resolve(["NVDA"]) == {
+        assert UncoveredDaysResolver(allow_bigquery=False, dataset_id="options_wheel").resolve(["NVDA"]) == {
             "NVDA": None}
 
 
@@ -386,8 +387,10 @@ class TestRowShape:
         if not _HAS_BIGQUERY:
             pytest.skip("bigquery not installed")
         columns = {f.name for f in _SCHEMAS["decision_events"]}
-        # `timestamp` is stamped by the writer at insert time.
-        assert set(self._row()) | {"timestamp"} == columns
+        # `timestamp` and `strategy_id` are stamped by the writer at insert
+        # time (FC-075 Seam 4 stamps the strategy at the chokepoint, so no
+        # producer can forget it), so the producer row carries neither.
+        assert set(self._row()) | {"timestamp", "strategy_id"} == columns
 
     def test_run_id_and_symbol_are_required(self):
         with pytest.raises(UnknownDecisionOutcome):

@@ -225,6 +225,15 @@ def strategy_config():
     global _CONFIG_CACHE
     if _CONFIG_CACHE is None:
         _CONFIG_CACHE = Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
+        # FC-075 Seam 4: hand this process's profile to the AnalyticsWriter
+        # singleton, which has no config in scope of its own. Every route
+        # resolves config through the decorators before a handler writes, so
+        # the singleton is configured before its first use on any request path.
+        from src.data.analytics_writer import configure_analytics_writer
+        configure_analytics_writer(
+            dataset_id=_CONFIG_CACHE.bigquery_dataset,
+            strategy_id=_CONFIG_CACHE.strategy_id,
+        )
     return _CONFIG_CACHE
 
 
@@ -366,6 +375,11 @@ def reset_strategy_state():
     global _CONFIG_CACHE, _INTERLOCK_VERDICT
     _CONFIG_CACHE = None
     _INTERLOCK_VERDICT = None
+    # The analytics singleton is configured from _CONFIG_CACHE, so it is part
+    # of the same process-scoped state: a profile flip that left the old
+    # singleton in place would make the next configure call raise.
+    from src.data.analytics_writer import _reset_for_tests
+    _reset_for_tests()
 
 
 @app.route('/')
@@ -1656,7 +1670,11 @@ def ingest_activities():
 
         config = strategy_config()
         alpaca_client = AlpacaClient(config)
-        ingestor = ActivitiesIngestor(alpaca_client)
+        ingestor = ActivitiesIngestor(
+            alpaca_client,
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
 
         if not ingestor.enabled:
             return jsonify({
@@ -1714,7 +1732,11 @@ def ingest_portfolio_history():
 
         config = strategy_config()
         alpaca_client = AlpacaClient(config)
-        ingestor = PortfolioHistoryIngestor(alpaca_client)
+        ingestor = PortfolioHistoryIngestor(
+            alpaca_client,
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
 
         if not ingestor.enabled:
             return jsonify({
@@ -1769,7 +1791,11 @@ def ingest_stock_history():
 
         config = strategy_config()
         alpaca_client = AlpacaClient(config)
-        ingestor = StockHistoryIngestor(alpaca_client)
+        ingestor = StockHistoryIngestor(
+            alpaca_client,
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
 
         if not ingestor.enabled:
             return jsonify({

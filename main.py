@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 
 from src.utils.config import Config
+from src.data.analytics_writer import configure_analytics_writer
 from src.utils.logger import setup_logging, get_logger
 from src.data.options_scanner import OptionsScanner
 from src.data.portfolio_tracker import PortfolioTracker
@@ -46,7 +47,16 @@ def main():
 
         # Load configuration
         config = Config(args.config)
-        
+
+        # FC-075 Seam 4: hand this process's profile to the AnalyticsWriter
+        # singleton before anything can reach for it. The CLI selects its
+        # profile with --config, NOT STRATEGY_CONFIG, which is why the
+        # singleton cannot resolve its own dataset from the environment.
+        configure_analytics_writer(
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
+
         logger.info("Starting Options Wheel Strategy",
                    event_category="system",
                    event_type="application_started",

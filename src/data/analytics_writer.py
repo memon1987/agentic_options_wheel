@@ -4,7 +4,8 @@ Replaces the fragile Cloud Logging → BQ log sink approach with direct
 writes to purpose-built, time-partitioned tables.  Each table has a
 code-defined schema — no auto-detection, no wildcard query conflicts.
 
-Manages these tables in the ``options_wheel`` dataset:
+Manages these tables in the dataset its constructor is given (FC-075 Seam 4 —
+``config.bigquery_dataset``; every row also carries ``strategy_id``):
   - errors          (error events)
   - executions      (endpoint run summaries)
   - decision_events (FC-065 Phase 4 — one covered-call decision per held
@@ -62,6 +63,10 @@ except ImportError:
 # Schema definitions
 # --------------------------------------------------------------------------- #
 
+# FC-075 Seam 4 (DD-3). NULLABLE and additive: pre-Seam-4 rows have no value,
+# so readers segmenting by strategy use IFNULL(strategy_id, 'wheel').
+_STRATEGY_ID_DESC = "Strategy profile that wrote this row; NULL = wheel (pre-Seam-4 rows)"
+
 _SCHEMAS: Dict[str, list] = {}
 
 if _HAS_BIGQUERY:
@@ -77,6 +82,7 @@ if _HAS_BIGQUERY:
             bigquery.SchemaField("recoverable", "BOOLEAN"),
             bigquery.SchemaField("request_id", "STRING"),
             bigquery.SchemaField("stack_trace", "STRING"),
+            bigquery.SchemaField("strategy_id", "STRING", description=_STRATEGY_ID_DESC),
         ],
         "executions": [
             bigquery.SchemaField("timestamp", "TIMESTAMP"),
@@ -92,6 +98,7 @@ if _HAS_BIGQUERY:
             bigquery.SchemaField("buying_power_after", "FLOAT"),
             bigquery.SchemaField("portfolio_value", "FLOAT"),
             bigquery.SchemaField("request_id", "STRING"),
+            bigquery.SchemaField("strategy_id", "STRING", description=_STRATEGY_ID_DESC),
         ],
         # scans table: populated by the Cloud Logging sink (filtering events).
         # AnalyticsWriter never wrote it — dead schema + methods removed in FC-012.
@@ -155,6 +162,7 @@ if _HAS_BIGQUERY:
             bigquery.SchemaField(
                 "dedup_key", "STRING",
                 description="run_id|symbol|stage — also the streaming insertId"),
+            bigquery.SchemaField("strategy_id", "STRING", description=_STRATEGY_ID_DESC),
         ],
     }
 
@@ -171,10 +179,19 @@ class AnalyticsWriter:
     def __init__(
         self,
         project_id: Optional[str] = None,
-        dataset_id: str = "options_wheel",
+        *,
+        dataset_id: str,
+        strategy_id: str,
     ):
+        # Both required and keyword-only (FC-075 Seam 4): a defaulted dataset is
+        # how a second strategy profile silently writes the wheel's tables.
+        # Assigned before any early return so a disabled writer still reports
+        # the identity it was constructed with.
         self._enabled = False
         self._tables: Dict[str, Any] = {}
+        self._dataset_id = dataset_id
+        self._strategy_id = strategy_id
+        self._project_id: Optional[str] = None
 
         if not _HAS_BIGQUERY:
             return
@@ -188,8 +205,6 @@ class AnalyticsWriter:
             logger.warning("No GCP project ID — AnalyticsWriter disabled")
             return
 
-        self._dataset_id = dataset_id
-
         try:
             self._client = bigquery.Client(project=self._project_id)
             self._ensure_all_tables()
@@ -200,6 +215,7 @@ class AnalyticsWriter:
                 event_type="analytics_writer_initialized",
                 project=self._project_id,
                 dataset=self._dataset_id,
+                strategy_id=self._strategy_id,
                 tables=list(_SCHEMAS.keys()),
             )
         except Exception:
@@ -207,11 +223,15 @@ class AnalyticsWriter:
                           exc_info=True)
 
     def _ensure_all_tables(self) -> None:
-        """Create dataset and all tables if they don't exist."""
+        """Create the analytics tables if they don't exist.
+
+        The dataset itself is NEVER created here (FC-075 Seam 4): datasets are
+        an operator provisioning step. Under dataset-create-capable credentials
+        a mis-pointed profile would otherwise conjure its own dataset and
+        side-step provisioning/IAM entirely; a missing dataset must instead
+        raise NotFound and leave this writer disabled.
+        """
         dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset_id)
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "us-central1"
-        self._client.create_dataset(dataset, exists_ok=True)
 
         for table_name, schema in _SCHEMAS.items():
             table_ref = dataset_ref.table(table_name)
@@ -237,6 +257,10 @@ class AnalyticsWriter:
             return
         if "timestamp" not in row:
             row["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Stamped at the chokepoint, not at each producer: two lines cover
+        # write_error / write_execution / write_decision_events and every
+        # future writer method (FC-075 Seam 4, DD-3).
+        row["strategy_id"] = self._strategy_id
         try:
             errors = self._client.insert_rows_json(self._tables[table_name], [row])
             if errors:
@@ -263,6 +287,7 @@ class AnalyticsWriter:
         for row in rows:
             if "timestamp" not in row:
                 row["timestamp"] = now
+            row["strategy_id"] = self._strategy_id
         try:
             kwargs = {"row_ids": row_ids} if row_ids else {}
             errors = self._client.insert_rows_json(
@@ -368,12 +393,48 @@ class AnalyticsWriter:
     def dataset_id(self) -> str:
         return self._dataset_id
 
+    @property
+    def strategy_id(self) -> str:
+        return self._strategy_id
+
+
+class _DisabledAnalyticsWriter(AnalyticsWriter):
+    """The unconfigured-singleton sentinel: structurally incapable of writing.
+
+    Returned by ``get_analytics_writer()`` when no process entry point has
+    called ``configure_analytics_writer``. It deliberately does NOT call
+    ``AnalyticsWriter.__init__``: constructing the real class with a
+    placeholder dataset would build a BigQuery client and create tables under
+    whatever ambient credentials exist — the fail-open this sentinel exists to
+    make impossible. No client, no ensure, no env reads.
+    """
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._tables: Dict[str, Any] = {}
+        # Identity attributes only, so the properties above stay answerable.
+        self._project_id = None
+        self._dataset_id = None
+        self._strategy_id = None
+
 
 # --------------------------------------------------------------------------- #
 # Module-level singleton
 # --------------------------------------------------------------------------- #
 
 _instance: Optional[AnalyticsWriter] = None
+_instance_lock = threading.Lock()
+
+# Set by configure_analytics_writer() at the process entry point (the Flask
+# strategy_config() cache, or main.py after it parses --config). Until then the
+# singleton is unconfigured and every fetch returns the disabled sentinel: one
+# process runs one strategy profile, and a profile that never announced itself
+# must not inherit the wheel's dataset by default.
+_configured_dataset_id: Optional[str] = None
+_configured_strategy_id: Optional[str] = None
+_warned_unconfigured = False
+
+_DISABLED_WRITER = _DisabledAnalyticsWriter()
 
 # THREAD-LOCAL override, for the same reason src/utils/clock.py is thread-local.
 # cloud_run_server runs Flask with threaded=True at containerConcurrency 10 and
@@ -385,15 +446,86 @@ _instance: Optional[AnalyticsWriter] = None
 _override = threading.local()
 
 
+def configure_analytics_writer(*, dataset_id: str, strategy_id: str) -> None:
+    """Declare which dataset/strategy this process's singleton writes.
+
+    Called once per process at the entry point that knows the profile — the
+    server's ``strategy_config()`` cache and ``main.py`` after it parses
+    ``--config``. The CLI selects its profile with ``--config`` rather than
+    ``STRATEGY_CONFIG``, which is why the singleton cannot self-resolve from the
+    environment.
+
+    Re-declaring DIFFERENT values after the singleton has been constructed
+    raises: one process, one profile, no silent re-pointing of live telemetry.
+    Before first construction a re-declaration is accepted silently — nothing
+    has been written under the old values, and in production there is only ever
+    one call.
+    """
+    global _configured_dataset_id, _configured_strategy_id
+    with _instance_lock:
+        if _instance is not None and (
+            (dataset_id, strategy_id)
+            != (_configured_dataset_id, _configured_strategy_id)
+        ):
+            raise RuntimeError(
+                "AnalyticsWriter already constructed for "
+                f"({_configured_dataset_id!r}, {_configured_strategy_id!r}); "
+                f"refusing to re-point it at ({dataset_id!r}, {strategy_id!r})"
+            )
+        _configured_dataset_id = dataset_id
+        _configured_strategy_id = strategy_id
+
+
 def get_analytics_writer() -> AnalyticsWriter:
-    """Get the writer for THIS thread: a replay override, else the singleton."""
+    """Get the writer for THIS thread: a replay override, else the singleton.
+
+    Fails CLOSED when unconfigured: returns the disabled sentinel and warns
+    once, rather than constructing a writer against a default dataset. The
+    sentinel is not cached, so a call after ``configure_analytics_writer``
+    still gets the real writer.
+    """
     override = getattr(_override, "writer", None)
     if override is not None:
         return override
-    global _instance
-    if _instance is None:
-        _instance = AnalyticsWriter()
+    global _instance, _warned_unconfigured
+    if _instance is not None:
+        return _instance
+    # Double-checked: Flask runs threaded=True at containerConcurrency 10, and
+    # the one-process-one-profile invariant now hangs off _instance identity.
+    with _instance_lock:
+        if _instance is not None:
+            return _instance
+        if _configured_dataset_id is None:
+            if not _warned_unconfigured:
+                _warned_unconfigured = True
+                logger.warning(
+                    "AnalyticsWriter unconfigured — analytics writes are no-ops",
+                    event_category="system",
+                    event_type="analytics_writer_unconfigured",
+                )
+            return _DISABLED_WRITER
+        _instance = AnalyticsWriter(
+            dataset_id=_configured_dataset_id,
+            strategy_id=_configured_strategy_id,
+        )
     return _instance
+
+
+def _reset_for_tests() -> None:
+    """Clear the singleton and its configuration. TESTS ONLY.
+
+    The suite flips ``STRATEGY_CONFIG`` between profiles inside one pytest
+    process; without this, the first test to construct the singleton would make
+    every later profile flip raise. Never call it from production code — a
+    re-pointing seam is precisely what ``configure_analytics_writer`` refuses.
+    """
+    global _instance, _configured_dataset_id, _configured_strategy_id
+    global _warned_unconfigured
+    with _instance_lock:
+        _instance = None
+        _configured_dataset_id = None
+        _configured_strategy_id = None
+        _warned_unconfigured = False
 
 
 def set_analytics_writer(writer: Optional[AnalyticsWriter]) -> Optional[AnalyticsWriter]:

@@ -27,6 +27,7 @@ def _ingestor_with_mock_bq(existing_dates=None):
     ingestor.alpaca = MagicMock()
     ingestor._project_id = "test-project"
     ingestor._dataset_id = "options_wheel"
+    ingestor._strategy_id = "wheel"   # FC-075 Seam 4: stamped onto every row
     ingestor._table_ref = MagicMock()
     ingestor._client = MagicMock()
     ingestor._enabled = True
@@ -69,6 +70,7 @@ class TestRunOnce:
     def test_disabled_returns_disabled(self):
         ingestor = PortfolioHistoryIngestor.__new__(PortfolioHistoryIngestor)
         ingestor._enabled = False
+        ingestor._strategy_id = "wheel"
         assert ingestor.run_once()["status"] == "disabled"
 
     def test_skips_today_row(self):

@@ -497,6 +497,7 @@ class TestJournalLabelingThroughExecute:
         from src.data.trade_journal import TradeJournal
         tj = TradeJournal.__new__(TradeJournal)
         tj._enabled = True
+        tj._strategy_id = "covered_call"
         tj._client = Mock()
         tj._client.insert_rows_json.return_value = []
         tj._table_ref = "proj.covered_call.trades"

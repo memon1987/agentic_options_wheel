@@ -17,15 +17,22 @@ from src.utils import clock as _time_seam
 
 @pytest.fixture(autouse=True)
 def _reset_cloud_run_caches():
-    """Reset the server's process-scoped caches between tests (FC-075 Seam 2).
+    """Reset the process-scoped strategy caches between tests (FC-075).
 
     ``deploy.cloud_run_server`` caches the Config and the account-interlock
     verdict at module scope. Without a reset, a verdict cached by one test
     (e.g. a mismatch → 503) would leak into the next. Only touches the module if
     a test already imported it, so non-server tests (and flask-less envs) are
     unaffected.
+
+    Seam 4 adds the AnalyticsWriter singleton to that state: its configured
+    dataset/strategy is per-process, and re-configuring it after construction
+    raises by design. It is reset unconditionally — the CLI configures it
+    without importing the server.
     """
     def _reset():
+        from src.data import analytics_writer
+        analytics_writer._reset_for_tests()
         mod = sys.modules.get("deploy.cloud_run_server")
         if mod is not None and hasattr(mod, "reset_strategy_state"):
             mod.reset_strategy_state()
