@@ -93,7 +93,13 @@ class ExecutionEngine:
         self.alpaca_client = alpaca_client
         self.config = config
         self.logger = log or logger
-        self.trade_journal = trade_journal or TradeJournal()
+        # The journal's dataset comes from THIS process's profile (FC-075 Seam
+        # 4) — never a writer-side default, which is how a second profile would
+        # journal into the wheel's trades table.
+        self.trade_journal = trade_journal or TradeJournal(
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
         # FC-065 Phase 4: underlying -> the reason its last CALL opportunity
         # was dropped this cycle. A read-only side channel for the decision
         # record, populated at the single `_log_drop` chokepoint so ranking

@@ -6,14 +6,13 @@ call-only filter + its `previously_failed`-mislabel fix, via the extracted
 `/run` (DD-6); the inventory validator — chain criteria + `excluded_symbols`
 decision row + wheel-neutrality (DD-3); strategy-scoped BQ reads (DD-4); the
 exposure alert incl. get_account-raises, via `_maybe_alert_long_exposure` (DD-5);
-the DD-7 write interlock on the server AND the main.py CLI; and the config surface.
+the config surface; and — since FC-075 Seam 4 deleted the DD-7 write interlock —
+the positive twins of the interlock tests, on the server AND the main.py CLI.
 
-Note on the covered-call `/run`/`/scan` handler bodies: DD-7 makes those endpoints
-503 for a non-wheel profile until Seam 4, so the covered-call *direction* of the
-inline gates is tested either through the extracted helpers (call-only filter,
-exposure alert) or by patching `strategy_config` to a mock covered-call profile
-with `writes_isolated=True` (simulating post-Seam-4), while the wheel direction is
-driven through the real endpoint.
+Note on the covered-call `/run` handler body: the covered-call *direction* of the
+inline gates is driven either through the extracted helpers (call-only filter,
+exposure alert) or by patching `strategy_config` to a mock covered-call profile,
+while the wheel direction is driven through the real endpoint.
 """
 
 import importlib
@@ -200,7 +199,7 @@ class TestConfigSurface:
     def test_real_covered_call_config_loads_with_phase2_keys(self):
         c = Config(str(REPO / "config" / "covered_call.yaml"))
         assert c.strategy_id == "covered_call"
-        assert c.writes_isolated is False          # DD-7 armed
+        assert c.bigquery_dataset == "covered_call"   # live-wired by Seam 4
         assert c.sizing_basis == "equity"
         assert c.min_open_interest == 500
         assert c.max_spread_pct == 0.10
@@ -209,7 +208,7 @@ class TestConfigSurface:
 
     def test_wheel_defaults_are_neutral(self):
         c = Config(str(REPO / "config" / "settings.yaml"))
-        assert c.writes_isolated is True
+        assert c.bigquery_dataset == "options_wheel"
         assert c.sizing_basis == "buying_power"
         assert c.min_open_interest is None
         assert c.max_spread_pct is None
@@ -264,39 +263,86 @@ def server():
     mod.reset_strategy_state()
 
 
-class TestWriteInterlock:
-    def test_covered_call_scan_refused_until_seam4(self, server, monkeypatch):
+CC_ACCOUNT = "PA37XLNWDLB3"
+
+
+class TestWriteInterlockRemoved:
+    """The positive twins of the deleted DD-7 tests (FC-075 Seam 4, DD-6).
+
+    Every one of these endpoints used to 503 ``write_isolation_unavailable``
+    for a non-wheel profile. Now the writers are dataset-correct, so the write
+    paths run — while the Seam 2 account interlock, which is a different
+    control entirely, still refuses a credential mismatch. (`/run`'s twin is
+    TestReconcileGate below, which drives the covered-call profile through the
+    real handler to a 200.)
+    """
+
+    def _cc_profile(self, server, monkeypatch, account=CC_ACCOUNT):
         monkeypatch.setenv("STRATEGY_CONFIG", "config/covered_call.yaml")
         monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
         server.reset_strategy_state()
-        # Pass the account interlock (CC account) so we reach the write guard.
         alpaca = Mock()
-        alpaca.get_account.return_value = {"account_number": "PA37XLNWDLB3"}
+        alpaca.get_account.return_value = {"account_number": account}
+        alpaca.get_positions.return_value = []
+        return alpaca
+
+    def test_covered_call_scan_proceeds(self, server, monkeypatch):
+        alpaca = self._cc_profile(server, monkeypatch)
+        scanner = Mock()
+        scanner.scan_for_put_opportunities.return_value = []   # put leg self-gates
+        scanner.scan_for_call_opportunities.return_value = []
+        store = Mock()
+        store.store_opportunities.return_value = 0
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca), \
+             patch("src.api.market_data.MarketDataManager", return_value=Mock()), \
+             patch("src.data.options_scanner.OptionsScanner", return_value=scanner), \
+             patch("src.data.opportunity_store.OpportunityStore", return_value=store):
+            resp = server.app.test_client().post("/scan")
+        assert resp.status_code == 200
+        assert b"write_isolation_unavailable" not in resp.data
+        assert scanner.scan_for_call_opportunities.called
+
+    @pytest.mark.parametrize("endpoint", ["/monitor", "/roll"])
+    def test_covered_call_monitor_and_roll_reach_their_handlers(
+            self, server, monkeypatch, endpoint):
+        # Both handlers open with a market-closed gate; reaching it at all
+        # proves the write guard is gone (it ran before the handler body).
+        alpaca = self._cc_profile(server, monkeypatch)
+        with patch.object(server, "_is_market_open", return_value=False), \
+             patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
+            resp = server.app.test_client().post(endpoint)
+        assert resp.status_code == 200, endpoint
+        assert b"write_isolation_unavailable" not in resp.data
+        assert b"Market closed" in resp.data
+
+    @pytest.mark.parametrize("endpoint,module,name", [
+        ("/ingest-activities", "src.data.activities_ingestor", "ActivitiesIngestor"),
+        ("/ingest-portfolio-history", "src.data.portfolio_history_ingestor",
+         "PortfolioHistoryIngestor"),
+        ("/ingest-stock-history", "src.data.stock_history_ingestor",
+         "StockHistoryIngestor"),
+    ])
+    def test_covered_call_ingest_endpoints_construct_their_ingestor(
+            self, server, monkeypatch, endpoint, module, name):
+        alpaca = self._cc_profile(server, monkeypatch)
+        ingestor_cls = Mock()
+        ingestor_cls.return_value.enabled = False
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca), \
+             patch(f"{module}.{name}", ingestor_cls):
+            resp = server.app.test_client().post(endpoint)
+        assert b"write_isolation_unavailable" not in resp.data
+        # It got as far as building the ingestor — against ITS OWN dataset.
+        _, kwargs = ingestor_cls.call_args
+        assert kwargs["dataset_id"] == "covered_call"
+        assert kwargs["strategy_id"] == "covered_call"
+
+    def test_account_interlock_still_refuses_a_mismatch(self, server, monkeypatch):
+        # Seam 2 is a different control and is untouched by Seam 4's deletion.
+        alpaca = self._cc_profile(server, monkeypatch, account="PA_WRONG_ACCOUNT")
         with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
             resp = server.app.test_client().post("/scan")
         assert resp.status_code == 503
-        assert b"write_isolation_unavailable" in resp.data
-
-    def test_ingest_also_write_isolated(self, server, monkeypatch):
-        monkeypatch.setenv("STRATEGY_CONFIG", "config/covered_call.yaml")
-        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
-        alpaca = Mock()
-        alpaca.get_account.return_value = {"account_number": "PA37XLNWDLB3"}
-        for ep in ("/ingest-activities", "/ingest-portfolio-history", "/ingest-stock-history"):
-            server.reset_strategy_state()
-            with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
-                resp = server.app.test_client().post(ep)
-            assert resp.status_code == 503, ep
-            assert b"write_isolation_unavailable" in resp.data
-
-    def test_wheel_passes_the_write_guard(self, server, monkeypatch):
-        # The wheel profile is always write-isolated: the guard must NOT 503 it.
-        # (It fails the account interlock with the mocked wrong account, but the
-        # point is the write guard doesn't fire — a wheel 503 here would be the
-        # account guard, not write_isolation.)
-        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
-        server.reset_strategy_state()
-        assert server.strategy_config().writes_isolated is True
+        assert b"account_interlock_mismatch" in resp.data
 
 
 # --------------------------------------------------------------------------- #
@@ -395,7 +441,6 @@ def _run_mock_config(strategy_id, account="PA_ACCT"):
     c = Mock()
     c.strategy_id = strategy_id
     c.expected_account_number = account
-    c.writes_isolated = True  # bypass DD-7 to reach the handler (post-Seam-4 sim)
     return c
 
 
@@ -463,9 +508,14 @@ class TestExcludedSymbols:
 # DD-7 — the main.py CLI write interlock (HIGH-2's mandated CLI test)
 # --------------------------------------------------------------------------- #
 
-class TestCliWriteInterlock:
-    def test_cli_scan_refused_for_covered_call_profile(self, monkeypatch):
+class TestCliWriteInterlockRemoved:
+    def test_cli_scan_proceeds_for_covered_call_profile(self, monkeypatch):
+        # The CLI guard's positive twin (FC-075 Seam 4, DD-6). It used to
+        # sys.exit(2) here; the scan now runs, and the analytics singleton is
+        # configured from --config's Config — NOT from STRATEGY_CONFIG, which
+        # the CLI never reads.
         import importlib
+        from src.data import analytics_writer
         main = importlib.import_module("main")
         monkeypatch.setattr(sys, "argv",
                             ["main.py", "--command", "scan",
@@ -476,10 +526,10 @@ class TestCliWriteInterlock:
              patch("main.PortfolioTracker", return_value=Mock()), \
              patch("main.OptionsScanner", return_value=Mock()), \
              patch("main.scan_opportunities") as scan_fn:
-            with pytest.raises(SystemExit) as exc:
-                main.main()
-        assert exc.value.code == 2          # writes_isolated False → refused
-        scan_fn.assert_not_called()          # never scanned
+            main.main()                      # no SystemExit
+        scan_fn.assert_called_once()
+        assert analytics_writer._configured_dataset_id == "covered_call"
+        assert analytics_writer._configured_strategy_id == "covered_call"
 
 
 # --------------------------------------------------------------------------- #
@@ -497,6 +547,7 @@ class TestJournalLabelingThroughExecute:
         from src.data.trade_journal import TradeJournal
         tj = TradeJournal.__new__(TradeJournal)
         tj._enabled = True
+        tj._strategy_id = "covered_call"
         tj._client = Mock()
         tj._client.insert_rows_json.return_value = []
         tj._table_ref = "proj.covered_call.trades"

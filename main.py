@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 
 from src.utils.config import Config
+from src.data.analytics_writer import configure_analytics_writer
 from src.utils.logger import setup_logging, get_logger
 from src.data.options_scanner import OptionsScanner
 from src.data.portfolio_tracker import PortfolioTracker
@@ -46,7 +47,16 @@ def main():
 
         # Load configuration
         config = Config(args.config)
-        
+
+        # FC-075 Seam 4: hand this process's profile to the AnalyticsWriter
+        # singleton before anything can reach for it. The CLI selects its
+        # profile with --config, NOT STRATEGY_CONFIG, which is why the
+        # singleton cannot resolve its own dataset from the environment.
+        configure_analytics_writer(
+            dataset_id=config.bigquery_dataset,
+            strategy_id=config.strategy_id,
+        )
+
         logger.info("Starting Options Wheel Strategy",
                    event_category="system",
                    event_type="application_started",
@@ -81,20 +91,6 @@ def main():
         # read-only equivalent that stays; execution lives on the Cloud Run
         # server, which is the only thing that trades.
         if args.command == 'scan':
-            # FC-075 Phase 2 (DD-7): the CLI bypasses the server's
-            # require_write_isolation decorator. `scan` writes decision_events to
-            # BigQuery via the scanner's DecisionRecorder; on a non-wheel profile
-            # those would land in the wheel's dataset until Seam 4 threads
-            # config.bigquery_dataset through the writers. Refuse rather than
-            # contaminate — same code property the server enforces.
-            if not config.writes_isolated:
-                logger.error(
-                    "Refusing scan: BigQuery write isolation not yet in place for this strategy",
-                    event_category="error",
-                    event_type="write_isolation_unavailable",
-                    strategy_id=config.strategy_id,
-                )
-                sys.exit(2)
             scan_opportunities(scanner, logger)
         elif args.command == 'status':
             show_status(portfolio_tracker, logger)

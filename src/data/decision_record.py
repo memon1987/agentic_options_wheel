@@ -494,8 +494,8 @@ class UncoveredDaysResolver:
     #: default and the stock-history ingestor's benchmark set.
     CALENDAR_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
 
-    def __init__(self, allow_bigquery: bool = True,
-                 dataset_id: str = "options_wheel"):
+    def __init__(self, allow_bigquery: bool = True, *,
+                 dataset_id: str):
         self.allow_bigquery = allow_bigquery
         self.dataset_id = dataset_id
         self._bq_client = None

@@ -80,6 +80,10 @@ if _HAS_BIGQUERY:
                                          "JNLC (account deposits/withdrawals). Null for FILL/OPASN/OPEXP."),
         bigquery.SchemaField("ingested_at", "TIMESTAMP",
                              description="When this row was written to BQ"),
+        # FC-075 Seam 4 (DD-3). NULLABLE and additive: pre-Seam-4 rows have no
+        # value, so readers segmenting by strategy use IFNULL(strategy_id, 'wheel').
+        bigquery.SchemaField("strategy_id", "STRING",
+                             description="Strategy profile that wrote this row; NULL = wheel (pre-Seam-4 rows)"),
     ]
 else:
     _SCHEMA = []
@@ -89,11 +93,17 @@ class ActivitiesIngestor:
     """Pulls Alpaca account activities and appends to BigQuery (append-only)."""
 
     def __init__(self, alpaca: AlpacaClient, project_id: Optional[str] = None,
-                 dataset_id: str = "options_wheel") -> None:
+                 *, dataset_id: str, strategy_id: str) -> None:
+        # dataset_id/strategy_id are required and keyword-only (FC-075 Seam 4):
+        # a defaulted dataset is how a second strategy profile silently writes
+        # the wheel's tables. Assigned before any early return so a disabled
+        # ingestor still reports the identity it was constructed with.
         self.alpaca = alpaca
         self._enabled = False
         self._client = None
         self._table_ref = None
+        self._dataset_id = dataset_id
+        self._strategy_id = strategy_id
 
         if not _HAS_BIGQUERY:
             logger.warning("google-cloud-bigquery not available — ActivitiesIngestor disabled")
@@ -108,8 +118,6 @@ class ActivitiesIngestor:
             logger.warning("No GCP project ID — ActivitiesIngestor disabled")
             return
 
-        self._dataset_id = dataset_id
-
         try:
             self._client = bigquery.Client(project=self._project_id)
             self._ensure_table()
@@ -120,6 +128,7 @@ class ActivitiesIngestor:
                 event_type="activities_ingestor_initialized",
                 project=self._project_id,
                 dataset=self._dataset_id,
+                strategy_id=self._strategy_id,
                 table=TABLE_NAME,
             )
         except Exception:
@@ -127,11 +136,13 @@ class ActivitiesIngestor:
                            exc_info=True)
 
     def _ensure_table(self) -> None:
-        """Create dataset and the trades_from_activities table if they don't exist."""
+        """Create the trades_from_activities table if it doesn't exist.
+
+        The dataset itself is NEVER created here (FC-075 Seam 4): datasets are
+        an operator provisioning step, so a missing dataset raises NotFound and
+        leaves this ingestor disabled.
+        """
         dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset_id)
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "us-central1"
-        self._client.create_dataset(dataset, exists_ok=True)
 
         table_ref = dataset_ref.table(TABLE_NAME)
         table = bigquery.Table(table_ref, schema=_SCHEMA)
@@ -406,6 +417,9 @@ class ActivitiesIngestor:
             if row is None:
                 malformed += 1
             else:
+                # Stamped here rather than inside the static normalizer: this is
+                # the single row-construction path feeding insert_rows_json.
+                row["strategy_id"] = self._strategy_id
                 rows.append(row)
 
         # Dedup against existing

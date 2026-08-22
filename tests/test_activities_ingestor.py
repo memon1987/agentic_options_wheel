@@ -256,6 +256,7 @@ def _build_ingestor_with_bq_mock(existing_ids=None, max_cursor=None):
     ingestor.alpaca = alpaca_mock
     ingestor._project_id = "test-project"
     ingestor._dataset_id = "options_wheel"
+    ingestor._strategy_id = "wheel"   # FC-075 Seam 4: stamped onto every row
     ingestor._table_ref = MagicMock()
     ingestor._client = MagicMock()
     ingestor._enabled = True
@@ -393,6 +394,7 @@ class TestRunOnce:
     def test_disabled_ingestor_returns_disabled(self):
         ingestor = ActivitiesIngestor.__new__(ActivitiesIngestor)
         ingestor._enabled = False
+        ingestor._strategy_id = "wheel"
         result = ingestor.run_once()
         assert result["status"] == "disabled"
 

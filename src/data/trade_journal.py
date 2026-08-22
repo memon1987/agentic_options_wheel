@@ -54,6 +54,10 @@ _TABLE_SCHEMA = [
     bigquery.SchemaField("realized_pnl", "FLOAT", description="Realized P&L if position closed"),
     bigquery.SchemaField("filled_at", "TIMESTAMP", description="Timestamp when order was actually filled"),
     bigquery.SchemaField("timestamp", "TIMESTAMP", description="UTC timestamp of the record"),
+    # FC-075 Seam 4 (DD-3). NULLABLE and additive: pre-Seam-4 rows have no
+    # value, so readers segmenting by strategy use IFNULL(strategy_id, 'wheel').
+    bigquery.SchemaField("strategy_id", "STRING",
+                         description="Strategy profile that wrote this row; NULL = wheel (pre-Seam-4 rows)"),
 ] if _HAS_BIGQUERY else []
 
 
@@ -67,10 +71,19 @@ class TradeJournal:
     def __init__(
         self,
         project_id: Optional[str] = None,
-        dataset_id: str = "options_wheel",
         table_id: str = "trades",
+        *,
+        dataset_id: str,
+        strategy_id: str,
     ):
+        # dataset_id/strategy_id are required and keyword-only (FC-075 Seam 4):
+        # a defaulted dataset is how a second strategy profile silently writes
+        # the wheel's trades table. Assigned before any early return so a
+        # disabled journal still reports the identity it was constructed with.
         self._enabled = False
+        self._dataset_id = dataset_id
+        self._strategy_id = strategy_id
+        self._table_id = table_id
 
         if not _HAS_BIGQUERY:
             return
@@ -80,17 +93,15 @@ class TradeJournal:
             logger.warning("No GCP project ID configured -- TradeJournal disabled")
             return
 
-        self._dataset_id = dataset_id
-        self._table_id = table_id
-
         try:
             self._client = bigquery.Client(project=self._project_id)
-            self._ensure_dataset_and_table()
+            self._ensure_table()
             self._enabled = True
             logger.info(
                 "TradeJournal initialised",
                 project=self._project_id,
                 dataset=self._dataset_id,
+                strategy_id=self._strategy_id,
                 table=self._table_id,
             )
         except Exception:
@@ -100,14 +111,15 @@ class TradeJournal:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _ensure_dataset_and_table(self) -> None:
-        """Create dataset and table if they do not already exist."""
-        dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset_id)
+    def _ensure_table(self) -> None:
+        """Create the trades table if it does not already exist.
 
-        # Dataset
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "us-central1"
-        self._client.create_dataset(dataset, exists_ok=True)
+        The dataset itself is NEVER created here (FC-075 Seam 4): datasets are
+        an operator provisioning step. A missing dataset must raise NotFound and
+        leave this journal disabled rather than conjure one under whatever
+        credentials happen to be ambient.
+        """
+        dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset_id)
 
         # Table
         table_ref = dataset_ref.table(self._table_id)
@@ -199,6 +211,7 @@ class TradeJournal:
             "realized_pnl": trade_data.get("realized_pnl"),
             "filled_at": trade_data.get("filled_at"),
             "timestamp": trade_data.get("timestamp") or now,
+            "strategy_id": self._strategy_id,
         }
 
         try:

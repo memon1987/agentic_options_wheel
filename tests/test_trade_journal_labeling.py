@@ -19,6 +19,7 @@ def _journal():
     """A TradeJournal wired to a fake BQ client (no real BigQuery)."""
     tj = TradeJournal.__new__(TradeJournal)
     tj._enabled = True
+    tj._strategy_id = "wheel"     # FC-075 Seam 4: stamped onto every row
     tj._client = Mock()
     tj._client.insert_rows_json.return_value = []  # no insert errors
     tj._table_ref = "proj.options_wheel.trades"
@@ -97,4 +98,5 @@ def test_absent_leg_does_not_guess_put():
 def test_disabled_journal_is_a_noop():
     tj = TradeJournal.__new__(TradeJournal)
     tj._enabled = False
+    tj._strategy_id = "wheel"
     tj.record_trade({"type": "call"})  # must not raise / not touch a client

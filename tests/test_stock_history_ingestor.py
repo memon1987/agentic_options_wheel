@@ -29,6 +29,7 @@ def _ingestor(universe=None, cursors=None):
     ingestor.alpaca.config.alpaca_secret_key = "secret"
     ingestor._project_id = "test"
     ingestor._dataset_id = "options_wheel"
+    ingestor._strategy_id = "wheel"   # FC-075 Seam 4: stamped onto every row
     ingestor._table_ref = MagicMock()
     ingestor._client = MagicMock()
     ingestor._enabled = True
