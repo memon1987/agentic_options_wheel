@@ -288,4 +288,6 @@ Opus build landed as `a487722` (DD-1/2/3) + `50982c8` (tests/docs) + `aab1ed7` (
   stock_history_from_alpaca:   strategy_id STRING/NULLABLE
   ```
 - **Confirmation pass (scoped, on `08460b5`): CONFIRMED-CLEAN** — fix verified (race closed, all interleavings walked, exception path improved fail-closed), suite 1341 green + 70 targeted, all bookkeeping landed. No STILL-BROKEN, no NEW-REGRESSIONS.
-- Remaining after merge: R3 deploy (FC-081 fixed — trigger live), R4 per-table verify (windows per LOW batch), R5 FC-067 UPDATE (62 rows re-verified by reviewer 2 with the hardened predicate), R6 bookkeeping.
+- **Merged 2026-08-22:** squash `cebb09b` (PR #90). **R3 DONE:** auto-build `7fd55262` SUCCESS → revision `options-wheel-strategy-00509-boz` serving.
+- **R4 — partial (weekend), completes with Monday 2026-08-24's organic cycles.** Saturday probe: manual `activities-ingest-off-hours` scheduler run → 200 on the new revision, zero insert errors, zero writer exceptions in logs (a clean idempotent no-op — Friday's activities were already ingested, and this endpoint's only BQ write is `trades_from_activities`; it writes no executions row). Stamped-row verification per table awaits real writes: `executions`/`errors`/`decision_events` on Monday's first scan/run cycles, `trades_from_activities` on Monday's market-hours ingests, `equity/stock_history` after Monday's 16:30/17:00 ET jobs, `trades` on the next fill.
+- **R5 (FC-067 corrective UPDATE, 62 rows): blocked on R4 completing** — do not run on a partial verify. Then R6 bookkeeping closes this plan.
