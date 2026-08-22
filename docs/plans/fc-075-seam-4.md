@@ -277,6 +277,15 @@ Opus build landed as `a487722` (DD-1/2/3) + `50982c8` (tests/docs) + `aab1ed7` (
 ## Execution
 
 - **PR:** https://github.com/memon1987/agentic_options_wheel/pull/90 (branch `claude/fc-075-seam-4`: `a487722`, `50982c8`, `aab1ed7`, review fix `08460b5`)
-- **R1 (7 live-table ALTERs): PENDING — gates merge.** `bq show` verification output to be pasted here when run.
-- **Confirmation pass (scoped, on `08460b5`): pending.**
+- **R1 (7 live-table ALTERs): DONE 2026-08-22, run by claude-operator** (`ADD COLUMN IF NOT EXISTS strategy_id STRING` ×7, all returned success). `bq show` verification, all seven tables:
+  ```
+  trades:                      strategy_id STRING/NULLABLE
+  errors:                      strategy_id STRING/NULLABLE
+  executions:                  strategy_id STRING/NULLABLE
+  decision_events:             strategy_id STRING/NULLABLE
+  trades_from_activities:      strategy_id STRING/NULLABLE
+  equity_history_from_alpaca:  strategy_id STRING/NULLABLE
+  stock_history_from_alpaca:   strategy_id STRING/NULLABLE
+  ```
+- **Confirmation pass (scoped, on `08460b5`): CONFIRMED-CLEAN** — fix verified (race closed, all interleavings walked, exception path improved fail-closed), suite 1341 green + 70 targeted, all bookkeeping landed. No STILL-BROKEN, no NEW-REGRESSIONS.
 - Remaining after merge: R3 deploy (FC-081 fixed — trigger live), R4 per-table verify (windows per LOW batch), R5 FC-067 UPDATE (62 rows re-verified by reviewer 2 with the hardened predicate), R6 bookkeeping.
