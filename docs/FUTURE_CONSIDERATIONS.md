@@ -1229,7 +1229,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-067: the trade journal labels every covered call as a put
 
-**Status:** CLOSED 2026-08-21 — fixed by PR #88 (`b02f48d`), hardened by its adversarial review to derive the leg **OCC-symbol-first** (`strict_option_type(option_symbol)` → `option_type` → `type` → infer-from-strategy; strategy follows the resolved leg; absent leg → null, never a guessed 'put'), because `execute_batch` routes by the symbol on declared/type drift (FC-048) and the audit row must record the leg actually traded. Root cause: scanner opps carry `type`, not `option_type`/`strategy`, so `record_trade`'s defaults fired on EVERY row. Forward-only — **the 29 historical mislabeled rows still need a corrective UPDATE** (synthetic/corrective-write discipline; natural rider on the Seam 4 plan). Tests: `tests/test_trade_journal_labeling.py` (7). Was the hard prerequisite for FC-075 Phase 2.
+**Status:** CLOSED 2026-08-21 — fixed by PR #88 (`b02f48d`), hardened by its adversarial review to derive the leg **OCC-symbol-first** (`strict_option_type(option_symbol)` → `option_type` → `type` → infer-from-strategy; strategy follows the resolved leg; absent leg → null, never a guessed 'put'), because `execute_batch` routes by the symbol on declared/type drift (FC-048) and the audit row must record the leg actually traded. Root cause: scanner opps carry `type`, not `option_type`/`strategy`, so `record_trade`'s defaults fired on EVERY row. Forward-only — historical mislabels corrected 2026-08-24 via the Seam 4 R5 rider: **62 rows** (grown from the entry's 29 while the fix sat merged-but-undeployed, FC-081) UPDATEd to `call`/`sell_call`; snapshot/rollback table `options_wheel.fc067_label_snapshot_20260824`; audit-after 0; census now 115 put / 63 call. Tests: `tests/test_trade_journal_labeling.py` (7). Was the hard prerequisite for FC-075 Phase 2.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1504,7 +1504,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-075: Standalone covered-call strategy — separate account, shared machinery
 
-**Status:** Executing — Phases 0–2 DONE (engine merged 2026-08-21, PR #89 `2e08d0a`; Phase 1 isolation PR #77; prereq FC-067 PR #88). Covered-call service is code-complete but **inert until Seam 4** (DD-7 write interlock fails non-wheel profiles closed). Remaining: Seam 4 → Phase 3 deploy → shadow week → first paper trade on `PA37XLNWDLB3`. See `docs/plans/fc-075-phase-2.md` §Execution + `docs/releases/RELEASE_2026-08-21.md`.
+**Status:** LIVE (paper) 2026-08-24 — Phases 0–3 DONE. Seam 4 merged+deployed 08-22 (PR #90 `cebb09b`; R1–R6 complete, `docs/plans/fc-075-seam-4.md`); Phase 3 provisioned + **interlock drill PASSED** 08-23 (`covered-call-engine` live, own dataset/bucket/schedulers, no `/roll`); go-live 08-24: first lots GOOGL 100 @ 348.02 + UNH 100 @ 398.08 in `PA37XLNWDLB3`, first cycle = clean fully-explained no-trade (`below_cost_basis` dominant — spot ≈ day-one basis; then premium/delta/OI). **First covered call pending qualifying strikes** (compressed shadow was an operator decision, recorded in `fc-075.md`). Remaining: first written call (organic), tunables iteration from live decision rows, cloudbuild deploy step for the CC service (image pinned to `27308f4` until then), CC alert policies, Phase 4 backtest (optional, pre-real-money).
 **Size estimate:** L
 **Owner:** zeshan
 **Plan file:** `docs/plans/fc-075.md`
