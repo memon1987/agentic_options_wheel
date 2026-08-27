@@ -374,7 +374,12 @@ called it canonical.
 `POST /regression` and invoked hourly at `:45` during market hours by Cloud
 Scheduler; **any check with status `fail` makes the endpoint return HTTP 500**.
 Check groups: `endpoint_health`, `trade_execution`, `log_analysis`,
-`position_reconciliation`, `performance_baseline`, `risk_parameters`.
+`position_reconciliation`, `performance_baseline` (**KNOWN DEAD — validates
+nothing: it queries columns/tables that never existed; do not trust its
+"pass". FC-085 owns the fix-or-delete decision**), `risk_parameters`.
+Since FC-082 (2026-08-27) the monitor's dataset is profile-derived
+(`BQ_DATASET` env survives as explicit override only), and
+`cc-regression-hourly` runs the same checks against the covered-call service.
 
 `check_risk_parameters` was synced to the real policy set by FC-069 S1 — four
 checks that mirrored deleted knobs (global position count, cash reserve,
