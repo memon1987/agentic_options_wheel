@@ -38,8 +38,14 @@ bigquery:
 # Covered-call trading parameters — this strategy's OWN tunables, distinct from
 # the wheel's (requirement #3). No put phase.
 strategy:
-  # Days to expiration for the calls written against held shares.
-  call_target_dte: 7
+  # Days to expiration for the calls written against held shares. This is the
+  # hard DTE CEILING for candidates (market_data.py _check_call_criteria_detailed).
+  # 7 -> 14 (operator, 2026-08-27): three live days showed the [0.15,0.25]
+  # delta band and the $0.30 premium floor have an empty intersection on a
+  # <=7-DTE chain at current IV (UNH zero-qualified while ABOVE basis).
+  # Week-2 expiries price the same deltas above the floor.
+  # See docs/plans/fc-075-cc-deploy-step.md.
+  call_target_dte: 14
   # Delta band for call selection. Own band; starts at the wheel's tightened
   # value and is tuned independently once there's covered-call backtest data.
   call_delta_range: [0.15, 0.25]

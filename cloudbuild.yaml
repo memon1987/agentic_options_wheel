@@ -124,6 +124,74 @@ steps:
     id: 'promote-bot'
     waitFor: ['smoke-test-bot']
 
+  # Deploy covered-call engine (canary - no traffic). Same image as the wheel;
+  # the profile is selected by STRATEGY_CONFIG (FC-075). Runs only after the
+  # wheel promoted, so a bad image trips on the wheel's canary first.
+  # NOTE: --set-env-vars REPLACES the literal env-var set — these three are the
+  # complete intended set. Secret-backed env vars (ALPACA_API_KEY/SECRET -> the
+  # -cc secrets, FINNHUB_API_KEY) are a separate list that --set-env-vars does
+  # not touch; do NOT add --set-secrets here (a typo'd name would break the
+  # service — bindings persist from provisioning, docs/plans/fc-075-cc-deploy-step.md).
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
+      - 'run'
+      - 'deploy'
+      - 'covered-call-engine'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--memory=512Mi'
+      - '--concurrency=10'
+      - '--max-instances=1'
+      - '--min-instances=0'
+      - '--timeout=300'
+      - '--set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml'
+      - '--no-traffic'
+      - '--tag=canary'
+    id: 'deploy-cc-canary'
+    waitFor: ['promote-bot']
+
+  # Verify the covered-call canary revision is ready (same poll-not-sample
+  # pattern as the wheel's smoke test — a single-shot check races startup).
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "Verifying covered-call canary revision is ready..."
+        for i in $(seq 1 30); do
+          STATUS=$(gcloud run revisions list --service=covered-call-engine \
+            --region=us-central1 --limit=1 \
+            --format="value(status.conditions[0].status)")
+          echo "attempt $${i}/30 — CC canary status: $${STATUS}"
+          if [ "$${STATUS}" = "True" ]; then
+            echo "PASS: CC canary revision is ready"
+            exit 0
+          fi
+          if [ "$${STATUS}" = "False" ]; then
+            echo "FAIL: CC canary revision failed to become ready"
+            exit 1
+          fi
+          sleep 5
+        done
+        echo "FAIL: timed out after 150s waiting for CC canary revision"
+        exit 1
+    id: 'smoke-test-cc'
+    waitFor: ['deploy-cc-canary']
+
+  # Shift traffic to the new covered-call revision
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - 'covered-call-engine'
+      - '--to-latest'
+      - '--region=us-central1'
+    id: 'promote-cc'
+    waitFor: ['smoke-test-cc']
+
   # Step 9: Deploy dashboard to Cloud Run (canary - no traffic)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     args:
@@ -201,7 +269,7 @@ options:
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
 
 # Timeout for the entire build
-timeout: '900s'  # 15 minutes (increased for dashboard build)
+timeout: '1200s'  # 20 min: measured builds run 8-12 min and the CC canary chain adds up to ~4 min serial worst-case (PR #91 review)
 
 # Substitutions for build variables
 substitutions:
