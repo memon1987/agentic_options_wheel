@@ -24,6 +24,7 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 ### FC-NNN: <short title>
 
 **Status:** Consideration | Researching | Plan drafted | Plan published | Executing | Done
+**Scope:** wheel | covered_call | shared  (REQUIRED since 2026-08-27 — which strategy the change serves; `shared` = reusable machinery both consume, e.g. writers, OCC parsers, ExecutionEngine, deploy/CI. Multi-scope work: name the primary, list the rest.)
 **Size estimate:** S | M | L  (M/L require a plan file before code changes)
 **Owner:** <who is thinking about this>
 **Plan file:** `docs/plans/<slug>.md` (once published)

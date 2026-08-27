@@ -25,6 +25,17 @@ durable strategy state (see §Accepted amnesia).
 Plan-First Development rules are defined in the parent `CLAUDE.md` and apply to
 this project. Project-specific plan files live in `docs/plans/`.
 
+**Scope tag (required since 2026-08-27, operator rule):** every FC entry and
+every plan file carries a `**Scope:**` line — `wheel` | `covered_call` |
+`shared` — naming which strategy the work serves (`shared` = machinery both
+consume: writers, OCC parsers, ExecutionEngine, config, deploy/CI). Two
+services now build from this repo; the tag is what lets a reviewer instantly
+know which service's behavior a change can touch, and which neutrality
+contract (wheel-neutral vs covered-call-neutral, see the reverse-neutrality
+note in `docs/plans/fc-075-phase-2.md`) the PR must prove. Multi-scope work
+names the primary and lists the rest. Entries filed before 2026-08-27 are not
+retro-tagged; tag them opportunistically when touched.
+
 ## Development Setup
 
 Install dependencies:

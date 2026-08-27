@@ -3,6 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-NNN
 **Plan file:** `docs/plans/fc-NNN.md`
 **Status:** Draft | In review | Approved | Executing | Done
+**Scope:** wheel | covered_call | shared  (required — must match the FC entry's tag)
 **Size:** S | M | L
 **Author:** <name>
 **Last updated:** YYYY-MM-DD
