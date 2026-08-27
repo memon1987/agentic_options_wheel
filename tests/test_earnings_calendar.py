@@ -316,15 +316,21 @@ class TestTheCacheIsSharedAndDurable:
         """
         client = _FakeFinnhub({"earningsCalendar": [{"date": "2026-08-26", "hour": "amc"}]})
 
-        first = EarningsCalendarService(_config())
-        first._client = client
-        assert first.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
-        assert client.calls == 1
+        # Frozen clock: the fixture's earnings date must stay in the FUTURE, or
+        # the D+1 stale-past-date refetch (tested elsewhere in this file) kicks
+        # in and the second read legitimately calls Finnhub again. Unfrozen,
+        # this test went red by pure calendar on 2026-08-27 (FC-083) and took
+        # the deploy pipeline with it.
+        with clock.frozen(datetime(2026, 8, 3, 12, 0)):
+            first = EarningsCalendarService(_config())
+            first._client = client
+            assert first.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
+            assert client.calls == 1
 
-        second = EarningsCalendarService(_config())
-        second._client = client
-        assert second.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
-        assert client.calls == 1, "second instance should have answered from L1"
+            second = EarningsCalendarService(_config())
+            second._client = client
+            assert second.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
+            assert client.calls == 1, "second instance should have answered from L1"
 
     @pytest.mark.real_finnhub_fetch
     def test_an_expired_entry_refetches(self):
@@ -354,10 +360,14 @@ class TestTheCacheIsSharedAndDurable:
         monkeypatch.setattr(
             EarningsCalendarService, "_l2_read",
             lambda self: {"NVDA": {"date": "2026-08-26", "hour": "amc",
-                                   "fetched_at": datetime.now().isoformat()}})
+                                   "fetched_at": datetime(2026, 8, 3, 11, 0).isoformat()}})
 
-        svc = EarningsCalendarService(_config())
-        assert svc.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
+        # Frozen for the same reason as the L1 test above (FC-083): a past
+        # earnings date is *supposed* to trigger a refetch, which here trips
+        # the _never sentinel by design once the calendar catches up.
+        with clock.frozen(datetime(2026, 8, 3, 12, 0)):
+            svc = EarningsCalendarService(_config())
+            assert svc.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
 
     def test_a_broken_gcs_client_is_a_cache_miss_not_an_error(self, monkeypatch):
         """The REAL `_l2_read`, against a client constructor that raises.
