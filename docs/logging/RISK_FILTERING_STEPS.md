@@ -501,10 +501,10 @@ All thresholds are configurable in [config/settings.yaml](../config/settings.yam
 ## Recent Improvements (Oct 3, 2025)
 
 1. **Fixed datetime bug** in gap detector affecting 5 stocks
-   - [Commit bcbbb23](https://github.com/memon1987/options_wheel/commit/bcbbb23)
+   - [Commit bcbbb23](https://github.com/memon1987/agentic_options_wheel/commit/bcbbb23)
 
 2. **Fixed logging configuration** to see all filter decisions
-   - [Commit 9fea03d](https://github.com/memon1987/options_wheel/commit/9fea03d)
+   - [Commit 9fea03d](https://github.com/memon1987/agentic_options_wheel/commit/9fea03d)
 
 3. **Added enhanced debug logging** for gap filtering
    - Shows exactly which stocks pass/fail at each stage

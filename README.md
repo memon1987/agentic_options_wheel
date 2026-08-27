@@ -23,7 +23,7 @@ for the full control inventory.
 ### Local Development
 ```bash
 # Clone and setup
-git clone https://github.com/memon1987/options_wheel.git
+git clone https://github.com/memon1987/agentic_options_wheel.git
 cd options_wheel
 
 # Install dependencies

@@ -1,0 +1,26 @@
+{
+  "displayName": "CC exposure — long_market_value > equity",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "CC exposure — long_market_value > equity",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"covered-call-engine\" AND (jsonPayload.error_type=\"long_exposure_exceeds_equity\" OR textPayload:\"long_exposure_exceeds_equity\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "4x-margin discipline alert (alert-only, never blocks): long market value exceeded equity x threshold in PA37XLNWDLB3. Operator bought more stock than equity covers. FC-075 DD-5.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "3600s"
+    },
+    "autoClose": "86400s"
+  }
+}

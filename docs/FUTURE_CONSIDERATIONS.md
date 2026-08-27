@@ -1604,7 +1604,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 **Lessons / follow-ups:**
 - **[OPEN — the durable fix] Merged-vs-deployed freshness alert:** a scheduled check comparing latest-push age vs. latest-build age (or `origin/main` HEAD vs. the serving revision's commit), alerting on drift > N hours via the FC-030 channel. FC-031's build-failure alert watches builds that *start*; this failure mode needs a check that watches for builds that *don't*. A rename like this would have been caught in hours, not 16 days.
-- **Redirect-masking:** GitHub's old-name redirects are exactly what made this silent. The old name is also now squattable — sweep docs/scripts/configs for hardcoded `github.com/memon1987/options_wheel` URLs to the new name (low urgency; redirects hold until the old name is reused).
+- **Redirect-masking:** GitHub's old-name redirects are exactly what made this silent. ~~Sweep docs/scripts for old-name URLs~~ **done 2026-08-27** (28 files, all docs-layer, mechanical).
 - **Rename checklist:** any future repo rename must same-day update: Cloud Build repo connection + trigger, local remotes, and any webhook-keyed integration.
 
 **Links:** FC-031 (the 11-days-undeployed precedent + build-failure alerting), FC-030 (the notification channel to reuse), `docs/plans/fc-075-seam-4.md` (rollout steps R3–R5 that this gated).
@@ -1716,43 +1716,43 @@ _Move entries here once a plan has been published, executed, and merged. Include
 
 ### FC-014: Wire RiskManager.validate_new_position() into sellers (or retire it)
 - Plan: `docs/plans/fc-069.md` (item 7)
-- PR: https://github.com/memon1987/options_wheel/pull/83
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/83
 - Closed: 2026-08-04 by FC-069 item 7 (operator decision: retire)
 - Notes: `validate_new_position` and its five sibling methods (six in all — `_validate_option_specific_risks`, `calculate_portfolio_risk_metrics`, `should_reduce_positions`, `get_emergency_stop_conditions`, `check_emergency_conditions`) were deleted with zero production call sites ever recorded; `validate_roll` survives as the roller's gate (FC-066's turf). All five checks this entry named are dispositioned: the global position cap by FC-069 item 1 (deleted — operator flip from revive), per-ticker exposure by item 2 (deleted; corrected structural bound documented — the real per-ticker bound is `max_position_size` × portfolio, which *floats with equity*, not an absolute dollar cap), per-stock cap by item 3 (deleted; emergent invariant documented with its open-order caveat), cash reserve by the item 7 rider (deleted with its detective check), and portfolio allocation by card 17 (knob deleted; its warn-only detective mirror deleted with it under card 16). The account-level loss-limit concepts inside the emergency-stop methods were dispositioned by item 7's sub-decision: carried into **FC-074** (filed 2026-08-01), the account-level kill-switch entry, whose thresholds are to be chosen from the account's actual drawdown history rather than inherited from the dead code's 15%/5%. The consolidate fork died with the method: enforcement on this system is distributed by design — scanner filters, selection ledgers, execute-time floor, plus the hourly `/regression` detective layer (card 16). This entry's third open question is answered on the record: **no**, `max_exposure_per_ticker` and `min_cash_reserve` were never checked anywhere — they were silently disabled from inception.
 
 ### FC-015: Centralize hold-period state in WheelStateManager (cold-start safe)
 - Plan: `docs/plans/fc-069.md` (item 6)
-- PR: https://github.com/memon1987/options_wheel/pull/83
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/83
 - Closed: 2026-08-04 by FC-069 item 6 (operator decision: delete)
 - Notes: `_entry_times` never survived a request (sellers are constructed per request, not per cold start as this entry assumed), so the 4h gate has been open since inception — 2026-05-12 evidence: 4 of 35 sub-4h closes. The raised DTE-band thresholds carry the hold discipline. The knob (`risk.profit_taking.min_hold_hours`), both dicts, their population sites and the gate code are deleted. If a hold gate is ever wanted, derive entry time statelessly from Alpaca order history (`filled_at`) — do not persist process state; that answer supersedes this entry's GCS-vs-Alpaca open question, and its "share infrastructure with FC-009" question is moot for the same reason.
 
 ### FC-039: Wheel state persistence has never worked in production
 - Plan: `docs/plans/fc-069.md` (item 8, stage 2)
-- PR: https://github.com/memon1987/options_wheel/pull/87
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/87
 - Closed: 2026-08-04 by FC-069 item 8 (operator decision: delete the illusion, per the coherence principle — derive from durable truth)
 - Notes: Persistence was never enabled and is not wanted: `reconcile_positions` rebuilds from Alpaca per request (this entry's own observation), the floor now resolves from Alpaca `avg_entry_price` (FC-065 P1) with no wheel_state source, and FC-066's roller direction is stateless-from-Alpaca — FC-078 shipped exactly that, which is what unblocked this stage. Stage 1 (S5, PR #86) removed the orphaned CallSeller state plumbing; stage 2 shrank `WheelStateManager` to reconcile's in-request bookkeeping: 747 → 331 lines, keeping only `symbol_states`, `handle_put_assignment`, `handle_call_assignment`, `get_position_summary` and the derived `get_wheel_phase` label, and deleting the GCS save/load, the `storage_bucket` parameter, the engine's `state_storage_bucket`/`STATE_STORAGE_BUCKET` lookup, the six roller state methods, the `can_sell_*` gates, the premium accumulators, the roll counters, and the in-memory `wheel_cycles` list. This entry's open questions are answered: **do not enable it** (question 1 — the fix was removing the illusion, not the bucket); questions 2 and 3 are moot with the code gone. Question 4 — the startup assertion — generalizes beyond this FC and is recorded as a standing rule in FC-069's plan (item 8(b)) and in `wheel_state_manager.py`'s module docstring: **any future configured-but-unresolvable persistence target must fail loudly at startup, never silently no-op.** The silent `storage_bucket=None` is how this layer stayed fictional for a year while the docs called it canonical; whoever next adds a durable-state target (FC-009's dedup, anything else) inherits that as a requirement, not a suggestion.
 
 ### FC-006: Covered call rolling engine (Friday EOW)
 - Plan: `docs/plans/fc-006.md`
-- PR: https://github.com/memon1987/options_wheel/pull/5 (merged 2026-04-16)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/5 (merged 2026-04-16)
 - Commit: `08fb876`
 - Notes: Deployed with `rolling.enabled: false`. Pending paper testing on Fridays before enabling Cloud Scheduler job.
 
 ### FC-007: Earnings Calendar Service (Finnhub)
 - Plan: `docs/plans/fc-007.md`
-- PR: https://github.com/memon1987/options_wheel/pull/5 (merged 2026-04-16)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/5 (merged 2026-04-16)
 - Commit: `0ccf852`
 - Notes: Finnhub API key in Secret Manager, injected into Cloud Run. Log enrichment active; PutSeller/CallSeller integration deferred.
 
 ### FC-010: Disable call stop-losses (assignment is profitable by design)
 - Plan: `docs/plans/fc-010.md`
-- PR: https://github.com/memon1987/options_wheel/pull/7 (merged 2026-04-17)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/7 (merged 2026-04-17)
 - Commit: `737db8a`
 - Notes: Single config change (`use_call_stop_loss: false`). Deployed to Cloud Run revision `00142-vz6`.
 
 ### FC-012: Shift dashboard logging to Alpaca queries wherever authoritative
 - Plan: `docs/plans/fc-012.md`
-- PR: https://github.com/memon1987/options_wheel/pull/8 (merged 2026-04-24)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/8 (merged 2026-04-24)
 - Commit: `8b31a1b`
 - Notes: All phases (2.1-2.7) shipped in one PR after user dropped the parity gate. New tables: `trades_from_activities` (465 rows backfilled) and `equity_history_from_alpaca` (124 rows). New views: `trades_with_outcomes`, `wheel_cycles_from_activities`. Three Cloud Scheduler jobs ingest on a split schedule. V1 tables (trades, wheel_cycles, position_snapshots, order_statuses) left inert pending manual `bq rm` — a follow-up remote routine on 2026-05-01 opens a cleanup PR. Follow-up fix PR #9 preserves `GCP_PROJECT` env var across bot deploys.
 
@@ -1769,7 +1769,7 @@ _Move entries here once a plan has been published, executed, and merged. Include
 
 ### FC-022: Trade Log contract IDs + ET timezone + By-Symbol summary table
 - Plan: `docs/plans/fc-022.md`
-- PR: https://github.com/memon1987/options_wheel/pull/26 (merged 2026-05-06)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/26 (merged 2026-05-06)
 - Commit: `cd1d47d`
 - Notes: Trade Log gains OCC symbol + expiration + Alpaca order ↗ link per row. All date helpers (`fmtDate`, `fmtDateShort`, `fmtDateTime`) now ET-anchored with explicit `timeZone: 'America/New_York'` and `fmtDateTime` shows the EST/EDT marker. `/symbol` landing page replaces the pill grid with a sortable summary table (`SymbolUniverseTable`) backed by existing scorecard data. Backend `fc018_acb_timeline_per_symbol` view extended with `occ_symbol`, `order_id`, `expiration` columns. `positionState`/`stateColor` extracted from SymbolScorecard into a shared util. 4 new vitest tests assert ET-stability across system locales.
 
@@ -1781,30 +1781,30 @@ _Move entries here once a plan has been published, executed, and merged. Include
 
 ### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
 - Plan: `docs/plans/fc-023.md`
-- PR: https://github.com/memon1987/options_wheel/pull/27 (merged 2026-05-07)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/27 (merged 2026-05-07)
 - Commit: `83bbd57`
 - Notes: Top-of-page "Realized P&L" card and Wheel-vs-B&H "Wheel" total now both display canonical `total_realized_pnl` (option leg + share leg, FC-019) instead of two different disagreeing numbers. UNH pre-fix: top $4,334, wheel $10,222 (double-counted premium). UNH post-fix: both $2,584. View `fc018_vs_buy_and_hold_per_symbol.wheel_minus_bh` formula corrected from `realized_pnl + total_premium` to `total_realized_pnl`. B&H labeled "(price only)" — dividend-reinvested B&H is a deferred concern (FC-017's neighborhood).
 
 ### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
 - Plan: `docs/plans/fc-024.md`
-- PRs: https://github.com/memon1987/options_wheel/pull/30 (merged 2026-05-07; replaces auto-closed [#28](https://github.com/memon1987/options_wheel/pull/28) which lost its base on FC-023's merge)
+- PRs: https://github.com/memon1987/agentic_options_wheel/pull/30 (merged 2026-05-07; replaces auto-closed [#28](https://github.com/memon1987/agentic_options_wheel/pull/28) which lost its base on FC-023's merge)
 - Commit: `1a4e401`
 - Notes: `fc018_acb_timeline_per_symbol` rewritten to source from `trades_from_activities` directly via four UNION-ALL blocks (opens / closes / OPASN with QUALIFY-guarded OPTRD pairing / OPEXP). Pre-fix every symbol had `rows_w_acb=0`; post-fix all 6 event types render correctly with ACB transitions during share-holding windows. Reference-dot positioning fixed (`dotAxisFor()` helper rides ACB axis when shares held, premium axis otherwise). Incidentally fixed Phase Timing observation #4 (UNH state machine now returns 4-phase split: cash 124d / short_put 61d / long_stock 10d / covered 17d). Surfaced AMZN silent-exercise data anomaly as a side discovery, filed as FC-025.
 
 ### FC-026: Decision Quality — surface Premium Received / Captured / Foregone macro stats
 - Plan: `docs/plans/fc-026.md`
-- PR: https://github.com/memon1987/options_wheel/pull/29 (merged 2026-05-07)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/29 (merged 2026-05-07)
 - Commit: `1b5559c`
 - Notes: Capture-ratio math validated as correct against raw activities (no data fixes shipped). Three new dollar-magnitude aggregates rendered in the chart card: Received / Captured / Foregone (buybacks). UNH macros: **$5,888 / $4,334 (73.6%) / $1,554 (26.4%)** (verified 2026-05-07 against raw Alpaca activity feed). "Foregone" is qualified "(buybacks)" to disambiguate from the counterfactual reading (which would require option-chain snapshots — FC-017). Frontend-only; no view, no backend, no payload change.
 
 ### FC-027: Cycle Table — separate "Total Premium" from "Cycle P&L"
 - Plan: `docs/plans/fc-027.md`
-- PR: https://github.com/memon1987/options_wheel/pull/31 (merged 2026-05-07)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/31 (merged 2026-05-07)
 - Commit: `9928db8`
 - Notes: Surfaced mid-trace during the FC-023/024/026 manual reconcile when the user noticed the Cycle Table column labeled "Cycle P&L" actually displayed `total_premium` only (option-side net), silently excluding `capital_gain` (share-side cash flow). For UNH Cycle 1 the column read +$1,218 but the true cycle outcome was $1,218 − $1,750 = −$532. Fix: rename existing column → "Total Premium" (matches the data), add new "Cycle P&L" column = `total_premium + capital_gain`. Same class of bug as FC-023 at cycle granularity. Peer review caught one defect (Cap Gain tooltip leaked internal nomenclature `Post-FC-019`/`OPTRD` — reverted to user-readable copy) and two test-strength suggestions (cell-position assertions) — all addressed pre-merge.
 
 ### FC-028: fmtDate calendar-date off-by-one (TZ shift on pure dates)
-- PR: https://github.com/memon1987/options_wheel/pull/32 (merged 2026-05-07)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/32 (merged 2026-05-07)
 - Commit: `0c4d20d`
 - Notes: Plan-exempt (single-file utility bug fix). User caught on Trade Log: OCC `UNH260424P00302500` (Apr 24 expiry) rendered "Apr 23" in the Expiration column. Root cause: `fmtDate()` parsed pure-date strings as UTC midnight then converted to ET (UTC−4) — rolled back to prior day. Same bug affected `event_date` Date column. Fix detects `YYYY-MM-DD`-shaped inputs and renders from year/month/day directly with no TZ conversion. Full ISO 8601 timestamps still ET-anchor per FC-022. 4 new vitests pin the contract; FC-022's ISO behavior verified preserved.
 
@@ -1818,13 +1818,13 @@ _Move entries here once a plan has been published, executed, and merged. Include
 ### FC-029: Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause)
 - Plan: `docs/plans/fc-029.md`
 - Investigations: `docs/investigations/strategy-review-2026-05-07.md`, `docs/investigations/cost-basis-floor-validation-2026-05-08.md`
-- PR: https://github.com/memon1987/options_wheel/pull/34 (merged 2026-05-08)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/34 (merged 2026-05-08)
 - Commit: `692f64e`
 - Notes: Three complementary changes addressing the 3-loss-cycle pattern (-$9k share losses) found in the senior-trader strategy review. **R1**: tightened `call_delta_range` from `[0.30, 0.70]` to `[0.15, 0.25]` (calls 2-4% further OTM, 30-70% → 15-25% assignment probability). **R2**: cost-basis floor source-order rewrite — Alpaca's `cost_basis` returns 0 for assigned paper positions (both safety guards were gated on `> 0` and silently bypassed), now `CallSeller._resolve_cost_basis_floor` reads `wheel_state.stock_cost_basis` (canonical, populated from put strike at OPASN) → BQ lookup of last 90-day OPASN-put strike (handles silent assignments + cold starts; back-fills wheel_state) → Alpaca (last-resort fallback for non-wheel positions); when ALL three fail with shares > 0 the call write is blocked with `event_type=cost_basis_floor_unresolved` (operator intervention). **R3**: drawdown pause — skip covered call writes when shares ≥ 5% below cost basis with `event_type=covered_call_drawdown_pause`. Bad/missing quote now defers (`event_type=covered_call_quote_missing`) instead of failing-open. Two-reviewer process (new ~/CLAUDE.md rule for high-stakes changes) caught 4 HIGH + 3 MEDIUM the first review missed — see PR comments. Tests 27 in `TestCallSellerCostBasisFloorFC029`; 253/253 pytest green. Follow-up FC-030 filed for drawdown-pause observability metric.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
-- PR: https://github.com/memon1987/options_wheel/pull/19 (merged 2026-05-05)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/19 (merged 2026-05-05)
 - Commit: `78acf92` (preceded by `4862159` — interim env-var-baseline fix that this PR replaces with the real JNLC sum)
 - Notes: Per-symbol scorecard now reconciles to actual account growth (sum of Total P&L = $21,808 vs account growth $20,080, with the ~$1,600 unexplained gap concentrated entirely on AMD's Alpaca-side data anomaly). New scorecard columns: Option P&L (renamed from Net P&L), Share P&L (FC-019), Total P&L (sum). `wheel_cycles_from_activities.capital_gain` now uses real OPTRD cash flow within the cycle window. `BASELINE_DEPOSITS` env var becomes a fallback only — primary source is `SUM(net_amount) WHERE activity_type='JNLC'`. Per-cycle pairing for overlapping share lots is filed as **FC-020** for follow-up.
 
@@ -1837,7 +1837,7 @@ _Move entries here once a plan has been published, executed, and merged. Include
 ### FC-030: Drawdown-pause alerting — operator notification for extended pauses
 - Plan: `docs/plans/fc-030.md`
 - Runbook: `deploy/monitoring/drawdown_pause_alert.md`
-- PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix — FastAPI-free service module), [#41](https://github.com/memon1987/options_wheel/pull/41) + [#42](https://github.com/memon1987/options_wheel/pull/42) (alert-filter fix + closeout, **duplicate fixes — see note**)
+- PRs: [#38](https://github.com/memon1987/agentic_options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/agentic_options_wheel/pull/40) (CI fix — FastAPI-free service module), [#41](https://github.com/memon1987/agentic_options_wheel/pull/41) + [#42](https://github.com/memon1987/agentic_options_wheel/pull/42) (alert-filter fix + closeout, **duplicate fixes — see note**)
 - Date: 2026-07-18
 - Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (threshold declared in `cloudbuild.yaml`); a Cloud Monitoring log-based policy emails the operator via the project's **first notification channel**. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and was prioritized ahead of the pause alert — FC-031 had sat undeployed 11 days behind an unnoticed red build; the new alert then caught three real failures the same session. **The mandatory fire drill caught a fatal defect:** the policy's `severity>=WARNING` clause matched zero entries, because Cloud Run only assigns severity to structured JSON logs while Python's `logging.warning()` writes plain text — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too.
 - Note on duplicate PRs: two parallel sessions independently found and fixed the same severity-filter defect (#41 and #42). The same collision duplicated this file's entire Completed section, repaired in `fix/dedupe-fc-ledger`. No code conflict resulted; the fixes were equivalent.
@@ -1845,13 +1845,13 @@ _Move entries here once a plan has been published, executed, and merged. Include
 
 ### FC-050: the covered-call below-basis floor never ran on the production path
 - Plan: `docs/plans/fc-050.md`
-- PR: https://github.com/memon1987/options_wheel/pull/74 (merged 2026-07-30, `8e05134`; implementation `b4975b2` + review fixes `1485be0`)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/74 (merged 2026-07-30, `8e05134`; implementation `b4975b2` + review fixes `1485be0`)
 - Date: 2026-07-30 (deployed build `1b6badcb`, revision `00384-yun`; production-verified 2026-07-31)
 - Notes: `execute_call_sale` read `stock_cost_basis`/`shares_covered` while scanner opportunities — the only kind production executes — carry `cost_basis_per_share`/`max_contracts`, so the guaranteed-loss guard **had never run in production**; the scanner's own floor used raw Alpaca `cost_basis` rather than FC-029's chain. Fix: extracted FC-029's resolver into `src/strategy/cost_basis.py` (`CostBasisResolver` + `opportunity_floor_per_share`), wired it into the scanner, and made the execute-time gate real and **fail-closed** on an unresolved floor. Also fixed a `shares_covered` default of 100 that FC-038's multi-contract calls had just made reachable. **Evidence query answered the FC's long-open question: the dead guard already cost money — 15 below-basis calls written, 3 called away for −$9,000** (UNH −1,750 / AMZN −3,500 / AMD −3,750) against $2,585 premium, independently reproduced by a reviewer and matching `strategy-review-2026-05-07.md`'s three-cycle figure; the last below-basis write (NVDA 2026-06-10) was post-FC-029. Two adversarial reviews both REQUEST_CHANGES with no disagreements; **reviewer 2 mutation-proved two new tests pinned nothing** (the backtest BigQuery gate and BQ-over-Alpaca precedence both survived behavior-breaking mutations) — fixed, and the backtest's BQ isolation is now pinned for the first time. Reviewers also caught two errors in the plan itself: a Risks-section mitigation describing a resolution chain that does not exist, and a post-deploy expectation (AAPL 303.50) that would have flagged correct behavior as a bug. Confirmation pass CONFIRMED-CLEAN, re-running both mutations itself. Suite 786. **Production-verified across three scan cycles:** floors resolve from BigQuery — AAPL 305.00, AMZN 262.50, GOOGL 370.00, NVDA 220.00 — every `basis_delta` positive (+1.30 to +1.66, the conservative direction, indicating clean single-assignment lots); zero unresolved-floor blocks; `/scan` 17.1s→25.5s (~2s per held symbol, scales linearly — revisit past ~10 positions). Follow-ups filed: FC-062 (roller fail-open floor + `execute_roll` bypasses this gate), FC-063 (type the opportunity boundary — FC-045/048/050 share this root cause), FC-064 (`max(BQ, broker)` for mixed lots), FC-065 (FC-029's R3 drawdown pause is dead on the same path).
 
 ### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
 - Plan: `docs/plans/fc-038.md`
 - Investigation: `docs/investigations/covered-call-starvation-2026-07-18.md`
-- PR: https://github.com/memon1987/options_wheel/pull/73 (merged 2026-07-30, `0545aff`; implementation `87791c5` + review fixes `3999a8b`)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/73 (merged 2026-07-30, `0545aff`; implementation `87791c5` + review fixes `3999a8b`)
 - Date: 2026-07-30 (investigated 2026-07-18; entry lost 12 days in a three-session index collision — the covered-call *extensibility* proposal that also claimed FC-038 must refile)
 - Notes: `/run` treated covered calls as cash-collateralized in two places — `put_seller._calculate_position_size` (BP-gated sizing applied to all types) and `select_batch` (`strike×100` phantom charge) — starving the call side while ~50–90 opportunities/day converted to 1–3 trades; AAPL sat uncovered 07-15→07-30 despite top-scored calls in every scan. Fix: **two-pool selection** — calls consume a per-underlying available-shares ledger (canonical OCC parsers, calls-first, `attractiveness_score`-ranked), puts keep the cash/BP pool; shares-based call sizing; every ranking/selection drop logs a structured reason (5-reason enum incl. `positions_unavailable` outage marker); scanner now **fails closed** on unresolved cost basis (`call_scan_skipped_cost_basis_unresolved`); single positions snapshot per cycle threaded from `/run` (and mirrored in the backtest simulator). Golden-replay test pins the 07-17 incident blob verbatim (mutation-checked: pre-fix behavior fails 12 tests). Two adversarial reviews (trader + reliability) → REQUEST_CHANGES ×2 → 4 fixes in code, open-order ledger blindness deferred to **FC-061** (broker share-lock verified live as interim control), 6 items accepted in writing; confirmation pass CONFIRMED-CLEAN. Suite 744 passed. **Production-verified 15:15 ET same day:** AAPL 8/3 347.5C sold/filled @ $1.66 (basis $303.50), AMZN dropped `insufficient_available_shares`, GOOGL/NVDA excluded by the floor, put pool unaffected. Follow-ups queued: FC-050 (dead execute-time floor — next PR), FC-061, FC-039/roller.

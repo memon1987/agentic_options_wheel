@@ -1,0 +1,26 @@
+{
+  "displayName": "CC interlock — covered-call-engine",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "CC interlock — covered-call-engine",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"covered-call-engine\" AND (jsonPayload.error_type=\"account_interlock_mismatch\" OR textPayload:\"account_interlock_mismatch\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The covered-call service refused to act because the live Alpaca account does not match config (right code, wrong credentials). Check secret bindings on covered-call-engine. Runbook: docs/plans/fc-075.md Phase 3.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "3600s"
+    },
+    "autoClose": "86400s"
+  }
+}

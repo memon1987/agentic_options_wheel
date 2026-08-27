@@ -1,0 +1,26 @@
+{
+  "displayName": "CC scan failure",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "CC scan failure",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"covered-call-engine\" AND (jsonPayload.error_type=\"scan_failure\" OR textPayload:\"scan_failure\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "A covered-call scan cycle failed outright. Check covered-call-engine logs for the exception; the wheel is unaffected (separate service).",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "3600s"
+    },
+    "autoClose": "86400s"
+  }
+}

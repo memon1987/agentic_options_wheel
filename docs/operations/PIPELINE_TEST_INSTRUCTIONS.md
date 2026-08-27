@@ -20,12 +20,12 @@ Event: Push to a branch
 - Select **"GitHub (Cloud Build GitHub App)"**
 - Click **"CONTINUE"**
 - **Authorize Google Cloud Build** in the popup
-- Select repository: **memon1987/options_wheel**
+- Select repository: **memon1987/agentic_options_wheel**
 - Click **"CONNECT"**
 
 ### 5. Final Configuration
 ```
-Repository: memon1987/options_wheel
+Repository: memon1987/agentic_options_wheel
 Branch: ^main$
 Configuration: Cloud Build configuration file (yaml or json)
 Cloud Build configuration file location: /cloudbuild.yaml
