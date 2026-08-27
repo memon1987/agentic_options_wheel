@@ -48,7 +48,6 @@ SERVICE_URL = os.environ.get(
     "https://options-wheel-strategy-799970961417.us-central1.run.app",
 )
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "gen-lang-client-0607444019")
-BQ_DATASET = os.environ.get("BQ_DATASET", "options_wheel")
 BQ_TABLE = os.environ.get("BQ_TABLE", "trades")
 
 # Thresholds
@@ -59,12 +58,62 @@ PREMIUM_MAX = 50.0
 DUPLICATE_ORDER_WINDOW_SECONDS = 300  # 5 minutes
 METRIC_DEVIATION_THRESHOLD = 2.0  # standard deviations
 
+# Sort sentinel for trade rows whose timestamp cell is missing or unparseable.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 # Error patterns that indicate critical issues
 CRITICAL_ERROR_PATTERNS = [
     "circuit_breaker_opened",
     "naked_call_blocked",
     "mark_executed_failed",
 ]
+
+
+def resolve_bq_dataset() -> str:
+    """The BigQuery dataset this monitor validates.
+
+    FC-082: this used to be the module constant
+    ``BQ_DATASET = os.environ.get("BQ_DATASET", "options_wheel")`` — a
+    hardcoded default that would make a covered-call service's ``/regression``
+    silently validate the **wheel's** tables and report "pass" on them. The
+    dataset is now derived from the profile the watched process runs, resolved
+    exactly the way ``deploy/cloud_run_server.strategy_config()`` and this
+    file's own ``check_risk_parameters`` resolve it: ``STRATEGY_CONFIG`` →
+    ``Config`` → ``bigquery_dataset``.
+
+    ``BQ_DATASET`` survives as an explicit operator override for ad-hoc runs
+    against another dataset. There is deliberately **no** string fallback if
+    the profile fails to load — the exception propagates and the check group
+    reports ``fail``. A guessed dataset is how an alarm layer ends up
+    validating another strategy's tables, which is the defect this replaces.
+    """
+    override = os.environ.get("BQ_DATASET")
+    if override:
+        return override
+
+    from src.utils.config import Config
+    return Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml")).bigquery_dataset
+
+
+def trade_timestamp(trade: Dict[str, Any]) -> Optional[datetime]:
+    """Read a trade row's ``timestamp`` (BigQuery TIMESTAMP) as a datetime.
+
+    FC-082: the column is ``timestamp`` (TIMESTAMP), not ``timestamp_iso`` —
+    see ``src/data/trade_journal._TABLE_SCHEMA``. BigQuery hands the cell back
+    as a tz-aware ``datetime``; a JSON/CSV path hands back an ISO string, so
+    both are accepted. Returns None when the cell is missing or unparseable —
+    callers skip those rows rather than compare against a fabricated time.
+    """
+    value = trade.get("timestamp")
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class CheckResult:
@@ -104,12 +153,27 @@ class RegressionMonitor:
         service_url: Optional[str] = None,
         api_key: Optional[str] = None,
         internal: bool = False,
+        bq_dataset: Optional[str] = None,
     ):
         self.service_url = service_url or SERVICE_URL
         self.api_key = api_key or os.environ.get("STRATEGY_API_KEY", "")
         self.internal = internal
+        # Resolved lazily (see the `bq_dataset` property): only the BigQuery
+        # check groups need it, and a caller may hand one in explicitly.
+        self._bq_dataset = bq_dataset
         self.results: List[CheckResult] = []
         self.start_time = datetime.now(timezone.utc)
+
+    @property
+    def bq_dataset(self) -> str:
+        """Dataset every BigQuery query in this monitor reads (FC-082).
+
+        Resolved on first use from the running profile — see
+        ``resolve_bq_dataset`` — and cached for the monitor's lifetime.
+        """
+        if self._bq_dataset is None:
+            self._bq_dataset = resolve_bq_dataset()
+        return self._bq_dataset
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -258,14 +322,17 @@ class RegressionMonitor:
             self.results.extend(checks)
             return checks
 
-        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-
-        # Fetch recent trades
+        # Fetch recent trades. FC-082: this filtered on `timestamp_iso`, a
+        # column that has never existed in the trades schema, so every hourly
+        # run got "BigQuery trade query failed: Unrecognized name" and this
+        # whole group warn-degraded instead of validating anything. The column
+        # is `timestamp` (TIMESTAMP) — compared as a timestamp, matching
+        # check 9 in `check_risk_parameters`, not as an ISO string.
         query = f"""
             SELECT *
-            FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
-            WHERE timestamp_iso >= '{one_hour_ago}'
-            ORDER BY timestamp_iso DESC
+            FROM `{GCP_PROJECT}.{self.bq_dataset}.{BQ_TABLE}`
+            WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+            ORDER BY timestamp DESC
         """
 
         try:
@@ -322,18 +389,19 @@ class RegressionMonitor:
 
         # -- No duplicate orders (same option_symbol within 5 minutes) --
         duplicates = []
-        sorted_trades = sorted(trades, key=lambda t: t.get("timestamp_iso", ""))
+        # Rows with an unreadable timestamp sort first and are skipped by the
+        # pairwise comparison below rather than compared against a made-up time.
+        sorted_trades = sorted(trades, key=lambda t: trade_timestamp(t) or _EPOCH)
         for i, trade in enumerate(sorted_trades):
             for j in range(i + 1, len(sorted_trades)):
                 other = sorted_trades[j]
                 if trade.get("symbol") == other.get("symbol"):
-                    try:
-                        t1 = datetime.fromisoformat(str(trade.get("timestamp_iso", "")))
-                        t2 = datetime.fromisoformat(str(other.get("timestamp_iso", "")))
-                        if abs((t2 - t1).total_seconds()) < DUPLICATE_ORDER_WINDOW_SECONDS:
-                            duplicates.append(trade.get("symbol"))
-                    except (ValueError, TypeError):
-                        pass
+                    t1 = trade_timestamp(trade)
+                    t2 = trade_timestamp(other)
+                    if t1 is None or t2 is None:
+                        continue
+                    if abs((t2 - t1).total_seconds()) < DUPLICATE_ORDER_WINDOW_SECONDS:
+                        duplicates.append(trade.get("symbol"))
 
         if duplicates:
             checks.append(CheckResult(
@@ -656,6 +724,19 @@ class RegressionMonitor:
 
         Queries BigQuery performance logs to build a baseline, then checks
         whether recent values deviate by more than 2 standard deviations.
+
+        **KNOWN DEAD — do not trust this group's "pass"** (found by the FC-082
+        sweep, not fixed by it). Both queries below read the *trades* table for
+        ``event_category`` / ``metric_name`` / ``metric_value``, none of which
+        exist in any code-defined schema in this repo (``trade_journal.
+        _TABLE_SCHEMA``, ``analytics_writer._SCHEMAS``, the three ingestors).
+        Performance metrics are emitted by ``log_performance_metric`` to Cloud
+        Logging only — there is no BigQuery table behind them. So this is not a
+        wrong-column bug FC-082 could rename away: the check has no data source
+        at all, and every run reports ``perf_baseline_* = warn`` ("Baseline
+        query failed"). Repointing it (Cloud Logging like ``check_logs``, or the
+        analytics ``executions`` table's ``duration_seconds`` by ``endpoint``)
+        changes what the check measures and needs its own FC.
         """
         checks: List[CheckResult] = []
 
@@ -683,7 +764,7 @@ class RegressionMonitor:
             baseline_query = f"""
                 SELECT
                     metric_value
-                FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+                FROM `{GCP_PROJECT}.{self.bq_dataset}.{BQ_TABLE}`
                 WHERE event_category = 'performance'
                   AND metric_name = '{metric_name}'
                   AND timestamp_iso >= '{seven_days_ago}'
@@ -714,7 +795,7 @@ class RegressionMonitor:
             recent_query = f"""
                 SELECT
                     metric_value
-                FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+                FROM `{GCP_PROJECT}.{self.bq_dataset}.{BQ_TABLE}`
                 WHERE event_category = 'performance'
                   AND metric_name = '{metric_name}'
                   AND timestamp_iso >= '{one_hour_ago}'
@@ -1073,7 +1154,7 @@ class RegressionMonitor:
             bq = bigquery.Client(project=GCP_PROJECT)
             query = f"""
                 SELECT symbol, option_type, premium, dte, strike_price, client_order_id
-                FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+                FROM `{GCP_PROJECT}.{self.bq_dataset}.{BQ_TABLE}`
                 WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
                 ORDER BY timestamp DESC
                 LIMIT 50
