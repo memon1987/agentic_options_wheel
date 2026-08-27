@@ -3,6 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-075
 **Parent plan:** `docs/plans/fc-075.md` (architecture, isolation seams, policy decisions — all carried forward, not restated)
 **Plan file:** `docs/plans/fc-075-phase-2.md`
+**Scope:** covered_call (touches shared pipeline files; wheel-neutrality proven by test — see Behavior contract)
 **Status:** DONE — merged 2026-08-21 (PR #89, squash `2e08d0a`)
 **Size:** M (~200 net production lines across 7 existing files; no new source file)
 **Author:** Claude (Fable), design pass 2026-08-19 against `main` @ `f84b50a`

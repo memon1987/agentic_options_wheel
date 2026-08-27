@@ -2,7 +2,7 @@
 
 **FC entry:** FC-075 (Phase 3 §deploy follow-up + OQ-1 tunables iteration)
 **Plan file:** `docs/plans/fc-075-cc-deploy-step.md`
-**Status:** Executing — PR [#91](https://github.com/memon1987/agentic_options_wheel/pull/91); two adversarial reviews dispositioned (see §Review disposition)
+**Status:** DONE — merged 2026-08-27 (PR #91, squash `7430ed5`); deployed + verified — see §Execution
 **Scope:** covered_call (primary; the cloudbuild edit touches the shared deploy pipeline — wheel/dashboard steps must be byte-identical, per Behavior contract)
 **Size:** S (~45 lines cloudbuild.yaml + 1 value in covered_call.yaml; no src/ changes)
 **Author:** Claude (Fable), 2026-08-27. **Builder:** Fable (deviation from the model table, noted openly: two mirrored yaml blocks + one config value — mechanical, single-right-answer work; Opus handoff adds ceremony without judgment). **Reviews:** two adversarial (Fable, fresh contexts) — cloudbuild is deploy config with FC-031/FC-081 history; no exemption.
@@ -59,5 +59,7 @@ Two adversarial reviews (Fable, fresh contexts: senior CI/CD-release engineer; s
 ## Execution
 
 - **PR:** https://github.com/memon1987/agentic_options_wheel/pull/91 (`024e4d5` + review fixes `aa54fa1`)
-- **Merge gate:** main builds `88a6288`/`861a473` SUCCESS + scoped confirmation pass on `aa54fa1`.
-- Post-merge verification per §Tests: build runs the CC chain green, CC revision serves the merge SHA, next scan's `reason_counts` shows the `dte_too_high` collapse.
+- **Merge gate cleared:** main builds `88a6288`/`861a473` SUCCESS; scoped confirmation on `aa54fa1` CONFIRMED-CLEAN. **Merged 2026-08-27, squash `7430ed5`.**
+- **Deployed + verified same day:** merge build `c2a5aefd` SUCCESS — first end-to-end run of the CC canary chain; `covered-call-engine-00003-waz` serving the merge SHA's image (digest-checked). 14 DTE live; pinned-image gap permanently closed.
+- **Outstanding verification (next session):** first 14-DTE scan's `reason_counts` should show the `dte_too_high` collapse (`covered_call.decision_events`, 10:00 ET cycle). Band-cliff watch per §Review disposition.
+- **Date:** 2026-08-27. **Notes:** timeout 900→1200s rode in as review fix `aa54fa1`; FC-083 (pipeline-blocking date-rotted tests) was discovered and fixed mid-flight as a hard dependency; FC-084 filed from the review.

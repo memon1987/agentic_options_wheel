@@ -1505,7 +1505,8 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-075: Standalone covered-call strategy — separate account, shared machinery
 
-**Status:** LIVE (paper) 2026-08-24 — Phases 0–3 DONE. Seam 4 merged+deployed 08-22 (PR #90 `cebb09b`; R1–R6 complete, `docs/plans/fc-075-seam-4.md`); Phase 3 provisioned + **interlock drill PASSED** 08-23 (`covered-call-engine` live, own dataset/bucket/schedulers, no `/roll`); go-live 08-24: first lots GOOGL 100 @ 348.02 + UNH 100 @ 398.08 in `PA37XLNWDLB3`, first cycle = clean fully-explained no-trade (`below_cost_basis` dominant — spot ≈ day-one basis; then premium/delta/OI). **First covered call pending qualifying strikes** (compressed shadow was an operator decision, recorded in `fc-075.md`). Remaining: first written call (organic), tunables iteration from live decision rows, cloudbuild deploy step for the CC service (image pinned to `27308f4` until then), CC alert policies, Phase 4 backtest (optional, pre-real-money).
+**Scope:** covered_call (tagged retroactively 2026-08-27)
+**Status:** LIVE (paper) 2026-08-24 — Phases 0–3 DONE. Seam 4 merged+deployed 08-22 (PR #90 `cebb09b`; R1–R6 complete, `docs/plans/fc-075-seam-4.md`); Phase 3 provisioned + **interlock drill PASSED** 08-23 (`covered-call-engine` live, own dataset/bucket/schedulers, no `/roll`); go-live 08-24: first lots GOOGL 100 @ 348.02 + UNH 100 @ 398.08 in `PA37XLNWDLB3`, first cycle = clean fully-explained no-trade (`below_cost_basis` dominant — spot ≈ day-one basis; then premium/delta/OI). **First covered call pending qualifying strikes** (compressed shadow was an operator decision, recorded in `fc-075.md`). **08-27 update:** tunables v2 (`call_target_dte` 14, PR #91) + CC auto-deploy chain MERGED+DEPLOYED (`7430ed5`, rev 00003-waz — image pinning gone); CC alert policies live (4, FC-030 channel); `cc-regression-hourly` created (FC-082). Remaining: first written call (organic — verify `dte_too_high` collapse next scan), band-cliff `dte_bands` retune from live exits (OQ-1), Phase 4 backtest (optional, pre-real-money).
 **Size estimate:** L
 **Owner:** zeshan
 **Plan file:** `docs/plans/fc-075.md`
@@ -1587,6 +1588,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
 
+**Scope:** shared (deploy pipeline, all services)
 **Status:** RESOLVED 2026-08-21 (same day) — root cause: **the GitHub repo was renamed `options_wheel` → `agentic_options_wheel`**; trigger rebound + repo re-connected. **Closure verified end-to-end:** the push recording this entry (`dd9e56a`) auto-fired build `6be2cfe7` → SUCCESS → strategy revision `00500-waw` (image digest matched to the commit's tag) + dashboard `00443-vaw` both serving, `/health` 200/healthy, zero WARNING+ logs on the new revision. The 16-day backlog (#88 FC-067, #89 FC-075 Phase 2) is now deployed. One follow-up open: the merged-vs-deployed freshness alert (below).
 **Size estimate:** S
 **Owner:** zeshan + Claude
@@ -1613,6 +1615,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-082: regression monitor's trade-execution check queries a nonexistent column — warn-degrading every hourly run
 
+**Scope:** shared (monitor serves both services since cc-regression-hourly)
 **Status:** CLOSED 2026-08-27 — PR #93 (`4a45e2d`): timestamp_iso → real TIMESTAMP compare (+ safe `trade_timestamp()` parsing in the duplicate-order pass); `BQ_DATASET` module constant deleted, dataset now profile-derived (env var survives as explicit override, NO string fallback — unresolvable profile = loud fail); 8 schema-drift tests added (mutation-checked). `cc-regression-hourly` scheduler job created same day — the detective layer now covers the CC book. Sweep found `check_performance_baseline` dead at the DATA-SOURCE level → FC-085.
 **Size estimate:** XS (one column name + a test)
 **Owner:** unassigned
@@ -1630,7 +1633,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-083: earnings-calendar cache tests are date-sensitive — went red on main with zero code changes
 
-**Status:** Filed 2026-08-27
+**Status:** CLOSED 2026-08-27 same day — PR #92 (`88a6288`): clock.frozen (the file's own convention) applied to both tests; suite 1341 green; deploy pipeline unblocked (next build SUCCESS). Residual fix-direction items (file-wide now()-audit, conftest guard) fold into future test-hermeticity work.
 **Scope:** shared (test hermeticity; the earnings cache serves both strategies' FC-013 gates)
 **Size estimate:** S
 **Owner:** unassigned
