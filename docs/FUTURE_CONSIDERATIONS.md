@@ -1613,7 +1613,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-082: regression monitor's trade-execution check queries a nonexistent column — warn-degrading every hourly run
 
-**Status:** Filed 2026-08-21 (found by the FC-075 Seam 4 plan review's live-schema sweep)
+**Status:** CLOSED 2026-08-27 — PR #93 (`4a45e2d`): timestamp_iso → real TIMESTAMP compare (+ safe `trade_timestamp()` parsing in the duplicate-order pass); `BQ_DATASET` module constant deleted, dataset now profile-derived (env var survives as explicit override, NO string fallback — unresolvable profile = loud fail); 8 schema-drift tests added (mutation-checked). `cc-regression-hourly` scheduler job created same day — the detective layer now covers the CC book. Sweep found `check_performance_baseline` dead at the DATA-SOURCE level → FC-085.
 **Size estimate:** XS (one column name + a test)
 **Owner:** unassigned
 **Plan file:** not needed (single-file fix; add a regression test)
@@ -1659,6 +1659,22 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 **Fix direction:** capture the deployed revision name at deploy time (deploy step writes it to a workspace file, or resolve the `canary` tag) and pin both the readiness poll and the promote (`update-traffic --to-revisions=REV=100`) to it, in all three chains. Alternatively serialize builds (Cloud Build concurrency control / queue-ttl) — cruder but one line.
 
 **Links:** `cloudbuild.yaml` (all `smoke-test-*` / `promote-*` steps), `docs/plans/fc-075-cc-deploy-step.md` §Review disposition, FC-031/FC-081 (the deploy-pipeline incident lineage).
+
+---
+
+### FC-085: regression monitor's performance_baseline check group is dead at the data-source level
+
+**Status:** Filed 2026-08-27 (FC-082 build's schema sweep)
+**Scope:** shared
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** both queries in `check_performance_baseline` (`tools/testing/regression_monitor.py`) read `event_category`/`metric_name`/`metric_value` off the `trades` table — columns that exist in NO code-defined schema in the repo, because performance metrics have no BigQuery table at all (`log_performance_metric` writes Cloud Logging only). Unlike FC-082's column typo, this cannot be renamed into working order: the data source doesn't exist. The group has silently "passed" (validated nothing) since inception — same class as the FC-069 S1 deletions. The method docstring now carries a `KNOWN DEAD — do not trust this group's "pass"` note (PR #93).
+
+**Fix direction:** either (a) repoint the check at what actually exists — Cloud Logging (like `check_logs`) or `executions.duration_seconds` per endpoint — accepting that this changes what the check measures, or (b) delete the group per the FC-069 precedent (an alarm that validates nothing cries wolf by staying green). Decide deliberately; do not leave the fictional group in place.
+
+**Links:** FC-082 (discovery, PR #93), FC-069 S1 (the delete-fictional-checks precedent), `docs/CLAUDE.md` §The detective layer.
 
 ---
 
