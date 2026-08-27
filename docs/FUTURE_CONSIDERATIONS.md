@@ -1628,6 +1628,24 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-083: earnings-calendar cache tests are date-sensitive — went red on main with zero code changes
+
+**Status:** Filed 2026-08-27
+**Scope:** shared (test hermeticity; the earnings cache serves both strategies' FC-013 gates)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (test-only fix; exempt)
+
+**Problem:** `tests/test_earnings_calendar.py::TestTheCacheIsSharedAndDurable::{test_l1_is_shared_across_instances, test_l2_blob_survives_a_cold_start}` fail on main as of 2026-08-27 with **no code change since the suite was 1341-green on 2026-08-24** — only docs commits landed in between, so the tests depend on ambient wall-clock date (cache TTL arithmetic or a fixture date that aged out). Reproduced with and without the PR #91 diff (stash A/B). Fourth instance of the "test depends on ambient environment" class (live-BQ / missing-FastAPI / missing-creds are blocked in conftest; the clock is not).
+
+**Why it matters:** a red-by-calendar suite poisons every PR's validation signal — PR #91 had to carry a "2 pre-existing failures" caveat, which is exactly how a real regression eventually hides. Also: `cloudbuild.yaml` step 1 runs the full suite and **a red suite blocks all deploys** (`|| exit 1`) — these two tests will fail the next build until fixed. **This makes the fix urgent, not cosmetic: PR #91 cannot deploy until these tests are green or the build's test step is amended.**
+
+**Fix direction:** freeze the clock in these tests (inject `clock`/`freezegun`-style, or pin the cache-entry timestamps relative to the mocked now); audit the file for other now()-relative assertions; consider a conftest guard for naked `datetime.now()` in cache-TTL test fixtures.
+
+**Links:** PR #91 (discovery), FC-030 session lessons (ambient-environment test defects), `src/api/earnings_calendar.py` (two-layer cache under test).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
