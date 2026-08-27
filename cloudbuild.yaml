@@ -269,7 +269,7 @@ options:
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
 
 # Timeout for the entire build
-timeout: '900s'  # 15 minutes (increased for dashboard build)
+timeout: '1200s'  # 20 min: measured builds run 8-12 min and the CC canary chain adds up to ~4 min serial worst-case (PR #91 review)
 
 # Substitutions for build variables
 substitutions:
