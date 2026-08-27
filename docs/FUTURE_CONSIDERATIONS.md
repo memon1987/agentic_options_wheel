@@ -1681,6 +1681,33 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-086: early-close mechanism revisit — DTE-keyed profit bands break when target DTE changes; evaluate an entry-relative/extensible framework across both strategies
+
+**Status:** Consideration (filed 2026-08-27, operator-requested)
+**Scope:** shared (the `/monitor` early-close path — `should_close_put_early` / `should_close_call_early` — serves both strategies; each profile carries its own `risk.profit_taking` block)
+**Size estimate:** M (parameter-semantics redesign + migration for two live profiles; plan-first)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem:** the profit-taking ladder (`risk.profit_taking.dte_bands`) is keyed by **absolute DTE** but was designed with **day-of-life** intent — settings.yaml's own band comments read "dte 7 → Day 0: just opened" — which is only coherent when entry DTE equals the top band. The covered-call profile just broke that assumption by design: `call_target_dte` moved 7 → 14 (PR #91), so a CC position now spends days 0–6 on the flat `default_long_dte_target` (0.50) and then *steps down* to the 0.35 "just-opened anti-churn" band at DTE 7 — mid-life, producing likely ~day-7 exits at ≥35% and a non-monotonic ladder (…0.50, 0.50, 0.35, 0.40, 0.35…). This was caught by PR #91's adversarial review, **accepted in writing as a temporary state** (`docs/plans/fc-075-cc-deploy-step.md` §Review disposition), and is now generating its first live data. The structural point: **any future DTE retune on either strategy re-breaks the ladder**, because the parameter encodes position age in units that shift with entry DTE.
+
+**Evaluate (candidate framings, not decided):**
+1. **Entry-relative bands** — key on days-since-entry (`entry_dte − current_dte`), preserving the original day-of-life semantics under any target DTE. Needs entry DTE per position (parseable from the OCC symbol + fill date via activities; note `_parse_dte_from_symbol`'s error-fallback of 7 must die in any redesign).
+2. **Normalized time-fraction bands** — key on `elapsed/total` (0.0–1.0), one ladder valid for 7-DTE puts, 7-DTE wheel calls, and 14-DTE CC calls alike; ladders stop needing per-profile copies.
+3. **Parametric curve** — replace the band table with a monotonic function (e.g., target ramps `min → max` as time-fraction grows), tunable by 2–3 knobs instead of 8 rows; kills the cliff class entirely.
+4. **Status quo + per-profile recalibrated tables** — cheapest, but every DTE change demands a manual ladder rewrite, which is exactly the failure mode just exercised.
+
+**Constraints for the eventual plan:** both legs and both strategies evaluated together (Symmetry Principle — put and call close logic share the machinery); the `[min_profit_target, max_profit_target]` clamp must cover *every* path (the `dte > 7` fallback currently returns unclamped — PR #91 review LOW); wheel behavior change requires its own neutrality proof; use the accumulating live data — wheel exits at 7-DTE entry vs CC exits at 14-DTE entry are a natural A/B on ladder shape.
+
+**Open questions:**
+- Do the first weeks of live CC 14-DTE exits confirm the predicted ~day-7/35% exit clustering, and is that outcome actually bad? (Early theta harvest may be *desirable* — decide from realized premium-capture data, not intuition.)
+- Is time-fraction the right x-axis for both legs, or do puts (assignment-seeking) and calls (upside-capped) want different curve shapes?
+- Does the backtest engine (FC-056 caveat: call premiums ~0.676×) support ladder-shape comparison well enough to pre-validate, or is this live-data-only?
+
+**Links:** `docs/plans/fc-075-cc-deploy-step.md` §Review disposition (the band-cliff finding + written acceptance), `src/strategy/call_seller.py` (`_get_profit_target_for_dte`, the `dte > 7` fallback, `_parse_dte_from_symbol`), `config/settings.yaml` + `config/covered_call.yaml` `risk.profit_taking`, FC-015 (early-close validation history, commit `1c26b43`), FC-010 (stop-loss removal — the close path IS the risk management), OQ-1 (tunables iteration).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
