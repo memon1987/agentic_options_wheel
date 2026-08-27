@@ -4,6 +4,7 @@
 **Parent plan:** `docs/plans/fc-075.md` §Seam 4 (deferral rationale); `docs/plans/fc-075-phase-2.md` DD-7 + HIGH-2 (the interlock this seam removes)
 **Plan file:** `docs/plans/fc-075-seam-4.md`
 **Status:** DONE — merged 2026-08-22 (PR #90, squash `cebb09b`); R1–R6 all complete 2026-08-24 — see §Execution
+**Scope:** shared (all five BQ writers + both profiles; wheel rows gain strategy_id, CC unblocked — tagged retroactively 2026-08-27)
 **Size:** S–M (~150 net production lines across 9 files + tests; plus 7 idempotent DDLs and one corrective DML run outside the PR)
 **Author:** Claude (Fable), 2026-08-21, against `main` @ `b034b93`
 **Builder:** Opus. **Reviews:** two adversarial (Fable, fresh contexts, different personas). Stakes calibration: this PR touches every canonical BigQuery table the dashboard and analytics read — at least one reviewer gets live BQ access and must verify schema/row claims against the real dataset, not the diff.
