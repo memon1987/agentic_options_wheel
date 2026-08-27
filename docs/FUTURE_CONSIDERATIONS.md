@@ -1646,6 +1646,22 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-084: cloudbuild canary chains assume "newest revision = my canary" — races under concurrent builds
+
+**Status:** Filed 2026-08-27 (PR #91 CI/CD review)
+**Scope:** shared (all three services' deploy chains: wheel, dashboard, covered-call)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** every smoke-test step identifies the canary it just deployed as `gcloud run revisions list --limit=1` (newest-first) and every promote step runs `update-traffic --to-latest` — neither is pinned to the revision *this build* created. Two concurrent builds on the same service can cross-validate and cross-promote each other's revisions. Not hypothetical: on 2026-08-27 two main builds started **3 seconds apart** (`88a6288`, `861a473` — the FC-083 fix-merge and its bookkeeping push). Consequences today are benign (both builds carry the same code ±docs), but a rollback-build racing a forward-build could promote the wrong revision. Also noted: the polls read `status.conditions[0].status` assuming Ready is first — true in practice, not contractual.
+
+**Fix direction:** capture the deployed revision name at deploy time (deploy step writes it to a workspace file, or resolve the `canary` tag) and pin both the readiness poll and the promote (`update-traffic --to-revisions=REV=100`) to it, in all three chains. Alternatively serialize builds (Cloud Build concurrency control / queue-ttl) — cruder but one line.
+
+**Links:** `cloudbuild.yaml` (all `smoke-test-*` / `promote-*` steps), `docs/plans/fc-075-cc-deploy-step.md` §Review disposition, FC-031/FC-081 (the deploy-pipeline incident lineage).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration

@@ -2,7 +2,7 @@
 
 **FC entry:** FC-075 (Phase 3 §deploy follow-up + OQ-1 tunables iteration)
 **Plan file:** `docs/plans/fc-075-cc-deploy-step.md`
-**Status:** Draft
+**Status:** Executing — PR [#91](https://github.com/memon1987/agentic_options_wheel/pull/91); two adversarial reviews dispositioned (see §Review disposition)
 **Scope:** covered_call (primary; the cloudbuild edit touches the shared deploy pipeline — wheel/dashboard steps must be byte-identical, per Behavior contract)
 **Size:** S (~45 lines cloudbuild.yaml + 1 value in covered_call.yaml; no src/ changes)
 **Author:** Claude (Fable), 2026-08-27. **Builder:** Fable (deviation from the model table, noted openly: two mirrored yaml blocks + one config value — mechanical, single-right-answer work; Opus handoff adds ceremony without judgment). **Reviews:** two adversarial (Fable, fresh contexts) — cloudbuild is deploy config with FC-031/FC-081 history; no exemption.
@@ -43,3 +43,21 @@ These ship as **one PR** because the cloudbuild step *is* the delivery mechanism
 - **Bad cloudbuild syntax breaks all deploys** (the trigger runs this file for every merge). Mitigated: steps are copies of proven blocks; two reviews; canary pattern means a bad CC deploy never takes traffic; wheel promotes before CC deploys.
 - **Env replacement drift**: if someone later adds a literal env var to the CC service out-of-band, the next build wipes it — same standing property as the wheel (documented gotcha); the fix is always "declare it in cloudbuild.yaml".
 - **14-DTE positions live longer**: slower theta, fewer cycles, longer exposure per position — the operator's accepted trade. Earnings span gate still bounds every candidate.
+
+---
+
+## Review disposition (2026-08-27) — PR #91
+
+Two adversarial reviews (Fable, fresh contexts: senior CI/CD-release engineer; senior options trader). **Both REQUEST_CHANGES; both affirmed the design and found the code faithful to the plan** (CI/CD lens verified the env/secrets contract against the *live* service and the step graph programmatically; trader lens proved the ranking math keeps week-1 preferred whenever it qualifies, so 14 is a true fallback). Union of findings and dispositions:
+
+- **Required — build `timeout` 900s → 1200s (both reviewers, independently):** measured builds already run 8–12 min; the serialized CC chain adds up to ~4 min worst-case → timeout-on-every-merge risk (FC-031 class). The plan estimated "+1–3 min" but never checked it against the ceiling — a genuine plan gap. **Fixed in `aa54fa1`.**
+- **Required — sequence the merge behind FC-083:** at filing time the PR's "merging deploys it" claim was false — main's suite was red (date-rotted earnings tests) and cloudbuild's test gate would have killed the merge build at step 0. Found and fixed mid-review (FC-083, PR #92, `88a6288`); **merge gate: main's builds for `88a6288`/`861a473` must show SUCCESS first.** The reviewer's sharpest framing is recorded verbatim: the red suite was "the delivery mechanism's off switch," and the PR had treated it as out of scope.
+- **Required — band-cliff disposition (trader lens, the review's best find): ACCEPTED, in writing.** `dte_bands` encode day-of-life intent but key on DTE; valid only at 7-DTE entry. A 14-DTE position runs its first week at the 0.50 fallback, then crossing DTE 8→7 drops the target to 0.35 — the "just-opened anti-churn" band firing mid-life, making exits at ≥35% gain around day 7 likely. **Accepted as-is for now:** the behavior is profit-taking-early, not risk-adding; bands are OQ-1 operator-tunable and the right retune (day-of-life bands, or extending bands to 14) should be chosen from live 14-DTE decision data, not guessed. Revisit after the first weeks of 14-DTE exits.
+- **Noted, no action:** unclamped `default_long_dte_target` path (inert at 0.50; escapes `[min,max]` bounds only if retuned — remember when touching); `_parse_dte_from_symbol` error-fallback of 7 mis-bands a 14-DTE position toward earlier exit (fail-safe direction); CC has no defensive roller so an ITM 14-DTE call pins shares up to 2 weeks (bounded — floor guarantees profitable assignment); post-deploy expectation set correctly: **watch `dte_too_high` collapse and re-file under other reasons — "UNH qualifies" is a hope, not an implication**; comment nit fixed in `aa54fa1`.
+- **Follow-up filed — FC-084:** the smoke-test/promote pattern identifies "my canary" as `revisions list --limit=1` and promotes `--to-latest` — a newest-revision assumption shared by all three services' chains. Live evidence same day: two main builds started 3 seconds apart; build A can validate and promote build B's revision. Inherited, not introduced here; fix is pinning to the deployed revision name.
+
+## Execution
+
+- **PR:** https://github.com/memon1987/agentic_options_wheel/pull/91 (`024e4d5` + review fixes `aa54fa1`)
+- **Merge gate:** main builds `88a6288`/`861a473` SUCCESS + scoped confirmation pass on `aa54fa1`.
+- Post-merge verification per §Tests: build runs the CC chain green, CC revision serves the merge SHA, next scan's `reason_counts` shows the `dte_too_high` collapse.
