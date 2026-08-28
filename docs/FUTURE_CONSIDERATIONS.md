@@ -909,7 +909,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-079: OCC-substring bugs survive on reconcile paths — call assignments structurally undetectable for P-containing underlyings
 
-**Status:** Executing — PR #98, plan `docs/plans/fc-079.md`. **Severity reframed by review 2026-08-28:** the position-diff reconcile branch is dead in production (per-request state), so the live consequence was one wrong telemetry field for AAPL; the PR's value is the gate + `reconcile_orphaned` + backtest fidelity. **Absorbs FC-054** (closed 2026-08-28 as a duplicate — same site). Sites verified live 2026-08-28: `src/strategy/wheel_engine.py:304,306` (reconcile option counts), `:408,410` (`'C' in opt_sym` + `opt_sym[-8:]` strike estimate on call-away), `tools/testing/regression_monitor.py:696` (`reconcile_orphaned`, warn-only).
+**Status:** CLOSED 2026-08-28 — merged PR #98 (`49f9f21`), plan `docs/plans/fc-079.md` §Execution. **Severity reframed by review:** the position-diff reconcile branch is dead in production (per-request state), so the live consequence was one wrong telemetry field for AAPL; the PR's value is the gate + `reconcile_orphaned` + backtest fidelity. **Absorbs FC-054** (closed 2026-08-28 as a duplicate — same site). Sites verified live 2026-08-28: `src/strategy/wheel_engine.py:304,306` (reconcile option counts), `:408,410` (`'C' in opt_sym` + `opt_sym[-8:]` strike estimate on call-away), `tools/testing/regression_monitor.py:696` (`reconcile_orphaned`, warn-only).
 **Size estimate:** S (canonical-parser rewire + tests; behavior change on live reconcile → own PR, two-reviewer gate)
 **Owner:** unassigned
 **Plan file:** not yet
