@@ -10,14 +10,9 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
-from .limit_pricing import sell_limit_price
+from .limit_pricing import refresh_quote, sell_limit_price
 
 logger = structlog.get_logger(__name__)
-
-# Fraction of the bid/ask spread the put leg adds to mid when the quote is
-# usable — biased toward the ask for premium collection. Historical value,
-# unchanged by FC-072 and deliberately not a config key (see execute_put_sale).
-PUT_LIMIT_SPREAD_FRACTION = 0.10
 
 
 class PutSeller:
@@ -236,26 +231,29 @@ class PutSeller:
                         'timestamp': clock.now().isoformat()
                     }
 
-            # Calculate limit price: mid + 10% of spread (biased toward ask for
-            # premium collection). The formula is unchanged by FC-072; what is
-            # new is the shared usability predicate underneath it — in
-            # particular the spread sanity cap (a book wider than half of mid
-            # is stale or crossed, and its midpoint is noise). Before FC-072
-            # this leg would happily price off a crossed quote. A normal quote
-            # prices exactly as it did.
+            # Limit price (FC-072 rev 2). Same two steps as the call leg, same
+            # module, by the Symmetry Principle: re-quote at execute time (the
+            # 15-minute :00-scan/:15-run gap is the dominant variable in where
+            # these orders land), then price `mid + f * spread` off whichever
+            # book was used and round to a legal tick.
             #
-            # PUT_LIMIT_SPREAD_FRACTION stays hardcoded on purpose: FC-072 gave
-            # the CALL leg a config knob because that leg is the one being
-            # moved and measured. Making both legs configurable in the same
-            # change would put two variables in flight at once.
-            bid = opportunity.get('bid')
-            ask = opportunity.get('ask')
-            limit_price, spread, applied_spread_fraction = sell_limit_price(
-                mid=premium,
-                bid=bid,
-                ask=ask,
-                spread_fraction=PUT_LIMIT_SPREAD_FRACTION,
+            # `f` here is `strategy.put_limit_spread_fraction`, default 0.10 —
+            # the value this leg has always used — so a normal book below $3.00
+            # prices exactly as it did before FC-072. The knob exists so the two
+            # legs are configured the same way, not to change this one; the
+            # tick rounding at/above $3.00 is the only intended behaviour change
+            # on the put leg, and this leg averages $1.44, so it is rare.
+            #
+            # The re-quote sits after the buying-power gate above, on purpose.
+            quote = refresh_quote(self.alpaca, option_symbol, opportunity, logger)
+            priced = sell_limit_price(
+                bid=quote.bid,
+                ask=quote.ask,
+                fallback_premium=premium,
+                spread_fraction=self.config.put_limit_spread_fraction,
+                underlying=opportunity.get('symbol') or '',
             )
+            limit_price = priced.limit_price
 
             logger.info("Executing put sale",
                        event_category="trade",
@@ -263,11 +261,15 @@ class PutSeller:
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
-                       bid=bid,
-                       ask=ask,
-                       spread=round(spread, 2) if spread is not None else None,
-                       # None when the fallback fired — see the call leg.
-                       spread_fraction=applied_spread_fraction,
+                       bid=quote.bid,
+                       ask=quote.ask,
+                       mid=priced.mid,
+                       spread=priced.spread,
+                       # None when the book was unusable — see the call leg.
+                       spread_fraction=priced.spread_fraction,
+                       quote_source=quote.source,
+                       quote_age_s=quote.age_s,
+                       tick_snapped=priced.tick_snapped,
                        limit_price=limit_price,
                        collateral_required=collateral_required)
 

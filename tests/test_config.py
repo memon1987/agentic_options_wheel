@@ -281,50 +281,64 @@ def _settings_strategy(tmp_path, **strategy_overrides):
     return str(path)
 
 
-class TestCallLimitSpreadFractionFC072:
-    """FC-072: `strategy.call_limit_spread_fraction`, the call leg's pricing knob.
+class TestLimitSpreadFractionsFC072:
+    """FC-072: one sell-to-open pricing knob per leg, same bounds.
 
-    The bounds are the point. Below 0.0 is "price the call under mid" — the 5%
-    donation FC-072 removed, which must not be reintroducible by a config edit.
-    Above 0.5 is a limit outside the book: at f=0.5 the limit sits exactly on
-    the ask, and beyond it the order cannot fill until the market moves to it.
+    The bounds are the point. Below 0.0 means "price under mid" — deliberately
+    marketable, which is what the pre-FC-072 call formula did in effect, and
+    reversing that decision must be a code change with a plan behind it rather
+    than a config flip. Above 0.5 is a limit outside the book: at f=0.5 the
+    limit sits exactly on the ask, and beyond it the order cannot fill until
+    the market moves to it.
     """
 
-    def test_both_shipped_profiles_price_at_mid(self):
-        """Both profiles must carry the key — a knob added to one profile and
-        forgotten on the other is this repo's documented failure mode
-        (FC-069 S1 found six such keys)."""
+    KEYS = ('call_limit_spread_fraction', 'put_limit_spread_fraction')
+    SHIPPED = {'call_limit_spread_fraction': 0.0,
+               'put_limit_spread_fraction': 0.10}
+
+    def test_both_shipped_profiles_carry_both_keys(self):
+        """A knob added to one profile and forgotten on the other is this
+        repo's documented failure mode (FC-069 S1 found six such keys)."""
         for profile in ('settings.yaml', 'covered_call.yaml'):
             with open(REPO / 'config' / profile) as fh:
                 strategy = yaml.safe_load(fh)['strategy']
-            assert 'call_limit_spread_fraction' in strategy, profile
-            assert strategy['call_limit_spread_fraction'] == 0.0, profile
+            for key in self.KEYS:
+                assert key in strategy, f"{profile} is missing {key}"
+                assert strategy[key] == self.SHIPPED[key], f"{profile}:{key}"
 
-    def test_the_shipped_wheel_config_reads_zero(self):
+    def test_the_shipped_wheel_config_reads_back_both_knobs(self):
         config = Config(str(REPO / 'config' / 'settings.yaml'))
         assert config.call_limit_spread_fraction == 0.0
+        assert config.put_limit_spread_fraction == 0.10
 
-    def test_the_default_is_zero_when_the_key_is_absent(self, tmp_path):
-        """A profile that omits the knob prices at mid rather than failing to
-        load — and, critically, does NOT fall back to the old 5% discount."""
-        config = Config(_settings_strategy(
-            tmp_path, call_limit_spread_fraction=_ABSENT))
-        assert config.call_limit_spread_fraction == 0.0
+    @pytest.mark.parametrize("key,expected", [
+        ('call_limit_spread_fraction', 0.0),
+        ('put_limit_spread_fraction', 0.10),
+    ])
+    def test_each_default_applies_when_its_key_is_absent(self, tmp_path, key,
+                                                         expected):
+        """A profile that omits a knob prices at its documented default rather
+        than failing to load."""
+        config = Config(_settings_strategy(tmp_path, **{key: _ABSENT}))
+        assert getattr(config, key) == expected
 
-    def test_a_configured_value_is_read_back(self, tmp_path):
-        config = Config(_settings_strategy(
-            tmp_path, call_limit_spread_fraction=0.10))
-        assert config.call_limit_spread_fraction == 0.10
-
+    @pytest.mark.parametrize("key", KEYS)
     @pytest.mark.parametrize("bad", [0.6, 1.0, -0.01, -0.10, 'mid', None, True])
-    def test_out_of_bounds_values_are_refused_at_load(self, tmp_path, bad):
+    def test_out_of_bounds_values_are_refused_at_load(self, tmp_path, key, bad):
         """Refused at load, not clamped at use: a config that means something
         other than what it says must not start."""
-        with pytest.raises(ValueError, match='call_limit_spread_fraction'):
-            Config(_settings_strategy(tmp_path, call_limit_spread_fraction=bad))
+        with pytest.raises(ValueError, match=key):
+            Config(_settings_strategy(tmp_path, **{key: bad}))
 
+    @pytest.mark.parametrize("key", KEYS)
     @pytest.mark.parametrize("ok", [0.0, 0.05, 0.10, 0.5])
-    def test_the_inclusive_bounds_load(self, tmp_path, ok):
-        config = Config(_settings_strategy(
-            tmp_path, call_limit_spread_fraction=ok))
-        assert config.call_limit_spread_fraction == ok
+    def test_the_inclusive_bounds_load(self, tmp_path, key, ok):
+        config = Config(_settings_strategy(tmp_path, **{key: ok}))
+        assert getattr(config, key) == ok
+
+    def test_a_configured_value_is_read_back(self, tmp_path):
+        config = Config(_settings_strategy(tmp_path,
+                                           call_limit_spread_fraction=0.10,
+                                           put_limit_spread_fraction=0.25))
+        assert config.call_limit_spread_fraction == 0.10
+        assert config.put_limit_spread_fraction == 0.25

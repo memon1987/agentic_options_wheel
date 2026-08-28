@@ -303,16 +303,50 @@ verified 2026-08-04:
 - **Premium floors**: `min_put_premium: 0.50`, `min_call_premium: 0.30`. The put
   floor is a real universe constraint, not a formality — several configured
   symbols cannot clear it at all.
-- **Sell-to-open limit pricing** (FC-072, both profiles): a usable quote prices
-  at `mid + f × (ask − bid)`, where the call leg's `f` is
-  `strategy.call_limit_spread_fraction` (**0.0** = at mid, validated `[0.0, 0.5]`)
-  and the put leg's is a hardcoded `0.10`. A missing, crossed, or stale quote
-  (`spread / mid > 0.5`) falls back to `mid × 0.95` on **both** legs — the
-  shared predicate lives in `src/strategy/limit_pricing.py`. The call leg
-  previously used `mid × 0.95` unconditionally; that 5% discount, not a
-  fill-rate policy, is what FC-072 removed. The knob is the *aggression* dial
-  and moving it trades fill rate for premium — see `docs/plans/fc-072.md` for
-  the 87%-call / 73%-put fill baseline before flipping it.
+- **Sell-to-open limit pricing** (FC-072, both legs, both profiles — the shared
+  implementation is `src/strategy/limit_pricing.py`):
+  - **The quote is refreshed at execution time.** `/scan` quotes at `:00` and
+    `/run` places at `:15`; nothing on the execute path used to re-quote, so
+    every limit was priced off a book up to 15 minutes old. **That staleness,
+    not the spread, is the dominant variable** in where these orders landed: of
+    66 filled calls, 17 filled below the *scan-time* bid and 28 at or above
+    scan-time mid. A refresh that fails never fails the order — it falls back
+    to the scan-time quote and logs `quote_refresh_failed`; the
+    `*_sale_executing` event carries `quote_source` (`live` / `blob`) and
+    `quote_age_s` so the two populations can be told apart.
+  - **Formula**: `mid + f × (ask − bid)`, `mid` recomputed from whichever book
+    was used. `f` is `strategy.call_limit_spread_fraction` (**0.0** — rest at
+    mid) and `strategy.put_limit_spread_fraction` (**0.10** — the put leg's
+    historical bias toward the ask, unchanged). Both validated `[0.0, 0.5]`;
+    `0.5` sits exactly on the ask.
+  - **Usable book** = `bid > 0 and ask > 0 and ask >= bid`. A **locked** book
+    (`ask == bid`) is usable and prices at the bid — never 5% *through* a
+    locked market. A **wide** book is usable with no cap: wide means illiquid,
+    not stale, and discounting it further concedes most where the mid is least
+    informative. Only **one-sided** and **crossed** books fall back, to the
+    historical `premium × 0.95`.
+  - **Tick increments are a broker rule, not a preference**: Alpaca quotes
+    options in $0.01 below $3.00 and **$0.05 at/above $3.00**, except the
+    penny-program names (SPY/QQQ/IWM, penny at all prices); a non-conforming
+    limit is rejected when no exchange accepts it. Sell limits snap **up**.
+    **The paper simulator does not enforce this**, so paper history is not
+    evidence that a live account would accept an off-tick limit. Below $3.00
+    the cent rounding is `ROUND_HALF_UP` on the exact decimal, not `round()` —
+    banker's rounding over floats put a half-cent mid on the bid or the ask by
+    luck.
+  - **Economics, corrected** (rev 1 of the plan got this wrong and the reviews
+    caught it): the call leg's old `premium × 0.95` was **not** a 5% donation.
+    On this book 5% of mid ≈ half a spread, so the limit sat about **at the
+    bid** — marketable, filling at the bid. Realised `Σ(mid − fill)` over the
+    journaled call fills was **−$87**. What the change buys is resting at mid
+    instead of crossing, ≈ **+$5/write gross**, against an expected **75–80%**
+    fill rate (vs ≈90% marketable). Do not repeat the retired "$2.3k" /
+    "5% donated" framing. `docs/plans/fc-072.md` holds the two-week readout
+    that decides whether the trade was worth it.
+  - **The roller is deliberately not routed through this module.** `CallRoller`
+    prices its sell-to-open **at the bid** (or `mid − $0.05` on imminence)
+    because a credit-only defensive roll must execute in the same session as
+    its buy-to-close leg. Opening writes can afford to rest; rolls cannot.
 - **Universe**: 14 symbols in `stocks.symbols`. The **effective** universe is
   smaller: the `$400` price ceiling and the premium floors exclude several
   symbols entirely, so a symbol that never trades is a *filter* result, not a

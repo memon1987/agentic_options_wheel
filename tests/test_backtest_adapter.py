@@ -18,6 +18,7 @@ from src.backtesting.engine.alpaca_adapter import (
     UnsupportedBacktestCall,
 )
 from src.backtesting.engine.broker import BacktestBroker
+from src.strategy.limit_pricing import refresh_quote, sell_limit_price
 from src.utils import clock
 
 D1 = date(2024, 6, 3)
@@ -358,3 +359,85 @@ class TestActivities:
         broker.settle_expirations(EXP, {"XYZ": 85.0})
         with _at(D2):  # D2 < EXP: the assignment has not happened yet, in sim time
             assert client.get_account_activities("OPASN", after="2024-06-01") == []
+
+
+class TestExecuteTimeRequoteStaysOfflineFC072:
+    """FC-072 rev 2 gave both sellers an execute-time re-quote. In a replay
+    that re-quote must never reach the network, and must never move the result.
+
+    It does not, structurally, and the mechanism is worth stating because the
+    plan proposed a different one. ``BacktestAlpacaClient.get_option_quote``
+    already existed and reads the **frozen daily chain snapshot** — the same
+    object the opportunity's own bid/ask came from. So in a replay the "fresh"
+    quote IS the scan-time quote: offline, deterministic, and numerically
+    identical.
+
+    The plan asked instead for the adapter's ``get_option_quote`` to return
+    something unusable so replay would take the blob fallback. That would have
+    been actively wrong here: ``CallRoller`` calls ``get_option_quote`` three
+    times and the simulator runs the roll cycle every simulated day, so
+    starving it would change ``rolls_executed`` — the opposite of leaving the
+    replay unchanged. The offline-by-construction property is what the plan
+    actually wanted; see the PR for the write-up.
+    """
+
+    def test_the_adapter_serves_the_frozen_snapshot_not_a_live_quote(self, setup):
+        _, client = setup
+        with _at(D1):
+            quote = client.get_option_quote(PUT)
+        assert (quote["bid"], quote["ask"]) == (0.90, 1.10)
+
+    def test_the_requote_resolves_through_the_adapter_and_is_usable(self, setup):
+        """`refresh_quote` handed the adapter returns source="live" — "live"
+        means "the client's current book", and the backtest client's current
+        book is the day's snapshot."""
+        _, client = setup
+        opportunity = {"symbol": "XYZ", "bid": 0.90, "ask": 1.10, "premium": 1.00}
+        with _at(D1):
+            quote = refresh_quote(client, PUT, opportunity)
+        assert quote.source == "live"
+        assert (quote.bid, quote.ask) == (0.90, 1.10)
+
+    def test_the_requoted_book_is_identical_to_the_opportunitys_own(self, setup):
+        """THE determinism argument: re-quoting cannot change a replay's price
+        because it returns the same numbers the opportunity carries."""
+        _, client = setup
+        opportunity = {"symbol": "XYZ", "bid": 0.90, "ask": 1.10, "premium": 1.00}
+        with _at(D1):
+            quote = refresh_quote(client, PUT, opportunity)
+        assert (quote.bid, quote.ask) == (opportunity["bid"], opportunity["ask"])
+
+    def test_a_contract_absent_from_the_day_falls_back_rather_than_reaching_out(
+            self, setup):
+        """D2's snapshot has no calls. The adapter returns {} — it does not go
+        looking for the contract anywhere else."""
+        _, client = setup
+        opportunity = {"symbol": "XYZ", "bid": 0.70, "ask": 0.90, "premium": 0.80}
+        with _at(D2):
+            quote = refresh_quote(client, CALL, opportunity)
+        assert quote.source == "blob"
+        assert (quote.bid, quote.ask) == (0.70, 0.90)
+
+    def test_reaching_for_a_live_client_raises_rather_than_reaching_out(self, setup):
+        """The structural guarantee behind "replay never issues a live quote":
+        the adapter's ``__getattr__`` refuses everything it does not simulate,
+        loudly. `get_option_quote` IS simulated, so the re-quote resolves
+        offline; anything a future change reached for instead would blow up
+        here rather than quietly opening a socket."""
+        _, client = setup
+        for attr in ("trading_client", "option_data_client", "stock_data_client"):
+            with pytest.raises(UnsupportedBacktestCall):
+                getattr(client, attr)
+        assert callable(client.get_option_quote)
+
+    def test_the_requote_is_priced_the_same_from_either_source(self, setup):
+        """Belt and braces on the byte-identity claim: price the same order off
+        the re-quote and off the blob and get the same limit."""
+        _, client = setup
+        opportunity = {"symbol": "XYZ", "bid": 0.90, "ask": 1.10, "premium": 1.00}
+        with _at(D1):
+            quote = refresh_quote(client, PUT, opportunity)
+        live_priced = sell_limit_price(quote.bid, quote.ask, 1.00, 0.10, "XYZ")
+        blob_priced = sell_limit_price(opportunity["bid"], opportunity["ask"],
+                                       1.00, 0.10, "XYZ")
+        assert live_priced.limit_price == blob_priced.limit_price

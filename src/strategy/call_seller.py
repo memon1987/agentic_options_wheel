@@ -15,7 +15,7 @@ from .cost_basis import (
     opportunity_shares_covered,
     opportunity_total_return_if_called,
 )
-from .limit_pricing import sell_limit_price
+from .limit_pricing import refresh_quote, sell_limit_price
 
 logger = structlog.get_logger(__name__)
 
@@ -156,33 +156,42 @@ class CallSeller:
             contracts = opportunity['contracts']
             premium = opportunity['premium']
             
-            # Calculate limit price (FC-072). This used to be an unconditional
-            # `round(premium * 0.95, 2)` — 5% below mid on every covered-call
-            # write, whether or not the book supported it. Measured over the
-            # trade journal that discount ran the call leg 5.0% below mid while
-            # the put leg ran 1.0% ABOVE it, an unstated Symmetry violation
-            # worth up to ~$2.3k of forgone premium across 138 fills.
+            # Limit price (FC-072 rev 2). Two things happen here, both in
+            # src/strategy/limit_pricing.py so the put leg cannot drift from
+            # this one:
             #
-            # Now: price at `mid + f * spread` on a usable quote, where `f` is
-            # `strategy.call_limit_spread_fraction` (default 0.0 -> exactly
-            # mid). The put leg's +10%-of-spread bias is deliberately NOT
-            # ported here in this change: the same measurement showed calls
-            # filling 87% priced below mid against puts at 73% priced above it,
-            # so the aggression is a second, separately-measured step the
-            # operator flips via config once fill data exists.
+            # 1. RE-QUOTE. `/scan` quotes at :00 and `/run` places at :15, and
+            #    nothing on this path used to refresh in between — every limit
+            #    was computed from a quote up to 15 minutes old. Of 66 filled
+            #    calls, 17 filled below the scan-time bid and 28 at or above
+            #    scan-time mid: pricing off a stale quote is selection, not
+            #    spread capture. The refresh NEVER fails the order; an
+            #    unavailable quote falls back to the scan-time book and says so
+            #    in the log (`quote_source`, `quote_age_s`).
+            # 2. PRICE at `mid + f * spread`, `f` =
+            #    `strategy.call_limit_spread_fraction` (default 0.0 -> at mid),
+            #    then round to a legal tick ($0.05 at/above $3.00 except
+            #    penny-program names; half-up to the cent below).
             #
-            # The fallback (`mid * 0.95`) is unchanged and fires on a missing,
-            # crossed, or stale quote — see src/strategy/limit_pricing.py for
-            # the shared predicate and the spread sanity cap, which both legs
-            # now use so they cannot drift.
-            bid = opportunity.get('bid')
-            ask = opportunity.get('ask')
-            limit_price, spread, applied_spread_fraction = sell_limit_price(
-                mid=premium,
-                bid=bid,
-                ask=ask,
+            # On the old formula, `round(premium * 0.95, 2)` was NOT a 5%
+            # donation: on this book it sat about at the bid, and realised
+            # sum(mid - fill) over the journaled call fills was -$87. What
+            # changes is resting at mid instead of crossing to the bid —
+            # ~+$5/write gross against an expected ~75-80% fill rate (vs ~90%
+            # marketable). It survives only if the two-week readout in
+            # docs/plans/fc-072.md says so.
+            #
+            # The re-quote happens AFTER the cost-basis floor above, on purpose:
+            # a refreshed quote must never be able to bypass the floor.
+            quote = refresh_quote(self.alpaca, option_symbol, opportunity, logger)
+            priced = sell_limit_price(
+                bid=quote.bid,
+                ask=quote.ask,
+                fallback_premium=premium,
                 spread_fraction=self.config.call_limit_spread_fraction,
+                underlying=opportunity.get('symbol') or '',
             )
+            limit_price = priced.limit_price
 
             logger.info("Executing covered call sale",
                        event_category="trade",
@@ -190,14 +199,18 @@ class CallSeller:
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
-                       bid=bid,
-                       ask=ask,
-                       spread=round(spread, 2) if spread is not None else None,
-                       # The fraction ACTUALLY applied: None means the fallback
-                       # fired, so a fill-rate study can separate priced-at-mid
-                       # writes from degraded-quote writes without a second
-                       # change.
-                       spread_fraction=applied_spread_fraction,
+                       bid=quote.bid,
+                       ask=quote.ask,
+                       mid=priced.mid,
+                       spread=priced.spread,
+                       # The fraction ACTUALLY applied: None means the book was
+                       # unusable and the premium fallback priced the order, so
+                       # a fill-rate study can separate the two without a
+                       # second change.
+                       spread_fraction=priced.spread_fraction,
+                       quote_source=quote.source,
+                       quote_age_s=quote.age_s,
+                       tick_snapped=priced.tick_snapped,
                        limit_price=limit_price)
             
             # Place the sell order

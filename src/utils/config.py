@@ -209,23 +209,26 @@ class Config:
         if len(call_delta) != 2 or not (0 <= call_delta[0] <= call_delta[1] <= 1):
             errors.append(f"call_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {call_delta})")
 
-        # FC-072: how far past mid a covered-call sell-to-open may be priced, as
-        # a fraction of the bid/ask spread. Bounded on BOTH sides on purpose:
-        #  - negative is rejected because "price below mid" is precisely the 5%
-        #    donation FC-072 removed; reintroducing it must be a code change
-        #    with a plan behind it, not a config flip.
-        #  - 0.5 is the ceiling because at f=0.5 the limit sits at the ask, and
-        #    anything beyond that is a limit outside the book — a resting order
-        #    that cannot fill until the market moves to it.
-        # Consumer: CallSeller.execute_call_sale (src/strategy/call_seller.py).
-        call_spread_fraction = strategy.get('call_limit_spread_fraction', 0.0)
-        if (isinstance(call_spread_fraction, bool)
-                or not isinstance(call_spread_fraction, (int, float))
-                or not (0.0 <= call_spread_fraction <= 0.5)):
-            errors.append(
-                "call_limit_spread_fraction must be a number in [0.0, 0.5] "
-                f"(got {call_spread_fraction!r})"
-            )
+        # FC-072: how far past mid a sell-to-open is priced, as a fraction of
+        # the bid/ask spread — one knob per leg, same bounds, validated
+        # together so the two cannot drift. Bounded on BOTH sides on purpose:
+        #  - negative would price BELOW mid, i.e. deliberately marketable. That
+        #    is what the pre-FC-072 call formula did in effect, and reversing
+        #    the decision must be a code change with a plan behind it, not a
+        #    config flip.
+        #  - 0.5 is the ceiling because at f=0.5 the limit sits exactly on the
+        #    ask; beyond it the limit is outside the book and cannot fill until
+        #    the market moves to it.
+        # Consumers: CallSeller.execute_call_sale / PutSeller.execute_put_sale.
+        for key, default in (('call_limit_spread_fraction', 0.0),
+                             ('put_limit_spread_fraction', 0.10)):
+            fraction = strategy.get(key, default)
+            if (isinstance(fraction, bool)
+                    or not isinstance(fraction, (int, float))
+                    or not (0.0 <= fraction <= 0.5)):
+                errors.append(
+                    f"{key} must be a number in [0.0, 0.5] (got {fraction!r})"
+                )
 
         # FC-013 DD-3 lookahead invariant. The call leg's span test asks "does
         # this candidate's expiry fall on or after the next earnings date" — a
@@ -497,16 +500,29 @@ class Config:
         """Fraction of the bid/ask spread added to mid when pricing a call sale.
 
         FC-072. ``0.0`` (the default, and both shipped profiles' value) prices a
-        covered-call sell-to-open exactly at the chain midpoint; ``0.10`` would
-        match the put leg's bias toward the ask. Validated to ``[0.0, 0.5]``.
-        Consumed by ``CallSeller.execute_call_sale``; a degraded quote ignores
-        it and takes the ``mid * 0.95`` fallback.
+        covered-call sell-to-open exactly at the execute-time midpoint;
+        ``0.10`` would match the put leg's bias toward the ask. Validated to
+        ``[0.0, 0.5]``. Consumed by ``CallSeller.execute_call_sale``; an
+        unusable book ignores it and takes the ``premium * 0.95`` fallback.
 
         ``.get`` with a default rather than a hard key read: the knob is
         optional by design, so a profile that omits it prices at mid rather
         than failing to load.
         """
         return float(self._config["strategy"].get("call_limit_spread_fraction", 0.0))
+
+    @property
+    def put_limit_spread_fraction(self) -> float:
+        """Fraction of the bid/ask spread added to mid when pricing a put sale.
+
+        FC-072. Defaults to ``0.10`` — the value this leg has always used,
+        hardcoded, biased toward the ask for premium collection. It became a key
+        so both legs are configured the same way (Symmetry Principle), NOT to
+        change the put leg: the default reproduces today's price on any normal
+        book below $3.00. Validated to ``[0.0, 0.5]``. Consumed by
+        ``PutSeller.execute_put_sale``.
+        """
+        return float(self._config["strategy"].get("put_limit_spread_fraction", 0.10))
 
     # FC-069 S1 (item 9) deleted `call_drawdown_pause_threshold`. The pause is
     # dead by operator decision (FC-065 OQ-3), FC-068 deleted its last

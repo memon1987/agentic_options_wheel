@@ -34,9 +34,10 @@ live path: ``TestExecuteTimeCostBasisFloorFC050``.
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.strategy.call_seller import CallSeller
+from src.utils import clock
 from src.utils.config import Config
 
 
@@ -600,26 +601,38 @@ class TestSellerStateOrphanDeletedFC069:
 
 
 class TestCallLimitPricingFC072:
-    """FC-072: the covered-call sell-to-open limit is priced at mid, not 5% under.
+    """FC-072 rev 2: the call leg re-quotes at execute time, then prices at mid.
 
-    Pre-FC-072 ``execute_call_sale`` priced every write at
-    ``round(premium * 0.95, 2)`` — unconditionally, quote or no quote. Measured
-    over the trade journal the call leg's limits sat **5.0% below mid** while
-    the put leg's sat **1.0% above** it; across 138 call fills the discount was
-    worth up to ~$2,350 of forgone premium. These tests fail against pre-FC-072
-    code: every one of them asserts a limit the old formula could not produce.
+    Two things changed and each has its own family below.
 
-    The knob (``strategy.call_limit_spread_fraction``) defaults to 0.0 — price
-    at mid, no more aggressive than the market's own midpoint. Biasing toward
-    the ask like the put leg is a separate, separately-measured step (the call
-    leg fills at 87% today, the put leg at 73%).
+    **The re-quote.** `/scan` quotes at :00 and `/run` places at :15; nothing on
+    this path refreshed in between, so every limit was priced off a book up to
+    15 minutes old. That staleness — not the spread — is what moved these
+    orders: of 66 filled calls, 17 filled below the *scan-time* bid and 28 at or
+    above scan-time mid, at a median 0.13 s to fill (marketable against the
+    *current* book, not the one we priced from).
+
+    **The price.** `mid + f x spread` off whichever book was used, `f` =
+    `call_limit_spread_fraction` (default 0.0 -> rest at mid), then rounded to a
+    legal tick. The old `round(premium * 0.95, 2)` was NOT a 5% donation: on
+    this book it sat about at the bid, and realised sum(mid - fill) over the
+    journaled fills was -$87. What is bought is resting instead of crossing,
+    ~+$5/write, against an expected 75-80% fill rate.
     """
 
-    def _seller(self, spread_fraction=0.0):
+    LIVE = {'bid': 1.30, 'ask': 1.50}
+
+    def _seller(self, spread_fraction=0.0, live_quote='default'):
         self.mock_alpaca = Mock()
         self.mock_alpaca.place_option_order.return_value = {
             'success': True, 'order_id': 'order-fc072', 'status': 'new',
         }
+        if live_quote == 'default':
+            live_quote = dict(self.LIVE)
+        if isinstance(live_quote, Exception):
+            self.mock_alpaca.get_option_quote.side_effect = live_quote
+        else:
+            self.mock_alpaca.get_option_quote.return_value = live_quote
         config = Mock(spec=Config)
         config.call_limit_spread_fraction = spread_fraction
         return CallSeller(self.mock_alpaca, Mock(), config)
@@ -628,35 +641,31 @@ class TestCallLimitPricingFC072:
     def _opportunity(**kw):
         """The shape OptionsScanner._create_call_opportunity emits.
 
-        ``premium`` is the chain mid (``mid_price``), and the scanner puts
-        ``bid`` / ``ask`` on the call payload exactly as it does on the put one
-        (options_scanner.py — ``'bid': call_option.get('bid', 0)``).
-
-        Default mid is **$3.24**, the measured average call premium, and it is
-        deliberately OFF the $0.05 tick: FC-072 verified against a year of
-        closed Alpaca orders that off-tick option limits at or above $3.00 are
-        accepted and filled (46 such sell-call limits, 38 filled, 0 rejected),
-        so there is no tick snapping to hide behind here.
+        `bid`/`ask` are the SCAN-time book (options_scanner.py puts them on the
+        call payload exactly as on the put one), `premium` is that book's mid,
+        and `scan_timestamp` is the stamp the scanner has always written — the
+        field `quote_age_s` is computed from.
         """
         opp = {
             'type': 'call',
             'symbol': 'AAPL',
             'option_symbol': 'AAPL260821C00310000',
             'strike_price': 310.0,
-            'premium': 3.24,
-            'bid': 3.14,
-            'ask': 3.34,
+            'premium': 1.30,
+            'bid': 1.20,
+            'ask': 1.40,
             'dte': 7,
             'shares_owned': 100,
             'max_contracts': 1,
             'contracts': 1,
             'cost_basis_per_share': 303.50,
+            'scan_timestamp': (clock.now() - timedelta(seconds=900)).isoformat(),
         }
         opp.update(kw)
         return opp
 
-    def _limit_of(self, opportunity, spread_fraction=0.0):
-        seller = self._seller(spread_fraction)
+    def _limit_of(self, opportunity, **kw):
+        seller = self._seller(**kw)
         result = seller.execute_call_sale(opportunity)
         assert result['success'] is True
         kwargs = self.mock_alpaca.place_option_order.call_args.kwargs
@@ -665,98 +674,8 @@ class TestCallLimitPricingFC072:
         assert result['limit_price'] == kwargs['limit_price']
         return kwargs['limit_price']
 
-    # --- Test 1: the core regression -------------------------------------
-
-    def test_a_usable_quote_prices_exactly_at_mid(self):
-        """THE regression. Pre-fix this was 3.08 (3.24 * 0.95); it is now 3.24.
-
-        Also pins that a $3.24 limit is submitted as $3.24 — not snapped up to
-        $3.25 — because Alpaca accepts penny increments at every price level.
-        """
-        assert self._limit_of(self._opportunity()) == 3.24
-
-    def test_the_five_percent_discount_is_gone_across_the_premium_range(self):
-        """Mutation guard: any surviving `premium * 0.95` shows up here."""
-        for mid, bid, ask in [(0.35, 0.30, 0.40),
-                              (1.80, 1.75, 1.85),
-                              (3.24, 3.14, 3.34),
-                              (14.41, 14.20, 14.62)]:
-            limit = self._limit_of(
-                self._opportunity(premium=mid, bid=bid, ask=ask))
-            assert limit == round(mid, 2), f"mid={mid} priced at {limit}"
-            assert limit != round(mid * 0.95, 2)
-
-    # --- Test 2: the knob is actually consumed ---------------------------
-
-    def test_a_nonzero_spread_fraction_biases_the_limit_toward_the_ask(self):
-        """f=0.10 -> mid + 10% of the spread, the put leg's bias.
-
-        3.24 + 0.10 * (3.34 - 3.14) = 3.26.
-        """
-        assert self._limit_of(self._opportunity(), spread_fraction=0.10) == 3.26
-
-    def test_the_full_fraction_prices_at_the_ask(self):
-        """f=0.5 is the validated ceiling and lands exactly on the ask —
-        which is why 0.5 is the ceiling. mid + 0.5*spread = 3.24 + 0.10."""
-        assert self._limit_of(self._opportunity(), spread_fraction=0.50) == 3.34
-
-    # --- Test 3: the fallback is untouched -------------------------------
-
-    def test_a_missing_quote_falls_back_to_five_percent_under_mid(self):
-        opp = self._opportunity()
-        del opp['bid']
-        del opp['ask']
-        assert self._limit_of(opp) == 3.08  # round(3.24 * 0.95, 2)
-
-    def test_a_zero_bid_falls_back(self):
-        """The scanner defaults absent quotes to 0, so 0 is the real shape of
-        'no bid' on a production opportunity — not None."""
-        assert self._limit_of(self._opportunity(bid=0, ask=0)) == 3.08
-
-    def test_a_none_quote_falls_back(self):
-        assert self._limit_of(self._opportunity(bid=None, ask=None)) == 3.08
-
-    def test_the_fallback_is_unchanged_even_with_a_nonzero_knob(self):
-        """A degraded quote must not be priced off the knob: there is no third
-        path, and f multiplies a spread that does not exist."""
-        opp = self._opportunity()
-        del opp['bid']
-        del opp['ask']
-        assert self._limit_of(opp, spread_fraction=0.10) == 3.08
-
-    # --- Test 4: the spread sanity cap ------------------------------------
-
-    def test_a_crossed_quote_falls_back(self):
-        """ask <= bid is not a market. Pricing off its 'spread' would produce a
-        limit BELOW mid on a positive fraction."""
-        assert self._limit_of(self._opportunity(bid=3.34, ask=3.14)) == 3.08
-
-    def test_a_locked_quote_falls_back(self):
-        """ask == bid: zero spread, and a book that is not quoting a market."""
-        assert self._limit_of(self._opportunity(bid=3.24, ask=3.24)) == 3.08
-
-    def test_a_stale_quote_wider_than_half_of_mid_falls_back(self):
-        """spread/mid = 2.00/3.24 = 0.617 > 0.5 -> the midpoint is noise."""
-        assert self._limit_of(self._opportunity(bid=2.24, ask=4.24)) == 3.08
-
-    def test_a_spread_exactly_at_the_cap_is_still_usable(self):
-        """The cap is `>` not `>=`: spread/mid == 0.5 exactly is admitted, so
-        the boundary cannot silently swallow a legitimate wide-but-real book.
-        mid 3.00, bid 2.25, ask 3.75 -> spread 1.50, ratio 0.50."""
-        assert self._limit_of(
-            self._opportunity(premium=3.00, bid=2.25, ask=3.75)) == 3.00
-
-    def test_the_cap_matters_because_the_fallback_is_cheaper(self):
-        """Guard against a 'cap' that is a no-op: with f=0 a capped quote must
-        price 5% under mid, not at mid."""
-        capped = self._limit_of(self._opportunity(bid=2.24, ask=4.24))
-        uncapped = self._limit_of(self._opportunity())
-        assert capped < uncapped
-
-    # --- Test 5: telemetry -------------------------------------------------
-
-    def _executing_event(self, opportunity, spread_fraction=0.0):
-        seller = self._seller(spread_fraction)
+    def _executing_event(self, opportunity, **kw):
+        seller = self._seller(**kw)
         with patch('src.strategy.call_seller.logger') as mock_logger:
             result = seller.execute_call_sale(opportunity)
         assert result['success'] is True
@@ -765,55 +684,185 @@ class TestCallLimitPricingFC072:
         assert len(events) == 1
         return events[0]
 
-    def test_the_executing_event_carries_the_pricing_inputs(self):
-        """Without these fields the two-week fill-rate study in fc-072.md
-        cannot be run from logs, which would mean a second change."""
+    # --- Test 1: the fresh quote is the one that prices the order ---------
+
+    def test_the_live_quote_prices_the_order_not_the_scan_time_one(self):
+        """THE regression. Scan book 1.20/1.40 (mid 1.30), live book 1.30/1.50
+        (mid 1.40). Pre-rev-2 this priced 1.24 (0.95 x the stale premium); it is
+        now 1.40, the CURRENT mid."""
+        assert self._limit_of(self._opportunity()) == 1.40
+
+    def test_the_stale_premium_cannot_leak_into_the_price(self):
+        """Mutation guard: an implementation that recomputed mid from the live
+        book but kept `premium` anywhere in the formula shows up here."""
+        opp = self._opportunity(premium=99.0)
+        assert self._limit_of(opp) == 1.40
+
+    def test_the_five_percent_formula_is_gone_on_a_live_book(self):
+        for bid, ask in [(0.30, 0.40), (1.30, 1.50), (2.00, 2.10)]:
+            limit = self._limit_of(self._opportunity(),
+                                   live_quote={'bid': bid, 'ask': ask})
+            assert limit == round((bid + ask) / 2, 2)
+
+    def test_the_event_reports_the_live_source(self):
+        event = self._executing_event(self._opportunity())
+        assert event['quote_source'] == 'live'
+        assert event['quote_age_s'] == 0.0
+        assert (event['bid'], event['ask']) == (1.30, 1.50)
+
+    # --- Test 2: the refresh never fails the order ------------------------
+
+    def test_an_empty_refresh_falls_back_to_the_scan_time_book(self):
+        """Scan book 1.20/1.40 -> mid 1.30. Still placed, still at mid."""
+        assert self._limit_of(self._opportunity(), live_quote={}) == 1.30
+
+    def test_a_raising_refresh_still_places_the_order(self):
+        """A refused order costs a full cycle of theta. The fallback is not
+        optional."""
+        limit = self._limit_of(self._opportunity(),
+                               live_quote=RuntimeError("alpaca down"))
+        assert limit == 1.30
+        self.mock_alpaca.place_option_order.assert_called_once()
+
+    def test_the_blob_fallback_reports_the_quote_age(self):
+        event = self._executing_event(self._opportunity(), live_quote={})
+        assert event['quote_source'] == 'blob'
+        assert 890 <= event['quote_age_s'] <= 910
+        assert (event['bid'], event['ask']) == (1.20, 1.40)
+
+    def test_a_missing_scan_stamp_gives_a_null_age_not_a_failure(self):
+        opp = self._opportunity()
+        del opp['scan_timestamp']
+        event = self._executing_event(opp, live_quote={})
+        assert event['quote_source'] == 'blob'
+        assert event['quote_age_s'] is None
+        assert event['limit_price'] == 1.30
+
+    def test_a_one_sided_live_quote_is_not_treated_as_live(self):
+        event = self._executing_event(self._opportunity(),
+                                      live_quote={'bid': 0.0, 'ask': 1.50})
+        assert event['quote_source'] == 'blob'
+        assert event['limit_price'] == 1.30
+
+    # --- Test 3: the book predicate --------------------------------------
+
+    def test_a_locked_book_prices_at_the_bid(self):
+        """Never 5% THROUGH a market that is quoting."""
+        assert self._limit_of(self._opportunity(),
+                              live_quote={'bid': 1.30, 'ask': 1.30}) == 1.30
+
+    def test_a_wide_book_takes_the_normal_formula(self):
+        """The real AMZN 2026-05-27 book. Rev 1's spread cap would have priced
+        this 0.86; wide means illiquid, not stale."""
+        assert self._limit_of(self._opportunity(),
+                              live_quote={'bid': 0.68, 'ask': 1.14}) == 0.91
+
+    def test_a_crossed_book_on_both_sources_takes_the_premium_fallback(self):
+        """No usable book anywhere -> round(premium x 0.95, 2) = 1.24."""
+        limit = self._limit_of(
+            self._opportunity(bid=1.40, ask=1.30),
+            live_quote={'bid': 1.50, 'ask': 1.40})
+        assert limit == 1.24
+
+    def test_a_one_sided_book_on_both_sources_takes_the_premium_fallback(self):
+        limit = self._limit_of(self._opportunity(bid=0, ask=0), live_quote={})
+        assert limit == 1.24
+
+    def test_the_fallback_reports_no_mid_and_no_fraction(self):
+        event = self._executing_event(self._opportunity(bid=0, ask=0),
+                                      live_quote={})
+        assert event['mid'] is None
+        assert event['spread_fraction'] is None
+        assert event['limit_price'] == 1.24
+
+    # --- Test 4: tick snapping -------------------------------------------
+
+    def test_a_limit_at_or_above_three_dollars_is_snapped_up(self):
+        """Alpaca ticks options at $0.05 from $3.00 up and REJECTS off-tick
+        limits when no exchange accepts them. Paper does not enforce it."""
+        limit = self._limit_of(self._opportunity(),
+                               live_quote={'bid': 3.14, 'ask': 3.34})
+        assert limit == 3.25
+
+    def test_a_penny_program_underlying_is_exempt(self):
+        limit = self._limit_of(
+            self._opportunity(symbol='SPY', option_symbol='SPY260821C00600000',
+                              strike_price=600.0, cost_basis_per_share=500.0),
+            live_quote={'bid': 3.14, 'ask': 3.34})
+        assert limit == 3.24
+
+    def test_the_event_flags_whether_the_tick_rule_moved_the_price(self):
+        snapped = self._executing_event(self._opportunity(),
+                                        live_quote={'bid': 3.14, 'ask': 3.34})
+        assert snapped['tick_snapped'] is True
+        assert snapped['mid'] == 3.24
+
+        not_snapped = self._executing_event(self._opportunity())
+        assert not_snapped['tick_snapped'] is False
+
+    def test_a_half_cent_mid_rests_on_the_ask(self):
+        """bid 0.60 / ask 0.61. `round()` would give 0.60 — the bid, i.e.
+        marketable. Half-up gives 0.61, which rests."""
+        assert self._limit_of(self._opportunity(),
+                              live_quote={'bid': 0.60, 'ask': 0.61}) == 0.61
+
+    # --- The knob --------------------------------------------------------
+
+    def test_a_nonzero_fraction_biases_the_limit_toward_the_ask(self):
+        """f=0.10 -> 1.40 + 0.10 x 0.20 = 1.42."""
+        assert self._limit_of(self._opportunity(), spread_fraction=0.10) == 1.42
+
+    def test_the_ceiling_fraction_prices_at_the_ask(self):
+        assert self._limit_of(self._opportunity(), spread_fraction=0.50) == 1.50
+
+    def test_the_fallback_ignores_the_knob(self):
+        limit = self._limit_of(self._opportunity(bid=0, ask=0),
+                               spread_fraction=0.10, live_quote={})
+        assert limit == 1.24
+
+    # --- Test 7: the full log contract ------------------------------------
+
+    def test_the_executing_event_carries_every_field_the_readout_needs(self):
+        """Without these the two-week fill-rate study in fc-072.md cannot be
+        run from logs, which would mean a second change."""
         event = self._executing_event(self._opportunity())
 
-        assert event['bid'] == 3.14
-        assert event['ask'] == 3.34
-        assert event['spread'] == 0.20
-        assert event['premium'] == 3.24
-        assert event['limit_price'] == 3.24
+        assert event['bid'] == 1.30
+        assert event['ask'] == 1.50
+        assert event['mid'] == 1.40
+        assert event['spread'] == pytest.approx(0.20)
         assert event['spread_fraction'] == 0.0
+        assert event['limit_price'] == 1.40
+        assert event['quote_source'] == 'live'
+        assert event['quote_age_s'] == 0.0
+        assert event['tick_snapped'] is False
+        assert event['premium'] == 1.30
 
-    def test_the_executing_event_reports_the_applied_fraction(self):
-        event = self._executing_event(self._opportunity(), spread_fraction=0.10)
-        assert event['spread_fraction'] == 0.10
-        assert event['limit_price'] == 3.26
+    # --- Test 10: ordering against the floor ------------------------------
 
-    def test_a_fallback_write_is_distinguishable_in_the_logs(self):
-        """`spread_fraction: None` is what separates a priced-at-mid write from
-        a degraded-quote write when f is 0 and the two limits differ only by
-        5%. The stale quote's spread is still reported, so the reason is
-        visible rather than merely absent."""
-        event = self._executing_event(self._opportunity(bid=2.24, ask=4.24))
-        assert event['spread_fraction'] is None
-        assert event['spread'] == 2.00
-        assert event['limit_price'] == 3.08
-
-    def test_a_missing_quote_logs_no_spread(self):
-        opp = self._opportunity()
-        del opp['bid']
-        del opp['ask']
-        event = self._executing_event(opp)
-        assert event['bid'] is None
-        assert event['ask'] is None
-        assert event['spread'] is None
-        assert event['spread_fraction'] is None
-
-    # --- Guardrails on what must NOT change --------------------------------
-
-    def test_pricing_does_not_run_before_the_cost_basis_floor(self):
-        """The floor is the strongest control in the system; a pricing change
-        must not have moved order submission ahead of it."""
+    def test_a_below_basis_call_is_rejected_before_any_quote_refresh(self):
+        """The cost-basis floor is the strongest control in the system. A
+        refreshed quote must never be able to bypass it — and a rejected write
+        must not spend a broker call either."""
         seller = self._seller()
         result = seller.execute_call_sale(
             self._opportunity(strike_price=290.0,
                               option_symbol='AAPL260821C00290000'))
+
         assert result['success'] is False
         assert result['error'] == 'strike_below_cost_basis'
+        self.mock_alpaca.get_option_quote.assert_not_called()
         self.mock_alpaca.place_option_order.assert_not_called()
+
+    def test_a_misrouted_put_is_rejected_before_any_quote_refresh(self):
+        seller = self._seller()
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL260821P00290000',
+            'symbol': 'AAPL', 'contracts': 1, 'premium': 1.30,
+            'strike_price': 290.0, 'cost_basis_per_share': 100.0,
+        })
+        assert result['success'] is False
+        self.mock_alpaca.get_option_quote.assert_not_called()
 
     def test_order_type_side_and_quantity_are_unchanged(self):
         seller = self._seller()
