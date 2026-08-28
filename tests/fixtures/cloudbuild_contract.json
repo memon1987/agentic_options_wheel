@@ -1,4 +1,5 @@
 {
+  "_source": "captured from `git show origin/main:cloudbuild.yaml` at 0910192 (FC-081 merged). This fixture pins MAIN's deploy flags. FC-084 intentionally adds --revision-suffix on top of them; that exception is declared in ALLOWED_NEW_DEPLOY_FLAGS in tests/test_cloudbuild_contract.py. Regenerate only alongside a deliberate, reviewed deploy-flag change.",
   "step_ids": [
     "run-tests",
     "build-bot-image",
@@ -57,15 +58,42 @@
       "smoke-test-dashboard"
     ]
   },
-  "set_env_vars": {
+  "deploy_flags": {
     "deploy-bot-canary": [
-      "ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID"
+      "--concurrency=10",
+      "--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA",
+      "--max-instances=1",
+      "--memory=512Mi",
+      "--min-instances=0",
+      "--no-traffic",
+      "--region=us-central1",
+      "--set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA",
+      "--tag=canary",
+      "--timeout=300"
     ],
     "deploy-cc-canary": [
-      "ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml"
+      "--concurrency=10",
+      "--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA",
+      "--max-instances=1",
+      "--memory=512Mi",
+      "--min-instances=0",
+      "--no-traffic",
+      "--region=us-central1",
+      "--set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml,GIT_COMMIT=$COMMIT_SHA",
+      "--tag=canary",
+      "--timeout=300"
     ],
     "deploy-dashboard-canary": [
-      "TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7"
+      "--cpu=1",
+      "--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA",
+      "--max-instances=2",
+      "--memory=512Mi",
+      "--min-instances=0",
+      "--no-traffic",
+      "--region=us-central1",
+      "--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA",
+      "--tag=canary",
+      "--timeout=300"
     ]
   }
 }

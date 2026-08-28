@@ -684,30 +684,109 @@ After any change:
 
 ## Deploy / CI — `cloudbuild.yaml`
 
-One Cloud Build trigger on `main` builds two images and runs three identical
-canary chains — `options-wheel-strategy`, `covered-call-engine`,
-`options-wheel-dashboard` — each `deploy → smoke-test → promote`. **Since FC-084
-every chain is pinned to the revision that build created.** The deploy step runs
-`gcloud run deploy --format='value(status.latestCreatedRevisionName)'` and writes
-the name to `/workspace/rev-<service>.txt`; the smoke test polls *that* revision
-by name (`revisions describe --format=json`, reading the condition whose
-`type == "Ready"` — Ready-first ordering in `status.conditions` is observed, not
-contractual); the promote step routes with `--to-revisions=$REV=100`. **Never
-reintroduce `--to-latest` or `revisions list --limit=1`** — both mean "whatever
-is newest", which under two overlapping builds is the *other* build's revision.
-Promote also carries a **superseded guard**: if the revision currently serving
-traffic was created after this build's canary, the step logs `SUPERSEDED` and
-**exits 0** — newer code keeps serving, and a superseded build is not a failure,
-so it must not trip the build-failure alert. Ordering is by
-`metadata.creationTimestamp`, not git ancestry: the Cloud Build checkout is
-shallow, and a deliberate rollback (re-running an older commit's trigger) creates
-a newer revision and should win. The deploy step also retries up to 3 times, 20 s
-apart, on Cloud Run's optimistic-concurrency error (`Conflict for resource ...:
-version 'X' was specified but current version is 'Y'`), which is what a
-concurrently-merging build produces. `tests/test_cloudbuild_contract.py` pins all
-of this, plus the must-not-change list (step ids, `waitFor` edges,
-`--set-env-vars` values) against a frozen fixture — that suite is step 1 of the
-build itself, so a regression fails before anything deploys.
+One Cloud Build trigger on `main` builds two images and runs three canary chains
+— `options-wheel-strategy`, `covered-call-engine`, `options-wheel-dashboard` —
+each `deploy → smoke-test → promote`. **Since FC-084 builds of that trigger are
+serialized, and each build deploys a revision it named itself.**
+
+**`serialize-builds` gates the deploys** (`waitFor: ['push-bot-image']`).
+It reads this build's `createTime` and `buildTriggerId` from
+`gcloud builds describe $BUILD_ID`, then polls `gcloud builds list` for
+QUEUED/WORKING builds of the same trigger:
+
+- **A newer build exists** → write `/workspace/superseded`, log `SUPERSEDED`,
+  **exit 0**. Newer code wins. This is not a failure and must not trip the
+  build-failure alert, so the exit code stays 0 — grep the logs for the literal
+  `SUPERSEDED` to count them.
+- **An older build is still running** → wait (20 s poll, 15 min cap, then fail
+  loudly).
+- **Alone and newest** → proceed.
+
+Cloud Build has no conditional steps, so the marker is the mechanism: **every
+deploy/smoke/promote step begins with**
+`[ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }`.
+`run-tests` / `build-*` / `push-*` are deliberately *not* gated — a superseded
+build still validates and pushes its image, which is what makes rollback-by-SHA
+possible.
+
+**Why the gate waits on `push-bot-image` rather than `['-']`, and the timing
+budget.** The gate blocks only the deploy steps, so a build's own test/build/push
+work runs in parallel either way; putting the gate after the push means a build
+that *does* have to wait has already banked that work, and the gate's own
+15-minute wait cap stays far wider than any legitimate wait. Worst case, with
+`T_full` = 8–12 min for a whole build (the figure the `timeout:` comment records),
+`T_deploy` ≈ 4–6 min for the three canary chains, and `T_bp = T_full − T_deploy`:
+
+```
+waiting build total = max(T_bp(self), T_full(older) − Δ) + T_deploy(self)
+worst case (Δ→0)    = max(8, 12) + 6 = 18 min = 1080 s   vs the 1200 s timeout
+```
+
+That leaves ~120 s of headroom, so **an overlapping pair fits, but not
+comfortably**. Note the arithmetic is unchanged by *where* the gate sits — the
+wait ends when the older build ends regardless — so if a live overlap ever times
+out, the fix is raising `timeout`, or revisiting the decision to let a superseded
+build finish its image push (`docs/plans/fc-084.md` §Open questions), not moving
+the gate again.
+
+The gate **fails closed**: if it cannot read or list builds it exits 1, because a
+gate that fails open is not a gate. It prints the fix, which is:
+
+```
+gcloud projects add-iam-policy-binding gen-lang-client-0607444019 \
+  --member=serviceAccount:799970961417@cloudbuild.gserviceaccount.com \
+  --role=roles/cloudbuild.builds.viewer
+```
+
+`roles/cloudbuild.builds.builder` — the role Cloud Build grants that SA by
+default — already includes `cloudbuild.builds.get`/`.list`, so this should be a
+no-op; it is here because the binding could not be read to confirm it (the
+Cloud Resource Manager API is disabled on the project, so `get-iam-policy`
+fails).
+
+**Revision identity comes from `--revision-suffix=<shortsha>-<buildid8>`**, so
+`<service>-<shortsha>-<buildid8>` is known *before* the deploy runs; the deploy
+then confirms it exists with `revisions describe` and writes it to
+`/workspace/rev-<service>.txt`, and the smoke test polls exactly that revision
+(reading the condition whose `type == "Ready"` — Ready-first ordering in
+`status.conditions` is observed, not contractual). **Never go back to reading the
+revision out of the deploy's own output.** `status.latestCreatedRevisionName` is
+re-read after gcloud's 100–190 s Ready wait and returns *another* build's
+revision when writes overlap — proven live on 2026-08-27, when build `046fd075`
+printed the revision that build `0d9756c0` created. gcloud's own source calls the
+field "slightly racy".
+
+**Promote is `update-traffic --to-latest`, and must stay that way.** Pinning
+traffic with `--to-revisions=REV=100` permanently removes `latestRevision: true`
+from the service's traffic spec; Cloud Run then keeps that split for every later
+revision, so a `gcloud run services update --update-env-vars ROLLER_ENABLED=false`
+creates a revision serving **0%** and the kill switch silently stops working.
+Every lever in §Development Notes (`EARNINGS_ENABLED`, `ROLLER_ENABLED`,
+`ROLLER_DRY_RUN`) depends on this. `--to-latest` is safe here because
+serialization means "latest" is this build's revision, and each promote asserts
+`status.latestReadyRevisionName == REV` and **refuses to promote** (exit 1) if an
+out-of-band deploy landed instead.
+
+**Rollback semantics.** Re-running an older commit's trigger creates the *newest
+build*, so it wins the gate and deploys the older code on purpose; a forward
+build racing it is superseded. Ordering is by build `createTime`, never by git
+ancestry — the Cloud Build checkout is shallow, and "newest build wins" is what
+makes a deliberate rollback work. Read `createTime` from `--format=json`
+(`2026-08-28T16:43:45.221420Z`, fixed-width microseconds, always `Z`), **not**
+`--format='value(createTime)'`, which renders `2026-08-28T16:43:45+00:00` and
+drops the microseconds that separate two builds pushed seconds apart.
+
+Deploy and promote both retry 3× / 20 s on Cloud Run's optimistic-concurrency
+error (`Conflict for resource ...: version 'X' was specified but current version
+is 'Y'`). With serialization that can only come from an out-of-band write — an
+operator `services update` during a build. A retried deploy reuses the same
+suffix, so `already exists` is treated as success.
+
+`tests/test_cloudbuild_contract.py` pins all of the above plus the
+must-not-change list — step ids, `waitFor` edges, and **every** `gcloud run
+deploy` flag per service — against a frozen fixture, and unit-tests the gate's
+decision logic directly. That suite is step 1 of the build itself, so a
+regression fails before anything deploys.
 
 ## Development Notes
 
