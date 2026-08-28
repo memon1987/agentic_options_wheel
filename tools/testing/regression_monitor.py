@@ -14,6 +14,8 @@ Checks performed:
     5. Performance baseline comparison (rolling 7-day metric deviations)
     6. Risk parameter validation (duplicate underlyings, position sizing,
        naked calls, cost-basis floor) — see `check_risk_parameters`
+    7. Deploy freshness (what is serving vs. what is on GitHub `main`) —
+       see `check_deploy_freshness` (FC-081 follow-up)
 """
 
 import os
@@ -49,6 +51,23 @@ SERVICE_URL = os.environ.get(
 )
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "gen-lang-client-0607444019")
 BQ_TABLE = os.environ.get("BQ_TABLE", "trades")
+
+# ---------------------------------------------------------------------------
+# Deploy freshness (FC-081 follow-up)
+# ---------------------------------------------------------------------------
+# The repo whose `main` is the authority on "what should be serving". This is a
+# named constant, and env-overridable, precisely because FC-081 was caused by a
+# repo RENAME that silently detached the build trigger for 16 days: a repo name
+# buried in an f-string is a repo name nobody edits when the repo moves.
+GITHUB_REPO = "memon1987/agentic_options_wheel"
+
+# How long `main` may sit ahead of the deployed commit before it counts as
+# drift rather than a build in flight. A build takes 10-12 minutes; 2 hours
+# absorbs a Cloud Build queue or a retried deploy without paging. Float hours,
+# overridable by env `DEPLOY_FRESHNESS_MAX_HOURS`.
+DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT = 2.0
+
+GITHUB_API_TIMEOUT_SECONDS = 10
 
 # Thresholds
 ERROR_WARNING_THRESHOLD = 5
@@ -193,6 +212,21 @@ class RegressionMonitor:
     def _post(self, path: str, payload: Optional[Dict] = None, timeout: int = 60) -> requests.Response:
         url = f"{self.service_url}{path}"
         return requests.post(url, headers=self._headers(), json=payload or {}, timeout=timeout)
+
+    def _github_get(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        timeout: int = GITHUB_API_TIMEOUT_SECONDS,
+    ) -> requests.Response:
+        """GET against the GitHub REST API.
+
+        A separate seam from ``_get`` (which is service-relative and carries
+        the strategy API key): this is absolute-URL, carries a GitHub token,
+        and is the single point tests stub so the freshness check never
+        touches the network.
+        """
+        return requests.get(url, headers=headers, timeout=timeout)
 
     # ------------------------------------------------------------------
     # 1. Endpoint health checks
@@ -1197,6 +1231,186 @@ class RegressionMonitor:
 
         return checks
 
+    # ------------------------------------------------------------------
+    # 7. Deploy freshness — merged vs. deployed (FC-081 follow-up)
+    # ------------------------------------------------------------------
+
+    def check_deploy_freshness(self) -> List[CheckResult]:
+        """Compare the commit this service is running against GitHub `main`.
+
+        The build-failure alert (FC-030/FC-031) watches builds that *start*.
+        This watches for builds that never start: FC-081 was a repo rename that
+        detached the Cloud Build trigger, so `main` ran 16 days ahead of
+        production with no red build and therefore no alert. Cloud Build's own
+        history cannot tell a quiet week from a dead trigger — only GitHub can.
+
+        Exactly one ``CheckResult`` per run:
+
+        =========================================  ======  =================================
+        Condition                                  status  name
+        =========================================  ======  =================================
+        drift beyond the window                    fail    deploy_freshness_drift
+        GitHub 404 on the repo                     fail    deploy_freshness_repo_unreachable
+        ``GIT_COMMIT`` unset                       warn    deploy_freshness_no_commit
+        ``GITHUB_TOKEN`` unset/empty               warn    deploy_freshness_unconfigured
+        401/403/5xx, timeout, malformed JSON       warn    deploy_freshness_github_error
+        in flight / match                          pass    deploy_freshness
+        =========================================  ======  =================================
+
+        ``fail`` makes ``/regression`` return HTTP 500, so it is reserved for
+        the two conditions that genuinely mean "production is not running
+        `main`". A GitHub outage must never 500 the monitor, and an
+        unprovisioned token must never read as ``pass``.
+        """
+        repo = os.environ.get("GITHUB_REPO") or GITHUB_REPO
+
+        raw_max_hours = os.environ.get("DEPLOY_FRESHNESS_MAX_HOURS")
+        try:
+            max_hours = (
+                float(raw_max_hours) if raw_max_hours
+                else DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT
+            )
+        except (TypeError, ValueError):
+            max_hours = DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT
+
+        git_commit = (os.environ.get("GIT_COMMIT") or "").strip()
+        token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+        details: Dict[str, Any] = {
+            "git_commit": git_commit or None,
+            "head_sha": None,
+            "head_age_minutes": None,
+            "max_hours": max_hours,
+            "repo": repo,
+        }
+
+        def _one(name: str, status: str, message: str) -> List[CheckResult]:
+            result = CheckResult(name, status, message, dict(details))
+            self.results.append(result)
+            return [result]
+
+        # Ordered deliberately: without GIT_COMMIT there is nothing to compare
+        # even with a token, so it is the more informative of the two.
+        if not git_commit:
+            return _one(
+                "deploy_freshness_no_commit", "warn",
+                "GIT_COMMIT is not set on this service — cannot compare the "
+                "deployed commit against GitHub main (pre-rollout state)",
+            )
+
+        if not token:
+            return _one(
+                "deploy_freshness_unconfigured", "warn",
+                "GITHUB_TOKEN is not set — deploy freshness cannot be checked",
+            )
+
+        url = f"https://api.github.com/repos/{repo}/commits/main"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        try:
+            resp = self._github_get(
+                url, headers=headers, timeout=GITHUB_API_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return _one(
+                "deploy_freshness_github_error", "warn",
+                f"GitHub request failed: {exc}",
+            )
+
+        status_code = getattr(resp, "status_code", None)
+
+        if status_code == 404:
+            # The FC-081 failure mode itself: the repo was renamed or moved, so
+            # nothing downstream of it (trigger, build, deploy) can be trusted.
+            message = (
+                f"GitHub returned 404 for {repo} — the repo was renamed, moved "
+                f"or is no longer visible to the token. The Cloud Build trigger "
+                f"is almost certainly detached (this is the FC-081 failure mode)."
+            )
+            log_error_event(
+                logger,
+                error_type="deploy_freshness_repo_unreachable",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                repo=repo,
+                git_commit=git_commit,
+            )
+            return _one("deploy_freshness_repo_unreachable", "fail", message)
+
+        if status_code != 200:
+            return _one(
+                "deploy_freshness_github_error", "warn",
+                f"GitHub returned HTTP {status_code} for {repo}",
+            )
+
+        try:
+            body = resp.json()
+            head_sha = body["sha"]
+            head_date_raw = body["commit"]["committer"]["date"]
+            head_date = datetime.fromisoformat(
+                str(head_date_raw).replace("Z", "+00:00")
+            )
+        except Exception as exc:
+            return _one(
+                "deploy_freshness_github_error", "warn",
+                f"Could not read sha/date from the GitHub response: {exc}",
+            )
+
+        if head_date.tzinfo is None:
+            head_date = head_date.replace(tzinfo=timezone.utc)
+
+        head_age_minutes = round(
+            (datetime.now(timezone.utc) - head_date).total_seconds() / 60.0, 1
+        )
+        details["head_sha"] = head_sha
+        details["head_age_minutes"] = head_age_minutes
+
+        # $COMMIT_SHA is full-length, so the common case is a 40-char compare.
+        # A hand-set short GIT_COMMIT is tolerated by prefix, but only at >= 7
+        # characters — shorter prefixes collide often enough to mask real drift.
+        matched = (
+            git_commit == head_sha
+            or (len(git_commit) >= 7 and str(head_sha).startswith(git_commit))
+        )
+
+        if matched:
+            return _one(
+                "deploy_freshness", "pass",
+                f"Deployed commit matches {repo}@main ({head_sha[:7]})",
+            )
+
+        if head_age_minutes / 60.0 > max_hours:
+            message = (
+                f"Deployed commit {git_commit[:7]} does not match "
+                f"{repo}@main {head_sha[:7]}, which was committed "
+                f"{head_age_minutes:.0f}m ago (> {max_hours}h). main is merged "
+                f"but NOT deployed — check the Cloud Build trigger."
+            )
+            log_error_event(
+                logger,
+                error_type="deploy_freshness_drift",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                repo=repo,
+                git_commit=git_commit,
+                head_sha=head_sha,
+                head_age_minutes=head_age_minutes,
+                max_hours=max_hours,
+            )
+            return _one("deploy_freshness_drift", "fail", message)
+
+        return _one(
+            "deploy_freshness", "pass",
+            f"build in flight ({head_age_minutes:.0f}m): {repo}@main "
+            f"{head_sha[:7]} is newer than the deployed {git_commit[:7]}",
+        )
+
     def run_all_checks(self) -> Dict[str, Any]:
         """Execute all regression checks and return a consolidated report."""
         self.results = []
@@ -1209,6 +1423,7 @@ class RegressionMonitor:
             "position_reconciliation": self.check_position_reconciliation,
             "performance_baseline": self.check_performance_baseline,
             "risk_parameters": self.check_risk_parameters,
+            "deploy_freshness": self.check_deploy_freshness,
         }
 
         group_results: Dict[str, List[Dict]] = {}

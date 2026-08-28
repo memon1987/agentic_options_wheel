@@ -376,10 +376,34 @@ Scheduler; **any check with status `fail` makes the endpoint return HTTP 500**.
 Check groups: `endpoint_health`, `trade_execution`, `log_analysis`,
 `position_reconciliation`, `performance_baseline` (**KNOWN DEAD — validates
 nothing: it queries columns/tables that never existed; do not trust its
-"pass". FC-085 owns the fix-or-delete decision**), `risk_parameters`.
+"pass". FC-085 owns the fix-or-delete decision**), `risk_parameters`,
+`deploy_freshness`.
 Since FC-082 (2026-08-27) the monitor's dataset is profile-derived
 (`BQ_DATASET` env survives as explicit override only), and
 `cc-regression-hourly` runs the same checks against the covered-call service.
+
+`deploy_freshness` (FC-081 follow-up) is the only group that looks *outside*
+GCP: it compares the commit the revision was built from (`GIT_COMMIT`, set to
+`$COMMIT_SHA` by all three `cloudbuild.yaml` deploy steps and echoed by
+`/health`) against `GET /repos/{GITHUB_REPO}/commits/main`. It exists because
+the build-failure alert watches builds that *start*, and **a build that never
+starts fires no failure alert** — FC-081's repo rename left `main` undeployed
+for 16 days in silence. It emits exactly one result per run:
+
+| Condition | status | name / log event |
+|---|---|---|
+| `main` ahead of the deployed commit by more than `DEPLOY_FRESHNESS_MAX_HOURS` (default 2.0) | `fail` | `deploy_freshness_drift` |
+| GitHub 404 on the repo (renamed/moved — the FC-081 mode itself) | `fail` | `deploy_freshness_repo_unreachable` |
+| `GIT_COMMIT` unset (pre-rollout) | `warn` | `deploy_freshness_no_commit` |
+| `GITHUB_TOKEN` unset/empty | `warn` | `deploy_freshness_unconfigured` |
+| GitHub 401/403/5xx, timeout, malformed JSON | `warn` | `deploy_freshness_github_error` |
+| SHAs match, or mismatch younger than the window (build in flight) | `pass` | `deploy_freshness` |
+
+The two `fail` rows are emitted through `log_error_event` (which sets
+`event_type` — `log_system_event` does not, FC-047) and are what
+`deploy/monitoring/deploy_freshness_alert_policy.json` matches on. Everything
+else is a `warn` on purpose: `fail` returns HTTP 500 from `/regression`, so a
+GitHub outage or a missing secret must never trip it.
 
 `check_risk_parameters` was synced to the real policy set by FC-069 S1 — four
 checks that mirrored deleted knobs (global position count, cash reserve,

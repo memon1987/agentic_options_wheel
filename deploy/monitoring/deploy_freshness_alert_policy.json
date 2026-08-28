@@ -1,0 +1,26 @@
+{
+  "displayName": "Deploy freshness — main merged but not deployed",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "Deployed commit drifted from GitHub main",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND (jsonPayload.event_type=\"deploy_freshness_drift\" OR jsonPayload.event_type=\"deploy_freshness_repo_unreachable\" OR textPayload:\"deploy_freshness_drift\" OR textPayload:\"deploy_freshness_repo_unreachable\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The hourly /regression deploy-freshness check found that what is SERVING is not what is on GitHub `main`.\n\nTwo events trip this policy:\n\n- `deploy_freshness_drift` — main is ahead of the deployed commit by more than DEPLOY_FRESHNESS_MAX_HOURS (default 2h). The merge happened; the deploy did not.\n- `deploy_freshness_repo_unreachable` — GitHub returned 404 for the repo. The repo was renamed/moved, or the token lost access. This is the FC-081 failure mode itself.\n\nWhy this policy exists: the build-failure alert watches builds that START. A build that never starts fires no failure alert. FC-031 sat undeployed 11 days behind a red build; FC-081 sat undeployed 16 days because a repo rename detached the Cloud Build trigger and no build ever ran.\n\nTriage:\n  # what is serving\n  curl -s https://options-wheel-strategy-799970961417.us-central1.run.app/health | jq .git_commit\n  # what should be serving\n  git ls-remote https://github.com/memon1987/agentic_options_wheel refs/heads/main\n  # did a build even run?\n  gcloud builds list --limit=5\n  gcloud beta builds triggers list\n\nIf no build ran for the merge commit, the trigger is detached — repoint it (this is what FC-081 fixed) rather than deploying by hand.\n\nNote: the check reports `warn`, never `fail`, when GITHUB_TOKEN or GIT_COMMIT is unset, and on any transient GitHub error — so this policy does not fire on a GitHub outage.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    },
+    "autoClose": "86400s"
+  }
+}

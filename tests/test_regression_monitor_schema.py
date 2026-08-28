@@ -207,3 +207,61 @@ def test_module_has_no_hardcoded_dataset_default():
         "module-level BQ_DATASET is back; the dataset must come from "
         "resolve_bq_dataset() so it follows the running profile"
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. Every check group appears in the report
+# ---------------------------------------------------------------------------
+
+# The report's `check_groups` keys are the contract that `/regression`'s
+# consumers (the hourly scheduler's 500-on-fail semantics, and any human
+# reading the JSON) see. A group silently dropped from `run_all_checks` is a
+# detective control that stops running with no other symptom — so the roster is
+# pinned here rather than left implicit.
+EXPECTED_CHECK_GROUPS = [
+    "endpoint_health",
+    "trade_execution",
+    "log_analysis",
+    "position_reconciliation",
+    "performance_baseline",
+    "risk_parameters",
+    "deploy_freshness",
+]
+
+_GROUP_METHODS = {
+    "endpoint_health": "check_endpoints",
+    "trade_execution": "check_trade_execution",
+    "log_analysis": "check_logs",
+    "position_reconciliation": "check_position_reconciliation",
+    "performance_baseline": "check_performance_baseline",
+    "risk_parameters": "check_risk_parameters",
+    "deploy_freshness": "check_deploy_freshness",
+}
+
+
+def test_run_all_checks_reports_every_group(monkeypatch):
+    """`run_all_checks` runs — and reports — exactly the expected roster.
+
+    Each check method is stubbed to return no results, so this exercises group
+    registration without touching HTTP, BigQuery or GitHub.
+    """
+    monitor = RegressionMonitor(service_url="http://test", api_key="k")
+    for method in _GROUP_METHODS.values():
+        monkeypatch.setattr(monitor, method, lambda: [])
+
+    report = monitor.run_all_checks()
+
+    assert list(report["check_groups"].keys()) == EXPECTED_CHECK_GROUPS
+
+
+def test_deploy_freshness_group_is_registered():
+    """FC-081 follow-up: the merged-vs-deployed check must actually be wired.
+
+    Writing `check_deploy_freshness` and forgetting to register it would leave
+    the exact silence the check exists to break.
+    """
+    for group in EXPECTED_CHECK_GROUPS:
+        assert hasattr(RegressionMonitor, _GROUP_METHODS[group]), group
+
+    source = __import__("inspect").getsource(RegressionMonitor.run_all_checks)
+    assert '"deploy_freshness": self.check_deploy_freshness' in source

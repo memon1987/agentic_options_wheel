@@ -1791,6 +1791,12 @@ def detailed_health():
     health_data = {
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
+        # The commit this revision was built from (cloudbuild sets
+        # GIT_COMMIT=$COMMIT_SHA on every deploy). null before the env var
+        # rolls out, or on a locally-run instance. FC-081 follow-up: the
+        # regression monitor compares this against GitHub main; this field is
+        # so a human can eyeball the same thing without running /regression.
+        'git_commit': os.environ.get('GIT_COMMIT') or None,
         'checks': {}
     }
 
