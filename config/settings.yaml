@@ -35,6 +35,15 @@ strategy:
   # See docs/plans/fc-029.md and docs/investigations/strategy-review-2026-05-07.md.
   call_delta_range: [0.15, 0.25]
 
+  # FC-072: how far past mid a covered-call sell-to-open is priced, as a
+  # fraction of the bid/ask spread. 0.0 = exactly at mid (the shipped default);
+  # 0.10 would match the put leg's bias toward the ask. Validated to [0.0, 0.5].
+  # Consumer: CallSeller.execute_call_sale (src/strategy/call_seller.py).
+  # Replaces an unconditional 5%-below-mid discount. Do not flip this without
+  # the fill-rate comparison in docs/plans/fc-072.md — the call leg's 87% fill
+  # rate is the thing being traded away.
+  call_limit_spread_fraction: 0.0
+
   # CRITICAL: Cost basis protection for covered calls
   # Never sell calls below stock cost basis to avoid guaranteed losses
   # This is automatically enforced in code - strikes below cost basis are rejected

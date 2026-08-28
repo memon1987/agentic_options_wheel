@@ -303,6 +303,16 @@ verified 2026-08-04:
 - **Premium floors**: `min_put_premium: 0.50`, `min_call_premium: 0.30`. The put
   floor is a real universe constraint, not a formality — several configured
   symbols cannot clear it at all.
+- **Sell-to-open limit pricing** (FC-072, both profiles): a usable quote prices
+  at `mid + f × (ask − bid)`, where the call leg's `f` is
+  `strategy.call_limit_spread_fraction` (**0.0** = at mid, validated `[0.0, 0.5]`)
+  and the put leg's is a hardcoded `0.10`. A missing, crossed, or stale quote
+  (`spread / mid > 0.5`) falls back to `mid × 0.95` on **both** legs — the
+  shared predicate lives in `src/strategy/limit_pricing.py`. The call leg
+  previously used `mid × 0.95` unconditionally; that 5% discount, not a
+  fill-rate policy, is what FC-072 removed. The knob is the *aggression* dial
+  and moving it trades fill rate for premium — see `docs/plans/fc-072.md` for
+  the 87%-call / 73%-put fill baseline before flipping it.
 - **Universe**: 14 symbols in `stocks.symbols`. The **effective** universe is
   smaller: the `$400` price ceiling and the premium floors exclude several
   symbols entirely, so a symbol that never trades is a *filter* result, not a

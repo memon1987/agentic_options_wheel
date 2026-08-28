@@ -15,6 +15,7 @@ from .cost_basis import (
     opportunity_shares_covered,
     opportunity_total_return_if_called,
 )
+from .limit_pricing import sell_limit_price
 
 logger = structlog.get_logger(__name__)
 
@@ -155,14 +156,48 @@ class CallSeller:
             contracts = opportunity['contracts']
             premium = opportunity['premium']
             
-            # Calculate limit price (slightly below mid to improve fill probability)
-            limit_price = round(premium * 0.95, 2)  # 5% below mid price
-            
+            # Calculate limit price (FC-072). This used to be an unconditional
+            # `round(premium * 0.95, 2)` — 5% below mid on every covered-call
+            # write, whether or not the book supported it. Measured over the
+            # trade journal that discount ran the call leg 5.0% below mid while
+            # the put leg ran 1.0% ABOVE it, an unstated Symmetry violation
+            # worth up to ~$2.3k of forgone premium across 138 fills.
+            #
+            # Now: price at `mid + f * spread` on a usable quote, where `f` is
+            # `strategy.call_limit_spread_fraction` (default 0.0 -> exactly
+            # mid). The put leg's +10%-of-spread bias is deliberately NOT
+            # ported here in this change: the same measurement showed calls
+            # filling 87% priced below mid against puts at 73% priced above it,
+            # so the aggression is a second, separately-measured step the
+            # operator flips via config once fill data exists.
+            #
+            # The fallback (`mid * 0.95`) is unchanged and fires on a missing,
+            # crossed, or stale quote — see src/strategy/limit_pricing.py for
+            # the shared predicate and the spread sanity cap, which both legs
+            # now use so they cannot drift.
+            bid = opportunity.get('bid')
+            ask = opportunity.get('ask')
+            limit_price, spread, applied_spread_fraction = sell_limit_price(
+                mid=premium,
+                bid=bid,
+                ask=ask,
+                spread_fraction=self.config.call_limit_spread_fraction,
+            )
+
             logger.info("Executing covered call sale",
                        event_category="trade",
                        event_type="call_sale_executing",
                        symbol=option_symbol,
                        contracts=contracts,
+                       premium=premium,
+                       bid=bid,
+                       ask=ask,
+                       spread=round(spread, 2) if spread is not None else None,
+                       # The fraction ACTUALLY applied: None means the fallback
+                       # fired, so a fill-rate study can separate priced-at-mid
+                       # writes from degraded-quote writes without a second
+                       # change.
+                       spread_fraction=applied_spread_fraction,
                        limit_price=limit_price)
             
             # Place the sell order

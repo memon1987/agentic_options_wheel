@@ -51,6 +51,14 @@ strategy:
   call_delta_range: [0.15, 0.25]
   # Minimum acceptable call premium (per share).
   min_call_premium: 0.30
+  # FC-072: how far past mid a sell-to-open is priced, as a fraction of the
+  # bid/ask spread. 0.0 = exactly at mid. Validated to [0.0, 0.5].
+  # Consumer: CallSeller.execute_call_sale (src/strategy/call_seller.py).
+  # Starts at the wheel's value on purpose (FC-072 open question: this profile's
+  # 14-DTE calls are richer and its spreads tighter, so it is the likelier
+  # candidate for 0.10 — but one variable at a time, and this profile has no
+  # fill-rate baseline of its own yet).
+  call_limit_spread_fraction: 0.0
   # Strike floor: the hard `strike >= avg_entry_price` rule is enforced by the
   # shared CostBasisResolver (FC-050/FC-065) on the execute path — there is no
   # config knob for it (a `floor_mode` key was removed here: it had no consumer,

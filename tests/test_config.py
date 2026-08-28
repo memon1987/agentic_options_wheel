@@ -257,3 +257,74 @@ class TestTheRollerEnvOverrides:
         path = _settings(tmp_path)
         monkeypatch.setenv("ROLLER_DRY_RUN", "sometimes")
         assert Config(path).roller_dry_run is False
+
+# Sentinel for "delete this key", distinct from any legal yaml value.
+_ABSENT = object()
+
+
+def _settings_strategy(tmp_path, **strategy_overrides):
+    """The shipped wheel config with `strategy` keys overridden or removed.
+
+    A value of ``_ABSENT`` deletes the key, which is how the "profile omits the
+    knob entirely" case is exercised against the real config rather than a
+    hand-rolled stub.
+    """
+    with open(REPO / 'config' / 'settings.yaml') as fh:
+        data = yaml.safe_load(fh)
+    for key, value in strategy_overrides.items():
+        if value is _ABSENT:
+            data['strategy'].pop(key, None)
+        else:
+            data['strategy'][key] = value
+    path = tmp_path / 'settings.yaml'
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+class TestCallLimitSpreadFractionFC072:
+    """FC-072: `strategy.call_limit_spread_fraction`, the call leg's pricing knob.
+
+    The bounds are the point. Below 0.0 is "price the call under mid" — the 5%
+    donation FC-072 removed, which must not be reintroducible by a config edit.
+    Above 0.5 is a limit outside the book: at f=0.5 the limit sits exactly on
+    the ask, and beyond it the order cannot fill until the market moves to it.
+    """
+
+    def test_both_shipped_profiles_price_at_mid(self):
+        """Both profiles must carry the key — a knob added to one profile and
+        forgotten on the other is this repo's documented failure mode
+        (FC-069 S1 found six such keys)."""
+        for profile in ('settings.yaml', 'covered_call.yaml'):
+            with open(REPO / 'config' / profile) as fh:
+                strategy = yaml.safe_load(fh)['strategy']
+            assert 'call_limit_spread_fraction' in strategy, profile
+            assert strategy['call_limit_spread_fraction'] == 0.0, profile
+
+    def test_the_shipped_wheel_config_reads_zero(self):
+        config = Config(str(REPO / 'config' / 'settings.yaml'))
+        assert config.call_limit_spread_fraction == 0.0
+
+    def test_the_default_is_zero_when_the_key_is_absent(self, tmp_path):
+        """A profile that omits the knob prices at mid rather than failing to
+        load — and, critically, does NOT fall back to the old 5% discount."""
+        config = Config(_settings_strategy(
+            tmp_path, call_limit_spread_fraction=_ABSENT))
+        assert config.call_limit_spread_fraction == 0.0
+
+    def test_a_configured_value_is_read_back(self, tmp_path):
+        config = Config(_settings_strategy(
+            tmp_path, call_limit_spread_fraction=0.10))
+        assert config.call_limit_spread_fraction == 0.10
+
+    @pytest.mark.parametrize("bad", [0.6, 1.0, -0.01, -0.10, 'mid', None, True])
+    def test_out_of_bounds_values_are_refused_at_load(self, tmp_path, bad):
+        """Refused at load, not clamped at use: a config that means something
+        other than what it says must not start."""
+        with pytest.raises(ValueError, match='call_limit_spread_fraction'):
+            Config(_settings_strategy(tmp_path, call_limit_spread_fraction=bad))
+
+    @pytest.mark.parametrize("ok", [0.0, 0.05, 0.10, 0.5])
+    def test_the_inclusive_bounds_load(self, tmp_path, ok):
+        config = Config(_settings_strategy(
+            tmp_path, call_limit_spread_fraction=ok))
+        assert config.call_limit_spread_fraction == ok

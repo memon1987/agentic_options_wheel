@@ -340,3 +340,139 @@ class TestPutSellerEarlyClose:
 
         result = self.put_seller.should_close_put_early(position)
         assert result is False
+
+
+class TestPutLimitPricingSanityCapFC072:
+    """FC-072: the put leg keeps its formula and gains the spread sanity cap.
+
+    The pricing change in FC-072 is the CALL leg's. The put leg is touched only
+    because the Symmetry Principle says a fix on one leg is applied to both
+    unless the difference is justified: the call leg gained a cap that rejects
+    a stale or crossed book, and the put leg had none — it would price
+    ``mid + 10% of spread`` off any two numbers the chain handed it, including
+    a crossed one, where the "spread" is negative and the bias inverts.
+
+    ``mid + 10% of spread`` on a normal quote is deliberately unchanged, and
+    the first test pins that with a fixture value so a future refactor of the
+    shared helper cannot quietly re-price the put leg.
+    """
+
+    def _seller(self):
+        self.mock_alpaca = Mock()
+        self.mock_alpaca.get_account.return_value = {
+            'portfolio_value': 100000.0,
+            'buying_power': 50000.0,
+            'options_buying_power': 50000.0,
+        }
+        self.mock_alpaca.place_option_order.return_value = {
+            'success': True, 'order_id': 'order-fc072-put', 'status': 'new',
+        }
+        return PutSeller(self.mock_alpaca, Mock(), Mock(spec=Config))
+
+    @staticmethod
+    def _opportunity(**kw):
+        """The shape OptionsScanner._create_put_opportunity emits.
+
+        Mid is $1.44 — the measured average put premium, which is exactly why
+        the missing tick question never surfaced on this leg (it rarely crosses
+        $3.00).
+        """
+        opp = {
+            'type': 'put',
+            'symbol': 'AAPL',
+            'option_symbol': 'AAPL260821P00290000',
+            'strike_price': 290.0,
+            'premium': 1.44,
+            'bid': 1.40,
+            'ask': 1.50,
+            'dte': 7,
+            'contracts': 1,
+        }
+        opp.update(kw)
+        return opp
+
+    def _limit_of(self, opportunity):
+        seller = self._seller()
+        result = seller.execute_put_sale(opportunity)
+        assert result['success'] is True
+        kwargs = self.mock_alpaca.place_option_order.call_args.kwargs
+        assert result['limit_price'] == kwargs['limit_price']
+        return kwargs['limit_price']
+
+    def test_a_normal_quote_prices_exactly_as_it_did_before_fc072(self):
+        """Pinned fixture value: 1.44 + 0.10 * (1.50 - 1.40) = 1.45.
+
+        This is the no-regression assertion for the whole put leg. If the
+        shared helper ever changes the put formula, this fails.
+        """
+        assert self._limit_of(self._opportunity()) == 1.45
+
+    def test_the_put_bias_is_still_above_mid(self):
+        """The put leg is the aggressive one; that asymmetry is deliberate and
+        survives FC-072."""
+        limit = self._limit_of(self._opportunity())
+        assert limit > 1.44
+
+    def test_a_wider_normal_spread_still_prices_off_the_formula(self):
+        """1.44 + 0.10 * (1.80 - 1.10) = 1.51. spread/mid = 0.486 <= 0.5, so
+        this is admitted, not capped — the cap must not eat ordinary width."""
+        assert self._limit_of(self._opportunity(bid=1.10, ask=1.80)) == 1.51
+
+    def test_a_stale_quote_wider_than_half_of_mid_falls_back(self):
+        """NEW in FC-072. spread/mid = 1.00/1.44 = 0.69 > 0.5.
+
+        Pre-fix this priced at 1.44 + 0.10 = 1.54 off a book that is not a
+        market. Now: round(1.44 * 0.95, 2) = 1.37.
+        """
+        assert self._limit_of(self._opportunity(bid=1.00, ask=2.00)) == 1.37
+
+    def test_a_crossed_quote_falls_back(self):
+        """NEW in FC-072. ask < bid meant a NEGATIVE spread, and
+        `premium + spread * 0.10` priced the put BELOW mid — the exact
+        donation this FC exists to stop, on the leg that was supposed to be
+        the disciplined one."""
+        assert self._limit_of(self._opportunity(bid=1.50, ask=1.40)) == 1.37
+
+    def test_a_missing_quote_still_falls_back(self):
+        """Unchanged behavior, pinned so the rewrite cannot lose it."""
+        opp = self._opportunity()
+        del opp['bid']
+        del opp['ask']
+        assert self._limit_of(opp) == 1.37
+
+    def test_the_executing_event_carries_the_applied_fraction(self):
+        """Symmetry: the call leg's new `spread_fraction` field exists on this
+        leg too, so one BigQuery query can compare the two legs' pricing."""
+        seller = self._seller()
+        with patch('src.strategy.put_seller.logger') as mock_logger:
+            result = seller.execute_put_sale(self._opportunity())
+        assert result['success'] is True
+        events = [c.kwargs for c in mock_logger.info.call_args_list
+                  if c.kwargs.get('event_type') == 'put_sale_executing']
+        assert len(events) == 1
+        assert events[0]['spread_fraction'] == 0.10
+        assert events[0]['spread'] == 0.10
+        assert events[0]['limit_price'] == 1.45
+
+    def test_a_capped_quote_reports_no_applied_fraction(self):
+        seller = self._seller()
+        with patch('src.strategy.put_seller.logger') as mock_logger:
+            seller.execute_put_sale(self._opportunity(bid=1.00, ask=2.00))
+        events = [c.kwargs for c in mock_logger.info.call_args_list
+                  if c.kwargs.get('event_type') == 'put_sale_executing']
+        assert events[0]['spread_fraction'] is None
+        assert events[0]['spread'] == 1.00
+
+    def test_the_buying_power_gate_still_runs_before_pricing(self):
+        """Guardrail: FC-072 must not have moved order submission ahead of the
+        collateral check."""
+        seller = self._seller()
+        self.mock_alpaca.get_account.return_value = {
+            'portfolio_value': 100000.0,
+            'buying_power': 100.0,
+            'options_buying_power': 100.0,
+        }
+        result = seller.execute_put_sale(self._opportunity())
+        assert result['success'] is False
+        assert result['error'] == 'insufficient_buying_power'
+        self.mock_alpaca.place_option_order.assert_not_called()

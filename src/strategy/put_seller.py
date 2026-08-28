@@ -10,8 +10,14 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
+from .limit_pricing import sell_limit_price
 
 logger = structlog.get_logger(__name__)
+
+# Fraction of the bid/ask spread the put leg adds to mid when the quote is
+# usable — biased toward the ask for premium collection. Historical value,
+# unchanged by FC-072 and deliberately not a config key (see execute_put_sale).
+PUT_LIMIT_SPREAD_FRACTION = 0.10
 
 
 class PutSeller:
@@ -230,16 +236,26 @@ class PutSeller:
                         'timestamp': clock.now().isoformat()
                     }
 
-            # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
+            # Calculate limit price: mid + 10% of spread (biased toward ask for
+            # premium collection). The formula is unchanged by FC-072; what is
+            # new is the shared usability predicate underneath it — in
+            # particular the spread sanity cap (a book wider than half of mid
+            # is stale or crossed, and its midpoint is noise). Before FC-072
+            # this leg would happily price off a crossed quote. A normal quote
+            # prices exactly as it did.
+            #
+            # PUT_LIMIT_SPREAD_FRACTION stays hardcoded on purpose: FC-072 gave
+            # the CALL leg a config knob because that leg is the one being
+            # moved and measured. Making both legs configurable in the same
+            # change would put two variables in flight at once.
             bid = opportunity.get('bid')
             ask = opportunity.get('ask')
-
-            if bid and ask:
-                spread = ask - bid
-                limit_price = round(premium + (spread * 0.10), 2)
-            else:
-                # Fallback if bid/ask not available
-                limit_price = round(premium * 0.95, 2)
+            limit_price, spread, applied_spread_fraction = sell_limit_price(
+                mid=premium,
+                bid=bid,
+                ask=ask,
+                spread_fraction=PUT_LIMIT_SPREAD_FRACTION,
+            )
 
             logger.info("Executing put sale",
                        event_category="trade",
@@ -249,7 +265,9 @@ class PutSeller:
                        premium=premium,
                        bid=bid,
                        ask=ask,
-                       spread=round(ask - bid, 2) if bid and ask else None,
+                       spread=round(spread, 2) if spread is not None else None,
+                       # None when the fallback fired — see the call leg.
+                       spread_fraction=applied_spread_fraction,
                        limit_price=limit_price,
                        collateral_required=collateral_required)
 

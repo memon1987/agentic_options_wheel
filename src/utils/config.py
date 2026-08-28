@@ -209,6 +209,24 @@ class Config:
         if len(call_delta) != 2 or not (0 <= call_delta[0] <= call_delta[1] <= 1):
             errors.append(f"call_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {call_delta})")
 
+        # FC-072: how far past mid a covered-call sell-to-open may be priced, as
+        # a fraction of the bid/ask spread. Bounded on BOTH sides on purpose:
+        #  - negative is rejected because "price below mid" is precisely the 5%
+        #    donation FC-072 removed; reintroducing it must be a code change
+        #    with a plan behind it, not a config flip.
+        #  - 0.5 is the ceiling because at f=0.5 the limit sits at the ask, and
+        #    anything beyond that is a limit outside the book — a resting order
+        #    that cannot fill until the market moves to it.
+        # Consumer: CallSeller.execute_call_sale (src/strategy/call_seller.py).
+        call_spread_fraction = strategy.get('call_limit_spread_fraction', 0.0)
+        if (isinstance(call_spread_fraction, bool)
+                or not isinstance(call_spread_fraction, (int, float))
+                or not (0.0 <= call_spread_fraction <= 0.5)):
+            errors.append(
+                "call_limit_spread_fraction must be a number in [0.0, 0.5] "
+                f"(got {call_spread_fraction!r})"
+            )
+
         # FC-013 DD-3 lookahead invariant. The call leg's span test asks "does
         # this candidate's expiry fall on or after the next earnings date" — a
         # question the calendar can only answer for expiries inside its own
@@ -473,6 +491,22 @@ class Config:
     def call_delta_range(self) -> List[float]:
         """Delta range for call options."""
         return self._config["strategy"]["call_delta_range"]
+
+    @property
+    def call_limit_spread_fraction(self) -> float:
+        """Fraction of the bid/ask spread added to mid when pricing a call sale.
+
+        FC-072. ``0.0`` (the default, and both shipped profiles' value) prices a
+        covered-call sell-to-open exactly at the chain midpoint; ``0.10`` would
+        match the put leg's bias toward the ask. Validated to ``[0.0, 0.5]``.
+        Consumed by ``CallSeller.execute_call_sale``; a degraded quote ignores
+        it and takes the ``mid * 0.95`` fallback.
+
+        ``.get`` with a default rather than a hard key read: the knob is
+        optional by design, so a profile that omits it prices at mid rather
+        than failing to load.
+        """
+        return float(self._config["strategy"].get("call_limit_spread_fraction", 0.0))
 
     # FC-069 S1 (item 9) deleted `call_drawdown_pause_threshold`. The pause is
     # dead by operator decision (FC-065 OQ-3), FC-068 deleted its last
