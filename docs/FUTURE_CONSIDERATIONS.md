@@ -982,7 +982,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-084: cloudbuild canary chains assume "newest revision = my canary" — races under concurrent builds
 
-**Status:** Filed 2026-08-27 (PR #91 CI/CD review)
+**Status:** CLOSED 2026-08-28 — PR #95 (`9a8f863`), plan `docs/plans/fc-084.md`. Mechanism: per-trigger build serialization (newer build → SUPERSEDED exit 0; older still running → wait), deterministic `--revision-suffix=<sha7>-<buildid8>`, promote `--to-latest` after asserting `latestReadyRevisionName` is this build's revision (or an env-only revision on its image). Live drill passed the same day. Note: the fix direction this entry originally proposed (`--to-revisions` pinning) was rejected in review — it permanently breaks `--update-env-vars` kill switches.
 **Scope:** shared (all three services' deploy chains: wheel, dashboard, covered-call)
 **Size estimate:** S
 **Owner:** unassigned
