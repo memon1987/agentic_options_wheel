@@ -462,6 +462,12 @@ deltas for the same kind of reason.
   - BigQuery `options_wheel.backtest_runs` — screening results (see
     `docs/bigquery/backtest_runs.md`)
   - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
+  - Google Cloud Storage: `gs://options-wheel-chain-lake/chains/v1/` — the
+    **chain lake** (FC-060 Layer 1): the point-in-time option chains the
+    backtest engine replays, one parquet per `<UNDERLYING>/<YYYY-MM-DD>`,
+    mirrored write-through from `ChainStore`. It is *input data for
+    simulations*, never a record of what the bot did — see the backtest
+    exception below.
   - Cloud Run dashboard endpoints
 - This ensures analysis reflects production-ready, persistent, centralized data.
 

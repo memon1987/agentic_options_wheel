@@ -254,12 +254,53 @@ deploy. Recorded because the same mistakes are easy to repeat:
 3. **Timeout.** It said `3600s`. The real run takes **1h47m**, so an hour would have timed
    out. Now `10800s`.
 
+### The chain lake (FC-060 Layer 1)
+
+Cloud Run's filesystem is ephemeral, so the local parquet chain cache is thrown away after
+every monthly run and every screen was cold. The **chain lake** is a GCS mirror of that
+cache, and `ChainStore` uses it write-through:
+
+| | |
+|---|---|
+| Bucket | `gs://options-wheel-chain-lake` (operator-provisioned; versioning on) |
+| Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, byte-identical |
+| Env | `CHAIN_LAKE_BUCKET` (unset ⇒ **no lake, no GCS client, behaviour identical to before**), `CHAIN_LAKE_PREFIX` (default `chains/v1`) |
+| Where it is read | `ChainStore.from_env()` in `src/backtesting/evaluate.py` — the Job, the CLI and the diagnostics all go through it |
+| Seed | `python tools/diagnostics/chain_lake_seed.py --cache-dir cache/backtest/chains --bucket options-wheel-chain-lake` |
+
+- **A local miss tries the lake before the provider**; a chain built from the provider is
+  uploaded after the atomic local write. A chain for a settled session never changes, so
+  there is no TTL and no invalidation — the object is immutable by construction.
+- **The coverage check is unchanged and still governs.** A lake-sourced file goes through
+  `_covers` and the narrowing read path exactly as a local file does, so a warm run and a
+  cold run return the identical chain. The lake moves files; it never answers questions.
+- **A lake failure is never fatal.** Every lake call is wrapped: the failure is logged as
+  `chain_lake_error` and the run continues local-only. A GCS hiccup must not turn a
+  two-hour screen into a failed execution.
+- **Measure it from the logs.** Each symbol emits one `chain_lake_summary` with
+  `lake_hits / lake_misses / lake_puts / lake_errors`. On a warm run expect hits ≫ puts;
+  `lake_errors > 0` means the run silently degraded to local-only and the lake is not
+  actually protecting anything.
+- **Corrupt files self-heal on both sides**: an unreadable local file is deleted *and* its
+  mirror is deleted (`chain_lake_corrupt_delete`), so a bad object cannot be re-downloaded
+  forever.
+- **Prefix is the format version.** The parquet schema (`_COLUMNS` plus the provenance
+  columns) is the contract for these objects; bump `chains/v1` if it ever changes
+  incompatibly rather than mixing generations in one prefix.
+- **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.
+
 ### Operating notes
 
-- **~5.5 min/symbol**, and the cache never warms — Cloud Run's filesystem is ephemeral, so
-  every run is cold. Roughly 16 of those minutes are spent building chains for F, PFE and VZ
+- **~5.5 min/symbol on a cold run.** Before FC-060 the cache never warmed — Cloud Run's
+  filesystem is ephemeral, so every run paid the full ~1h47m. With `CHAIN_LAKE_BUCKET` set
+  and the lake seeded, only the days since the previous run are fetched from Alpaca and the
+  rest are downloaded; the expected steady state is a small fraction of that. **Record the
+  measured runtime of the first warm execution here** — the number above is the cold-run
+  figure and should not be quoted as current once the lake is live.
+- Roughly 16 of those cold minutes are spent building chains for F, PFE and VZ
   only to discover no put clears the `$0.50` floor: they pass the price band, so the engine
-  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned.
+  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned. The
+  lake removes the *fetch* cost of those days, not the decision cost.
 - **Schedule is 02:00 ET deliberately.** A ~2h run must not overlap the trading session; the
   previous `0 12 1 * *` (08:00 ET) would have finished ~09:47 ET, on top of the open and
   contending with the live bot for the same Alpaca quota.

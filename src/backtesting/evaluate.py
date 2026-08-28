@@ -69,7 +69,10 @@ def evaluate_symbol(
     # different fill assumption — without a cache that pays the full API bill
     # twice over for chains that cannot differ between the two passes.
     if use_cache and chain_store is None:
-        chain_store = ChainStore()
+        # from_env, not ChainStore(): mirrors the local cache to the GCS chain
+        # lake when CHAIN_LAKE_BUCKET is set (FC-060 Layer 1). Unset — every
+        # local run without the env var — it is exactly ChainStore().
+        chain_store = ChainStore.from_env()
     builder = ChainBuilder(provider, store=chain_store if use_cache else None)
     max_dte = getattr(config, "put_target_dte", 7)
     # ONE schedule for both legs. The wheel's dividends come from this table via
@@ -109,6 +112,16 @@ def evaluate_symbol(
                 symbol=symbol, mid_verdict=report.verdict(),
                 bid_verdict=bid_report.verdict(),
             )
+    # One line per symbol, only when a lake is configured — with no lake the
+    # logs must stay byte-identical to the pre-FC-060 engine. This is how the
+    # first warm monthly screen is measurable: hits >> puts means the lake is
+    # carrying the run, and lake_errors > 0 means it silently degraded.
+    if chain_store is not None and chain_store.lake is not None:
+        logger.info(
+            "Chain lake usage for this symbol",
+            event_category="backtest_data", event_type="chain_lake_summary",
+            symbol=symbol, **chain_store.summary(),
+        )
     return report, sensitivity
 
 
