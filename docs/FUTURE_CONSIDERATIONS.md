@@ -811,7 +811,7 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ### FC-072: call-side limit pricing never received the put side's spread-aware improvement
 
-**Status:** Executing — plan `docs/plans/fc-072.md` **rev 2** (execute-time re-quote on both legs, tick snapping, corrected economics); PR #97; rev-2 reviews → REQUEST_CHANGES ×2 → fix round in progress. **The premise of this entry was falsified in review:** the `mid×0.95` call limit sat ≈ at the bid, and realized Σ(mid − fill) on 66 journaled call fills was −$87 — the discount was never money; quote staleness (`/scan` :00 → `/run` :15) is the variable. See the plan's §Context. **Real-money precondition surfaced:** the account's option quotes are Alpaca's *indicative* feed (OPRA agreement unsigned) — operator decision before any live account.
+**Status:** CLOSED 2026-08-28 — merged PR #97 (`90ad3e5`), plan `docs/plans/fc-072.md` §Execution (rev 2). **The premise of this entry was falsified in review:** the `mid×0.95` call limit sat ≈ at the bid and realized Σ(mid − fill) on 66 journaled call fills was −$87 — the discount was never money; quote staleness (`/scan` :00 → `/run` :15) was the variable. What shipped: execute-time re-quote on both legs, tick snapping (a live-account correctness fix), journal consistency, corrected economics. Readout due 2026-09-11 (fill rate by `quote_source` × leg vs a 75–80% baseline). **Real-money precondition:** the account's option quotes are Alpaca's *indicative* feed (OPRA unsigned).
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
