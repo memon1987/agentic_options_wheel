@@ -106,7 +106,7 @@ therefore **still un-snapped above $3.00** (paper-only today; its own FC).
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import structlog
@@ -423,7 +423,8 @@ def refresh_quote(alpaca: Any, option_symbol: str,
     )
 
 
-def round_to_tick(value: Decimal, underlying: str = "") -> Tuple[float, bool]:
+def round_to_tick(value: Decimal, underlying: str = "",
+                  not_above: Optional[Decimal] = None) -> Tuple[float, bool]:
     """Round a SELL limit to a legal increment. Returns ``(price, snapped)``.
 
     Always-penny roots round to the cent, half-up, at every price level.
@@ -434,15 +435,27 @@ def round_to_tick(value: Decimal, underlying: str = "") -> Tuple[float, bool]:
     The $3.00 test is on the UNROUNDED value: a raw 2.995 is a sub-$3 price, so
     it rounds half-up to 3.00 -- which is itself on a $0.05 tick, so nothing is
     lost by not re-testing after rounding.
+
+    ``not_above`` (the ask, on the usable-book path) is the one exception to
+    rounding up. On a book straddling $3.00 the next legal $0.05 tick can sit
+    ABOVE the ask -- 2.98/3.03 prices a raw 3.005, whose next legal price is
+    3.05, outside the book -- and a sell limit above the ask can never fill.
+    When that happens the limit rounds DOWN to the previous legal tick instead
+    (3.00 here), which is inside the book and marketable at worst. Conceding
+    half a cent beats an order that cannot trade. There is no bound on the
+    premium-fallback path, which has no usable ask to bound it with.
     """
     _warn_if_unverified(underlying)
     cent = value.quantize(_PENNY, rounding=ROUND_HALF_UP)
-    if tick_size(value, underlying) == _NICKEL:
-        nickel = (value / _NICKEL).to_integral_value(
-            rounding=ROUND_CEILING) * _NICKEL
-        nickel = nickel.quantize(_PENNY)
-        return float(nickel), nickel != cent
-    return float(cent), False
+    if tick_size(value, underlying) != _NICKEL:
+        return float(cent), False
+
+    ticks = value / _NICKEL
+    up = (ticks.to_integral_value(rounding=ROUND_CEILING) * _NICKEL).quantize(_PENNY)
+    if not_above is not None and up > not_above:
+        down = (ticks.to_integral_value(rounding=ROUND_FLOOR) * _NICKEL).quantize(_PENNY)
+        return float(down), down != cent
+    return float(up), up != cent
 
 
 def sell_limit_price(bid: Any, ask: Any, fallback_premium: Any,
@@ -474,13 +487,19 @@ def sell_limit_price(bid: Any, ask: Any, fallback_premium: Any,
         # market are the bid and the ask, and "mid rounded half-up" is the ask
         # under another name. Resting at the ask on a low-delta call costs more
         # in missed cycles than it captures, so take the bid.
-        if spread_d == tick_size(mid_d, underlying):
+        #
+        # The tick is measured at the BID, not the mid. A book straddling $3.00
+        # -- 2.98/3.03 -- has a 5c spread and a mid above $3.00, so a mid-based
+        # test called it one tick wide and priced it at 2.98. It is not: 2.99
+        # and 3.00 are both legal prices inside it. The tick that defines "one
+        # tick wide" is the increment the book's own bid is quoted in.
+        if spread_d == tick_size(bid_d, underlying):
             _warn_if_unverified(underlying)
             return PricedLimit(float(bid_d), float(mid_d), float(spread_d),
                                float(spread_fraction), False, True)
 
         raw = mid_d + _dec(spread_fraction) * spread_d
-        limit, snapped = round_to_tick(raw, underlying)
+        limit, snapped = round_to_tick(raw, underlying, not_above=ask_d)
         return PricedLimit(limit, float(mid_d), float(spread_d),
                            float(spread_fraction), snapped, False)
 

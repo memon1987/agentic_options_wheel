@@ -335,17 +335,25 @@ verified 2026-08-04:
     A genuine **non-penny class ticks $0.05/$0.10** — increments this code
     deliberately **cannot emit**, because no such root is tradeable here and an
     untested third regime is worse than a loud warning. A non-conforming limit
-    is rejected when no exchange accepts it, and sell limits snap **up**.
+    is rejected when no exchange accepts it, and sell limits snap **up** — with
+    one exception: on a book straddling $3.00 the next legal $0.05 tick can
+    sit *above the ask* (2.98/3.03 prices a raw 3.005, whose next legal price
+    is 3.05), and a sell limit above the ask can never fill, so it rounds
+    **down** to the last legal tick inside the book instead — marketable beats
+    unfillable.
     **The paper simulator does not enforce increments**, so paper history is
     not evidence that a live account would accept an off-tick limit. Below the
     $0.05 regime the cent rounding is `ROUND_HALF_UP` on the exact decimal, not
     `round()` — banker's rounding over floats put a half-cent mid on the bid or
     the ask by luck.
-  - **A one-tick book prices at the bid**, flagged `one_tick_book`. When the
-    spread is exactly one tick there is no midpoint to rest at and "mid rounded
-    half-up" is the ask by another name; on a 0.15–0.25Δ call, resting there
-    costs more in missed cycles (≈−$30 on the journal sample) than the spread
-    it captures (≈+$6).
+  - **A one-tick book prices at the bid**, flagged `one_tick_book`, **on both
+    legs**. When the spread is exactly one tick — measured at the *bid*, since a
+    book straddling $3.00 is five ticks wide, not one — there is no midpoint to
+    rest at and "mid rounded half-up" is the ask by another name; resting there
+    on a DAY order risks a full cycle of theta to gain a cent. On a 0.15–0.25Δ
+    call that is ≈−$30 in missed cycles against ≈+$6 of spread. The put leg
+    inherits the rule by Symmetry, at a measured cost of −$1/contract on 5 of
+    118 journaled rows — accepted deliberately (see `docs/plans/fc-072.md`).
   - **These are INDICATIVE quotes, not NBBO.** `alpaca_client.OPTION_QUOTE_FEED`
     is `"indicative"` and is passed explicitly on every option quote, because
     the **OPRA agreement is not signed**. Indicative is an *adjusted* BBO: fine

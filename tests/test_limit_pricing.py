@@ -477,10 +477,17 @@ class TestOneTickBooksFC072Review:
 
     def test_a_one_cent_book_above_three_dollars_is_NOT_one_tick_for_aapl(self):
         """On a penny-program root at $3+, one tick is $0.05 — a $0.01 book is
-        a sub-tick quote, so the normal formula runs (and snaps up)."""
+        a SUB-tick quote (the broker should not be showing it), so the one-tick
+        rule does not apply.
+
+        Snapping up would land on 3.25, above the ask, where the order could
+        never fill; the limit rounds down to 3.20 instead. Marketable beats
+        unfillable.
+        """
         priced = sell_limit_price(3.20, 3.21, 3.205, 0.0, "AAPL")
         assert priced.one_tick_book is False
-        assert priced.limit_price == 3.25
+        assert priced.limit_price == 3.20
+        assert priced.limit_price <= 3.21, "a sell limit above the ask cannot fill"
 
     def test_a_one_cent_book_above_three_dollars_IS_one_tick_for_spy(self):
         """SPY is penny at every level, so $0.01 is one tick even at $3+."""
@@ -652,3 +659,129 @@ class TestSharedLogFieldSetsFC072Review:
         assert set(fields) == {'bid', 'ask', 'mid', 'quote_source',
                                'quote_age_s', 'tick_snapped'}
         assert (fields['bid'], fields['ask'], fields['mid']) == (1.30, 1.50, 1.40)
+
+
+class TestBooksStraddlingThreeDollarsFC072Confirm:
+    """P3: the tick that defines "one tick wide" is the one at the BID.
+
+    A book straddling $3.00 is the case that separates a mid-based test from a
+    bid-based one. 2.98/3.03 is 5c wide with a mid above $3.00, so measuring the
+    tick at the mid called it one tick wide and priced it at the bid, 2.98 —
+    but 2.99 and 3.00 are both legal prices inside that book, so it is five
+    ticks wide, not one, and there was a whole cent of price being given away.
+
+    Where those books land is the other half of the answer. Raw 3.005 is not a
+    legal price: at and above $3.00 the increment is $0.05, so 3.01 through
+    3.04 do not exist. The next legal price UP is 3.05 — above the ask, where a
+    sell order can never fill — so the limit rounds DOWN to 3.00, the only legal
+    price inside the book. Conceding half a cent beats an unfillable order.
+    """
+
+    @pytest.mark.parametrize("bid,ask", [(2.98, 3.03), (2.99, 3.04)])
+    @pytest.mark.parametrize("fraction", [0.0, 0.10, 0.5])
+    def test_a_straddling_book_is_not_one_tick_wide(self, bid, ask, fraction):
+        priced = sell_limit_price(bid, ask, (bid + ask) / 2, fraction, "NVDA")
+        assert priced.one_tick_book is False, (
+            "measuring the tick at the mid called this one tick wide")
+        assert priced.limit_price != bid, "and priced it at the bid"
+
+    @pytest.mark.parametrize("bid,ask", [(2.98, 3.03), (2.99, 3.04)])
+    @pytest.mark.parametrize("fraction", [0.0, 0.10, 0.5])
+    def test_a_straddling_book_prices_at_the_last_legal_tick_inside_it(
+            self, bid, ask, fraction):
+        """3.00 in every case: 3.01-3.04 are not legal at/above $3.00, and 3.05
+        is outside the book."""
+        priced = sell_limit_price(bid, ask, (bid + ask) / 2, fraction, "NVDA")
+        assert priced.limit_price == 3.00
+
+    @pytest.mark.parametrize("bid,ask", [(2.98, 3.03), (2.99, 3.04)])
+    def test_a_straddling_books_limit_stays_inside_the_book(self, bid, ask):
+        """The invariant that matters: a sell limit above the ask never fills,
+        and one below the bid gives away a cent for nothing."""
+        priced = sell_limit_price(bid, ask, (bid + ask) / 2, 0.0, "NVDA")
+        assert bid <= priced.limit_price <= ask
+
+    def test_an_always_penny_root_straddling_three_dollars_keeps_the_cent(self):
+        """SPY ticks a penny at every level, so its mid is legal as-is and
+        nothing is rounded away. 2.98/3.03 -> mid 3.005 -> 3.01 half-up."""
+        priced = sell_limit_price(2.98, 3.03, 3.005, 0.0, "SPY")
+        assert priced.limit_price == 3.01
+        assert priced.one_tick_book is False
+
+    def test_a_five_cent_book_wholly_above_three_dollars_is_still_one_tick(self):
+        """The bid-based test must not have broken the case it was derived
+        from: 3.05/3.10 has a $0.05 tick at its bid too."""
+        priced = sell_limit_price(3.05, 3.10, 3.075, 0.0, "NVDA")
+        assert priced.one_tick_book is True
+        assert priced.limit_price == 3.05
+
+    def test_a_sell_limit_is_never_snapped_above_the_ask(self):
+        """Swept across every 5c-regime book up to $10: rounding up must never
+        push the limit outside the book."""
+        offenders = []
+        for bid_c in range(295, 1000):
+            for spread_c in (1, 2, 3, 4, 5, 6, 7, 10, 15):
+                bid, ask = bid_c / 100.0, (bid_c + spread_c) / 100.0
+                for fraction in (0.0, 0.10, 0.5):
+                    limit = sell_limit_price(
+                        bid, ask, (bid + ask) / 2, fraction, "NVDA").limit_price
+                    if limit > ask + 1e-9:
+                        offenders.append((bid, ask, fraction, limit))
+        assert offenders == [], offenders[:10]
+
+
+class TestHistoricalPutFormulaSweepFC072Confirm:
+    """P3: the full cent-grid sweep of the put leg below $3.00.
+
+    The claim this pins is narrow and total: on every two-sided cent book below
+    $3.00, the new pricer agrees with the pre-FC-072 put formula
+    ``round(mid + 0.10 * spread, 2)`` EXCEPT on one-cent-wide books, where the
+    one-tick rule deliberately takes the bid. No half-up-vs-banker's divergence,
+    no rounding drift, nothing else.
+
+    That is the acceptance evidence for the put-leg carve-out: the behaviour
+    change on this leg is exactly 1c books and nothing more.
+    """
+
+    @staticmethod
+    def _sweep():
+        agree, differ = [], []
+        for bid_c in range(1, 299):
+            for spread_c in range(1, 56):
+                ask_c = bid_c + spread_c
+                if ask_c > 299:
+                    continue
+                bid, ask = bid_c / 100.0, ask_c / 100.0
+                mid = (bid + ask) / 2
+                historical = round(mid + 0.10 * (ask - bid), 2)
+                new = sell_limit_price(bid, ask, mid, 0.10, "NVDA").limit_price
+                (agree if historical == new else differ).append(
+                    (bid_c, ask_c, spread_c, historical, new))
+        return agree, differ
+
+    def test_every_difference_is_a_one_cent_book_and_every_one_cent_book_differs(self):
+        agree, differ = self._sweep()
+
+        assert len(agree) + len(differ) == 14905, "the sweep itself changed"
+        assert {row[2] for row in differ} == {1}, (
+            "a book wider than one cent priced differently from the historical "
+            "formula: " + str([r for r in differ if r[2] != 1][:5]))
+        assert len(differ) == 298, "every one-cent book in the grid, and only those"
+
+    def test_each_one_cent_difference_is_exactly_one_cent_lower(self):
+        """The carve-out's price: the ask becomes the bid, never more."""
+        _, differ = self._sweep()
+        for bid_c, ask_c, _, historical, new in differ:
+            assert round(historical - new, 2) == 0.01
+            assert new == bid_c / 100.0, "and the new price is the bid"
+
+    def test_no_book_below_three_dollars_is_tick_snapped(self):
+        """Below $3.00 the increment is a cent, so the $0.05 rule must never
+        fire — if it did, the sweep's agreement would be luck."""
+        for bid_c in (1, 57, 150, 298):
+            for spread_c in (2, 7, 33):
+                if bid_c + spread_c > 299:
+                    continue
+                bid, ask = bid_c / 100.0, (bid_c + spread_c) / 100.0
+                priced = sell_limit_price(bid, ask, (bid + ask) / 2, 0.10, "NVDA")
+                assert priced.tick_snapped is False

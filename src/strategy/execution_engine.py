@@ -1050,11 +1050,20 @@ class ExecutionEngine:
                     # `opp`. `**opp` carries the :00 scan blob's bid/ask, and
                     # since FC-072 the limit is priced off a quote refreshed at
                     # :15 — so a row built from the opportunity alone showed a
-                    # live-priced limit sitting next to a 15-minute-old book,
-                    # and `mid_price` was NULL because no opportunity ever had
-                    # that key. Any "where did we price relative to the market"
-                    # analysis read the wrong book. The sellers return the book
-                    # they actually priced off; it wins here.
+                    # live-priced limit sitting next to a 15-minute-old book.
+                    # Any "where did we price relative to the market" analysis
+                    # read the wrong book. The sellers return the book they
+                    # actually priced off; it wins here.
+                    #
+                    # `mid_price` was NOT previously NULL, contrary to an
+                    # earlier draft of this comment: `rank_opportunities` above
+                    # backfills `opp['mid_price'] = opp['premium']`, and all 193
+                    # journaled rows carry `mid_price == premium`. It was the
+                    # SCAN-time mid — which is exactly the value to keep when no
+                    # executing mid exists, so the fallback below is
+                    # `opp.get("mid_price")`, not None. Writing None there would
+                    # have replaced a usable scan mid with a hole on every
+                    # premium-fallback write.
                     #
                     # `.get(..., opp.get(...))` rather than a bare `.get`: a
                     # seller that predates FC-072, or any future producer that
@@ -1069,7 +1078,7 @@ class ExecutionEngine:
                         "limit_price": result.get("limit_price"),
                         "bid": result.get("bid", opp.get("bid")),
                         "ask": result.get("ask", opp.get("ask")),
-                        "mid_price": result.get("mid"),
+                        "mid_price": result["mid"] if result.get("mid") is not None else opp.get("mid_price"),
                     })
                 else:
                     error_message = result.get('message', '') or result.get('error_message', 'Unknown error')

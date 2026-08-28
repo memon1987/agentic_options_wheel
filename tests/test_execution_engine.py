@@ -2041,6 +2041,8 @@ class TestJournalRecordsTheExecutingQuoteFC072:
             self.call_seller.execute_call_sale.return_value = result
         else:
             self.put_seller.execute_put_sale.return_value = result
+        # Reset so a test may journal more than one order and assert on each.
+        self.engine.trade_journal.reset_mock()
         self.engine.execute_batch([opp], self.put_seller,
                                   call_seller=self.call_seller)
         assert self.engine.trade_journal.record_trade.call_count == 1
@@ -2058,10 +2060,34 @@ class TestJournalRecordsTheExecutingQuoteFC072:
         row = self._row(call=True)
         assert (row["bid"], row["ask"], row["mid_price"]) == (1.30, 1.50, 1.40)
 
-    def test_mid_price_is_no_longer_null(self):
-        """No opportunity dict has ever carried `mid_price`, so the column was
-        NULL on every row this engine has ever written."""
-        assert self._row()["mid_price"] is not None
+    def test_journal_mid_price_is_the_executing_mid_else_the_scan_mid(self):
+        """`mid_price` was never NULL, and an earlier version of this test said
+        it was. `rank_opportunities` backfills `opp['mid_price'] =
+        opp['premium']` before execution, and all 193 journaled rows carry
+        `mid_price == premium`. So the column always held the SCAN-time mid.
+
+        What FC-072 changes is that it now holds the EXECUTING mid when one
+        exists. When none does — the premium fallback, where no midpoint priced
+        the order — the scan-time mid is kept rather than overwritten with a
+        hole, which is what a bare `result.get("mid")` would have done on every
+        such write.
+        """
+        # Branch 1: a live quote priced the order -> the executing mid wins.
+        assert self._row()["mid_price"] == 1.40
+
+        # Branch 2: the premium fallback priced it -> the scan mid survives.
+        row = self._row(
+            opp=self._opportunity(mid_price=1.30),
+            result=self._result(mid=None, bid=self.BLOB["bid"],
+                                ask=self.BLOB["ask"], quote_source="blob",
+                                limit_price=1.24))
+        assert row["mid_price"] == 1.30, (
+            "a fallback write must not blank the scan-time mid")
+
+    def test_the_scan_mid_is_not_used_when_an_executing_mid_exists(self):
+        """Mutation guard for the branch above: the fallback must not win."""
+        row = self._row(opp=self._opportunity(mid_price=99.0))
+        assert row["mid_price"] == 1.40
 
     def test_a_blob_priced_order_journals_the_blob_book_it_actually_used(self):
         """The point is provenance, not liveness: whatever priced the order is
