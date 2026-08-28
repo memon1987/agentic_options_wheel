@@ -32,16 +32,34 @@ Needs write access to the bucket (ADC or GOOGLE_APPLICATION_CREDENTIALS) —
 
 Safety
 ------
-Skip-if-exists is the default. An object in the lake is either identical to the
-local file or built from a *wider* request than the local one (the lake is
-shared across machines), and blindly overwriting a wider file with a narrower
-one would turn cache hits into misses for everyone. `--force` overrides that
-and is the only mode that can lose coverage; use it deliberately.
+Skip-if-exists is the default, and the report distinguishes the two kinds of
+skip by comparing the local file's MD5 with the object's:
+
+  * `skipped_identical` — same bytes; nothing to do.
+  * `skipped_differs`  — the object was built from a *different* request. It may
+    well be WIDER than the local file (the lake is shared across machines), and
+    overwriting it would turn cache hits into misses for everyone. These are
+    listed so a human can look before deciding.
+
+`--force` uploads regardless and is the only mode here that can lose coverage.
+It exists for one job: replacing an object known to be bad (unreadable parquet),
+which nothing else in the system will ever do — `ChainStore` deliberately never
+deletes a lake object.
+
+Every upload carries an `if_generation_match` precondition captured at the
+metadata read, so two people seeding at once cannot silently clobber each other;
+a lost race is reported as `failed`, not as a successful upload.
+
+Note `--dry-run` still issues **one metadata RPC per file** (that is how it can
+report identical-vs-differs), so it needs credentials and is not free — it just
+never writes.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import sys
 from dataclasses import dataclass, field
 from datetime import date
@@ -65,15 +83,22 @@ class SeedCounts:
 
     scanned: int = 0
     uploaded: int = 0
-    skipped_existing: int = 0
+    skipped_identical: int = 0
+    skipped_differs: int = 0
     failed: int = 0
     unparseable: int = 0
     errors: List[str] = field(default_factory=list)
+    differs: List[str] = field(default_factory=list)
+
+    @property
+    def skipped_existing(self) -> int:
+        return self.skipped_identical + self.skipped_differs
 
     def as_line(self) -> str:
         return (
             f"scanned={self.scanned} uploaded={self.uploaded} "
-            f"skipped_existing={self.skipped_existing} "
+            f"skipped_identical={self.skipped_identical} "
+            f"skipped_differs={self.skipped_differs} "
             f"unparseable={self.unparseable} failed={self.failed}"
         )
 
@@ -83,6 +108,15 @@ def _as_of(path: Path) -> Optional[date]:
         return date.fromisoformat(path.stem)
     except ValueError:
         return None
+
+
+def local_md5(path: Path) -> str:
+    """Base64 MD5 of a local file, in the same encoding GCS reports."""
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
 
 
 def discover(cache_dir) -> List[Tuple[str, date, Path]]:
@@ -121,17 +155,31 @@ def seed(
     counts.unparseable = sum(1 for p in root.glob("*/*.parquet") if _as_of(p) is None)
     for i, (underlying, as_of, path) in enumerate(discover(cache_dir), start=1):
         counts.scanned += 1
+        label = f"{underlying} {as_of.isoformat()}"
         try:
-            if not force and lake.exists(underlying, as_of):
-                counts.skipped_existing += 1
-            elif dry_run:
+            existing = lake.stat(underlying, as_of)
+            if existing is not None and not force:
+                if existing.md5_hash and existing.md5_hash == local_md5(path):
+                    counts.skipped_identical += 1
+                else:
+                    # Different bytes. It may be WIDER than what we hold, and
+                    # this tool will not gamble on that — report and move on.
+                    counts.skipped_differs += 1
+                    counts.differs.append(label)
+                continue
+            if dry_run:
                 counts.uploaded += 1  # what a real run would have uploaded
-            else:
-                lake.upload(path, underlying, as_of)
-                counts.uploaded += 1
+                continue
+            lake.upload(
+                path,
+                underlying,
+                as_of,
+                if_generation_match=(0 if existing is None else existing.generation),
+            )
+            counts.uploaded += 1
         except Exception as exc:  # noqa: BLE001 - one bad file must not stop the seed
             counts.failed += 1
-            counts.errors.append(f"{underlying} {as_of.isoformat()}: {exc}")
+            counts.errors.append(f"{label}: {type(exc).__name__}: {exc}")
         if progress_every and i % progress_every == 0:
             print(f"  ... {counts.as_line()}", flush=True)
     return counts
@@ -155,7 +203,11 @@ def main(argv=None) -> int:
         print(f"No such cache dir: {root}", file=sys.stderr)
         return 2
 
-    lake = ChainLake(args.bucket, args.prefix)
+    try:
+        lake = ChainLake(args.bucket, args.prefix)
+    except ValueError as exc:
+        print(f"Bad lake configuration: {exc}", file=sys.stderr)
+        return 2
     print(f"Seeding gs://{args.bucket}/{lake.prefix} from {root}"
           f"{' (DRY RUN)' if args.dry_run else ''}"
           f"{' (FORCE)' if args.force else ''}")
@@ -164,6 +216,13 @@ def main(argv=None) -> int:
     print(counts.as_line())
     if counts.unparseable:
         print(f"note: {counts.unparseable} file(s) skipped — filename is not a date")
+    if counts.differs:
+        print(f"note: {len(counts.differs)} object(s) already in the lake differ "
+              f"from the local file and were NOT overwritten:")
+        for label in counts.differs[:20]:
+            print(f"  DIFFERS {label}")
+        if len(counts.differs) > 20:
+            print(f"  ... and {len(counts.differs) - 20} more")
     for err in counts.errors[:20]:
         print(f"  FAILED {err}", file=sys.stderr)
     if len(counts.errors) > 20:

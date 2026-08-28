@@ -467,7 +467,9 @@ deltas for the same kind of reason.
     backtest engine replays, one parquet per `<UNDERLYING>/<YYYY-MM-DD>`,
     mirrored write-through from `ChainStore`. It is *input data for
     simulations*, never a record of what the bot did — see the backtest
-    exception below.
+    exception below. Objects are only ever replaced by a file covering a
+    **wider** request and are never deleted by code; the vendor may not serve
+    these chains again, so treat the bucket as append-mostly history.
   - Cloud Run dashboard endpoints
 - This ensures analysis reflects production-ready, persistent, centralized data.
 

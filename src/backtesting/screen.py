@@ -27,6 +27,7 @@ import structlog
 
 from ..utils.config import Config
 from .data.alpaca_provider import ALPACA_OPTIONS_HISTORY_START, UnadjustedCorporateAction
+from .data.chain_store import ChainStore
 from .evaluate import evaluate_symbol
 from .reporting.bq_writer import BacktestRunWriter, build_row, config_hash
 
@@ -154,11 +155,20 @@ def run_screen(
 
     result = ScreenResult(run_id=run_id, start=start, end=end,
                           run_kind=run_kind, universe_size=len(universe))
+    # ONE lake for the run, shared by the per-symbol stores (FC-060). The GCS
+    # client, the bucket probe and the circuit breaker are then run-scoped: a
+    # dead bucket is discovered once, not once per symbol, and five consecutive
+    # failures switch the lake off for the whole screen rather than for one
+    # symbol at a time.
+    lake = ChainStore.lake_from_env()
+    lake_totals: Dict[str, int] = {}
     for symbol in universe:
+        chain_store = ChainStore(lake=lake) if lake is not None else None
         try:
             report, sensitivity = evaluate_symbol(
                 symbol, start, end, config=config,
                 starting_cash=starting_cash, run_sensitivity=run_sensitivity,
+                chain_store=chain_store,
             )
             result.results.append(SymbolResult(symbol, report, sensitivity))
             logger.info("Screened symbol",
@@ -180,6 +190,14 @@ def run_screen(
                          event_category="backtest",
                          event_type="screen_symbol_failed",
                          symbol=symbol, error=str(exc)[:300])
+        finally:
+            # Accumulated in `finally` so a symbol that raised still contributes
+            # its lake usage — a run whose lake died mid-way is exactly the case
+            # the run-level summary exists to make visible.
+            if chain_store is not None:
+                _accumulate_lake(lake_totals, chain_store.summary())
+
+    _log_lake_run_summary(lake, lake_totals, run_id)
 
     if persist:
         rows = [
@@ -198,6 +216,49 @@ def run_screen(
                 demote_candidates=result.demote_candidates,
                 failures=result.failures, persisted=result.persisted)
     return result
+
+
+_LAKE_COUNTERS = (
+    "lake_hits", "lake_misses", "lake_rejected",
+    "lake_puts", "lake_skipped", "lake_errors",
+)
+
+
+def _accumulate_lake(totals: Dict[str, int], summary: Dict) -> None:
+    for key in _LAKE_COUNTERS:
+        totals[key] = totals.get(key, 0) + int(summary.get(key, 0))
+
+
+def _log_lake_run_summary(lake, totals: Dict[str, int], run_id: str) -> None:
+    """One run-level line, plus a warning when the lake did not do its job.
+
+    The per-symbol `chain_lake_summary` lines are the detail; this is the line
+    an operator reads after a monthly screen. `chain_lake_degraded` exists
+    because the failure mode of this feature is *silence*: a lake that errored
+    on every call still produces a green run that took the full cold 1h47m, and
+    without a warning nobody would look.
+    """
+    if lake is None:
+        return
+    payload = dict(totals)
+    payload.update(
+        lake_bucket=lake.bucket_name,
+        lake_prefix=lake.prefix,
+        lake_disabled=lake.disabled,
+        lake_disabled_reason=lake.disabled_reason,
+    )
+    logger.info("Chain lake usage for this run",
+                event_category="backtest_data",
+                event_type="chain_lake_run_summary",
+                run_id=run_id, **payload)
+    if lake.disabled or totals.get("lake_errors", 0) > 0:
+        logger.warning(
+            "Chain lake degraded during this run — the screen ran at least "
+            "partly cold and the lake may not have been updated",
+            event_category="backtest_data",
+            event_type="chain_lake_degraded",
+            run_id=run_id, **payload,
+        )
 
 
 def render_screen_summary(result: ScreenResult) -> str:

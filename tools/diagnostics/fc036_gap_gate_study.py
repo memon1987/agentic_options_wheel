@@ -768,7 +768,9 @@ def _run_sim(symbol: str, start: date, end: date, config):
     from src.backtesting.engine.simulator import Simulator
 
     provider = AlpacaDataProvider.from_config(config)
-    store = ChainStore()
+    # from_env(): shares the FC-060 chain lake when CHAIN_LAKE_BUCKET is set,
+    # so a study run warms (and contributes to) the same history the Job uses.
+    store = ChainStore.from_env()
     builder = ChainBuilder(provider, store=store)
     sim = Simulator(
         config, provider, builder, [symbol], start, end,

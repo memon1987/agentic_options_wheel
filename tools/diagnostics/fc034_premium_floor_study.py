@@ -334,7 +334,8 @@ def _decision_context(symbol: str, start: date, end: date):
 
     config = Config()
     provider = AlpacaDataProvider.from_config(config)
-    builder = ChainBuilder(provider, store=ChainStore())
+    # from_env(): see fc036_gap_gate_study — the lake is shared with the Job.
+    builder = ChainBuilder(provider, store=ChainStore.from_env())
     sim = Simulator(config, provider, builder, [symbol], start, end)
     stock_bars = sim._load_stock_bars()
     days = sim._trading_days(stock_bars)

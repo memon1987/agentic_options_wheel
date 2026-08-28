@@ -263,31 +263,62 @@ cache, and `ChainStore` uses it write-through:
 | | |
 |---|---|
 | Bucket | `gs://options-wheel-chain-lake` (operator-provisioned; versioning on) |
-| Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, byte-identical |
+| Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, same bytes |
 | Env | `CHAIN_LAKE_BUCKET` (unset ⇒ **no lake, no GCS client, behaviour identical to before**), `CHAIN_LAKE_PREFIX` (default `chains/v1`) |
-| Where it is read | `ChainStore.from_env()` in `src/backtesting/evaluate.py` — the Job, the CLI and the diagnostics all go through it |
+| Read by | `ChainStore.from_env()` — the Job (`screen.py`, which builds **one** lake for the whole run), `main.py --command backtest` via `evaluate_symbol`, and the `fc034` / `fc036` diagnostics. A `ChainStore()` constructed directly anywhere else bypasses the lake by design. |
 | Seed | `python tools/diagnostics/chain_lake_seed.py --cache-dir cache/backtest/chains --bucket options-wheel-chain-lake` |
 
 - **A local miss tries the lake before the provider**; a chain built from the provider is
-  uploaded after the atomic local write. A chain for a settled session never changes, so
-  there is no TTL and no invalidation — the object is immutable by construction.
+  uploaded after the atomic local write. A miss is a single RPC (`NotFound`), not a probe
+  followed by a fetch.
 - **The coverage check is unchanged and still governs.** A lake-sourced file goes through
   `_covers` and the narrowing read path exactly as a local file does, so a warm run and a
   cold run return the identical chain. The lake moves files; it never answers questions.
-- **A lake failure is never fatal.** Every lake call is wrapped: the failure is logged as
-  `chain_lake_error` and the run continues local-only. A GCS hiccup must not turn a
-  two-hour screen into a failed execution.
-- **Measure it from the logs.** Each symbol emits one `chain_lake_summary` with
-  `lake_hits / lake_misses / lake_puts / lake_errors`. On a warm run expect hits ≫ puts;
-  `lake_errors > 0` means the run silently degraded to local-only and the lake is not
-  actually protecting anything.
-- **Corrupt files self-heal on both sides**: an unreadable local file is deleted *and* its
-  mirror is deleted (`chain_lake_corrupt_delete`), so a bad object cannot be re-downloaded
-  forever.
-- **Prefix is the format version.** The parquet schema (`_COLUMNS` plus the provenance
-  columns) is the contract for these objects; bump `chains/v1` if it ever changes
-  incompatibly rather than mixing generations in one prefix.
+- **Objects are coverage-monotone, not immutable.** The *chain* for a settled session never
+  changes, but the *file* records the window it was built under, and that window is
+  path-dependent — the bid pass of `evaluate_symbol` rebuilds the same session under a
+  different `cost_basis`/`low_anchor` than the mid pass, and another machine gets a third.
+  An object is therefore replaced only by a file whose request is a **superset** (same
+  model, ≥ DTE reach, ⊇ strike window). A narrowing is refused and logged as
+  `chain_lake_overwrite_skipped`; every upload carries an `if_generation_match`
+  precondition so concurrent writers cannot clobber each other. Merging two partial windows
+  into their union on write is the **Layer 2** follow-up.
+- **A model change needs a prefix bump.** The `model` fingerprint is part of the format
+  contract, and a different model is never a *wider* answer — such an upload is skipped, so
+  without bumping `CHAIN_LAKE_PREFIX` a model change silently stops populating the lake.
+- **Nothing ever deletes an object.** An unreadable local file is discarded locally and the
+  mirror is left alone: `except Exception` around `read_parquet` fires on a pyarrow version
+  skew, a `MemoryError` or an exhausted fd limit as readily as on real corruption, and the
+  lake exists precisely because the vendor may not serve these chains again. The only way
+  to replace a genuinely bad object is `chain_lake_seed.py --force`, by hand.
+- **A lake failure is never fatal, and never unbounded.** Every call is wrapped: the failure
+  is logged as `chain_lake_error` and the run continues local-only. Every RPC carries a 30s
+  timeout and a 60s retry deadline. Five consecutive failures — or a credentials failure, or
+  a bucket that is missing/unreachable on the one-time startup probe — switch the lake off
+  for the rest of the run (`chain_lake_disabled` / `chain_lake_unavailable`), so an outage
+  costs the run once rather than 5,400 times.
+- **Measure it from the logs.** Each symbol emits one `chain_lake_summary`; the run emits
+  one `chain_lake_run_summary` with the totals, plus a `chain_lake_degraded` **warning** if
+  anything errored or the lake was disabled. The failure mode of this feature is silence —
+  a lake erroring on every call still produces a green run that took the full cold 1h47m.
+
+| counter | meaning |
+|---|---|
+| `lake_hits` | object downloaded and used |
+| `lake_misses` | object absent |
+| `lake_rejected` | downloaded, then failed the coverage check (should be rare; persistent non-zero means the window is thrashing) |
+| `lake_puts` | object written |
+| `lake_skipped` | upload declined — would have narrowed coverage, or lost a generation race |
+| `lake_errors` | operation failed; the run continued local-only |
+
 - **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.
+- **Clock caveat.** What may be cached at all is decided by `chain_builder._is_cacheable`
+  and `alpaca_provider._is_settled`, both `date.today()` — the *process's local* date, not
+  an exchange calendar. That was previously a local-cache-only hazard; with the lake, a
+  machine with a skewed clock or a surprising timezone could publish a partial session to
+  storage everyone reads. The Job runs UTC at 02:00 ET, well after the close, so it is
+  correct today; treat it as a constraint on where the engine may be run, not as a
+  guarantee.
 
 ### Operating notes
 
