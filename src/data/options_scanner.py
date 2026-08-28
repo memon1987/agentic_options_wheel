@@ -16,7 +16,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils import clock
 from ..utils.logging_events import log_performance_metric, log_error_event
-from ..utils.option_symbols import parse_option_symbol
+from ..utils.option_symbols import occ_root, parse_option_symbol
 from ..utils.positions import get_stock_positions
 from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
 from .decision_record import (
@@ -1031,6 +1031,14 @@ class OptionsScanner:
         (``AAPL1260821C…`` -> ``AAPL``), which is the answer we want; it is the
         no-structure case (``''``, ``'NOT_AN_OCC'``) where trusting the
         fallback would mean guessing.
+
+        FC-041: the equality is taken on :func:`occ_root`, not on the raw
+        strings. ``symbol`` is the *equity* ticker being scanned (``BRK.B``);
+        the held contract's underlying is the OCC root (``BRKB``). Without the
+        normalization a held ``BRKB…`` position would not block a ``BRK.B``
+        put, breaking the one-position-per-underlying invariant on exactly the
+        tickers where it is hardest to notice. Plain tickers are unaffected —
+        ``occ_root`` is the identity on them.
         """
         try:
             parsed = parse_option_symbol(position_symbol or '')
@@ -1040,7 +1048,7 @@ class OptionsScanner:
             underlying, structured = '', False
         if not underlying or not structured:
             return 'unparseable'
-        return 'match' if underlying == symbol else 'no_match'
+        return 'match' if occ_root(underlying) == occ_root(symbol) else 'no_match'
 
     def _has_existing_position(self, symbol: str) -> bool:
         """Check if we already have positions in a stock. Emits the skip event.

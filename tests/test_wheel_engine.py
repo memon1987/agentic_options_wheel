@@ -1153,3 +1153,101 @@ class TestPositionDiffCallAssignmentOnAffectedRoots:
         assert len(detected) == 1
         assert detected[0]['contracts'] == 1
         assert wheel_state.symbol_states['AAPL']['active_calls'] == 1
+
+
+class TestClassShareCallsReachTheRoller(_CycleFixture):
+    """FC-041(2) review finding F3 — the roller's stock lookup.
+
+    `run_rolling_cycle` keyed `stock_by_symbol` on the raw equity symbol
+    (`BRK.B`) and looked it up by the short call's parsed underlying (`BRKB`).
+    A fully covered class-share call therefore landed in `uncovered_calls` and
+    was reported `no_covering_shares` — the one position shape that reads as
+    "genuinely naked short call" — and was never rolled. 100 shares were
+    sitting behind it the whole time.
+
+    MUTATION CHECK: revert the `occ_root` keying and
+    `test_a_covered_class_share_call_is_rollable` fails.
+    """
+
+    def _class_share_book(self):
+        return [
+            {'symbol': 'BRKB260807C00450000', 'qty': '-1',
+             'asset_class': 'us_option'},
+            {'symbol': 'BRK.B', 'qty': '100', 'asset_class': 'us_equity',
+             'avg_entry_price': '400.00', 'side': 'long'},
+        ]
+
+    def _run(self, positions):
+        config = Mock(spec=Config)
+        config.rolling_enabled = True
+        config.earnings_enabled = False
+
+        alpaca = Mock()
+        alpaca.get_positions.return_value = positions
+        alpaca.get_orders.return_value = []
+
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca,
+                                 wheel_state=Mock())
+
+        seen = {'evaluated': [], 'skipped': []}
+
+        class _StubRoller:
+            def __init__(self, *a, **kw):
+                pass
+
+            def log_terminal_skip(self, option_symbol, underlying, reason, **kw):
+                seen['skipped'].append((option_symbol, underlying, reason))
+
+            def evaluate_roll_opportunity(self, call_pos, stock_pos,
+                                          open_syms=None):
+                seen['evaluated'].append(
+                    (call_pos['symbol'], stock_pos['symbol']))
+                return None
+
+            def execute_roll(self, opportunity):   # pragma: no cover
+                raise AssertionError("not reached")
+
+        with patch('src.strategy.wheel_engine.CallRoller', _StubRoller):
+            with patch('src.strategy.wheel_engine.log_error_event'):
+                results = engine.run_rolling_cycle()
+        return results, seen
+
+    def test_a_covered_class_share_call_is_rollable(self):
+        """THE F3 REGRESSION. Pre-fix `evaluated` is empty and the call is
+        reported `no_covering_shares`."""
+        _results, seen = self._run(self._class_share_book())
+
+        assert seen['evaluated'] == [('BRKB260807C00450000', 'BRK.B')], (
+            "the covered class-share call never reached the roller")
+        assert [s for s in seen['skipped'] if s[2] == 'no_covering_shares'] == []
+
+    def test_a_genuinely_naked_class_share_call_is_still_reported(self):
+        """The fix must not blind the uncovered path: with no equity leg the
+        call is still `no_covering_shares`."""
+        _results, seen = self._run([
+            {'symbol': 'BRKB260807C00450000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ])
+
+        assert seen['evaluated'] == []
+        assert [s[2] for s in seen['skipped']] == ['no_covering_shares']
+
+    def test_a_different_share_class_does_not_count_as_coverage(self):
+        """BRK.A shares must not make a BRKB call look covered."""
+        _results, seen = self._run([
+            {'symbol': 'BRKB260807C00450000', 'qty': '-1',
+             'asset_class': 'us_option'},
+            {'symbol': 'BRK.A', 'qty': '100', 'asset_class': 'us_equity',
+             'avg_entry_price': '700000.00', 'side': 'long'},
+        ])
+
+        assert seen['evaluated'] == []
+        assert [s[2] for s in seen['skipped']] == ['no_covering_shares']
+
+    def test_plain_tickers_still_pair_with_their_shares(self):
+        """The behavior contract: nothing moves for the live universe."""
+        _results, seen = self._run(self._book(['AAPL']))
+
+        assert seen['evaluated'] == [
+            (_occ('AAPL', self.EXPIRY, 100.0), 'AAPL')]

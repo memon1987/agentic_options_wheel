@@ -166,6 +166,49 @@ midnight, so neither can change value in that window.
 | 17 | Wrong-seller routing | `PutSeller.execute_put_sale`, `CallSeller.execute_call_sale` | — | `call_rejected_by_put_seller`, `put_rejected_by_call_seller` | closed |
 | 18 | Execute-time cost-basis floor | `CallSeller`, via `opportunity_floor_per_share` | — | rejection before order submit | closed (FC-050 restored this; it reads the floor off the opportunity so scan and execute enforce the same number) |
 | 19 | Naked-call block | `ExecutionEngine.execute_batch` | — | `naked_call_blocked` | closed |
+| 20 | Naked-call invariant (FC-041) | `ExecutionEngine.execute_batch`, immediately before `execute_call_sale` | — | `naked_call_invariant_blocked` + `selection_dropped{reason=naked_call_invariant, stage=execution}` | closed on both limbs |
+
+Gate 20 is **belt to gate 19's braces, not a duplicate of it.** Gate 19 asks
+`_available_shares`, which uses `parse_option_symbol` — whose leading-letters
+fallback is a heuristic. Gate 20 recounts the same positions snapshot with an
+independent implementation (`_invariant_shares`) that uses only
+`strict_option_type` and `occ_root`. It refuses the write on **either** of two
+limbs:
+
+1. **The arithmetic disagrees** — `committed + about-to-sell > owned`. Two
+   implementations that must agree; when they do not, we cannot tell which is
+   right, so the order is refused and both answers go in the log.
+2. **An unclassifiable short option on the underlying** — `strict_option_type`
+   returns `None` for an *adjusted* contract (`AAPL1260821C00250000`, the root a
+   split or special dividend leaves behind) and for anything else off-shape.
+   Treating those as "commits 0 shares" is precisely the naked write this gate
+   exists to stop, so any short `us_option` whose leading-alpha prefix
+   normalizes to the target root is collected into
+   `unclassifiable_short_options` and blocks. The share arithmetic is
+   deliberately *not* attempted on an adjusted contract — its deliverable is
+   not 100 shares, so any number would be wrong.
+
+That second limb is type-blind (an unclassifiable short *put* on the underlying
+also blocks — we cannot prove it is not a call) and root-prefix scoped, so
+unrelated garbage like `NOT_AN_OCC` blocks nothing. A non-string `symbol` is
+skipped rather than collected: the prefix rule cannot tell whether it is even on
+this underlying, and it still surfaces within the hour as the regression
+monitor's `risk_unclassifiable_option`.
+
+**What gate 20 does not cover.** It reads one positions snapshot, so a *working
+order* not yet filled commits nothing to it (FC-061), and it cannot see a
+position that changes between the snapshot and the order landing at the
+exchange. It is a pre-submit check against the account as last reported, not a
+guarantee about the account as it will be.
+
+Any `naked_call_invariant_blocked` error event is a **defect report or a
+corporate action**, never an ordinary batch outcome — the two signals to watch
+are that event and `selection_dropped{reason=naked_call_invariant,
+stage=execution}`. There is deliberately **no** count in
+`batch_selection_completed`: the gate fires in `execute_batch`, after selection
+is over, so a field there could only ever be a structural zero. Neither gate
+marks the contract non-retryable: share ownership is transient, and a corporate
+action resolves.
 
 ---
 

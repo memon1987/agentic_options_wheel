@@ -10,7 +10,8 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_trade_event, log_error_event
 from ..utils.positions import get_stock_positions
-from ..utils.option_symbols import parse_option_symbol, strict_option_type
+from ..utils.option_symbols import (
+    occ_root, parse_option_symbol, strict_option_type)
 from .call_roller import CallRoller
 from .wheel_state_manager import WheelStateManager
 from ..risk.risk_manager import RiskManager
@@ -740,11 +741,17 @@ class WheelEngine:
         option_positions = [p for p in positions
                            if p.get('asset_class') == 'us_option']
 
-        # Build stock lookup by symbol
+        # Build stock lookup, keyed on the OCC root (FC-041). The lookup below
+        # is by the short call's parsed underlying (`BRKB`) while the equity
+        # position renders as `BRK.B`, so a raw-symbol key would file a fully
+        # covered class-share call under `uncovered_calls` -- reporting
+        # `no_covering_shares` for a position that has 100 shares behind it,
+        # and never rolling it.
         stock_by_symbol = {}
         for sp in stock_positions:
             sym = sp.get('symbol', '')
-            stock_by_symbol[sym] = sp
+            if sym:
+                stock_by_symbol[occ_root(sym)] = sp
 
         # Filter to short call positions
         short_calls = []
@@ -757,8 +764,8 @@ class WheelEngine:
             if parsed.get('option_type') != 'call':
                 continue
             underlying = parsed.get('underlying', '')
-            if underlying in stock_by_symbol:
-                short_calls.append((op, stock_by_symbol[underlying]))
+            if occ_root(underlying) in stock_by_symbol:
+                short_calls.append((op, stock_by_symbol[occ_root(underlying)]))
             else:
                 # A short call with NO covering shares. The roller cannot roll
                 # it (there is no cost-basis floor to resolve), but silently

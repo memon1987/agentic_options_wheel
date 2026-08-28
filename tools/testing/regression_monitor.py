@@ -39,7 +39,7 @@ from src.utils.logging_events import log_system_event, log_error_event, log_perf
 # Canonical OCC parsing. FC-069 S1 (item 12 family) replaced this module's
 # hand-rolled leading-alpha underlying extraction and its `"C" in symbol`
 # short-call test with these — the eighth site in the OCC-substring family.
-from src.utils.option_symbols import parse_option_symbol, strict_option_type
+from src.utils.option_symbols import occ_root, parse_option_symbol, strict_option_type
 
 logger = structlog.get_logger(__name__)
 
@@ -1141,11 +1141,17 @@ class RegressionMonitor:
             ))
 
         # --- 7. Naked call detection (short calls must have underlying shares) ---
+        # Keyed on the OCC root, not the raw equity symbol (FC-041): Alpaca
+        # renders Berkshire's B shares as `BRK.B` and the contracts on them as
+        # `BRKB...`, so a raw-string join reads 0 owned shares and reports a
+        # fully covered call as naked. This mirrors the preventive join in
+        # `ExecutionEngine._available_shares` -- the detective and the control
+        # must agree on what "the same underlying" means.
         stock_qty: Dict[str, int] = {}
         for p in stock_positions:
             sym = p.get("symbol")
             if sym:
-                stock_qty[sym] = int(float(p.get("qty", 0)))
+                stock_qty[occ_root(sym)] = int(float(p.get("qty", 0)))
 
         for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
@@ -1158,7 +1164,7 @@ class RegressionMonitor:
                 continue  # long calls commit no shares
 
             underlying = parsed.get("underlying", "")
-            owned_shares = stock_qty.get(underlying, 0)
+            owned_shares = stock_qty.get(occ_root(underlying), 0)
             required_shares = qty * 100
 
             if owned_shares < required_shares:
@@ -1177,7 +1183,14 @@ class RegressionMonitor:
         # floor source (FC-065 Phase 1). The previous derivation, cost_basis/qty,
         # returns 0 for assigned positions, so the `> 0` guard skipped exactly
         # the assigned lots this check exists to protect.
-        stock_by_symbol = {p.get("symbol"): p for p in stock_positions if p.get("symbol")}
+        # Keyed on the OCC root for the same reason check 7 is (FC-041): the
+        # lookup below is by the contract's parsed underlying (`BRKB`) and the
+        # equity renders as `BRK.B`. A raw-string key finds no stock position,
+        # the loop `continue`s, and the floor goes UNVERIFIED for exactly the
+        # tickers check 7 had just started reporting correctly -- a silent hole
+        # opened by half-fixing the file.
+        stock_by_symbol = {occ_root(p.get("symbol")): p
+                           for p in stock_positions if p.get("symbol")}
 
         for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
@@ -1191,7 +1204,7 @@ class RegressionMonitor:
             if strike <= 0:
                 continue
 
-            stock_pos = stock_by_symbol.get(underlying)
+            stock_pos = stock_by_symbol.get(occ_root(underlying))
             if not stock_pos:
                 continue  # naked — check 7's finding, not this one's
 

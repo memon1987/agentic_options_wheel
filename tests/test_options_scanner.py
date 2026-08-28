@@ -2123,3 +2123,103 @@ class TestPutSideExistingPositionSkip:
         ])
 
         assert emitted == ['F']
+
+
+class TestPutSideSkipHandlesClassShareTickers:
+    """FC-041 test 6 — the put-side skip on a dotted ticker.
+
+    Same defect class as the share ledger, on the other leg: the scanned
+    symbol is the equity spelling (``BRK.B``) and a held contract's underlying
+    is the OCC root (``BRKB``), so the raw-string equality missed and a held
+    ``BRKB`` option did NOT block a new ``BRK.B`` put — breaking the
+    one-position-per-underlying invariant on exactly the tickers nobody is
+    watching.
+
+    MUTATION CHECK: revert ``occ_root`` to the identity and
+    ``test_a_held_option_on_the_occ_root_blocks_the_dotted_symbol`` fails.
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.strategy_id = 'wheel'
+        self.mock_config.excluded_symbols = set()
+        self.mock_config.min_open_interest = None
+        self.mock_config.max_spread_pct = None
+        self.mock_config.bigquery_dataset = 'options_wheel'
+        self.mock_config.stock_symbols = ['BRK.B', 'MSFT']
+        self.mock_config.put_target_dte = 7
+        self.mock_config.call_target_dte = 7
+        self.mock_config.earnings_enabled = False
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'BRK.B', 'current_price': 450.0},
+            {'symbol': 'MSFT', 'current_price': 400.0},
+        ]
+        # The OCC root, not the equity symbol — this is how Alpaca names the
+        # contracts on a class share (verified 2026-08-28: BRK.B ->
+        # BRKB260828C00270000, root_symbol 'BRKB').
+        _roots = {'BRK.B': 'BRKB', 'MSFT': 'MSFT'}
+        self.mock_market_data.find_suitable_puts.side_effect = lambda symbol: [{
+            'symbol': '%s260821P00400000' % _roots[symbol], 'strike_price': 400.0,
+            'expiration_date': '2026-08-21', 'dte': 7, 'delta': -0.15,
+            'mid_price': 0.60, 'bid': 0.55, 'ask': 0.65, 'volume': 1500,
+            'open_interest': 5000, 'implied_volatility': 0.25,
+        }]
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+
+    def _scan(self, positions):
+        self.mock_alpaca.get_positions.return_value = positions
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            results = self.scanner.scan_for_put_opportunities()
+        return [r['symbol'] for r in results], mock_logger
+
+    def test_a_held_option_on_the_occ_root_blocks_the_dotted_symbol(self):
+        """THE FC-041 REGRESSION on this leg. Pre-fix ``emitted`` comes back
+        as ``['BRK.B', 'MSFT']`` — the held BRKB contract blocks nothing."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'BRKB260821P00400000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('BRK.B', 'option_position')]
+
+    def test_a_held_short_call_on_the_occ_root_blocks_it_too(self):
+        """The check is type-blind: one option position per underlying,
+        whichever leg it is."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'BRKB260821C00470000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('BRK.B', 'option_position')]
+
+    def test_the_equity_limb_still_blocks_on_the_dotted_spelling(self):
+        """The stock limb is an exact match and Alpaca renders the equity as
+        ``BRK.B`` on both sides, so it was never broken — pinned so the
+        normalization cannot silently be moved onto this limb and change it."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'BRK.B', 'asset_class': 'us_equity', 'qty': 100},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('BRK.B', 'stock_position')]
+
+    def test_another_class_of_the_same_issuer_does_not_block(self):
+        """The fix must not over-block: BRKA is a different underlying."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'BRKA260821P00400000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['BRK.B', 'MSFT']
+        assert _events(mock_logger, 'put_scan_skipped_existing_position') == []

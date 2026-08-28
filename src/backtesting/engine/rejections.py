@@ -134,6 +134,11 @@ _SELECTION_DROP_REASONS = {
     "duplicate_underlying": "selection: duplicate underlying",
     "sizing_failed": "selection: sizing failed",
     "positions_unavailable": "selection: positions snapshot unavailable",
+    # FC-041: raised at the execution stage, not by select_batch, but it rides
+    # the same `selection_dropped` event and the same closed enum -- and
+    # test_every_closed_enum_value_has_a_bucket requires every member to have a
+    # bucket, precisely so a new reason cannot go silently uncounted.
+    "naked_call_invariant": "execution: naked-call invariant violated",
 }
 
 
