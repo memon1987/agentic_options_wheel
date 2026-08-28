@@ -60,21 +60,41 @@ Copy `_template.md` in this directory to start a new plan.
 
 ## Index
 
-_List active plans here as they are added._
+_All plan files, regenerated 2026-08-28 from each file's `**Status:**` line (pr-body drafts omitted)._
 
-- [fc-006.md](fc-006.md) — FC-006: Covered call rolling engine, status: done
-- [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: done
-- [fc-010.md](fc-010.md) — FC-010: Disable call stop-losses, status: done
-- [fc-012.md](fc-012.md) — FC-012: Shift dashboard logging to Alpaca queries, status: done
-- [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: done (PR #81, merged 2026-08-03)
-- [fc-018.md](fc-018.md) — FC-018: Wheel-centric dashboard rebuild (frontend only), status: draft
-- [fc-019.md](fc-019.md) — FC-019: True P&L reconciliation (JNLC + OPTRD ingest), status: done
-- [fc-020.md](fc-020.md) — FC-020: FIFO cycle pairing for overlapping share lots, status: draft
-- [fc-030.md](fc-030.md) — FC-030: Drawdown-pause alerting (operator notification for extended pauses), status: done
-- [fc-031.md](fc-031.md) — FC-031: Dashboard metrics overhaul (vetted portfolio metrics + bot execution health), status: done
-- [fc-032.md](fc-032.md) — FC-032: Backtesting engine overhaul (symbol wheel-fitness evaluation), status: draft
-- [fc-038.md](fc-038.md) — FC-038: Two-pool execution selection (covered-call phantom-collateral fix), status: done
-- [fc-050.md](fc-050.md) — FC-050: Restore the covered-call below-basis floor on the production path, status: done
-- [fc-065.md](fc-065.md) — FC-065: One floor, one path, one decision record (covered-call gating layer), status: draft — awaiting review
-- [fc-075.md](fc-075.md) — FC-075: Standalone covered-call strategy (separate account, shared machinery), status: executing — Phases 0–2 done, Seam 4 next
-- [fc-075-phase-2.md](fc-075-phase-2.md) — FC-075 Phase 2: the covered-call engine (call-only gating of the shared pipeline), status: done (PR #89)
+- [fc-006.md](fc-006.md) — Covered Call Rolling Engine (Friday EOW), status: Done
+- [fc-007.md](fc-007.md) — Earnings Calendar Service, status: Done
+- [fc-010.md](fc-010.md) — Disable Call Stop-Losses, status: Done
+- [fc-012.md](fc-012.md) — Shift dashboard logging to Alpaca queries where authoritative, status: Done
+- [fc-013.md](fc-013.md) — Earnings Blackout Gate on the Live Sell Path (rev 2), status: Done
+- [fc-018.md](fc-018.md) — Wheel-Centric Dashboard Rebuild (frontend only), status: Done
+- [fc-019.md](fc-019.md) — True P&L reconciliation — ingest JNLC/OPTRD and surface share-side P&L, status: Done
+- [fc-020.md](fc-020.md) — FIFO cycle pairing in `wheel_cycles_from_activities`, status: Draft
+- [fc-021.md](fc-021.md) — FC-021 — Synthetic activity correction for Alpaca paper-engine silent settlements, status: Done
+- [fc-022.md](fc-022.md) — FC-022 — Trade Log + ET timezone + By-Symbol summary table, status: Done
+- [fc-023.md](fc-023.md) — Per-symbol Realized P&L reconciliation, status: Done
+- [fc-024.md](fc-024.md) — ACB walk view rewrite, status: Done
+- [fc-025.md](fc-025.md) — FC-025 — Synthetic activity correction for AMZN silent paper-engine assignment, status: Done
+- [fc-026.md](fc-026.md) — Decision Quality — surface Premium Received / Captured / Foregone, status: Done
+- [fc-027.md](fc-027.md) — Cycle Table — separate Total Premium from Cycle P&L, status: Done
+- [fc-029.md](fc-029.md) — FC-029 — Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause), status: Done
+- [fc-030.md](fc-030.md) — Drawdown-pause alerting — operator notification for extended pauses, status: Done
+- [fc-031.md](fc-031.md) — Dashboard metrics overhaul — vetted portfolio metrics + bot execution health, status: Done
+- [fc-032.md](fc-032.md) — Backtesting Engine Overhaul — Symbol Wheel-Fitness Evaluation, status: Done
+- [fc-035.md](fc-035.md) — Delete the `poll_order_statuses` path and the `order_statuses` table, status: Done
+- [fc-036.md](fc-036.md) — FC-036 — Fix the dead Stage-4 execution gap check (study first, then fix), status: Done
+- [fc-038.md](fc-038.md) — Two-pool execution selection — covered calls stop competing for cash they don't need, status: Done
+- [fc-042.md](fc-042.md) — Backtest Engine Follow-on — Performance, Fidelity, and the Filter Studies, status: Done
+- [fc-043.md](fc-043.md) — Fix `AlpacaClient.get_orders` — the status filter has never worked, status: Done
+- [fc-048.md](fc-048.md) — FC-048 — Route execution on the contract, not a defaulted dict key (backtests model half a wheel), status: Done
+- [fc-050.md](fc-050.md) — Restore the covered-call below-basis floor on the path production actually runs, status: Done
+- [fc-065.md](fc-065.md) — One floor, one path, one decision record — the covered-call gating layer, status: Done
+- [fc-068.md](fc-068.md) — Delete the dead engine call path; repoint the backtest to the real pipeline, status: Done
+- [fc-069.md](fc-069.md) — FC-069 — the decommission sweep. 15 decision cards for operator sign-off, status: DONE
+- [fc-071.md](fc-071.md) — FC-071 — at-floor scoring bonus aligned to the gate (`>=`), status: Approved by operator 2026-08-02
+- [fc-075-cc-deploy-step.md](fc-075-cc-deploy-step.md) — FC-075 follow-on — CC service deploy step in cloudbuild + first tunables iteration (14 DTE), status: DONE
+- [fc-075-phase-2.md](fc-075-phase-2.md) — FC-075 Phase 2 — the covered-call engine (file-level build spec), status: DONE
+- [fc-075-seam-4.md](fc-075-seam-4.md) — FC-075 Seam 4 — BigQuery write-side dataset threading (+ `strategy_id` column, DD-7 removal), status: DONE
+- [fc-075.md](fc-075.md) — Standalone covered-call strategy — separate account, shared machinery, status: LIVE
+- [fc-078.md](fc-078.md) — Minimal roller revival — credit-only defensive rolls, daily evaluation, status: Done
+
