@@ -6,17 +6,26 @@ so no build failed, so nothing alerted, and `main` ran 16 days ahead of
 production in silence. `check_deploy_freshness` closes that hole by comparing
 what is serving (`GIT_COMMIT`) against what is on GitHub `main`.
 
-Every test here stubs the GitHub getter (`RegressionMonitor._github_get`) and
-the environment. Nothing touches the network — a detective control that needs
-the internet to be tested is a detective control nobody runs in CI.
+Every test here stubs the GitHub getter (`RegressionMonitor._github_get`), the
+clock seam (`_utcnow`, where a boundary is under test) and the environment.
+Nothing touches the network — a detective control that needs the internet to be
+tested is a detective control nobody runs in CI.
 
-The two properties worth the most:
+The properties worth the most, in order:
 
-* **Drift beyond the window is `fail`** (test 2) — this is the FC-081 regression
-  itself, and `fail` is what makes `/regression` return HTTP 500 and page.
-* **Drift inside the window is `pass`** (test 3) — without this, every merge
-  pages the operator for the 10-12 minutes a build takes, and the alert gets
-  muted, which is how FC-031's red build went unseen in the first place.
+* **A rename is a REDIRECT, not a 404** (`TestRepoUnreachable`). GitHub keeps a
+  rename redirect alive indefinitely and `requests` follows redirects by
+  default, so the naive implementation of this check returns a cheerful 200
+  from the renamed repo and reports `pass` on the exact condition it exists to
+  catch. `allow_redirects=False` is the whole detector.
+* **Drift beyond the window is `fail`** — `fail` is what makes `/regression`
+  return HTTP 500 and page.
+* **Drift inside the window is `pass`** — without it every merge pages the
+  operator for the 10-12 minutes a build takes, and the alert gets muted, which
+  is how FC-031's red build went unseen in the first place.
+* **No warn is silent** — every degraded path emits `deploy_freshness_degraded`,
+  because a control that reports `warn` forever looks exactly like one that is
+  working.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -34,10 +43,11 @@ DEPLOYED_SHA = "b" * 39 + "2"
 class _Resp:
     """Minimal stand-in for `requests.Response`."""
 
-    def __init__(self, payload=None, status_code=200, raises=None):
+    def __init__(self, payload=None, status_code=200, raises=None, headers=None):
         self._payload = payload
         self.status_code = status_code
         self._raises = raises
+        self.headers = headers or {}
 
     def json(self):
         if self._raises is not None:
@@ -45,9 +55,9 @@ class _Resp:
         return self._payload
 
 
-def _commit_body(sha=HEAD_SHA, age_minutes=5.0):
+def _commit_body(sha=HEAD_SHA, age_minutes=5.0, now=None):
     """A GitHub `GET /repos/{repo}/commits/main` body, `age_minutes` old."""
-    committed = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    committed = (now or datetime.now(timezone.utc)) - timedelta(minutes=age_minutes)
     return {
         "sha": sha,
         "commit": {"committer": {"date": committed.isoformat().replace("+00:00", "Z")}},
@@ -70,14 +80,31 @@ def env(monkeypatch):
 
 @pytest.fixture
 def logged_errors(monkeypatch):
-    """Capture `log_error_event` calls made by the check."""
+    """Capture `log_error_event` calls — the alertable, page-worthy events."""
+    calls = []
+    monkeypatch.setattr(rm, "log_error_event", lambda logger, **kw: calls.append(kw))
+    return calls
+
+
+@pytest.fixture
+def degraded(monkeypatch):
+    """Capture `deploy_freshness_degraded` warnings off the module logger."""
     calls = []
 
-    def _capture(logger, **kwargs):
-        calls.append(kwargs)
+    class _Logger:
+        def warning(self, event, **kwargs):
+            calls.append({"event": event, **kwargs})
 
-    monkeypatch.setattr(rm, "log_error_event", _capture)
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(rm, "logger", _Logger())
     return calls
+
+
+def freeze(monkeypatch, at):
+    """Pin the check's clock seam so a boundary is exactly a boundary."""
+    monkeypatch.setattr(rm, "_utcnow", lambda: at)
 
 
 def run_check(monkeypatch, response=None, raises=None):
@@ -105,11 +132,15 @@ def run_check(monkeypatch, response=None, raises=None):
     return result
 
 
+def reasons(degraded_calls):
+    return [c["reason"] for c in degraded_calls]
+
+
 # ---------------------------------------------------------------------------
-# 1. Match -> pass
+# The happy paths: match, and prefix matching
 # ---------------------------------------------------------------------------
 
-def test_deployed_commit_matching_main_passes(env, logged_errors):
+def test_deployed_commit_matching_main_passes(env, logged_errors, degraded):
     env.setenv("GIT_COMMIT", HEAD_SHA)
 
     result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
@@ -118,7 +149,9 @@ def test_deployed_commit_matching_main_passes(env, logged_errors):
     assert result.name == "deploy_freshness"
     assert result.details["head_sha"] == HEAD_SHA
     assert result.details["git_commit"] == HEAD_SHA
+    assert result.details["authenticated"] is True
     assert not logged_errors, "a matching deploy must not emit an error event"
+    assert not degraded, "a fully configured, matching check is not degraded"
 
 
 def test_short_git_commit_matches_by_prefix(env):
@@ -145,10 +178,10 @@ def test_prefix_shorter_than_seven_chars_is_not_a_match(env):
 
 
 # ---------------------------------------------------------------------------
-# 2. Drift beyond the window -> fail  (THE core regression)
+# Drift beyond the window -> fail  (THE core regression)
 # ---------------------------------------------------------------------------
 
-def test_drift_beyond_the_window_fails_and_logs_the_event(env, logged_errors):
+def test_drift_beyond_the_window_fails_and_logs_the_event(env, logged_errors, degraded):
     """main merged 3h ago, still not deployed: `fail` (=> /regression 500)."""
     result = run_check(env, response=_Resp(_commit_body(age_minutes=180)))
 
@@ -165,11 +198,8 @@ def test_drift_beyond_the_window_fails_and_logs_the_event(env, logged_errors):
     # does not (FC-047), and the alert policy matches on event_type.
     assert event["error_type"] == "deploy_freshness_drift"
     assert event["component"] == "regression_monitor"
+    assert not degraded, "real drift is a page, not a degradation"
 
-
-# ---------------------------------------------------------------------------
-# 3. Drift inside the window -> pass ("build in flight")
-# ---------------------------------------------------------------------------
 
 def test_fresh_mismatch_is_a_build_in_flight_not_drift(env, logged_errors):
     """A merge 20 minutes ago is a build running, not a dead trigger."""
@@ -183,8 +213,39 @@ def test_fresh_mismatch_is_a_build_in_flight_not_drift(env, logged_errors):
     )
 
 
+class TestWindowBoundary:
+    """Drift iff age > window. Exactly at the window is still in flight.
+
+    The clock is pinned so "exactly" means exactly; without the seam the few
+    microseconds between building the body and running the check push the age
+    past the boundary and the test silently stops testing the boundary.
+    """
+
+    NOW = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_age_exactly_at_the_window_is_not_drift(self, env, logged_errors):
+        freeze(env, self.NOW)
+        body = _commit_body(age_minutes=120, now=self.NOW)
+
+        result = run_check(env, response=_Resp(body))
+
+        assert result.details["head_age_minutes"] == 120.0
+        assert result.status == "pass", "the window is a grace period, not a deadline"
+        assert "in flight" in result.message
+        assert not logged_errors
+
+    def test_one_minute_past_the_window_is_drift(self, env):
+        freeze(env, self.NOW)
+        body = _commit_body(age_minutes=121, now=self.NOW)
+
+        result = run_check(env, response=_Resp(body))
+
+        assert result.status == "fail"
+        assert result.name == "deploy_freshness_drift"
+
+
 # ---------------------------------------------------------------------------
-# 4. The window is env-overridable
+# The window env var
 # ---------------------------------------------------------------------------
 
 def test_env_window_override_is_honored(env, logged_errors):
@@ -207,87 +268,266 @@ def test_same_age_passes_under_the_default_window(env):
     assert "in flight" in result.message
 
 
-def test_unparseable_window_falls_back_to_the_default(env):
-    env.setenv("DEPLOY_FRESHNESS_MAX_HOURS", "not-a-number")
+def test_zero_window_is_legal_and_makes_any_mismatch_drift(env):
+    """`DEPLOY_FRESHNESS_MAX_HOURS=0` is the documented negative drill.
 
-    result = run_check(env, response=_Resp(_commit_body(age_minutes=90)))
+    It must NOT be swept up by the "not a usable window" guard, or the drill
+    would quietly test nothing.
+    """
+    env.setenv("DEPLOY_FRESHNESS_MAX_HOURS", "0")
 
-    assert result.details["max_hours"] == rm.DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT
-    assert result.status == "pass"
+    result = run_check(env, response=_Resp(_commit_body(age_minutes=5)))
 
-
-# ---------------------------------------------------------------------------
-# 5. 404 -> fail (the FC-081 failure mode itself)
-# ---------------------------------------------------------------------------
-
-def test_repo_404_fails(env, logged_errors):
-    """A renamed/moved repo is precisely what detached the trigger in FC-081."""
-    result = run_check(env, response=_Resp({"message": "Not Found"}, status_code=404))
-
+    assert result.details["max_hours"] == 0.0
     assert result.status == "fail"
-    assert result.name == "deploy_freshness_repo_unreachable"
-    assert len(logged_errors) == 1
-    assert logged_errors[0]["error_type"] == "deploy_freshness_repo_unreachable"
 
-
-# ---------------------------------------------------------------------------
-# 6. Transient GitHub trouble -> warn, never fail
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "response,raises",
+    "raw",
+    ["not-a-number", "nan", "NaN", "inf", "-inf", "Infinity", "-1", "-0.5", ""],
+)
+def test_unusable_window_falls_back_to_the_default(env, degraded, raw):
+    """NaN is the dangerous one: it loses every comparison.
+
+    `age > nan` is False for any age, so an unguarded NaN window would make
+    drift unreachable — the check would report "in flight" forever while
+    looking perfectly healthy.
+    """
+    env.setenv("DEPLOY_FRESHNESS_MAX_HOURS", raw)
+
+    result = run_check(env, response=_Resp(_commit_body(age_minutes=180)))
+
+    assert result.details["max_hours"] == rm.DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT
+    assert result.status == "fail", "the default window must still catch 3h drift"
+    if raw:  # an empty value is "unset", not "malformed"
+        assert reasons(degraded) == ["bad_window"]
+    else:
+        assert not degraded
+
+
+# ---------------------------------------------------------------------------
+# Repo unreachable: the redirect (rename) and the 404 (gone)
+# ---------------------------------------------------------------------------
+
+class TestRepoUnreachable:
+    """A renamed repo REDIRECTS. It does not 404.
+
+    GitHub answers 301 with the new location and keeps doing so indefinitely.
+    `requests` follows redirects by default, so a check that does not opt out
+    gets a 200 from the renamed repo and reports `pass` — while the Cloud Build
+    trigger, which matches the old literal name and has no forwarding, is dead.
+    That is FC-081, exactly.
+    """
+
+    @pytest.mark.parametrize("status", [301, 302, 307, 308])
+    def test_redirect_is_the_rename_detector(self, env, logged_errors, status):
+        resp = _Resp(
+            {},
+            status_code=status,
+            headers={"Location": "https://api.github.com/repositories/12345/commits/main"},
+        )
+
+        result = run_check(env, response=resp)
+
+        assert result.status == "fail"
+        assert result.name == "deploy_freshness_repo_unreachable"
+        assert "is stale" in result.message
+        assert "https://api.github.com/repositories/12345/commits/main" in result.message
+        assert "Cloud Build trigger" in result.message
+        assert result.details["redirect_location"].endswith("/commits/main")
+
+        assert len(logged_errors) == 1
+        assert logged_errors[0]["error_type"] == "deploy_freshness_repo_unreachable"
+
+    def test_redirect_without_a_location_header_still_fails(self, env, logged_errors):
+        """A redirect is the signal; the Location header is only the detail."""
+        result = run_check(env, response=_Resp({}, status_code=301, headers={}))
+
+        assert result.status == "fail"
+        assert result.name == "deploy_freshness_repo_unreachable"
+        assert len(logged_errors) == 1
+
+    def test_the_getter_does_not_follow_redirects(self, env, monkeypatch):
+        """The opt-out itself, at the one place it can be got wrong."""
+        captured = {}
+
+        def fake_requests_get(url, **kwargs):
+            captured.update(kwargs)
+            return _Resp({}, status_code=301)
+
+        monkeypatch.setattr(rm.requests, "get", fake_requests_get)
+        monitor = RegressionMonitor(service_url="http://test", api_key="k")
+
+        monitor._github_get("https://api.github.com/x", headers={})
+
+        assert captured["allow_redirects"] is False, (
+            "following redirects turns a renamed repo into a passing check"
+        )
+
+    def test_404_fails_with_an_honest_message(self, env, logged_errors):
+        """404 is NOT the rename case — say what it actually means."""
+        result = run_check(
+            env, response=_Resp({"message": "Not Found"}, status_code=404)
+        )
+
+        assert result.status == "fail"
+        assert result.name == "deploy_freshness_repo_unreachable"
+        assert "repo not found" in result.message
+        assert "deleted, made private, or the token lost access" in result.message
+        assert len(logged_errors) == 1
+        assert logged_errors[0]["error_type"] == "deploy_freshness_repo_unreachable"
+
+
+# ---------------------------------------------------------------------------
+# Transient GitHub trouble -> warn, never fail, never silent
+# ---------------------------------------------------------------------------
+
+def _body_with(sha):
+    return {
+        "sha": sha,
+        "commit": {"committer": {"date": "2026-08-28T10:00:00Z"}},
+    }
+
+
+@pytest.mark.parametrize(
+    "response,raises,reason",
     [
-        (_Resp({"message": "Bad credentials"}, status_code=401), None),
-        (_Resp({"message": "Forbidden"}, status_code=403), None),
-        (_Resp({"message": "boom"}, status_code=503), None),
-        (_Resp(raises=ValueError("Expecting value: line 1 column 1")), None),
-        (_Resp({"commit": {}}), None),                      # no sha
-        (_Resp({"sha": HEAD_SHA, "commit": {}}), None),     # no committer date
+        (_Resp({"message": "Bad credentials"}, status_code=401), None, "http_error"),
+        (_Resp({"message": "Forbidden"}, status_code=403), None, "http_error"),
+        (_Resp({"message": "rate limited"}, status_code=429), None, "http_error"),
+        (_Resp({"message": "boom"}, status_code=500), None, "http_error"),
+        (_Resp({"message": "boom"}, status_code=503), None, "http_error"),
+        (_Resp(raises=ValueError("Expecting value: line 1 column 1")), None, "bad_json"),
+        (_Resp({"commit": {}}), None, "bad_json"),                       # no sha key
+        (_Resp({"sha": HEAD_SHA, "commit": {}}), None, "bad_json"),      # no date key
+        (_Resp(_body_with(None)), None, "bad_sha"),
+        (_Resp(_body_with(123)), None, "bad_sha"),
+        (_Resp(_body_with("not-a-sha")), None, "bad_sha"),
+        (_Resp(_body_with(HEAD_SHA.upper())), None, "bad_sha"),
         (_Resp({"sha": HEAD_SHA,
-                "commit": {"committer": {"date": "not-a-date"}}}), None),
-        (None, TimeoutError("read timed out")),
-        (None, ConnectionError("name resolution failed")),
+                "commit": {"committer": {"date": "not-a-date"}}}), None, "bad_date"),
+        (None, TimeoutError("read timed out"), "request_failed"),
+        (None, ConnectionError("name resolution failed"), "request_failed"),
     ],
     ids=[
-        "401", "403", "503", "non-json-body", "no-sha", "no-date",
+        "401", "403", "429", "500", "503", "non-json-body", "no-sha-key",
+        "no-date-key", "sha-none", "sha-int", "sha-garbage", "sha-uppercase",
         "bad-date", "timeout", "connection-error",
     ],
 )
-def test_github_trouble_warns_never_fails(env, logged_errors, response, raises):
-    """A GitHub outage must not 500 the hourly monitor."""
+def test_github_trouble_warns_never_fails(env, logged_errors, degraded,
+                                          response, raises, reason):
+    """A GitHub outage must not 500 the hourly monitor — and must not be silent.
+
+    The `sha` cases matter beyond the status: every line after the parse
+    assumes a 40-hex string (`head_sha[:7]`, `startswith`). An unvalidated
+    None or int would raise out of the check group, which `run_all_checks`
+    converts into a `fail` — a 500 on the monitor caused by a bad response body.
+    """
     result = run_check(env, response=response, raises=raises)
 
     assert result.status == "warn"
     assert result.name == "deploy_freshness_github_error"
     assert not logged_errors, "a transient GitHub error is not an alertable event"
+    assert reasons(degraded) == [reason], "exactly one degraded event, right reason"
+    assert degraded[0]["event_type"] == "deploy_freshness_degraded"
+    assert degraded[0]["event_category"] == "system"
+    assert degraded[0]["check"] == "deploy_freshness_github_error"
 
 
 # ---------------------------------------------------------------------------
-# 7. Unconfigured -> warn, and the reporting order between the two
+# The token never reaches a message, a detail or a log
 # ---------------------------------------------------------------------------
 
-def test_missing_token_warns_unconfigured(env, logged_errors):
-    """The pre-secret state: visible as a warn row, never a silent pass."""
-    env.delenv("GITHUB_TOKEN", raising=False)
+TAINTED_TOKEN = "github_pat_SECRET\rinjected"
 
-    result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
 
+def test_a_rejected_token_is_never_echoed_into_the_result(env, degraded):
+    """`requests` puts header VALUES in its InvalidHeader message.
+
+    A token with a stray CR (a trailing newline in the secret is the realistic
+    version) makes `requests` raise
+    `InvalidHeader("... in header value 'Bearer github_pat_SECRET\\rinjected'")`
+    before any socket is opened. Interpolating `str(exc)` would copy the live
+    GitHub token into a CheckResult that `/regression` returns over HTTP and
+    that Cloud Logging stores — turning a config typo into a credential leak.
+
+    The real `_github_get` is used here: the raise happens during header
+    validation, so this needs no network.
+    """
+    env.setenv("GITHUB_TOKEN", TAINTED_TOKEN)
+    monitor = RegressionMonitor(service_url="http://test", api_key="k")
+
+    results = monitor.check_deploy_freshness()
+
+    assert len(results) == 1
+    result = results[0]
     assert result.status == "warn"
-    assert result.name == "deploy_freshness_unconfigured"
-    assert result.requested == [], "no token means no GitHub call"
-    assert not logged_errors
+    assert result.name == "deploy_freshness_github_error"
+    # The exception CLASS is informative and safe; the exception TEXT is not.
+    assert "InvalidHeader" in result.message
+
+    haystack = f"{result.message} {result.details} {degraded}"
+    for secret in ("github_pat_SECRET", "SECRET", TAINTED_TOKEN):
+        assert secret not in haystack, (
+            f"the GitHub token leaked into the check result via {secret!r}"
+        )
 
 
-def test_empty_token_is_treated_as_missing(env):
-    env.setenv("GITHUB_TOKEN", "   ")
+# ---------------------------------------------------------------------------
+# Degraded-but-working: no token (public repo), no GIT_COMMIT, bad repo
+# ---------------------------------------------------------------------------
 
-    result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+class TestUnauthenticatedFallback:
+    """The repo is public, so a missing token is a degradation, not a stop.
 
-    assert result.name == "deploy_freshness_unconfigured"
+    Reporting `deploy_freshness_unconfigured` and giving up would have left the
+    check inert for however long secret provisioning took — while the whole
+    comparison was available unauthenticated the entire time.
+    """
+
+    def test_no_token_still_produces_a_real_verdict(self, env, logged_errors, degraded):
+        env.delenv("GITHUB_TOKEN", raising=False)
+
+        result = run_check(env, response=_Resp(_commit_body(age_minutes=180)))
+
+        assert result.status == "fail", "an unauthenticated check still detects drift"
+        assert result.name == "deploy_freshness_drift"
+        assert result.details["authenticated"] is False
+        assert len(logged_errors) == 1
+        assert reasons(degraded) == ["unauthenticated"]
+
+    def test_no_token_sends_no_authorization_header(self, env):
+        env.delenv("GITHUB_TOKEN", raising=False)
+
+        result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+
+        headers = result.requested[0]["headers"]
+        assert "Authorization" not in headers
+        assert headers["Accept"] == "application/vnd.github+json"
+
+    def test_whitespace_token_is_treated_as_absent(self, env, degraded):
+        env.setenv("GITHUB_TOKEN", "   ")
+        env.setenv("GIT_COMMIT", HEAD_SHA)
+
+        result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+
+        assert result.status == "pass"
+        assert "Authorization" not in result.requested[0]["headers"]
+        assert reasons(degraded) == ["unauthenticated"]
+
+    def test_a_passing_unauthenticated_check_still_passes(self, env, degraded):
+        env.delenv("GITHUB_TOKEN", raising=False)
+        env.setenv("GIT_COMMIT", HEAD_SHA)
+
+        result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+
+        assert result.status == "pass"
+        assert reasons(degraded) == ["unauthenticated"]
 
 
-def test_missing_git_commit_warns_no_commit(env):
-    """Pre-rollout: the env var is not on the revision yet."""
+def test_missing_git_commit_warns_no_commit(env, degraded):
+    """Pre-rollout, and after a manual `gcloud builds submit` (no $COMMIT_SHA)."""
     env.delenv("GIT_COMMIT", raising=False)
 
     result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
@@ -296,13 +536,14 @@ def test_missing_git_commit_warns_no_commit(env):
     assert result.name == "deploy_freshness_no_commit"
     assert result.details["git_commit"] is None
     assert result.requested == [], "nothing to compare means no GitHub call"
+    assert reasons(degraded) == ["no_commit"]
 
 
-def test_git_commit_is_reported_before_the_token(env):
-    """Both missing: report the more informative one.
+def test_missing_git_commit_wins_over_a_missing_token(env, degraded):
+    """Both absent: report the one that actually blocks the comparison.
 
-    Without GIT_COMMIT there is nothing to compare even with a valid token, so
-    provisioning the secret alone would not clear the warn.
+    Without GIT_COMMIT there is nothing to compare even against a public repo,
+    so `unauthenticated` would send the operator after the wrong problem.
     """
     env.delenv("GIT_COMMIT", raising=False)
     env.delenv("GITHUB_TOKEN", raising=False)
@@ -310,16 +551,68 @@ def test_git_commit_is_reported_before_the_token(env):
     result = run_check(env, response=_Resp(_commit_body()))
 
     assert result.name == "deploy_freshness_no_commit"
+    assert reasons(degraded) == ["no_commit"]
+
+
+@pytest.mark.parametrize(
+    "bad_repo",
+    # NOTE: "" is deliberately absent — an empty env var reads as unset and
+    # falls back to the module constant (covered by the next test), so it is
+    # not a malformed repo.
+    ["../../user", "memon1987", "https://github.com/memon1987/x",
+     "memon1987/agentic options wheel", "a/b/c", "/x", "x/"],
+    ids=["traversal", "no-slash", "full-url", "space", "three-parts",
+         "empty-owner", "empty-name"],
+)
+def test_malformed_github_repo_is_unconfigured(env, degraded, bad_repo):
+    """A repo reference is `owner/name`; anything else is an operator typo.
+
+    Sending `../../user` to GitHub and interpreting whatever comes back is how
+    a path-traversal-shaped config value becomes a confident verdict about the
+    wrong repository.
+    """
+    env.setenv("GITHUB_REPO", bad_repo)
+
+    result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+
+    assert result.status == "warn"
+    assert result.name == "deploy_freshness_unconfigured"
+    assert result.requested == [], "a malformed repo is never sent to GitHub"
+    assert reasons(degraded) == ["bad_repo"]
+
+
+def test_empty_github_repo_env_falls_back_to_the_constant(env):
+    """An empty env var is "unset", so the module default applies."""
+    env.setenv("GITHUB_REPO", "")
+    env.setenv("GIT_COMMIT", HEAD_SHA)
+
+    result = run_check(env, response=_Resp(_commit_body(age_minutes=600)))
+
+    assert result.details["repo"] == rm.GITHUB_REPO
+    assert result.status == "pass"
 
 
 # ---------------------------------------------------------------------------
-# 8. The group is registered in the report
+# Clock skew
 # ---------------------------------------------------------------------------
-#  (the enumeration contract lives in tests/test_regression_monitor_schema.py)
+
+def test_future_commit_date_is_clamped_and_reported(env, logged_errors, degraded):
+    """A forward-dated commit would otherwise be "in flight" forever.
+
+    `age > window` is false for every negative age, so drift would become
+    permanently unreachable while the check looked healthy.
+    """
+    result = run_check(env, response=_Resp(_commit_body(age_minutes=-45)))
+
+    assert result.status == "pass", "clamped to zero == inside any window"
+    assert "in flight" in result.message
+    assert result.details["head_age_minutes"] < 0, "the real measurement is reported"
+    assert reasons(degraded) == ["future_commit_date"]
+    assert not logged_errors
 
 
 # ---------------------------------------------------------------------------
-# 9. GITHUB_REPO override reaches the request URL
+# The outbound request
 # ---------------------------------------------------------------------------
 
 def test_default_repo_is_used_when_no_override(env):
@@ -379,7 +672,7 @@ class TestHealthReportsGitCommit:
 
     `/regression` is the automated comparison; `/health` is what an operator
     curls at 2am to answer "what is actually serving?" without waiting for the
-    hourly run.
+    next scheduled run.
     """
 
     @staticmethod

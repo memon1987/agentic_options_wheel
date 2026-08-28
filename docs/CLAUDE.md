@@ -393,17 +393,66 @@ for 16 days in silence. It emits exactly one result per run:
 | Condition | status | name / log event |
 |---|---|---|
 | `main` ahead of the deployed commit by more than `DEPLOY_FRESHNESS_MAX_HOURS` (default 2.0) | `fail` | `deploy_freshness_drift` |
-| GitHub 404 on the repo (renamed/moved — the FC-081 mode itself) | `fail` | `deploy_freshness_repo_unreachable` |
-| `GIT_COMMIT` unset (pre-rollout) | `warn` | `deploy_freshness_no_commit` |
-| `GITHUB_TOKEN` unset/empty | `warn` | `deploy_freshness_unconfigured` |
-| GitHub 401/403/5xx, timeout, malformed JSON | `warn` | `deploy_freshness_github_error` |
+| GitHub **redirect** (301/302/307/308) — the repo was RENAMED or moved | `fail` | `deploy_freshness_repo_unreachable` |
+| GitHub 404 — repo deleted, made private, or access lost | `fail` | `deploy_freshness_repo_unreachable` |
+| `GIT_COMMIT` unset (pre-rollout, or a manual `gcloud builds submit`) | `warn` | `deploy_freshness_no_commit` |
+| `GITHUB_REPO` is not a valid `owner/name` pair | `warn` | `deploy_freshness_unconfigured` |
+| GitHub 401/403/429/5xx, timeout, malformed JSON, bad `sha`/date | `warn` | `deploy_freshness_github_error` |
 | SHAs match, or mismatch younger than the window (build in flight) | `pass` | `deploy_freshness` |
+
+**A rename is a REDIRECT, not a 404 — and that is the whole detector.** GitHub
+answers a renamed repo with 301 plus the new name in `Location`, and keeps
+doing so indefinitely; `requests` follows redirects by default, so the obvious
+implementation of this check gets a cheerful 200 back from the renamed repo and
+reports `pass` on the exact condition it exists to catch. `_github_get` passes
+`allow_redirects=False` for that reason alone. Meanwhile the Cloud Build
+trigger, which matches the *old literal name* and has no forwarding, is the
+half that has actually stopped working — so the fix repoints **both**.
 
 The two `fail` rows are emitted through `log_error_event` (which sets
 `event_type` — `log_system_event` does not, FC-047) and are what
 `deploy/monitoring/deploy_freshness_alert_policy.json` matches on. Everything
 else is a `warn` on purpose: `fail` returns HTTP 500 from `/regression`, so a
-GitHub outage or a missing secret must never trip it.
+GitHub outage must never trip it.
+
+**No `warn` is silent.** Every degraded path also emits a
+`deploy_freshness_degraded` log event carrying a `reason`
+(`no_commit`, `unauthenticated`, `bad_repo`, `bad_window`, `http_error`,
+`request_failed`, `bad_json`, `bad_sha`, `bad_date`, `future_commit_date`),
+watched by `deploy/monitoring/deploy_freshness_degraded_alert_policy.json` at a
+**24h notification rate limit — a once-a-day nag, not a page**. A detective
+control that degrades quietly is indistinguishable from one that is working,
+which is the same silence FC-081 was, in a different colour.
+
+**The token is optional.** The repo is public, so an empty `GITHUB_TOKEN` makes
+the request unauthenticated rather than terminal: the check still returns a
+real verdict, sets `details.authenticated=false`, and nags with reason
+`unauthenticated`. The token buys the 5000/hr authenticated rate limit instead
+of the 60/hr per-IP unauthenticated pool (a 429 surfaces as `http_error`).
+
+Four operational facts that decide whether an alert — or a silence — means
+anything:
+
+- **Cadence: six runs a day, weekdays only.** The check rides the existing
+  `:45`, 10:45–15:45 ET schedulers. Nothing runs overnight or at the weekend, so
+  **a trigger that dies on a Friday evening is first reported at 10:45 ET
+  Monday**. Silence outside market hours is not health.
+- **The clock is the commit's committer date, not the push time.** A change
+  committed locally and pushed more than two hours later is already past the
+  window when it lands, so it pages once even though the build ran promptly.
+  This is accepted, not overlooked: the alternative is looking up the Cloud
+  Build record for the commit, which would add an IAM dependency
+  (`cloudbuild.builds.viewer`) on the *runtime* service account purely to soften
+  an alert. This repo's workflow pushes immediately, so the case is rare and the
+  extra runtime permission is the worse trade.
+- **A deliberate traffic pin will alert every run.** While traffic is pinned to
+  an older revision (rollback, canary hold), the deployed commit is
+  intentionally behind `main` — which is drift by every definition the check
+  has. Disable the drift policy for the duration of the pin and re-enable it
+  when traffic returns to latest.
+- **A manual `gcloud builds submit` supplies no `$COMMIT_SHA`**, so the revision
+  comes up with an empty `GIT_COMMIT` and reports `deploy_freshness_no_commit` —
+  a degraded warn on the *nag* policy, never drift on the paging one.
 
 `check_risk_parameters` was synced to the real policy set by FC-069 S1 — four
 checks that mirrored deleted knobs (global position count, cash reserve,
