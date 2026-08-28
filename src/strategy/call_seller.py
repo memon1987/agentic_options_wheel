@@ -15,7 +15,12 @@ from .cost_basis import (
     opportunity_shares_covered,
     opportunity_total_return_if_called,
 )
-from .limit_pricing import refresh_quote, sell_limit_price
+from .limit_pricing import (
+    executing_quote_fields as _executing_quote_fields,
+    pricing_log_fields as _pricing_log_fields,
+    refresh_quote,
+    sell_limit_price,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -199,19 +204,7 @@ class CallSeller:
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
-                       bid=quote.bid,
-                       ask=quote.ask,
-                       mid=priced.mid,
-                       spread=priced.spread,
-                       # The fraction ACTUALLY applied: None means the book was
-                       # unusable and the premium fallback priced the order, so
-                       # a fill-rate study can separate the two without a
-                       # second change.
-                       spread_fraction=priced.spread_fraction,
-                       quote_source=quote.source,
-                       quote_age_s=quote.age_s,
-                       tick_snapped=priced.tick_snapped,
-                       limit_price=limit_price)
+                       **_pricing_log_fields(quote, priced))
             
             # Place the sell order
             order_result = self.alpaca.place_option_order(
@@ -231,7 +224,13 @@ class CallSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_call',
-                    'timestamp': clock.now().isoformat()
+                    'timestamp': clock.now().isoformat(),
+                    # FC-072: the book this order was PRICED off, so the trade
+                    # journal records the :15 execute-time quote rather than
+                    # the :00 scan blob sitting next to a live-priced limit.
+                    # `execution_engine.execute_batch` merges these into the
+                    # journal row; see `_executing_quote_fields`.
+                    **_executing_quote_fields(quote, priced),
                 }
 
                 # Enhanced logging for BigQuery analytics.

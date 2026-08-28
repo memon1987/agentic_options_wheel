@@ -325,15 +325,40 @@ verified 2026-08-04:
     not stale, and discounting it further concedes most where the mid is least
     informative. Only **one-sided** and **crossed** books fall back, to the
     historical `premium × 0.95`.
-  - **Tick increments are a broker rule, not a preference**: Alpaca quotes
-    options in $0.01 below $3.00 and **$0.05 at/above $3.00**, except the
-    penny-program names (SPY/QQQ/IWM, penny at all prices); a non-conforming
-    limit is rejected when no exchange accepts it. Sell limits snap **up**.
-    **The paper simulator does not enforce this**, so paper history is not
-    evidence that a live account would accept an off-tick limit. Below $3.00
-    the cent rounding is `ROUND_HALF_UP` on the exact decimal, not `round()` —
-    banker's rounding over floats put a half-cent mid on the bid or the ask by
-    luck.
+  - **Tick increments are a broker rule, not a preference.** Two regimes, and
+    the distinction matters: **always-penny** names (`ALWAYS_PENNY_SYMBOLS` —
+    SPY/QQQ/IWM) tick $0.01 at *every* price level, while **penny-program**
+    roots tick $0.01 below $3.00 and **$0.05 at and above**. All 14 configured
+    roots were verified `ppind=True` on 2026-08-28 and are listed in
+    `VERIFIED_PENNY_PROGRAM_ROOTS`; an unrecognised root is priced under the
+    penny-program rule and logged once per process as `tick_class_unverified`.
+    A genuine **non-penny class ticks $0.05/$0.10** — increments this code
+    deliberately **cannot emit**, because no such root is tradeable here and an
+    untested third regime is worse than a loud warning. A non-conforming limit
+    is rejected when no exchange accepts it, and sell limits snap **up**.
+    **The paper simulator does not enforce increments**, so paper history is
+    not evidence that a live account would accept an off-tick limit. Below the
+    $0.05 regime the cent rounding is `ROUND_HALF_UP` on the exact decimal, not
+    `round()` — banker's rounding over floats put a half-cent mid on the bid or
+    the ask by luck.
+  - **A one-tick book prices at the bid**, flagged `one_tick_book`. When the
+    spread is exactly one tick there is no midpoint to rest at and "mid rounded
+    half-up" is the ask by another name; on a 0.15–0.25Δ call, resting there
+    costs more in missed cycles (≈−$30 on the journal sample) than the spread
+    it captures (≈+$6).
+  - **These are INDICATIVE quotes, not NBBO.** `alpaca_client.OPTION_QUOTE_FEED`
+    is `"indicative"` and is passed explicitly on every option quote, because
+    the **OPRA agreement is not signed**. Indicative is an *adjusted* BBO: fine
+    for paper and for the FC-072 readout, not fine for real money, since a limit
+    priced off it can rest away from the true market with nothing in the logs to
+    say so. **Signing the OPRA agreement is a precondition before this code
+    prices a real-money order.** The feed is echoed back on every quote and
+    logged as `quote_feed` so that precondition is auditable rather than
+    remembered.
+  - **Only the opening writes are tick-correct.** The roller's STO/BTC limits
+    and `/monitor`'s `ask × 0.95` buy-to-close still round to the cent and are
+    therefore **off-tick above $3.00**. Harmless on paper (the simulator does
+    not enforce increments), a rejected order on a live account — its own FC.
   - **Economics, corrected** (rev 1 of the plan got this wrong and the reviews
     caught it): the call leg's old `premium × 0.95` was **not** a 5% donation.
     On this book 5% of mid ≈ half a spread, so the limit sat about **at the

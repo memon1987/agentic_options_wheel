@@ -10,7 +10,12 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
-from .limit_pricing import refresh_quote, sell_limit_price
+from .limit_pricing import (
+    executing_quote_fields as _executing_quote_fields,
+    pricing_log_fields as _pricing_log_fields,
+    refresh_quote,
+    sell_limit_price,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -261,16 +266,7 @@ class PutSeller:
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
-                       bid=quote.bid,
-                       ask=quote.ask,
-                       mid=priced.mid,
-                       spread=priced.spread,
-                       # None when the book was unusable — see the call leg.
-                       spread_fraction=priced.spread_fraction,
-                       quote_source=quote.source,
-                       quote_age_s=quote.age_s,
-                       tick_snapped=priced.tick_snapped,
-                       limit_price=limit_price,
+                       **_pricing_log_fields(quote, priced),
                        collateral_required=collateral_required)
 
             # Place the sell order
@@ -292,7 +288,10 @@ class PutSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_put',
-                    'timestamp': clock.now().isoformat()
+                    'timestamp': clock.now().isoformat(),
+                    # FC-072: the book this order was PRICED off — see the call
+                    # leg. Merged into the trade journal by execute_batch.
+                    **_executing_quote_fields(quote, priced),
                 }
 
                 # Enhanced logging for BigQuery analytics

@@ -1034,9 +1034,32 @@ class ExecutionEngine:
                         premium=opp.get('premium'),
                         strike_price=opp.get('strike_price'),
                         order_id=order_id,
+                        # FC-072: `quote_source` has no column on `trades` and
+                        # deliberately does not get one — a new column on the
+                        # canonical table for a provenance flag is not worth the
+                        # schema migration. It rides the event instead, joinable
+                        # to the row by order_id.
+                        quote_source=result.get("quote_source"),
+                        quote_age_s=result.get("quote_age_s"),
+                        tick_snapped=result.get("tick_snapped"),
                     )
 
-                    # Persist trade to BigQuery journal
+                    # Persist trade to BigQuery journal.
+                    #
+                    # FC-072: the quote columns come from the RESULT, not from
+                    # `opp`. `**opp` carries the :00 scan blob's bid/ask, and
+                    # since FC-072 the limit is priced off a quote refreshed at
+                    # :15 — so a row built from the opportunity alone showed a
+                    # live-priced limit sitting next to a 15-minute-old book,
+                    # and `mid_price` was NULL because no opportunity ever had
+                    # that key. Any "where did we price relative to the market"
+                    # analysis read the wrong book. The sellers return the book
+                    # they actually priced off; it wins here.
+                    #
+                    # `.get(..., opp.get(...))` rather than a bare `.get`: a
+                    # seller that predates FC-072, or any future producer that
+                    # does not carry the fields, degrades to the old behaviour
+                    # instead of writing NULLs over a usable scan-time quote.
                     self.trade_journal.record_trade({
                         **opp,
                         "order_id": order_id,
@@ -1044,6 +1067,9 @@ class ExecutionEngine:
                         "status": "submitted",
                         "fill_price": result.get("fill_price"),
                         "limit_price": result.get("limit_price"),
+                        "bid": result.get("bid", opp.get("bid")),
+                        "ask": result.get("ask", opp.get("ask")),
+                        "mid_price": result.get("mid"),
                     })
                 else:
                     error_message = result.get('message', '') or result.get('error_message', 'Unknown error')

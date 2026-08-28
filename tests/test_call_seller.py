@@ -34,7 +34,7 @@ live path: ``TestExecuteTimeCostBasisFloorFC050``.
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.strategy.call_seller import CallSeller
 from src.utils import clock
@@ -620,7 +620,9 @@ class TestCallLimitPricingFC072:
     ~+$5/write, against an expected 75-80% fill rate.
     """
 
-    LIVE = {'bid': 1.30, 'ask': 1.50}
+    # Shaped like the real client's payload: FC-072 has it return the feed
+    # it asked for, and the sellers log it on every order.
+    LIVE = {'bid': 1.30, 'ask': 1.50, 'feed': 'indicative'}
 
     def _seller(self, spread_fraction=0.0, live_quote='default'):
         self.mock_alpaca = Mock()
@@ -707,7 +709,7 @@ class TestCallLimitPricingFC072:
     def test_the_event_reports_the_live_source(self):
         event = self._executing_event(self._opportunity())
         assert event['quote_source'] == 'live'
-        assert event['quote_age_s'] == 0.0
+        assert event['quote_age_s'] is None
         assert (event['bid'], event['ask']) == (1.30, 1.50)
 
     # --- Test 2: the refresh never fails the order ------------------------
@@ -800,11 +802,16 @@ class TestCallLimitPricingFC072:
         not_snapped = self._executing_event(self._opportunity())
         assert not_snapped['tick_snapped'] is False
 
-    def test_a_half_cent_mid_rests_on_the_ask(self):
-        """bid 0.60 / ask 0.61. `round()` would give 0.60 — the bid, i.e.
-        marketable. Half-up gives 0.61, which rests."""
+    def test_a_one_tick_book_prices_at_the_bid(self):
+        """bid 0.60 / ask 0.61 is one tick wide — no midpoint exists, and the
+        half-up "mid" would just be the ask."""
         assert self._limit_of(self._opportunity(),
-                              live_quote={'bid': 0.60, 'ask': 0.61}) == 0.61
+                              live_quote={'bid': 0.60, 'ask': 0.61}) == 0.60
+
+    def test_a_two_tick_book_still_takes_the_midpoint(self):
+        """0.60/0.62 is two ticks wide: mid 0.61 exists and is taken."""
+        assert self._limit_of(self._opportunity(),
+                              live_quote={'bid': 0.60, 'ask': 0.62}) == 0.61
 
     # --- The knob --------------------------------------------------------
 
@@ -834,7 +841,7 @@ class TestCallLimitPricingFC072:
         assert event['spread_fraction'] == 0.0
         assert event['limit_price'] == 1.40
         assert event['quote_source'] == 'live'
-        assert event['quote_age_s'] == 0.0
+        assert event['quote_age_s'] is None
         assert event['tick_snapped'] is False
         assert event['premium'] == 1.30
 
@@ -872,3 +879,118 @@ class TestCallLimitPricingFC072:
         assert kwargs['order_type'] == 'limit'
         assert kwargs['qty'] == 2
         assert kwargs['symbol'] == 'AAPL260821C00310000'
+
+
+class FC072ReviewMixin(TestCallLimitPricingFC072):
+    """Reuses the FC-072 call fixtures; adds an `_execute` that returns the
+    seller's whole result dict rather than just the limit."""
+
+    def _execute(self, opportunity, **kw):
+        seller = self._seller(**kw)
+        result = seller.execute_call_sale(opportunity)
+        assert result['success'] is True
+        return result
+
+
+class TestCallPricingProvenanceFC072Review(FC072ReviewMixin):
+    """Review round 2 (N1/N2/N5/N7) on the call leg.
+
+    The four things the reviews asked for, each of which is invisible in a
+    diff and expensive in production:
+
+    * the order's result must carry the book it was PRICED off, so the trade
+      journal stops pairing a :15 limit with a :00 quote (N1);
+    * a live book we REFUSED must be distinguishable from a broker that never
+      answered (N2);
+    * every line must say which feed the quote came from, because this account
+      is on the indicative feed until the OPRA agreement is signed (N5);
+    * a live quote's age must come from the broker's stamp, so a halted name's
+      hours-old "latest" quote cannot read as fresh (N7).
+    """
+
+    def test_the_result_carries_the_executing_book(self):
+        """N1: this is what `execute_batch` merges into the journal row."""
+        result = self._execute(self._opportunity())
+
+        assert result['bid'] == 1.3
+        assert result['ask'] == 1.5
+        assert result['mid'] == 1.4
+        assert result['quote_source'] == 'live'
+        assert result['tick_snapped'] is False
+        assert 'quote_age_s' in result
+
+    def test_the_result_carries_the_blob_book_when_that_is_what_priced_it(self):
+        result = self._execute(self._opportunity(), live_quote={})
+
+        assert (result['bid'], result['ask']) == (1.20, 1.40)
+        assert result['quote_source'] == 'blob'
+        assert 890 <= result['quote_age_s'] <= 910
+
+    def test_the_result_reports_no_mid_on_the_premium_fallback(self):
+        """`mid_price` in the journal must be NULL when no midpoint priced the
+        order, rather than quietly inheriting one."""
+        result = self._execute(self._opportunity(bid=0, ask=0), live_quote={})
+        assert result['mid'] is None
+
+    @pytest.mark.parametrize("live_quote,reason", [
+        ({}, 'empty'),
+        ({'bid': 0.0, 'ask': 1.50}, 'unusable_live_book'),
+        ({'bid': 1.50, 'ask': 1.40}, 'unusable_live_book'),
+    ])
+    def test_the_event_names_why_the_fallback_fired(self, live_quote, reason):
+        """N2. Rev 2 fell back SILENTLY on an unusable live book, so a market
+        we refused looked exactly like a broker that never answered."""
+        event = self._executing_event(self._opportunity(), live_quote=live_quote)
+        assert event['quote_fallback_reason'] == reason
+
+    def test_an_api_error_is_named_too(self):
+        event = self._executing_event(self._opportunity(),
+                                      live_quote=RuntimeError("boom"))
+        assert event['quote_fallback_reason'] == 'api_error'
+
+    def test_a_live_quote_has_no_fallback_reason(self):
+        event = self._executing_event(self._opportunity())
+        assert event['quote_fallback_reason'] is None
+
+    def test_the_event_records_which_feed_priced_the_order(self):
+        """N5: indicative is an ADJUSTED BBO, not the NBBO. Signing the OPRA
+        agreement is a precondition before this prices real money, and the log
+        is where that gets audited."""
+        event = self._executing_event(self._opportunity())
+        assert event['quote_feed'] == 'indicative'
+
+    def test_a_stale_live_quote_does_not_read_as_fresh(self):
+        """N7: a halted or thin name's "latest" quote can be hours old."""
+        stale = datetime.now(timezone.utc) - timedelta(seconds=3600)
+        event = self._executing_event(
+            self._opportunity(),
+            live_quote={'bid': 1.3, 'ask': 1.5,
+                        'feed': 'indicative', 'timestamp': stale})
+
+        assert event['quote_source'] == 'live'
+        assert 3590 <= event['quote_age_s'] <= 3610
+
+    def test_a_fresh_live_quote_reads_as_fresh(self):
+        event = self._executing_event(
+            self._opportunity(),
+            live_quote={'bid': 1.3, 'ask': 1.5,
+                        'timestamp': datetime.now(timezone.utc)})
+        assert event['quote_age_s'] < 5
+
+    def test_a_one_tick_book_prices_at_the_bid_and_says_so(self):
+        """N4 on this leg: no midpoint exists to rest at."""
+        event = self._executing_event(
+            self._opportunity(), live_quote={'bid': 0.60, 'ask': 0.61})
+        assert event['limit_price'] == 0.60
+        assert event['one_tick_book'] is True
+
+    def test_a_normal_book_is_not_flagged_as_one_tick(self):
+        assert self._executing_event(self._opportunity())['one_tick_book'] is False
+
+    def test_both_legs_emit_the_same_pricing_field_set(self):
+        """A field present on one leg only silently halves the readout."""
+        event = self._executing_event(self._opportunity())
+        assert {'bid', 'ask', 'mid', 'spread', 'spread_fraction',
+                'quote_source', 'quote_age_s', 'quote_fallback_reason',
+                'quote_feed', 'quote_ts', 'tick_snapped', 'one_tick_book',
+                'limit_price'} <= set(event)

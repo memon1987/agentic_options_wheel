@@ -12,7 +12,7 @@ migrated.
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.strategy.put_seller import PutSeller
 from src.utils import clock
@@ -363,7 +363,8 @@ class TestPutLimitPricingFC072:
     snapping at/above $3.00 — this leg averages $1.44, so it is rare.
     """
 
-    LIVE = {'bid': 1.40, 'ask': 1.48}
+    # Shaped like the real client's payload — see the call leg.
+    LIVE = {'bid': 1.40, 'ask': 1.48, 'feed': 'indicative'}
 
     def _seller(self, spread_fraction=0.10, live_quote='default'):
         self.mock_alpaca = Mock()
@@ -471,7 +472,7 @@ class TestPutLimitPricingFC072:
     def test_the_event_reports_source_and_age(self):
         live = self._executing_event(self._opportunity())
         assert live['quote_source'] == 'live'
-        assert live['quote_age_s'] == 0.0
+        assert live['quote_age_s'] is None
 
         blob = self._executing_event(self._opportunity(), live_quote={})
         assert blob['quote_source'] == 'blob'
@@ -532,7 +533,7 @@ class TestPutLimitPricingFC072:
         assert event['spread_fraction'] == 0.10
         assert event['limit_price'] == 1.45
         assert event['quote_source'] == 'live'
-        assert event['quote_age_s'] == 0.0
+        assert event['quote_age_s'] is None
         assert event['tick_snapped'] is False
 
     def test_the_fallback_reports_no_mid_and_no_fraction(self):
@@ -566,3 +567,118 @@ class TestPutLimitPricingFC072:
         assert result['success'] is False
         assert result['error_type'] == 'wrong_seller'
         self.mock_alpaca.get_option_quote.assert_not_called()
+
+
+class FC072ReviewMixin(TestPutLimitPricingFC072):
+    """Reuses the FC-072 put fixtures; adds an `_execute` that returns the
+    seller's whole result dict rather than just the limit."""
+
+    def _execute(self, opportunity, **kw):
+        seller = self._seller(**kw)
+        result = seller.execute_put_sale(opportunity)
+        assert result['success'] is True
+        return result
+
+
+class TestPutPricingProvenanceFC072Review(FC072ReviewMixin):
+    """Review round 2 (N1/N2/N5/N7) on the put leg.
+
+    The four things the reviews asked for, each of which is invisible in a
+    diff and expensive in production:
+
+    * the order's result must carry the book it was PRICED off, so the trade
+      journal stops pairing a :15 limit with a :00 quote (N1);
+    * a live book we REFUSED must be distinguishable from a broker that never
+      answered (N2);
+    * every line must say which feed the quote came from, because this account
+      is on the indicative feed until the OPRA agreement is signed (N5);
+    * a live quote's age must come from the broker's stamp, so a halted name's
+      hours-old "latest" quote cannot read as fresh (N7).
+    """
+
+    def test_the_result_carries_the_executing_book(self):
+        """N1: this is what `execute_batch` merges into the journal row."""
+        result = self._execute(self._opportunity())
+
+        assert result['bid'] == 1.4
+        assert result['ask'] == 1.48
+        assert result['mid'] == 1.44
+        assert result['quote_source'] == 'live'
+        assert result['tick_snapped'] is False
+        assert 'quote_age_s' in result
+
+    def test_the_result_carries_the_blob_book_when_that_is_what_priced_it(self):
+        result = self._execute(self._opportunity(), live_quote={})
+
+        assert (result['bid'], result['ask']) == (1.20, 1.40)
+        assert result['quote_source'] == 'blob'
+        assert 890 <= result['quote_age_s'] <= 910
+
+    def test_the_result_reports_no_mid_on_the_premium_fallback(self):
+        """`mid_price` in the journal must be NULL when no midpoint priced the
+        order, rather than quietly inheriting one."""
+        result = self._execute(self._opportunity(bid=0, ask=0), live_quote={})
+        assert result['mid'] is None
+
+    @pytest.mark.parametrize("live_quote,reason", [
+        ({}, 'empty'),
+        ({'bid': 0.0, 'ask': 1.50}, 'unusable_live_book'),
+        ({'bid': 1.50, 'ask': 1.40}, 'unusable_live_book'),
+    ])
+    def test_the_event_names_why_the_fallback_fired(self, live_quote, reason):
+        """N2. Rev 2 fell back SILENTLY on an unusable live book, so a market
+        we refused looked exactly like a broker that never answered."""
+        event = self._executing_event(self._opportunity(), live_quote=live_quote)
+        assert event['quote_fallback_reason'] == reason
+
+    def test_an_api_error_is_named_too(self):
+        event = self._executing_event(self._opportunity(),
+                                      live_quote=RuntimeError("boom"))
+        assert event['quote_fallback_reason'] == 'api_error'
+
+    def test_a_live_quote_has_no_fallback_reason(self):
+        event = self._executing_event(self._opportunity())
+        assert event['quote_fallback_reason'] is None
+
+    def test_the_event_records_which_feed_priced_the_order(self):
+        """N5: indicative is an ADJUSTED BBO, not the NBBO. Signing the OPRA
+        agreement is a precondition before this prices real money, and the log
+        is where that gets audited."""
+        event = self._executing_event(self._opportunity())
+        assert event['quote_feed'] == 'indicative'
+
+    def test_a_stale_live_quote_does_not_read_as_fresh(self):
+        """N7: a halted or thin name's "latest" quote can be hours old."""
+        stale = datetime.now(timezone.utc) - timedelta(seconds=3600)
+        event = self._executing_event(
+            self._opportunity(),
+            live_quote={'bid': 1.4, 'ask': 1.48,
+                        'feed': 'indicative', 'timestamp': stale})
+
+        assert event['quote_source'] == 'live'
+        assert 3590 <= event['quote_age_s'] <= 3610
+
+    def test_a_fresh_live_quote_reads_as_fresh(self):
+        event = self._executing_event(
+            self._opportunity(),
+            live_quote={'bid': 1.4, 'ask': 1.48,
+                        'timestamp': datetime.now(timezone.utc)})
+        assert event['quote_age_s'] < 5
+
+    def test_a_one_tick_book_prices_at_the_bid_and_says_so(self):
+        """N4 on this leg: no midpoint exists to rest at."""
+        event = self._executing_event(
+            self._opportunity(), live_quote={'bid': 0.60, 'ask': 0.61})
+        assert event['limit_price'] == 0.60
+        assert event['one_tick_book'] is True
+
+    def test_a_normal_book_is_not_flagged_as_one_tick(self):
+        assert self._executing_event(self._opportunity())['one_tick_book'] is False
+
+    def test_both_legs_emit_the_same_pricing_field_set(self):
+        """A field present on one leg only silently halves the readout."""
+        event = self._executing_event(self._opportunity())
+        assert {'bid', 'ask', 'mid', 'spread', 'spread_fraction',
+                'quote_source', 'quote_age_s', 'quote_fallback_reason',
+                'quote_feed', 'quote_ts', 'tick_snapped', 'one_tick_book',
+                'limit_price'} <= set(event)
