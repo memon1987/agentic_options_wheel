@@ -582,9 +582,12 @@ def trigger_strategy():
             # feeds a per-request, ephemeral WheelStateManager that nothing on the
             # /run trading path reads (opportunities come from the blob; sizing and
             # idempotency from the positions snapshot). On a covered-call book it is
-            # pure liability: it traverses the live FC-054/079 OCC-substring sites in
-            # wheel_engine (miscounting P-ticker calls) and emits wheel-shaped trade
-            # events from the covered-call account into shared telemetry.
+            # pure liability: it emits wheel-shaped trade events from the
+            # covered-call account into shared telemetry. (It also used to traverse
+            # the FC-054/079 OCC-substring sites in wheel_engine, miscounting
+            # P-ticker calls; FC-079 rewired those onto strict_option_type, so that
+            # half of the rationale is spent — the telemetry-contamination half is
+            # not, and is what still justifies the gate.)
             if config.strategy_id == 'wheel':
                 try:
                     engine = WheelEngine(config)

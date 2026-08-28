@@ -661,39 +661,59 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
              patch.object(wheel_engine_module, 'logger') as engine_logger:
             stats = engine.reconcile_positions()
 
+        self._last_warnings = [call.kwargs
+                               for call in engine_logger.warning.call_args_list]
         swallowed = [
-            call.kwargs.get('event_type')
-            for call in engine_logger.warning.call_args_list
-            if str(call.kwargs.get('event_type', '')).endswith(
-                '_state_update_failed')
+            w.get('event_type') for w in self._last_warnings
+            if str(w.get('event_type', '')).endswith('_state_update_failed')
         ]
         return stats, events, swallowed
 
-    def test_a_call_away_on_a_seeded_entry_still_emits_its_events(self):
+    def _warned(self, event_type):
+        return [w for w in getattr(self, '_last_warnings', [])
+                if w.get('event_type') == event_type]
+
+    def test_a_call_away_with_a_surviving_leg_still_emits_its_events(self):
         """The end-to-end path: reconcile seeds the entry from Alpaca, then a
-        later reconcile on the same instance sees the shares called away and
-        must transition that entry — emitting the assignment telemetry rather
-        than dying inside the swallowed try/except.
+        later reconcile on the same instance sees shares called away and must
+        transition that entry — emitting the assignment telemetry rather than
+        dying inside the swallowed try/except.
+
+        FC-079 changed this fixture. It used to have Alpaca return NOTHING on
+        the second pass, which left the strike estimate with no source at all;
+        the engine passed 0.0 through and this test asserted the transition
+        happened anyway. That is now refused (see
+        `test_a_call_away_with_no_strike_source_refuses_the_transition`), so
+        the fixture keeps one surviving leg — a partial call-away, 2 contracts
+        down to 1 — which is what the branch is actually for and which leaves a
+        real strike to read.
         """
         engine, state, alpaca = self._engine(self._held_stock_and_call())
         engine.reconcile_positions()
         assert state.symbol_states['MSFT']['active_calls'] == 1
 
-        # The call is exercised: both legs vanish from Alpaca.
-        alpaca.get_positions.return_value = []
+        # A second contract is written, then one of the two is exercised: 200
+        # shares -> 100, 2 calls -> 1. The surviving leg carries the strike.
+        state.symbol_states['MSFT']['active_calls'] = 2
+        state.symbol_states['MSFT']['stock_shares'] = 200
+        alpaca.get_positions.return_value = [
+            {'symbol': 'MSFT', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '18000', 'current_price': '185.0'},
+            {'symbol': self.HELD_CALL, 'qty': '-1', 'asset_class': 'us_option'},
+        ]
         stats, events, swallowed = self._reconcile_capturing_events(engine)
 
         assert 'error' not in stats, stats
         assert swallowed == [], (
             f"reconcile swallowed a state-update failure: {swallowed}. The "
             "seeded entry is missing a key handle_call_assignment reads.")
+        assert self._warned('call_assignment_strike_unresolved') == []
 
         assigned = [e for e in events if e['event_type'] == 'call_assignment']
         assert len(assigned) == 1, events
         assert assigned[0]['shares'] == 100
-        assert assigned[0]['remaining_shares'] == 0
+        assert assigned[0]['remaining_shares'] == 100
         assert assigned[0]['phase_before'] == 'selling_calls'
-        assert assigned[0]['phase_after'] == 'selling_puts'
         # Seeded entries carry no wheel_cycle_start (reconcile cannot know when
         # the lot was acquired), so the cycle event correctly does NOT fire.
         assert assigned[0]['cycle_duration_days'] == 0
@@ -701,7 +721,47 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
                     if e['event_type'] == 'wheel_cycle_complete']
 
         assert stats['call_assignments_detected'] == 1
-        assert state.symbol_states['MSFT']['stock_shares'] == 0
+
+    def test_a_call_away_with_no_strike_source_refuses_the_transition(self):
+        """FC-079 review fix: never transition on a fabricated 0.0 strike.
+
+        The shape: the last lot is called away, so Alpaca reports neither a
+        surviving call leg nor a stock position — there is nothing to estimate
+        the strike from. The old code passed `strike_price=0.0` into
+        `handle_call_assignment`, which writes `exit_price=0.0` into
+        `wheel_cycle_complete` — the one wheel event with a live BigQuery
+        consumer — i.e. a fabricated 100% loss on the cycle, indistinguishable
+        from a real one downstream.
+
+        The transition is now skipped and the refusal is named. State stays in
+        SELLING_CALLS: visibly wrong, and therefore fixable, rather than
+        silently wrong and permanent.
+        """
+        engine, state, alpaca = self._engine(self._held_stock_and_call())
+        engine.reconcile_positions()
+        assert state.symbol_states['MSFT']['active_calls'] == 1
+
+        # Everything vanishes from Alpaca: no call leg, no shares.
+        alpaca.get_positions.return_value = []
+        stats, events, _swallowed = self._reconcile_capturing_events(engine)
+
+        assert 'error' not in stats, stats
+
+        warned = self._warned('call_assignment_strike_unresolved')
+        assert len(warned) == 1, self._last_warnings
+        assert warned[0]['symbol'] == 'MSFT'
+        assert warned[0]['shares_called'] == 100
+        assert stats['strike_unresolved'] == 1
+
+        # The detection still happened and is still counted — what is refused
+        # is the state transition built on a made-up number.
+        assert stats['call_assignments_detected'] == 1
+        assert [e['event_type'] for e in events
+                if e['event_type'] in ('call_assignment',
+                                       'wheel_cycle_complete')] == []
+        assert not [e for e in events
+                    if e['event_type'] == 'wheel_cycle_complete'
+                    and e.get('exit_price') == 0.0]
 
     def test_a_call_away_after_a_put_assignment_completes_the_cycle(self):
         """The other seeding route — `handle_put_assignment` creates the entry
@@ -710,20 +770,30 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
         live BigQuery consumer (`options_wheel_logs.wheel_cycles`).
         """
         engine, state, alpaca = self._engine([])
-        state.handle_put_assignment('MSFT', 100, 180.0, datetime(2026, 7, 1))
+        state.handle_put_assignment('MSFT', 200, 180.0, datetime(2026, 7, 1))
         assert set(state.symbol_states['MSFT']) == self.SEEDED_KEYS, (
             "handle_put_assignment and reconcile's seeding dict must agree on "
             "the entry shape — reconcile reads both through the same code")
-        state.symbol_states['MSFT']['active_calls'] = 1
+        state.symbol_states['MSFT']['active_calls'] = 2
 
-        alpaca.get_positions.return_value = []
+        # FC-079: one of two contracts is exercised, so a call leg survives to
+        # supply the strike. Draining Alpaca entirely would now (correctly)
+        # refuse the transition rather than complete the cycle at exit_price
+        # 0.0 — see
+        # `test_a_call_away_with_no_strike_source_refuses_the_transition`.
+        alpaca.get_positions.return_value = [
+            {'symbol': self.HELD_CALL, 'qty': '-1', 'asset_class': 'us_option'},
+        ]
         stats, events, swallowed = self._reconcile_capturing_events(engine)
 
         assert 'error' not in stats, stats
         assert swallowed == []
+        assert self._warned('call_assignment_strike_unresolved') == []
         cycle = [e for e in events if e['event_type'] == 'wheel_cycle_complete']
         assert len(cycle) == 1, events
         assert cycle[0]['cost_basis'] == 180.0
+        # The strike came off the surviving leg, not a fallback or a zero.
+        assert cycle[0]['exit_price'] == 190.0
 
 
 # =========================================================================== #
@@ -869,6 +939,41 @@ class TestReconcileClassifiesLegsStrictly:
                     if c.kwargs.get('event_type')
                     == 'reconcile_unclassifiable_option']
         assert len(warnings) == 1
+
+    def test_the_untracked_position_events_carry_the_unclassified_count(self):
+        """FC-079 review fix (G5). `untracked_position_found` and its
+        `reconciliation_untracked_position` twin are the only telemetry that
+        carries the leg counts. Without `unclassified`, a symbol whose legs did
+        not classify reads as `puts=0 calls=0` — identical to a bare equity
+        holding, on exactly the positions where the operator needs to know the
+        engine abstained.
+        """
+        engine, _state = self._engine([
+            {'symbol': 'AAPL', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '23000', 'current_price': '232.0'},
+            {'symbol': 'AAPL1260918C00230000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ])
+
+        system_events = []
+        with patch.object(wheel_engine_module, 'logger') as log, \
+             patch('src.strategy.wheel_engine.log_system_event',
+                   side_effect=lambda logger, **kw: system_events.append(kw)):
+            stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+
+        found = [c.kwargs for c in log.warning.call_args_list
+                 if c.kwargs.get('event_type') == 'untracked_position_found']
+        assert len(found) == 1, log.warning.call_args_list
+        assert found[0]['symbol'] == 'AAPL'
+        assert (found[0]['puts'], found[0]['calls']) == (0, 0)
+        assert found[0]['unclassified'] == 1
+
+        twin = [e for e in system_events
+                if e.get('event_type') == 'reconciliation_untracked_position']
+        assert len(twin) == 1, system_events
+        assert twin[0]['unclassified'] == 1
 
     def test_an_adjusted_symbol_does_not_break_reconciliation(self):
         """No exception, and the pass still completes."""

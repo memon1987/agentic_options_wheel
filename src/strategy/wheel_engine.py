@@ -116,12 +116,25 @@ class WheelEngine:
 
         FC-079. This used to classify with ``'P' in option_symbol`` / ``elif
         'C' in option_symbol``, testing the whole contract string rather than
-        the type character. Every underlying whose root carries a P or a C was
-        misread — AAPL, SPY and PFE all contain a ``'P'``, so the put branch
-        fired first and every one of their *calls* was counted as a put. These
-        counts feed the position-diff assignment fallback in
-        ``reconcile_positions``, so on a third of the universe a call
-        assignment could never be detected on that path.
+        the type character. The ``'P'`` branch is tested first, so every root
+        containing a P had its *calls* counted as puts: AAPL, SPY and PFE — 3
+        of the 14 configured symbols. (Only P-roots were affected here. A
+        C-root would break the ``elif``, but no configured root contains a C;
+        that shape is what the two *latent* FC-079 sites — the call-away strike
+        estimate below, and ``regression_monitor.reconcile_orphaned`` — were
+        exposed to.)
+
+        On the CONSEQUENCE, honestly: these counts feed the position-diff
+        assignment fallback in ``reconcile_positions``, and that fallback is
+        **dead in production**. ``/run`` builds a fresh ``WheelEngine`` per
+        request, so its ``WheelStateManager`` starts empty and ``tracked_puts``
+        / ``tracked_calls`` are always 0 — no ``tracked_* > actual_*`` predicate
+        can ever fire. BigQuery has zero ``put_assignment_detected`` /
+        ``call_assignment_detected`` rows, ever. What the miscount actually
+        corrupted is the *telemetry*: ``untracked_position_found`` has been
+        emitting ``puts=1 calls=0`` for AAPL roughly six times a day. So this
+        is a correctness fix on a path that is presently observational — and a
+        prerequisite for the diff path ever being made live.
 
         Classification is strict, and it never guesses: a symbol that is not an
         exact OCC contract (an adjusted root after a split, e.g.
@@ -451,15 +464,14 @@ class WheelEngine:
                     # Trigger wheel state transition: SELLING_CALLS -> cycle complete
                     # This fires wheel_cycle_complete if all shares are called away
                     try:
-                        # Estimate strike from option positions (approximate).
-                        # FC-079: ``'C' in opt_sym`` matched the first option
-                        # whose *symbol text* contained a C — for PFE that is
-                        # every PFE contract, puts included — and the strike
-                        # then came off a blind ``[-8:]`` slice. Classify with
-                        # strict_option_type and read the strike from the
-                        # parser. An unclassifiable symbol is skipped, which
-                        # falls through to the current-price fallback below
-                        # rather than inventing a strike.
+                        # Estimate the strike from the surviving option legs.
+                        #
+                        # FC-079: this used to select the leg with
+                        # ``'C' in opt_sym`` — true for every contract on a
+                        # root containing a C, puts included — and then read
+                        # the strike off a blind ``[-8:]`` slice. Both are now
+                        # the canonical parsers. An unclassifiable symbol
+                        # (adjusted root) is skipped rather than guessed at.
                         strike_price = 0.0
                         for pos in option_positions:
                             opt_sym = pos.get('symbol', '')
@@ -473,19 +485,49 @@ class WheelEngine:
                                 except (TypeError, ValueError):
                                     pass
                                 break
+
                         if strike_price == 0.0:
-                            # Fallback: use current stock price as estimate
+                            # Second-best: the stock's current price. This is
+                            # an ESTIMATE, not the strike — it is wrong by
+                            # whatever the call was in-the-money by, and it is
+                            # accepted only because the alternative (no
+                            # transition at all) leaves wheel state stuck in
+                            # SELLING_CALLS. It is not "avoiding inventing a
+                            # strike"; it is inventing a cheaper one.
                             for pos in stock_positions:
                                 if pos.get('symbol') == symbol:
                                     strike_price = float(pos.get('current_price', 0))
                                     break
 
-                        self.wheel_state.handle_call_assignment(
-                            symbol=symbol,
-                            shares=shares_called,
-                            strike_price=strike_price,
-                            assignment_date=clock.now(),
-                        )
+                        if strike_price <= 0.0:
+                            # Nothing to estimate from: no surviving call leg
+                            # AND no stock position (the usual shape when the
+                            # last lot was called away — Alpaca reports
+                            # neither). Passing 0.0 through would write
+                            # exit_price=0.0 into `wheel_cycle_complete`, i.e.
+                            # a fabricated 100% loss on the cycle, into the
+                            # one wheel event with a live BigQuery consumer.
+                            # Refuse: skip the transition and say so. State
+                            # stays in SELLING_CALLS, which is visibly wrong
+                            # and therefore fixable, rather than silently
+                            # wrong and permanent.
+                            stats.setdefault('strike_unresolved', 0)
+                            stats['strike_unresolved'] += 1
+                            logger.warning(
+                                "Call-away strike unresolved - skipping wheel state transition",
+                                event_category="reconciliation",
+                                event_type="call_assignment_strike_unresolved",
+                                symbol=symbol,
+                                shares_called=shares_called,
+                                tracked_calls=tracked_calls,
+                                actual_calls=actual_calls)
+                        else:
+                            self.wheel_state.handle_call_assignment(
+                                symbol=symbol,
+                                shares=shares_called,
+                                strike_price=strike_price,
+                                assignment_date=clock.now(),
+                            )
                     except Exception as e:
                         logger.warning("Failed to update wheel state for call assignment",
                                       event_category="error",
@@ -557,13 +599,20 @@ class WheelEngine:
                 actual_opts = alpaca_option_counts.get(
                     symbol, {'puts': 0, 'calls': 0, 'unclassified': 0})
 
+                # `unclassified` rides along on both events (FC-079). These
+                # two are the only telemetry that carries the leg counts at
+                # all, and a symbol whose legs did not classify would otherwise
+                # read as `puts=0 calls=0` — indistinguishable from a bare
+                # equity holding, on exactly the positions (adjusted contracts)
+                # where the operator most needs to know the engine abstained.
                 logger.warning("Position exists in Alpaca but not in wheel state — adding",
                               event_category="reconciliation",
                               event_type="untracked_position_found",
                               symbol=symbol,
                               shares=actual_shares,
                               puts=actual_opts['puts'],
-                              calls=actual_opts['calls'])
+                              calls=actual_opts['calls'],
+                              unclassified=actual_opts['unclassified'])
                 log_system_event(
                     logger,
                     event_type="reconciliation_untracked_position",
@@ -571,7 +620,8 @@ class WheelEngine:
                     symbol=symbol,
                     shares=actual_shares,
                     puts=actual_opts['puts'],
-                    calls=actual_opts['calls'])
+                    calls=actual_opts['calls'],
+                    unclassified=actual_opts['unclassified'])
 
                 self.wheel_state.symbol_states[symbol] = {
                     'stock_shares': actual_shares,

@@ -10,6 +10,10 @@ from pathlib import Path
 
 import pytest
 
+# FC-079: one walker, shared, so the two OCC gates cannot cover different
+# trees. `tests/test_no_occ_substring.py` owns it.
+from tests.test_no_occ_substring import walked_files
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -112,16 +116,12 @@ def _occ_substring_sites(py_file: Path):
 
 def test_no_occ_substring_routing_outside_allowlist():
     offenders = []
-    for base in ("src", "tools", "deploy"):
-        root = REPO_ROOT / base
-        if not root.exists():
+    for py in walked_files():
+        rel = py.relative_to(REPO_ROOT).as_posix()
+        if rel in _OCC_SUBSTRING_ALLOWLIST:
             continue
-        for py in root.rglob("*.py"):
-            rel = py.relative_to(REPO_ROOT).as_posix()
-            if rel in _OCC_SUBSTRING_ALLOWLIST:
-                continue
-            for lineno, text in _occ_substring_sites(py):
-                offenders.append(f"{rel}:{lineno}: {text}")
+        for lineno, text in _occ_substring_sites(py):
+            offenders.append(f"{rel}:{lineno}: {text}")
 
     assert not offenders, (
         "OCC-substring routing found in non-allowlisted code (the "
@@ -129,6 +129,24 @@ def test_no_occ_substring_routing_outside_allowlist():
         "src.utils.option_symbols.strict_option_type instead:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_both_occ_gates_walk_the_same_files():
+    """The two gates must not disagree about coverage.
+
+    They used to have independent walk sets — this one did `("src", "tools",
+    "deploy")`, the other did `("src", "tools/testing")` and missed `deploy/`
+    entirely. Two gates for one bug family, each blind somewhere the other
+    looks, is worse than one honest gate. This file now imports the walker
+    rather than reimplementing it; the assertion below stops a future edit from
+    forking them again.
+    """
+    from tests.test_no_occ_substring import walked_files as canonical_walker
+
+    assert set(walked_files()) == set(canonical_walker())
+    rels = {p.relative_to(REPO_ROOT).as_posix() for p in walked_files()}
+    assert "deploy/cloud_run_server.py" in rels
+    assert "main.py" in rels
 
 
 PROBE = (
