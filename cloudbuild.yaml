@@ -4,11 +4,10 @@
 # FC-084 (rev 2) — builds of this trigger are SERIALIZED, and each build deploys a
 # revision whose name it chose before deploying. Three mechanisms, in order:
 #
-#   1. `serialize-builds` gates the deploys (waitFor: ['push-bot-image'] — it runs
-#      AFTER this build has done its own test/build/push work, so a build that ends up
-#      waiting has already spent that time productively and only the ~4-6 min deploy
-#      chain is serialized; see docs/CLAUDE.md §Deploy / CI for the timing arithmetic).
-#      It asks Cloud Build which other builds of this trigger are QUEUED/WORKING. A NEWER one
+#   1. `serialize-builds` gates the deploys. It is LISTED after `push-bot-image` and
+#      waits on it: Cloud Build resolves `waitFor` only against ids defined earlier in
+#      the list, so listing this step first makes the whole config invalid. It asks
+#      Cloud Build which other builds of this trigger are PENDING/QUEUED/WORKING. A NEWER one
 #      exists -> this build writes /workspace/superseded, logs SUPERSEDED and exits 0
 #      (not a failure: newer code wins, no alert). An OLDER one is still running ->
 #      wait for it. Alone and newest -> proceed.
@@ -31,167 +30,16 @@
 # safe here because serialization means "latest" is always this build's revision, and
 # each promote asserts `latestReadyRevisionName == REV` before shifting traffic.
 #
+# The gate needs `cloudbuild.builds.get`/`.list`. Trigger builds run as the TRIGGER's
+# service account — 799970961417-compute@developer.gserviceaccount.com — NOT the
+# `serviceAccount:` field at the bottom of this file, which Cloud Build ignores for
+# trigger builds. That account does NOT have the permission today (verified by probe
+# build 3d4db40d on 2026-08-28), so it must be granted roles/cloudbuild.builds.viewer
+# before this config can deploy anything. The gate fails closed and says so.
+#
 # See docs/plans/fc-084.md (rev 2) and docs/CLAUDE.md §Deploy / CI.
 
 steps:
-  # Step 0: Serialize builds of this trigger (FC-084).
-  # waitFor: ['push-bot-image'] rather than ['-']: a build that has to wait for an
-  # older one has by then already run its own tests/build/push in parallel, so the
-  # serialized window is just the deploy chain. It also keeps the gate's own 15-minute
-  # wait cap comfortably wider than any legitimate wait. Only the deploy steps wait
-  # on this step, so nothing else in the graph is delayed.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: 'bash'
-    env:
-      - 'BUILD_ID=$BUILD_ID'
-      - 'SHORT_SHA=$SHORT_SHA'
-    args:
-      - '-c'
-      - |
-        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
-        # The decision is a standalone program so it can be unit-tested directly
-        # (tests/test_cloudbuild_contract.py extracts this heredoc and runs it).
-        cat > /workspace/gate_decision.py <<'PYEOF'
-        """Decide whether this build may deploy, must wait, or is superseded.
-
-        stdin : `gcloud builds list --format=json` for the QUEUED/WORKING builds of
-                this trigger (this build itself is normally in that list).
-        env   : MY_BUILD_ID, MY_CREATE_TIME
-        stdout: exactly one of
-                  SUPERSEDED <id> <createTime>
-                  WAIT <id> <createTime>
-                  PROCEED
-
-        createTime is compared as a STRING. That is valid only on the raw API value
-        (`2026-08-28T16:43:45.221420Z` — RFC3339, always Z, fixed-width microseconds),
-        which is why the caller passes --format=json. Do NOT switch the caller to
-        --format='value(createTime)': gcloud reformats that to
-        `2026-08-28T16:43:45+00:00`, dropping the microseconds that separate two
-        builds pushed seconds apart.
-
-        Equal createTime is broken deterministically by build id, so two builds can
-        never both WAIT (deadlock) or both PROCEED (the race we are removing).
-        """
-        import json
-        import os
-        import sys
-
-        me_id = os.environ["MY_BUILD_ID"]
-        me_ct = os.environ["MY_CREATE_TIME"]
-
-        builds = json.load(sys.stdin)
-        if isinstance(builds, dict):
-            builds = [builds]
-
-        newer = []
-        older = []
-        for b in builds:
-            bid = b.get("id") or ""
-            ct = b.get("createTime") or ""
-            if not bid or not ct or bid == me_id:
-                continue
-            key = (ct, bid)
-            if key > (me_ct, me_id):
-                newer.append(key)
-            else:
-                older.append(key)
-
-        if newer:
-            ct, bid = max(newer)
-            print("SUPERSEDED %s %s" % (bid, ct))
-        elif older:
-            ct, bid = min(older)
-            print("WAIT %s %s" % (bid, ct))
-        else:
-            print("PROCEED")
-        PYEOF
-        echo "serialize-builds: this build is $${BUILD_ID}"
-
-        # Who am I? createTime + trigger, from the raw API value.
-        MY_CREATE_TIME=""
-        MY_TRIGGER=""
-        for attempt in 1 2 3; do
-          if gcloud builds describe "$${BUILD_ID}" --format=json \
-               > /workspace/gate-me.json 2> /workspace/gate-err.txt; then
-            MY_CREATE_TIME=$(python3 -c "import json;print(json.load(open('/workspace/gate-me.json')).get('createTime') or '')")
-            MY_TRIGGER=$(python3 -c "import json;print(json.load(open('/workspace/gate-me.json')).get('buildTriggerId') or '')")
-            break
-          fi
-          cat /workspace/gate-err.txt
-          sleep 5
-        done
-        if [ -z "$${MY_CREATE_TIME}" ]; then
-          echo "FAIL: cannot read this build's own record — missing cloudbuild.builds.get."
-          echo "Failing closed on purpose: without build ordering this build could race"
-          echo "another one and silently deploy the older commit (FC-084). To fix, run:"
-          echo ""
-          echo "  gcloud projects add-iam-policy-binding gen-lang-client-0607444019 \\"
-          echo "    --member=serviceAccount:799970961417@cloudbuild.gserviceaccount.com \\"
-          echo "    --role=roles/cloudbuild.builds.viewer"
-          echo ""
-          echo "then re-run this build. See docs/CLAUDE.md §Deploy / CI."
-          exit 1
-        fi
-        if [ -z "$${MY_TRIGGER}" ]; then
-          echo "PROCEED: build has no buildTriggerId (manual submit) — nothing to serialize against"
-          exit 0
-        fi
-        echo "serialize-builds: createTime=$${MY_CREATE_TIME} trigger=$${MY_TRIGGER}"
-
-        # Wait at most 15 min. The build-level timeout is 1200s (20 min); keeping the
-        # loop shorter means this message wins the race to explain what happened.
-        DEADLINE=$(( $(date +%s) + 900 ))
-        while :; do
-          LISTED=""
-          for attempt in 1 2 3; do
-            if gcloud builds list \
-                 --filter="buildTriggerId=$${MY_TRIGGER} AND status:(QUEUED,WORKING)" \
-                 --format=json > /workspace/gate-others.json 2> /workspace/gate-err.txt; then
-              LISTED="yes"
-              break
-            fi
-            cat /workspace/gate-err.txt
-            sleep 5
-          done
-          if [ -z "$${LISTED}" ]; then
-            echo "FAIL: cannot list builds for this trigger — missing cloudbuild.builds.list."
-            echo "Failing closed on purpose: without build ordering this build could race"
-            echo "another one and silently deploy the older commit (FC-084). To fix, run:"
-            echo ""
-            echo "  gcloud projects add-iam-policy-binding gen-lang-client-0607444019 \\"
-            echo "    --member=serviceAccount:799970961417@cloudbuild.gserviceaccount.com \\"
-            echo "    --role=roles/cloudbuild.builds.viewer"
-            echo ""
-            echo "then re-run this build. See docs/CLAUDE.md §Deploy / CI."
-            exit 1
-          fi
-
-          DECISION=$(MY_BUILD_ID="$${BUILD_ID}" MY_CREATE_TIME="$${MY_CREATE_TIME}" \
-            python3 /workspace/gate_decision.py < /workspace/gate-others.json)
-          echo "serialize-builds: $${DECISION}"
-
-          case "$${DECISION}" in
-            SUPERSEDED*)
-              touch /workspace/superseded
-              echo "SUPERSEDED — a newer build of this trigger exists; skipping deploy."
-              echo "This is not a failure: the newer build deploys the newer commit. Exiting 0."
-              exit 0
-              ;;
-            PROCEED*)
-              echo "PROCEED — newest build of this trigger and alone; deploying."
-              exit 0
-              ;;
-          esac
-
-          if [ "$(date +%s)" -ge "$${DEADLINE}" ]; then
-            echo "FAIL: an older build of this trigger is still running after 15 min."
-            exit 1
-          fi
-          sleep 20
-        done
-    id: 'serialize-builds'
-    waitFor: ['push-bot-image']
-
   # Step 1: Run critical tests only (faster)
   - name: 'python:3.11-slim'
     entrypoint: 'bash'
@@ -238,6 +86,230 @@ steps:
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy'
     id: 'push-bot-image'
     waitFor: ['build-bot-image']
+
+  # Step 4b: Serialize builds of this trigger (FC-084).
+  # MUST be listed after `push-bot-image`: Cloud Build resolves `waitFor` against
+  # step ids defined EARLIER in this list, and rejects the config outright with
+  # "depends on ... which has not been defined" otherwise. Listing it first also
+  # made `run-tests` (no explicit waitFor, so it implicitly waits on every prior
+  # step) wait on this gate, which is a cycle.
+  # waitFor: ['push-bot-image'] rather than ['-']: a build that has to wait for an
+  # older one has by then already run its own tests/build/push in parallel, so the
+  # serialized window is just the deploy chain. It also keeps the gate's own 15-minute
+  # wait cap comfortably wider than any legitimate wait. Only the deploy steps wait
+  # on this step, so nothing else in the graph is delayed.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    env:
+      - 'BUILD_ID=$BUILD_ID'
+      - 'SHORT_SHA=$SHORT_SHA'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        # The decision is a standalone program so it can be unit-tested directly
+        # (tests/test_cloudbuild_contract.py extracts this heredoc and runs it).
+        cat > /workspace/gate_decision.py <<'PYEOF'
+        """Decide whether this build may deploy, must wait, or is superseded.
+
+        stdin : `gcloud builds list --format=json` for the PENDING/QUEUED/WORKING builds
+                of this trigger (this build itself is normally in that list).
+        env   : MY_BUILD_ID, MY_CREATE_TIME
+        stdout: exactly one of
+                  SUPERSEDED <id> <createTime>
+                  WAIT <id> <createTime>
+                  PROCEED
+
+        createTime is PARSED to a datetime, never string-compared. Protobuf JSON emits 0,
+        3, 6 or 9 fractional digits, so `...:45Z`, `...:45.221Z` and `...:45.221420123Z`
+        all occur and lexicographic order between them is simply wrong. The caller must
+        pass --format=json for the same reason: gcloud's --format='value(createTime)'
+        renders `2026-08-28T16:43:45+00:00` and drops the fraction entirely.
+
+        Equal createTime breaks deterministically on build id, so two builds can never
+        both WAIT (deadlock) or both PROCEED (the race this removes).
+        """
+        import datetime
+        import json
+        import os
+        import re
+        import sys
+
+        _RFC3339 = re.compile(
+            r"^(?P<base>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+            r"(?:\.(?P<frac>\d+))?"
+            r"(?P<tz>Z|[+-]\d{2}:?\d{2})?$"
+        )
+
+
+        def parse_rfc3339(value):
+            """RFC3339 -> aware datetime, with the fraction normalized to 6 digits.
+
+            datetime.fromisoformat on Python 3.9 (what the cloud-sdk image ships)
+            accepts neither a trailing 'Z' nor 9 fractional digits, and protobuf JSON
+            emits both.
+            """
+            m = _RFC3339.match((value or "").strip())
+            if not m:
+                raise ValueError("not RFC3339: %r" % (value,))
+            frac = (m.group("frac") or "")[:6].ljust(6, "0")
+            tz = m.group("tz") or "+00:00"
+            if tz == "Z":
+                tz = "+00:00"
+            if len(tz) == 5:
+                tz = tz[:3] + ":" + tz[3:]
+            return datetime.datetime.fromisoformat(
+                "%s.%s%s" % (m.group("base"), frac, tz)
+            )
+
+
+        def decide(builds, me_id, me_ct):
+            me = (parse_rfc3339(me_ct), me_id)
+            newer = []
+            older = []
+            for b in builds:
+                bid = b.get("id") or ""
+                ct = b.get("createTime") or ""
+                if not bid or not ct or bid == me_id:
+                    continue
+                try:
+                    key = (parse_rfc3339(ct), bid)
+                except ValueError:
+                    continue
+                (newer if key > me else older).append((key, ct))
+            if newer:
+                (_, bid), ct = max(newer)
+                return "SUPERSEDED %s %s" % (bid, ct)
+            if older:
+                (_, bid), ct = min(older)
+                return "WAIT %s %s" % (bid, ct)
+            return "PROCEED"
+
+
+        def main():
+            builds = json.load(sys.stdin)
+            if isinstance(builds, dict):
+                builds = [builds]
+            print(decide(builds, os.environ["MY_BUILD_ID"], os.environ["MY_CREATE_TIME"]))
+
+
+        if __name__ == "__main__":
+            main()
+        PYEOF
+
+        # Fail closed, loudly, and only blame IAM when IAM is actually the problem.
+        fail_closed() {
+          echo "FAIL: $${1}"
+          echo "Failing closed on purpose: without build ordering this build could race"
+          echo "another one and silently deploy the older commit (FC-084)."
+          echo "--- gcloud output ---"
+          cat /workspace/gate-err.txt 2>/dev/null
+          echo "---------------------"
+          if grep -q 'PERMISSION_DENIED' /workspace/gate-err.txt 2>/dev/null; then
+            SA=$(gcloud builds describe "$${BUILD_ID}" --format='value(serviceAccount)' 2>/dev/null | sed 's#.*/##')
+            if [ -z "$${SA}" ]; then
+              SA="799970961417-compute@developer.gserviceaccount.com"
+              echo "(could not read this build's serviceAccount; naming the trigger's default)"
+            fi
+            echo "This build runs as: $${SA}"
+            echo "That account needs roles/cloudbuild.builds.viewer (console name: Cloud Build"
+            echo "Viewer). NOTE: the Cloud Resource Manager API is DISABLED on this project, so"
+            echo "gcloud projects add-iam-policy-binding will NOT work — grant it in the console:"
+            echo "  https://console.cloud.google.com/iam-admin/iam?project=gen-lang-client-0607444019"
+          else
+            echo "No PERMISSION_DENIED above, so this is most likely a transient API error."
+            echo "Re-run the build; if it repeats, check Cloud Build API status."
+          fi
+          echo "See docs/CLAUDE.md section 'Deploy / CI'."
+          exit 1
+        }
+
+        echo "serialize-builds: this build is $${BUILD_ID}"
+
+        # Who am I? createTime / startTime / trigger, from the raw API values.
+        MY_CREATE_TIME=""
+        MY_TRIGGER=""
+        for attempt in 1 2 3; do
+          if gcloud builds describe "$${BUILD_ID}" --format=json \
+               > /workspace/gate-me.json 2> /workspace/gate-err.txt; then
+            MY_CREATE_TIME=$(python3 -c "import json;print(json.load(open('/workspace/gate-me.json')).get('createTime') or '')")
+            MY_TRIGGER=$(python3 -c "import json;print(json.load(open('/workspace/gate-me.json')).get('buildTriggerId') or '')")
+            break
+          fi
+          cat /workspace/gate-err.txt
+          sleep 5
+        done
+        if [ -z "$${MY_CREATE_TIME}" ]; then
+          fail_closed "cannot read this build's own record (cloudbuild.builds.get)."
+        fi
+        if [ -z "$${MY_TRIGGER}" ]; then
+          echo "PROCEED: build has no buildTriggerId (manual submit, or a console Rebuild that"
+          echo "did not carry one) — there is nothing to serialize against. NOTE: forward"
+          echo "builds cannot see this one as a trigger sibling either, so it neither"
+          echo "supersedes nor is superseded. See docs/CLAUDE.md section 'Deploy / CI'."
+          exit 0
+        fi
+        echo "serialize-builds: createTime=$${MY_CREATE_TIME} trigger=$${MY_TRIGGER}"
+
+        # Give up 90s before Cloud Build's own timeout so THIS message is what the log
+        # shows rather than an opaque TIMEOUT. Keep BUILD_TIMEOUT_SECONDS equal to the
+        # `timeout:` field at the bottom of this file — a contract test asserts they match.
+        BUILD_TIMEOUT_SECONDS=1500
+        START_EPOCH=$(python3 -c "import json,sys;sys.path.insert(0,'/workspace');from gate_decision import parse_rfc3339;d=json.load(open('/workspace/gate-me.json'));v=d.get('startTime') or d.get('createTime') or '';print(int(parse_rfc3339(v).timestamp()) if v else 0)" 2>/dev/null || echo 0)
+        if [ -z "$${START_EPOCH}" ] || [ "$${START_EPOCH}" = "0" ]; then
+          START_EPOCH=$(date +%s)
+          echo "serialize-builds: no startTime on the build record; measuring the deadline from now"
+        fi
+        DEADLINE=$(( START_EPOCH + BUILD_TIMEOUT_SECONDS - 90 ))
+        echo "serialize-builds: will give up at epoch $${DEADLINE} (90s before the build timeout)"
+
+        while :; do
+          LISTED=""
+          for attempt in 1 2 3; do
+            if gcloud builds list \
+                 --filter="buildTriggerId=$${MY_TRIGGER} AND status:(PENDING,QUEUED,WORKING)" \
+                 --format=json > /workspace/gate-others.json 2> /workspace/gate-err.txt; then
+              LISTED="yes"
+              break
+            fi
+            cat /workspace/gate-err.txt
+            sleep 5
+          done
+          if [ -z "$${LISTED}" ]; then
+            fail_closed "cannot list builds for this trigger (cloudbuild.builds.list)."
+          fi
+
+          DECISION=$(MY_BUILD_ID="$${BUILD_ID}" MY_CREATE_TIME="$${MY_CREATE_TIME}" \
+            python3 /workspace/gate_decision.py < /workspace/gate-others.json 2> /workspace/gate-err.txt)
+          echo "serialize-builds: $${DECISION}"
+
+          case "$${DECISION}" in
+            SUPERSEDED*)
+              touch /workspace/superseded
+              echo "SUPERSEDED — a newer build of this trigger exists; skipping deploy."
+              echo "This is not a failure: the newer build deploys the newer commit. Exiting 0."
+              exit 0
+              ;;
+            PROCEED*)
+              echo "PROCEED — newest build of this trigger and alone; deploying."
+              exit 0
+              ;;
+            WAIT*)
+              ;;
+            *)
+              fail_closed "gate produced no usable decision (got: '$${DECISION}')."
+              ;;
+          esac
+
+          if [ "$(date +%s)" -ge "$${DEADLINE}" ]; then
+            echo "FAIL: an older build of this trigger is still running, and this build is"
+            echo "90s from its own timeout. Something is stuck — check the build list."
+            exit 1
+          fi
+          sleep 20
+        done
+    id: 'serialize-builds'
+    waitFor: ['push-bot-image']
 
   # Step 5: Push the dashboard container image
   - name: 'gcr.io/cloud-builders/docker'
@@ -364,20 +436,42 @@ steps:
       - |
         [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
         REV=$(cat /workspace/rev-options-wheel-strategy.txt)
-        LATEST=$(gcloud run services describe options-wheel-strategy --region=us-central1 \
-          --format='value(status.latestReadyRevisionName)')
-        echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
-        if [ "$${LATEST}" != "$${REV}" ]; then
-          echo "FAIL: latest ready is $${LATEST}, expected $${REV} — an out-of-band deploy landed; refusing to promote"
-          exit 1
-        fi
+        MY_IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA"
         for attempt in 1 2 3; do
+          # Re-evaluated on EVERY attempt, never retried blind: between this build's
+          # --no-traffic deploy and this step, an operator kill switch
+          # (`services update --update-env-vars ROLLER_ENABLED=false`) can create a new
+          # 0%-traffic revision. Refusing outright would leave the service pinned to the
+          # OLD revision with the kill switch NOT applied — the opposite of what the
+          # operator asked for. So: if the latest ready revision runs THIS build's image,
+          # it is that env-only change and we promote it.
+          LATEST=$(gcloud run services describe options-wheel-strategy --region=us-central1 \
+            --format='value(status.latestReadyRevisionName)')
+          echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
+          if [ "$${LATEST}" != "$${REV}" ]; then
+            LATEST_IMAGE=$(gcloud run revisions describe "$${LATEST}" --region=us-central1 \
+              --format='value(spec.containers[0].image)')
+            if [ "$${LATEST_IMAGE}" = "$${MY_IMAGE}" ]; then
+              echo "PROMOTING latest ready $${LATEST} (env-only change on this build's image)"
+            else
+              SERVING=$(gcloud run services describe options-wheel-strategy --region=us-central1 --format=json \
+                | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+              echo "FAIL: refusing to promote options-wheel-strategy."
+              echo "  serving now       : $${SERVING}"
+              echo "  latest ready      : $${LATEST} (image $${LATEST_IMAGE})"
+              echo "  this build's rev  : $${REV} (image $${MY_IMAGE})"
+              echo "An out-of-band deploy of a DIFFERENT image landed during this build, so"
+              echo "promoting would ship code this build never tested. Decide which one wins,"
+              echo "then run:  gcloud run services update-traffic options-wheel-strategy --to-latest"
+              exit 1
+            fi
+          fi
           if gcloud run services update-traffic options-wheel-strategy \
             --to-latest \
             --region=us-central1 \
             > /workspace/promote-log-options-wheel-strategy.txt 2>&1; then
             cat /workspace/promote-log-options-wheel-strategy.txt
-            echo "PROMOTED: 100% traffic to latest ($${REV})"
+            echo "PROMOTED: 100% traffic to latest"
             exit 0
           fi
           cat /workspace/promote-log-options-wheel-strategy.txt
@@ -503,20 +597,42 @@ steps:
       - |
         [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
         REV=$(cat /workspace/rev-covered-call-engine.txt)
-        LATEST=$(gcloud run services describe covered-call-engine --region=us-central1 \
-          --format='value(status.latestReadyRevisionName)')
-        echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
-        if [ "$${LATEST}" != "$${REV}" ]; then
-          echo "FAIL: latest ready is $${LATEST}, expected $${REV} — an out-of-band deploy landed; refusing to promote"
-          exit 1
-        fi
+        MY_IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA"
         for attempt in 1 2 3; do
+          # Re-evaluated on EVERY attempt, never retried blind: between this build's
+          # --no-traffic deploy and this step, an operator kill switch
+          # (`services update --update-env-vars ROLLER_ENABLED=false`) can create a new
+          # 0%-traffic revision. Refusing outright would leave the service pinned to the
+          # OLD revision with the kill switch NOT applied — the opposite of what the
+          # operator asked for. So: if the latest ready revision runs THIS build's image,
+          # it is that env-only change and we promote it.
+          LATEST=$(gcloud run services describe covered-call-engine --region=us-central1 \
+            --format='value(status.latestReadyRevisionName)')
+          echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
+          if [ "$${LATEST}" != "$${REV}" ]; then
+            LATEST_IMAGE=$(gcloud run revisions describe "$${LATEST}" --region=us-central1 \
+              --format='value(spec.containers[0].image)')
+            if [ "$${LATEST_IMAGE}" = "$${MY_IMAGE}" ]; then
+              echo "PROMOTING latest ready $${LATEST} (env-only change on this build's image)"
+            else
+              SERVING=$(gcloud run services describe covered-call-engine --region=us-central1 --format=json \
+                | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+              echo "FAIL: refusing to promote covered-call-engine."
+              echo "  serving now       : $${SERVING}"
+              echo "  latest ready      : $${LATEST} (image $${LATEST_IMAGE})"
+              echo "  this build's rev  : $${REV} (image $${MY_IMAGE})"
+              echo "An out-of-band deploy of a DIFFERENT image landed during this build, so"
+              echo "promoting would ship code this build never tested. Decide which one wins,"
+              echo "then run:  gcloud run services update-traffic covered-call-engine --to-latest"
+              exit 1
+            fi
+          fi
           if gcloud run services update-traffic covered-call-engine \
             --to-latest \
             --region=us-central1 \
             > /workspace/promote-log-covered-call-engine.txt 2>&1; then
             cat /workspace/promote-log-covered-call-engine.txt
-            echo "PROMOTED: 100% traffic to latest ($${REV})"
+            echo "PROMOTED: 100% traffic to latest"
             exit 0
           fi
           cat /workspace/promote-log-covered-call-engine.txt
@@ -640,20 +756,42 @@ steps:
       - |
         [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
         REV=$(cat /workspace/rev-options-wheel-dashboard.txt)
-        LATEST=$(gcloud run services describe options-wheel-dashboard --region=us-central1 \
-          --format='value(status.latestReadyRevisionName)')
-        echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
-        if [ "$${LATEST}" != "$${REV}" ]; then
-          echo "FAIL: latest ready is $${LATEST}, expected $${REV} — an out-of-band deploy landed; refusing to promote"
-          exit 1
-        fi
+        MY_IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA"
         for attempt in 1 2 3; do
+          # Re-evaluated on EVERY attempt, never retried blind: between this build's
+          # --no-traffic deploy and this step, an operator kill switch
+          # (`services update --update-env-vars ROLLER_ENABLED=false`) can create a new
+          # 0%-traffic revision. Refusing outright would leave the service pinned to the
+          # OLD revision with the kill switch NOT applied — the opposite of what the
+          # operator asked for. So: if the latest ready revision runs THIS build's image,
+          # it is that env-only change and we promote it.
+          LATEST=$(gcloud run services describe options-wheel-dashboard --region=us-central1 \
+            --format='value(status.latestReadyRevisionName)')
+          echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
+          if [ "$${LATEST}" != "$${REV}" ]; then
+            LATEST_IMAGE=$(gcloud run revisions describe "$${LATEST}" --region=us-central1 \
+              --format='value(spec.containers[0].image)')
+            if [ "$${LATEST_IMAGE}" = "$${MY_IMAGE}" ]; then
+              echo "PROMOTING latest ready $${LATEST} (env-only change on this build's image)"
+            else
+              SERVING=$(gcloud run services describe options-wheel-dashboard --region=us-central1 --format=json \
+                | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+              echo "FAIL: refusing to promote options-wheel-dashboard."
+              echo "  serving now       : $${SERVING}"
+              echo "  latest ready      : $${LATEST} (image $${LATEST_IMAGE})"
+              echo "  this build's rev  : $${REV} (image $${MY_IMAGE})"
+              echo "An out-of-band deploy of a DIFFERENT image landed during this build, so"
+              echo "promoting would ship code this build never tested. Decide which one wins,"
+              echo "then run:  gcloud run services update-traffic options-wheel-dashboard --to-latest"
+              exit 1
+            fi
+          fi
           if gcloud run services update-traffic options-wheel-dashboard \
             --to-latest \
             --region=us-central1 \
             > /workspace/promote-log-options-wheel-dashboard.txt 2>&1; then
             cat /workspace/promote-log-options-wheel-dashboard.txt
-            echo "PROMOTED: 100% traffic to latest ($${REV})"
+            echo "PROMOTED: 100% traffic to latest"
             exit 0
           fi
           cat /workspace/promote-log-options-wheel-dashboard.txt
@@ -675,11 +813,25 @@ options:
   machineType: 'E2_HIGHCPU_8'
   diskSizeGb: 30
 
-# Service account for Cloud Build
+# Service account for Cloud Build.
+# IGNORED FOR TRIGGER BUILDS. The push trigger sets its own service account and that
+# one wins: all 372 historical builds ran as
+# 799970961417-compute@developer.gserviceaccount.com, not the account named here.
+# This line still applies to a manual `gcloud builds submit` that does not pass
+# --service-account, which is the only reason it is kept. Any IAM grant this config
+# needs (see the FC-084 header) must go to the COMPUTE account, not this one.
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
 
 # Timeout for the entire build
-timeout: '1200s'  # 20 min: measured builds run 8-12 min and the CC canary chain adds up to ~4 min serial worst-case (PR #91 review)
+# Raised from 1200s by FC-084. Measured single-build runtime: max 798s, p95 662s
+# (queue time is on top of this and does not count against the timeout: <=110s).
+# When one build has to wait for an older one, worst case is
+#   wait for the older build to finish (<=798s) + this build's own deploy chain (~360s)
+#   = ~1158s,
+# which left only ~42s of headroom under 1200s. 1500s restores ~342s. The gate's own
+# deadline is derived from this number (BUILD_TIMEOUT_SECONDS in serialize-builds) and
+# a contract test asserts the two stay equal.
+timeout: '1500s'
 
 # Substitutions for build variables
 substitutions:

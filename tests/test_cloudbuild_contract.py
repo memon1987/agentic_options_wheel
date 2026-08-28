@@ -71,6 +71,9 @@ CHAINS = {
 
 GATE_ID = "serialize-builds"
 GATE_WAITS_FOR = "push-bot-image"
+# The one step Cloud Build allows to omit `waitFor` (it implicitly waits on every
+# step listed before it, and nothing is listed before index 0).
+FIRST_STEP_ID = "run-tests"
 MARKER_CHECK = '[ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }'
 
 # The fixture pins the deploy flags as they stand on `main`. FC-084 deliberately adds
@@ -85,9 +88,6 @@ MARKER_CHECK = '[ -f /workspace/superseded ] && { echo "skip: superseded"; exit 
 # scripts and are pinned by tests 1-4 instead. Anything else appearing in, or
 # disappearing from, the deploy flag set is drift and fails test 5.
 ALLOWED_NEW_DEPLOY_FLAGS = {"--revision-suffix"}
-
-# Cloud Build built-in substitutions that may appear bare (single `$`) in a script.
-ALLOWED_BARE_SUBSTITUTIONS = {"PROJECT_ID", "COMMIT_SHA", "BUILD_ID", "SHORT_SHA"}
 
 
 # --------------------------------------------------------------------------
@@ -179,6 +179,18 @@ def simulate_substitution(text):
     return "".join(out)
 
 
+def retry_loop_body(script):
+    """The body of the `for attempt in 1 2 3; do ... done` loop in a script.
+
+    Used to prove that a check lives INSIDE the retry, not once before it — the
+    difference between re-evaluating state on every attempt and retrying blind.
+    """
+    start = script.index("for attempt in 1 2 3; do")
+    end = script.rindex("done")
+    assert end > start, "malformed retry loop"
+    return script[start:end]
+
+
 def extract_gate_program(script):
     """The `gate_decision.py` heredoc body from the serialize-builds script."""
     m = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF\n", script, re.DOTALL)
@@ -232,6 +244,43 @@ def test_serialize_builds_gate_exists_and_gates_every_deploy(by_id):
             f"{deploy_id} must waitFor {GATE_ID}; otherwise {service} deploys before "
             "the build ordering has been decided."
         )
+
+
+def test_every_wait_for_id_is_defined_earlier_in_the_list(steps):
+    """Cloud Build resolves `waitFor` against ids defined EARLIER in the list.
+
+    A forward reference is not a runtime surprise — Cloud Build rejects the whole
+    config with "depends on ... which has not been defined", so every build fails
+    instantly. FC-084 rev 2 shipped exactly that bug: `serialize-builds` was listed
+    first with `waitFor: ['push-bot-image']`.
+    """
+    seen = set()
+    for step in steps:
+        for dep in step.get("waitFor") or []:
+            if dep == "-":
+                continue
+            assert dep in seen, (
+                f"step `{step['id']}` waits on `{dep}`, which is not defined earlier "
+                "in the steps list. Cloud Build rejects this config outright."
+            )
+        seen.add(step["id"])
+
+
+def test_only_the_first_step_omits_wait_for(steps):
+    """A step without `waitFor` implicitly waits on every step listed before it.
+
+    That implicit edge is how the rev-2 ordering bug became a cycle: with the gate
+    listed first, `run-tests` implicitly waited on the gate, and the gate waited on
+    a push that waited on `run-tests`.
+    """
+    assert steps[0]["id"] == FIRST_STEP_ID, (
+        f"the first step should be `{FIRST_STEP_ID}`; got `{steps[0]['id']}`"
+    )
+    implicit = [s["id"] for s in steps if "waitFor" not in s]
+    assert implicit == [FIRST_STEP_ID], (
+        f"only `{FIRST_STEP_ID}` may omit `waitFor`; these also omit it and would "
+        f"silently wait on everything listed before them: {implicit}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -294,6 +343,43 @@ def test_chain_pins_revision_and_promotes_to_latest(service, by_id):
     )
     assert "--to-latest" in promote, (
         f"{roles['promote']} must promote with --to-latest — see the next assertion."
+    )
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_promote_promotes_an_env_only_change_on_this_builds_image(service, by_id):
+    """A kill switch applied mid-build must not strand the service on old code.
+
+    Between a chain's `--no-traffic` deploy and its promote, an operator running
+    `gcloud run services update --update-env-vars ROLLER_ENABLED=false` creates a
+    new 0%-traffic revision. A promote that refuses on any mismatch leaves the
+    service pinned to the OLD revision with the kill switch NOT applied — the exact
+    opposite of what the operator asked for. So the promote checks the image: same
+    image as this build means it is that env-only change, and it gets promoted.
+    """
+    step_id = CHAINS[service]["promote"]
+    script = script_of(by_id[step_id])
+    loop = retry_loop_body(script)
+
+    assert "latestReadyRevisionName" in loop, (
+        f"{step_id} must read latestReadyRevisionName INSIDE the retry loop. Reading "
+        "it once before the loop and then retrying update-traffic blind means a "
+        "retry can promote a revision that appeared after the check."
+    )
+    assert "spec.containers[0].image" in loop, (
+        f"{step_id} must compare the latest ready revision's image against this "
+        "build's image, inside the retry loop."
+    )
+    assert "env-only change on this build's image" in loop, (
+        f"{step_id} must log PROMOTING ... (env-only change on this build's image) "
+        "when it promotes a revision it did not create because the image matches."
+    )
+    assert 'MY_IMAGE=' in script, (
+        f"{step_id} must pin the image it expects in MY_IMAGE."
+    )
+    assert f"update-traffic {service} --to-latest" in script, (
+        f"{step_id}'s failure message must give the operator the one-line remedy "
+        f"`gcloud run services update-traffic {service} --to-latest`."
     )
 
 
@@ -395,6 +481,44 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
     )
 
 
+def test_gate_deadline_tracks_the_build_timeout(by_id):
+    """The gate gives up 90s before Cloud Build would, so its message wins.
+
+    If `timeout:` is raised and BUILD_TIMEOUT_SECONDS is not, the gate quits early
+    and throws away exactly the headroom the raise bought; if it is lowered and the
+    constant is not, the build dies with an opaque TIMEOUT instead of the gate's
+    explanation of which build it was waiting for.
+    """
+    doc = yaml.safe_load(CLOUDBUILD.read_text())
+    timeout_seconds = int(str(doc["timeout"]).rstrip("s"))
+
+    script = script_of(by_id[GATE_ID])
+    m = re.search(r"BUILD_TIMEOUT_SECONDS=(\d+)", script)
+    assert m, "serialize-builds must define BUILD_TIMEOUT_SECONDS"
+    assert int(m.group(1)) == timeout_seconds, (
+        f"BUILD_TIMEOUT_SECONDS={m.group(1)} but the build `timeout:` is "
+        f"{timeout_seconds}s — they must match."
+    )
+    assert "- 90" in script, "the gate must give up 90s before the build timeout"
+
+
+def test_build_timeout_matches_frozen_fixture(frozen):
+    """The build timeout is pinned like any other must-not-change value.
+
+    FC-084 deliberately raises it from main's 1200s to 1500s: an overlapping pair
+    needs ~1158s worst case (wait <=798s for the older build + ~360s for this
+    build's own deploy chain), which left only ~42s of headroom. The fixture records
+    the NEW value, and this is the one place the fixture intentionally departs from
+    main — see `_deviations` in the fixture file.
+    """
+    doc = yaml.safe_load(CLOUDBUILD.read_text())
+    assert str(doc["timeout"]) == frozen["timeout"], (
+        f"build timeout is {doc['timeout']}, fixture pins {frozen['timeout']}. "
+        "Changing it is a deploy-behaviour change: update the fixture in the same "
+        "reviewed commit, and BUILD_TIMEOUT_SECONDS in serialize-builds with it."
+    )
+
+
 # --------------------------------------------------------------------------
 # 6. Every script is valid bash once Cloud Build has substituted it.
 # --------------------------------------------------------------------------
@@ -419,6 +543,32 @@ def test_script_is_valid_bash_after_substitution(step_id, by_id):
     )
     assert result.returncode == 0, (
         f"{step_id}'s script is not valid bash after substitution:\n{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ["superseded", "gate_decision.py", "gate-me.json", "gate-others.json"]
+)
+def test_gate_runtime_files_are_not_committed(name):
+    """These live in /workspace at build time and must never be tracked files.
+
+    Cloud Build copies the repo into /workspace, so a committed file named
+    `superseded` at the repo root would make EVERY build skip EVERY deploy while
+    still reporting SUCCESS — a silent, total deploy outage.
+    """
+    assert not (REPO_ROOT / name).exists(), (
+        f"`{name}` must not exist at the repo root: Cloud Build checks the repo out "
+        "into /workspace, where the gate writes this file at runtime. A committed "
+        "copy would be read as if the gate had written it."
+    )
+
+
+def test_no_committed_revision_files():
+    """Same hazard as above for the per-service revision hand-off files."""
+    stray = sorted(p.name for p in REPO_ROOT.glob("rev-*.txt"))
+    assert stray == [], (
+        f"revision hand-off files must not be committed at the repo root: {stray}. "
+        "They are written into /workspace by each deploy step at build time."
     )
 
 
@@ -505,6 +655,60 @@ def test_gate_breaks_createtime_ties_deterministically(gate_program):
     )
     assert low_sees.startswith("SUPERSEDED "), low_sees
     assert high["id"] in low_sees
+
+
+@pytest.fixture(scope="module")
+def gate_module(gate_program):
+    """The gate program's namespace, so its helpers can be tested directly."""
+    ns = {"__name__": "gate_decision_under_test"}
+    exec(compile(gate_program, "gate_decision.py", "exec"), ns)
+    return ns
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-08-28T16:43:45Z",              # 0 fractional digits
+        "2026-08-28T16:43:45.221Z",          # 3  (protobuf JSON emits 0/3/6/9)
+        "2026-08-28T16:43:45.221420Z",       # 6
+        "2026-08-28T16:43:45.221420123Z",    # 9
+        "2026-08-28T16:43:45.221420+00:00",  # explicit offset
+        "2026-08-28T16:43:45+0000",          # offset without the colon
+    ],
+)
+def test_gate_parses_every_rfc3339_shape_the_api_emits(gate_module, value):
+    """Python 3.9's fromisoformat rejects both 'Z' and 9 fractional digits.
+
+    The cloud-sdk image ships 3.9, and protobuf JSON emits 0, 3, 6 or 9 digits, so
+    an unnormalized parse crashes the gate on a perfectly ordinary timestamp — and
+    a crashed gate is a failed build (fail-closed), not a silent skip.
+    """
+    dt = gate_module["parse_rfc3339"](value)
+    assert dt.tzinfo is not None
+    assert (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second) == (
+        2026, 8, 28, 16, 43, 45,
+    )
+
+
+def test_gate_orders_mixed_precision_timestamps_correctly(gate_module):
+    """The bug string comparison would have caused, pinned.
+
+    `...:45Z` is EARLIER than `...:45.221420Z`, but as strings "Z" > "." so the
+    naive compare calls it later — inverting the order of two builds a fifth of a
+    second apart and handing the deploy to the wrong commit.
+    """
+    parse = gate_module["parse_rfc3339"]
+    assert parse("2026-08-28T16:43:45Z") < parse("2026-08-28T16:43:45.221420Z")
+    assert "2026-08-28T16:43:45Z" > "2026-08-28T16:43:45.221420Z"  # the naive bug
+
+
+def test_gate_supersedes_across_mixed_precision(gate_program):
+    """End to end: a newer build whose timestamp has fewer digits still wins."""
+    me = {"id": "aaaa1111", "createTime": "2026-08-28T16:43:45.221420Z"}
+    newer = {"id": "bbbb2222", "createTime": "2026-08-28T16:43:46Z"}
+    out = run_gate_decision(gate_program, me["id"], me["createTime"], [me, newer])
+    assert out.startswith("SUPERSEDED "), out
+    assert newer["id"] in out
 
 
 def test_gate_ignores_malformed_entries(gate_program):

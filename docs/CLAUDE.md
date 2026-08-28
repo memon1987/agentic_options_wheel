@@ -689,10 +689,14 @@ One Cloud Build trigger on `main` builds two images and runs three canary chains
 each `deploy → smoke-test → promote`. **Since FC-084 builds of that trigger are
 serialized, and each build deploys a revision it named itself.**
 
-**`serialize-builds` gates the deploys** (`waitFor: ['push-bot-image']`).
-It reads this build's `createTime` and `buildTriggerId` from
+**`serialize-builds` gates the deploys** (`waitFor: ['push-bot-image']`). It must
+be **listed after** `push-bot-image`, not first: Cloud Build resolves `waitFor`
+only against ids defined earlier in the list and rejects the config outright
+otherwise, and a step with no `waitFor` implicitly waits on everything listed
+before it — so listing the gate first also made `run-tests` wait on it, a cycle.
+It reads this build's `createTime`, `startTime` and `buildTriggerId` from
 `gcloud builds describe $BUILD_ID`, then polls `gcloud builds list` for
-QUEUED/WORKING builds of the same trigger:
+PENDING/QUEUED/WORKING builds of the same trigger:
 
 - **A newer build exists** → write `/workspace/superseded`, log `SUPERSEDED`,
   **exit 0**. Newer code wins. This is not a failure and must not trip the
@@ -709,40 +713,53 @@ deploy/smoke/promote step begins with**
 build still validates and pushes its image, which is what makes rollback-by-SHA
 possible.
 
-**Why the gate waits on `push-bot-image` rather than `['-']`, and the timing
-budget.** The gate blocks only the deploy steps, so a build's own test/build/push
-work runs in parallel either way; putting the gate after the push means a build
-that *does* have to wait has already banked that work, and the gate's own
-15-minute wait cap stays far wider than any legitimate wait. Worst case, with
-`T_full` = 8–12 min for a whole build (the figure the `timeout:` comment records),
-`T_deploy` ≈ 4–6 min for the three canary chains, and `T_bp = T_full − T_deploy`:
+**Timing budget.** Measured single-build runtime is **max 798 s, p95 662 s**
+(queue time sits on top and does not count against the build timeout: ≤110 s).
+When one build waits for an older one:
 
 ```
-waiting build total = max(T_bp(self), T_full(older) − Δ) + T_deploy(self)
-worst case (Δ→0)    = max(8, 12) + 6 = 18 min = 1080 s   vs the 1200 s timeout
+waiting build total = wait for the older build to finish (≤798 s)
+                    + this build's own deploy chain (~360 s)
+                    ≈ 1158 s
 ```
 
-That leaves ~120 s of headroom, so **an overlapping pair fits, but not
-comfortably**. Note the arithmetic is unchanged by *where* the gate sits — the
-wait ends when the older build ends regardless — so if a live overlap ever times
-out, the fix is raising `timeout`, or revisiting the decision to let a superseded
-build finish its image push (`docs/plans/fc-084.md` §Open questions), not moving
-the gate again.
+Under the old 1200 s timeout that left **~42 s** of headroom, so `timeout:` is
+raised to **1500 s** (~342 s of headroom). Both adversarial reviews called the
+original "don't touch 1200 s" a plan defect. The gate derives its own deadline
+from that number — `BUILD_TIMEOUT_SECONDS` in `serialize-builds`, asserted equal
+to `timeout:` by a contract test — and gives up **90 s early** so its explanation
+of *which* build it was waiting for is what the log shows, instead of an opaque
+`TIMEOUT`. Note the placement of the gate does not change this total: the wait
+ends when the older build ends regardless of when the gate started polling.
 
-The gate **fails closed**: if it cannot read or list builds it exits 1, because a
-gate that fails open is not a gate. It prints the fix, which is:
+**Which service account this runs as — and the IAM grant it needs.** Trigger
+builds run as the **trigger's** service account,
+`799970961417-compute@developer.gserviceaccount.com`. The `serviceAccount:` field
+at the bottom of `cloudbuild.yaml` is **ignored for trigger builds** (it names
+`799970961417@cloudbuild.gserviceaccount.com`, which no trigger build has ever
+used — all 372 historical builds ran as the compute account); it is kept only for
+a manual `gcloud builds submit`. The gate needs `cloudbuild.builds.get`/`.list`,
+and a live probe build (`3d4db40d`, 2026-08-28) proved the compute account **does
+not have them** — `gcloud builds list` inside the build fails with
+`PERMISSION_DENIED … authenticated as 799970961417-compute@…`. Grant it
+`roles/cloudbuild.builds.viewer` ("Cloud Build Viewer"). **`gcloud projects
+add-iam-policy-binding` will not work** — the Cloud Resource Manager API is
+disabled on this project — so use the console IAM page:
+<https://console.cloud.google.com/iam-admin/iam?project=gen-lang-client-0607444019>.
+Verify with `gcloud builds submit --no-source --config=<one-step yaml running
+gcloud builds list>`; it should print a build id rather than PERMISSION_DENIED.
 
-```
-gcloud projects add-iam-policy-binding gen-lang-client-0607444019 \
-  --member=serviceAccount:799970961417@cloudbuild.gserviceaccount.com \
-  --role=roles/cloudbuild.builds.viewer
-```
-
-`roles/cloudbuild.builds.builder` — the role Cloud Build grants that SA by
-default — already includes `cloudbuild.builds.get`/`.list`, so this should be a
-no-op; it is here because the binding could not be read to confirm it (the
-Cloud Resource Manager API is disabled on the project, so `get-iam-policy`
-fails).
+**The alternative that was considered and deferred: ordering by git ancestry.**
+The gate could ask the public GitHub API whether this build's commit is an
+ancestor of the branch head instead of asking Cloud Build which builds exist —
+no Cloud Build IAM dependency at all, and "newer" would mean *newer commit*
+rather than *newer build*, which is arguably the more honest definition. It was
+not taken because the Cloud Build oracle is already built and twice-reviewed
+while the grant is a one-time click, and because it changes the rollback story:
+re-running an older commit's trigger would no longer win, so rolling back would
+have to be `git revert` (a forward commit) rather than a trigger re-run. Worth
+revisiting if the IAM grant proves hard to get or if trigger re-runs turn out not
+to carry a `buildTriggerId`.
 
 **Revision identity comes from `--revision-suffix=<shortsha>-<buildid8>`**, so
 `<service>-<shortsha>-<buildid8>` is known *before* the deploy runs; the deploy
@@ -764,8 +781,24 @@ creates a revision serving **0%** and the kill switch silently stops working.
 Every lever in §Development Notes (`EARNINGS_ENABLED`, `ROLLER_ENABLED`,
 `ROLLER_DRY_RUN`) depends on this. `--to-latest` is safe here because
 serialization means "latest" is this build's revision, and each promote asserts
-`status.latestReadyRevisionName == REV` and **refuses to promote** (exit 1) if an
-out-of-band deploy landed instead.
+`status.latestReadyRevisionName == REV` before shifting traffic.
+
+**Kill switch applied mid-build.** Between a chain's `--no-traffic` deploy and its
+promote there is a window in which an operator `gcloud run services update
+--update-env-vars ROLLER_ENABLED=false` creates a new 0%-traffic revision. A
+promote that refused on any mismatch would leave the service pinned to the **old**
+revision with the kill switch **not applied** — the opposite of what the operator
+asked for. So the promote compares images: if the latest ready revision runs *this
+build's image*, it is that env-only change and gets promoted
+(`PROMOTING latest ready <rev> (env-only change on this build's image)`). If it
+runs a **different** image, the promote fails loudly, naming the serving revision,
+the latest ready revision and the remedy
+(`gcloud run services update-traffic <svc> --to-latest`) — promoting would ship
+code this build never tested. The whole check re-runs on every retry attempt;
+`--to-latest` is never retried blind. Two things to know regardless: a kill switch
+applied mid-build **is** carried forward by that build, and **any** kill switch is
+wiped by the next `--set-env-vars` deploy, because `--set-env-vars` replaces the
+entire env set.
 
 **Rollback semantics.** Re-running an older commit's trigger creates the *newest
 build*, so it wins the gate and deploys the older code on purpose; a forward
@@ -781,6 +814,31 @@ error (`Conflict for resource ...: version 'X' was specified but current version
 is 'Y'`). With serialization that can only come from an out-of-band write — an
 operator `services update` during a build. A retried deploy reuses the same
 suffix, so `already exists` is treated as success.
+
+**Operational consequences worth knowing before you need them.**
+
+- **A rollback re-run leaves `main` ahead of production.** Re-running an older
+  commit's trigger wins the gate and deploys older code on purpose — but `main`
+  still points at the newer commit, so `deploy_freshness_drift` pages on **both**
+  services after 2 h until `main` is reverted to match. Either revert `main` or
+  expect the page.
+- **A SUPERSEDED commit is never retried.** If the superseding build then fails or
+  is cancelled, the older *good* commit stays undeployed and its build is green —
+  nothing retries it. Recovery is to push a fix forward or re-run the older
+  commit's trigger. The 2 h weekday-hours freshness check is the backstop that
+  makes this visible rather than silent.
+- **A `promote-bot` failure strands the chain unevenly.** `deploy-cc-canary`
+  waits on `promote-bot`, so the covered-call engine never deploys that build —
+  while the dashboard chain, which does not, promotes normally. That leaves three
+  services on two different commits until the next successful build.
+- **Fast rollback recipe:** `gcloud run services update <svc> --image=<image at
+  the good SHA>`. It creates a new revision, keeps `latestRevision: true`, and
+  serves in about a minute. **Never** roll back with `--to-revisions` — that
+  strips `latestRevision: true` and breaks the kill switches permanently.
+- **A superseded build still runs its nine deploy/smoke/promote steps as no-ops**,
+  each pulling the cloud-sdk image before exiting. That is a few seconds and a few
+  image pulls per superseded build — accepted, in exchange for the marker being
+  the only conditional mechanism Cloud Build offers.
 
 `tests/test_cloudbuild_contract.py` pins all of the above plus the
 must-not-change list — step ids, `waitFor` edges, and **every** `gcloud run

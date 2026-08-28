@@ -1,5 +1,7 @@
 {
   "_source": "captured from `git show origin/main:cloudbuild.yaml` at 0910192 (FC-081 merged). This fixture pins MAIN's deploy flags. FC-084 intentionally adds --revision-suffix on top of them; that exception is declared in ALLOWED_NEW_DEPLOY_FLAGS in tests/test_cloudbuild_contract.py. Regenerate only alongside a deliberate, reviewed deploy-flag change.",
+  "_deviations": "One value here is deliberately NOT main's: `timeout` is 1500s, main is 1200s. FC-084 raises it because a build that waits for an older one needs ~1158s worst case (wait <=798s for the older build + its own ~360s deploy chain), which left only ~42s of headroom under 1200s. Both adversarial reviews called the original 1200s must-not-change a plan defect. serialize-builds' BUILD_TIMEOUT_SECONDS is asserted equal to this value by test_gate_deadline_tracks_the_build_timeout.",
+  "timeout": "1500s",
   "step_ids": [
     "run-tests",
     "build-bot-image",
