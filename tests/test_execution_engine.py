@@ -1702,33 +1702,270 @@ class TestNakedCallInvariant:
     def test_the_recount_ignores_a_long_call_and_another_underlying(self):
         """`_invariant_shares` is a second implementation, so its own
         arithmetic needs pinning — a bug here blocks legitimate calls."""
-        owned, committed = self.engine._invariant_shares("AAPL", [
+        assert self.engine._invariant_shares("AAPL", [
             _equity("AAPL", 200),
             {"symbol": "AAPL260724C00340000", "qty": "1",
              "asset_class": "us_option", "side": "long"},
             _equity("GOOGL", 500),
             _short_option("GOOGL260724C00370000"),
             _short_option("AAPL260724P00300000"),
-        ])
-
-        assert (owned, committed) == (200, 0)
+        ]) == (200, 0, [])
 
     def test_the_recount_joins_class_shares_on_the_occ_root_too(self):
         """Both sides of the belt normalize, or the belt would fire on every
         legitimate class-share call the moment the ledger was fixed."""
         assert self.engine._invariant_shares(BRK_EQUITY, [
-            _equity(BRK_EQUITY, 200), _short_option(BRK_CALL)]) == (200, 100)
-
-    def test_the_recount_refuses_to_classify_a_non_occ_symbol(self):
-        """It uses only `strict_option_type`, so it never inherits
-        `parse_option_symbol`'s `'C' if 'C' in symbol` last resort."""
-        owned, committed = self.engine._invariant_shares("AAPL", [
-            _equity("AAPL", 100), _short_option("NOT_AN_OCC"),
-            _short_option("1AAPL260724C00340000"),
-        ])
-
-        assert (owned, committed) == (100, 0)
+            _equity(BRK_EQUITY, 200), _short_option(BRK_CALL)]) == (200, 100, [])
 
     def test_the_recount_fails_closed_on_no_underlying(self):
-        assert self.engine._invariant_shares(None, [_equity("AAPL", 100)]) == (0, 0)
-        assert self.engine._invariant_shares("AAPL", PositionsUnavailable()) == (0, 0)
+        assert self.engine._invariant_shares(None, [_equity("AAPL", 100)]) == (0, 0, [])
+        assert self.engine._invariant_shares(
+            "AAPL", PositionsUnavailable()) == (0, 0, [])
+
+
+class TestNakedCallInvariantFailsClosedOnUnclassifiableShorts:
+    """S1/S2 review finding F1 — the corporate-action hole.
+
+    `strict_option_type` returns None for an ADJUSTED contract
+    (`AAPL1260821C00250000` — the root a split or special dividend leaves
+    behind). Both share counters therefore scored such a short call as
+    committing **0 shares**, so gate 20 sailed past a real obligation against
+    real shares and the docs claimed a fail-closed posture the code did not
+    have. An unclassifiable short option whose leading-alpha prefix lands on
+    the target root now blocks the write instead.
+    """
+
+    def setup_method(self):
+        from src.strategy.execution_engine import clear_failed_symbols
+        clear_failed_symbols()
+        self.alpaca = Mock()
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+        self.call_seller = Mock(spec=CallSeller)
+        self.put_seller.execute_put_sale.return_value = {"success": True, "order_id": "p1"}
+        self.call_seller.execute_call_sale.return_value = {"success": True, "order_id": "c1"}
+
+    def _errors(self, event_type):
+        return [c.kwargs for c in self.engine.logger.error.call_args_list
+                if c.kwargs.get("event_type") == event_type]
+
+    def _aapl_call(self, contracts=1):
+        return {"symbol": "AAPL", "option_symbol": "AAPL260724C00350000",
+                "type": "call", "contracts": contracts, "premium": 1.0,
+                "strike_price": 350.0, "shares_covered": contracts * 100,
+                "stock_cost_basis": 200.0}
+
+    def test_an_adjusted_short_call_blocks_the_write(self):
+        """F1 test (a). MUTATION CHECK: drop the unclassifiable limb and the
+        adjusted call scores 0 committed, 100 owned covers the 100 requested,
+        and this naked write goes out.
+        """
+        self.alpaca.get_positions.return_value = [
+            _equity("AAPL", 100), _short_option("AAPL1260821C00250000")]
+
+        results, count = self.engine.execute_batch(
+            [self._aapl_call()], self.put_seller, call_seller=self.call_seller)
+
+        self.call_seller.execute_call_sale.assert_not_called()
+        assert count == 0 and results[0]["success"] is False
+        assert results[0]["result"]["error_type"] == "naked_call_invariant"
+
+        errors = self._errors("naked_call_invariant_blocked")
+        assert len(errors) == 1
+        assert errors[0]["unclassifiable_short_options"] == [
+            "AAPL1260821C00250000"]
+
+        drops = _drop_events(self.engine.logger)
+        assert [(d["reason"], d["stage"]) for d in drops] == [
+            ("naked_call_invariant", "execution")]
+        assert drops[0]["unclassifiable_short_options"] == [
+            "AAPL1260821C00250000"]
+
+    def test_an_off_shape_short_call_blocks_even_with_shares_to_spare(self):
+        """F1 test (b), and the parser-independence pin.
+
+        `AAPL260724C00340000X` is rejected by `strict_option_type` but
+        `parse_option_symbol` resolves it to AAPL/call via its last-resort
+        heuristic. 200 shares are owned and only 100 are requested, so a
+        `_invariant_shares` rewritten onto `parse_option_symbol` would score
+        100 committed, find 100 + 100 <= 200, and let the write through.
+        MUTATION CHECK: that rewrite fails this test.
+        """
+        self.alpaca.get_positions.return_value = [
+            _equity("AAPL", 200), _short_option("AAPL260724C00340000X")]
+
+        results, count = self.engine.execute_batch(
+            [self._aapl_call()], self.put_seller, call_seller=self.call_seller)
+
+        self.call_seller.execute_call_sale.assert_not_called()
+        assert count == 0 and results[0]["success"] is False
+        assert self._errors("naked_call_invariant_blocked")[0][
+            "unclassifiable_short_options"] == ["AAPL260724C00340000X"]
+
+    def test_gate_19_does_not_catch_either_of_them_first(self):
+        """The finding only matters because `_available_shares` also scores an
+        adjusted contract at 0 committed. Pinned so this class cannot silently
+        start testing gate 19 instead of gate 20."""
+        assert self.engine._available_shares("AAPL", [
+            _equity("AAPL", 100), _short_option("AAPL1260821C00250000"),
+        ]) == (100, 100, 0)
+        assert self.engine._available_shares("AAPL", [
+            _equity("AAPL", 200), _short_option("AAPL260724C00340000X"),
+        ]) == (200, 200, 0)
+
+    def test_unrelated_garbage_does_not_block_the_underlying(self):
+        """Rewritten from `test_the_recount_refuses_to_classify_a_non_occ_symbol`,
+        which pinned the fail-OPEN behavior this finding removed.
+
+        The limb is root-prefix scoped on purpose: a position we cannot parse
+        AND cannot tie to this underlying must not block every call in the
+        account. `NOT_AN_OCC` -> prefix `NOT`; `1AAPL...` -> prefix empty.
+        """
+        assert self.engine._invariant_shares("AAPL", [
+            _equity("AAPL", 100), _short_option("NOT_AN_OCC"),
+            _short_option("1AAPL260724C00340000"),
+        ]) == (100, 0, [])
+
+    def test_it_is_type_blind_on_the_unclassifiable_limb(self):
+        """An adjusted short PUT commits no shares, but we cannot prove it is
+        a put without the parser we deliberately refuse to use here. Documented
+        over-block: the cost is one skipped covered call."""
+        assert self.engine._invariant_shares("AAPL", [
+            _equity("AAPL", 200), _short_option("AAPL1260821P00250000"),
+        ]) == (200, 0, ["AAPL1260821P00250000"])
+
+    def test_a_long_unclassifiable_option_commits_nothing_and_blocks_nothing(self):
+        """Only SHORT options are obligations."""
+        assert self.engine._invariant_shares("AAPL", [
+            _equity("AAPL", 200),
+            {"symbol": "AAPL1260821C00250000", "qty": "1",
+             "asset_class": "us_option", "side": "long"},
+        ]) == (200, 0, [])
+
+    def test_it_matches_a_class_share_root_through_the_prefix_rule(self):
+        """The two findings meet: an adjusted BRKB contract must block a BRK.B
+        call, which needs the prefix normalized too."""
+        assert self.engine._invariant_shares(BRK_EQUITY, [
+            _equity(BRK_EQUITY, 200), _short_option("BRKB1260918C00450000"),
+        ]) == (200, 0, ["BRKB1260918C00450000"])
+
+    def test_a_non_string_symbol_does_not_raise(self):
+        """F6. A malformed field must not take the whole batch down with a
+        TypeError; the posture matches `_available_shares` exactly, and the
+        position still surfaces as the monitor's `risk_unclassifiable_option`.
+        """
+        positions = [_equity("AAPL", 200),
+                     {"symbol": 12345, "qty": "-1",
+                      "asset_class": "us_option", "side": "short"}]
+
+        owned, committed, unclassifiable = self.engine._invariant_shares(
+            "AAPL", positions)
+
+        assert (owned, committed) == (200, 0)
+        assert unclassifiable == []
+        # Same answer as the primary ledger, which is the contract between them.
+        assert self.engine._available_shares("AAPL", positions)[1:] == (
+            owned, committed)
+
+    def test_a_multi_contract_write_is_blocked_when_it_would_oversell(self):
+        """F7. The arithmetic limb has to scale with `contracts`; pinned at 1
+        contract only, `required_shares` could be hardcoded and nothing would
+        notice."""
+        self.alpaca.get_positions.return_value = [
+            _equity("AAPL", 200), _short_option("AAPL260724C00340000")]
+        self.engine._available_shares = Mock(return_value=(200, 200, 0))
+
+        results, count = self.engine.execute_batch(
+            [self._aapl_call(contracts=2)], self.put_seller,
+            call_seller=self.call_seller)
+
+        self.call_seller.execute_call_sale.assert_not_called()
+        assert count == 0 and results[0]["success"] is False
+        errors = self._errors("naked_call_invariant_blocked")
+        assert (errors[0]["owned"], errors[0]["committed"],
+                errors[0]["requested"]) == (200, 100, 200)
+
+    def test_a_multi_contract_write_passes_when_the_shares_are_there(self):
+        """F7, the other side: 300 owned - 100 committed backs two contracts."""
+        self.alpaca.get_positions.return_value = [
+            _equity("AAPL", 300), _short_option("AAPL260724C00340000")]
+
+        results, count = self.engine.execute_batch(
+            [self._aapl_call(contracts=2)], self.put_seller,
+            call_seller=self.call_seller)
+
+        self.call_seller.execute_call_sale.assert_called_once()
+        assert count == 1 and results[0]["success"] is True
+        assert self._errors("naked_call_invariant_blocked") == []
+
+
+class TestSelectBatchDedupesOnTheOccRoot:
+    """F8 — the per-batch keys are OCC roots, not equity spellings.
+
+    Keyed on the raw symbol, `BRK.B` and `BRKB` are two underlyings to
+    `select_batch`: each gets its own 100-share budget out of the same 100
+    shares, and the one-position-per-underlying rule lets both through.
+    """
+
+    def setup_method(self):
+        self.alpaca = Mock()
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+
+    @staticmethod
+    def _item(opp, collateral=0.0, premium=100.0, roi=0.0):
+        return {"opportunity": opp, "collateral": collateral, "premium": premium,
+                "roi": roi, "type": opp.get("type", "put")}
+
+    def test_two_spellings_of_one_underlying_are_one_underlying(self):
+        dotted = _brk_call(BRK_CALL_2)
+        rooted = dict(_brk_call("BRKB260918C00470000"), symbol="BRKB")
+        self.alpaca.get_positions.return_value = [_equity(BRK_EQUITY, 100)]
+
+        selected, _ = self.engine.select_batch(
+            [self._item(dotted), self._item(rooted)], 0.0)
+
+        assert [o["option_symbol"] for o in selected] == [BRK_CALL_2]
+        assert [d["reason"] for d in _drop_events(self.engine.logger)] == [
+            "duplicate_underlying"]
+
+    def test_the_share_ledger_is_one_budget_across_both_spellings(self):
+        """Without the shared key each spelling would draw its own 100 shares
+        from the same 100, and the second drop would never happen."""
+        dotted = _brk_call(BRK_CALL_2)
+        rooted = dict(_brk_call("BRKB260918C00470000"), symbol="BRKB")
+        self.alpaca.get_positions.return_value = [
+            _equity(BRK_EQUITY, 100), _short_option(BRK_CALL)]
+
+        selected, _ = self.engine.select_batch(
+            [self._item(dotted), self._item(rooted)], 0.0)
+
+        assert selected == []
+        assert [d["reason"] for d in _drop_events(self.engine.logger)] == [
+            "insufficient_available_shares", "insufficient_available_shares"]
+
+    def test_a_call_and_a_put_on_one_underlying_still_collapse(self):
+        """The cross-pool rule survives the rekey."""
+        call = _brk_call(BRK_CALL_2)
+        put = {"symbol": "BRKB", "option_symbol": "BRKB260918P00400000",
+               "type": "put", "strike_price": 400.0, "premium": 1.0,
+               "contracts": 1}
+        self.alpaca.get_positions.return_value = [_equity(BRK_EQUITY, 100)]
+
+        selected, _ = self.engine.select_batch(
+            [self._item(call), self._item(put, collateral=40000.0)], 100000.0)
+
+        assert [o["option_symbol"] for o in selected] == [BRK_CALL_2]
+        assert [d["reason"] for d in _drop_events(self.engine.logger)] == [
+            "duplicate_underlying"]
+
+    def test_the_selection_event_still_reports_the_equity_spelling(self):
+        """The key is normalized; the telemetry is not. An operator greps for
+        the symbol they hold."""
+        self.alpaca.get_positions.return_value = [_equity(BRK_EQUITY, 100)]
+
+        self.engine.select_batch([self._item(_brk_call(BRK_CALL_2))], 0.0)
+
+        assert [e["symbol"] for e in _select_events(self.engine.logger)] == [
+            BRK_EQUITY]

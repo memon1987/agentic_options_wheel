@@ -891,3 +891,86 @@ class TestEarningsReasonsAreScopedToBlocked:
             REASON_EARNINGS_BLACKOUT, REASON_EARNINGS_UNKNOWN)
 
         assert REASON_EARNINGS_BLACKOUT != REASON_EARNINGS_UNKNOWN
+
+
+# ======================================================================
+# FC-041(2) review finding F4 — the covered-set membership test
+#
+# `covered_underlyings` returns OCC roots parsed off contract symbols
+# (`BRKB`); `scan_for_covered_call_opportunities` passes `held_symbols`, which
+# are equity symbols (`BRK.B`). The raw `in` test missed, so a class-share
+# holding with a live short call reported as never covered: it burned a
+# BigQuery lookup, came back `None` or a stale day count, and the covered-call
+# scan's own "how long has this been uncovered" signal lied about the one
+# position that was actually covered.
+#
+# Normalization is at the MEMBERSHIP TEST, both sides through occ_root, so the
+# returned dict stays keyed on the caller's spelling — the scan looks it up as
+# `uncovered_days.get(symbol)` with the equity symbol.
+# ======================================================================
+
+class TestUncoveredDaysResolverOnClassShareTickers:
+
+    def test_a_class_share_short_call_counts_as_covered(self):
+        """THE F4 REGRESSION. Pre-fix `BRK.B` is not in `{'BRKB'}`, so this
+        falls through to BigQuery and never reports 0."""
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
+
+        def _explode(symbols):
+            raise AssertionError(
+                "must not query for a symbol we know is covered: %r" % (symbols,))
+
+        resolver._lookup_uncovered_days = _explode
+
+        assert resolver.resolve(["BRK.B"], covered={"BRKB"}) == {"BRK.B": 0}
+
+    def test_the_result_keeps_the_callers_spelling(self):
+        """The scan looks this up as `uncovered_days.get(symbol)` with the
+        equity symbol; a normalized key would silently render every class-share
+        holding as "never covered"."""
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
+        resolver._lookup_uncovered_days = lambda symbols: {}
+
+        out = resolver.resolve(["BRK.B", "AAPL"], covered={"BRKB"})
+
+        assert set(out) == {"BRK.B", "AAPL"}
+        assert out["BRK.B"] == 0
+
+    def test_an_uncovered_class_share_still_goes_to_the_lookup(self):
+        """The fix must not mark everything covered."""
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
+        seen = []
+
+        def _lookup(symbols):
+            seen.append(list(symbols))
+            return {"BRK.B": 6}
+
+        resolver._lookup_uncovered_days = _lookup
+
+        assert resolver.resolve(["BRK.B"], covered={"AAPL"}) == {"BRK.B": 6}
+        assert seen == [["BRK.B"]]
+
+    def test_a_different_share_class_is_not_coverage(self):
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
+        resolver._lookup_uncovered_days = lambda symbols: {"BRK.B": 3}
+
+        assert resolver.resolve(["BRK.B"], covered={"BRKA"}) == {"BRK.B": 3}
+
+    def test_plain_tickers_are_unchanged(self):
+        resolver = UncoveredDaysResolver(dataset_id="options_wheel")
+        resolver._lookup_uncovered_days = lambda symbols: {"NVDA": 9}
+
+        assert resolver.resolve(["NVDA", "AAPL"], covered={"AAPL"}) == {
+            "AAPL": 0, "NVDA": 9}
+
+
+class TestCoveredUnderlyingsReturnsOccRoots:
+    """Pins the contract F4's membership test depends on: this set holds OCC
+    roots, not equity symbols. Any future caller comparing it to a holding's
+    `symbol` must normalize both sides."""
+
+    def test_a_class_share_call_reports_the_occ_root(self):
+        assert covered_underlyings([
+            {"asset_class": "us_option", "symbol": "BRKB260918C00450000",
+             "qty": -1},
+        ]) == {"BRKB"}

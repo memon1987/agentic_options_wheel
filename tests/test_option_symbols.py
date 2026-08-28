@@ -23,8 +23,13 @@ class TestOccRoot:
     @pytest.mark.parametrize("equity_symbol,expected", [
         ("BRK.B", "BRKB"),      # Alpaca's live spelling for the class share
         ("brk.b", "BRKB"),      # case is normalized
-        ("BRK/B", "BRKB"),      # the other conventional separator
-        ("BF-B", "BFB"),        # and the third
+        # `/` and `-` are NOT Alpaca forms -- get_asset('BRK/B') and
+        # get_asset('BF-B') both 404. They are the other two conventional
+        # class-share separators, seen in hand-entered config, CSV exports and
+        # other vendors' feeds, and are harmless to strip (no listed US equity
+        # ticker contains either character).
+        ("BRK/B", "BRKB"),
+        ("BF-B", "BFB"),
         ("AAPL", "AAPL"),       # plain tickers are the identity
         ("", ""),               # empty stays empty, never a crash
     ])

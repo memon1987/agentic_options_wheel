@@ -82,8 +82,17 @@ def occ_root(equity_symbol: Optional[str]) -> str:
     committed shares read as 0 and the next covered call naked.
 
     Normalization is: uppercase, drop all whitespace, drop ``.``/``/``/``-``.
-    ``BRK.B`` -> ``BRKB``, ``BRK/B`` -> ``BRKB``, ``BF-B`` -> ``BFB``,
-    ``AAPL`` -> ``AAPL`` (plain tickers are byte-identical, by construction).
+    ``BRK.B`` -> ``BRKB``, ``AAPL`` -> ``AAPL`` (plain tickers are
+    byte-identical, by construction).
+
+    **Alpaca uses the dotted form only** — verified: ``get_asset('BRK.B')`` and
+    ``get_asset('BF.B')`` resolve, while ``get_asset('BRK/B')`` and
+    ``get_asset('BF-B')`` both 404. ``/`` and ``-`` are stripped anyway because
+    they are the other two conventional class-share separators and appear in
+    hand-entered config, CSV exports and other vendors' feeds; they are not
+    spellings this API will ever hand us. They are harmless to strip (no listed
+    US equity ticker contains either character), not evidence of a second
+    Alpaca form.
 
     Deliberately NOT a loosening of :data:`OCC_STRICT_RE`: a dotted OCC symbol
     does not exist, so the equity side is the side that needs normalizing.

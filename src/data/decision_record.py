@@ -48,7 +48,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import structlog
 
 from ..strategy.execution_engine import DROP_REASONS
-from ..utils.option_symbols import strict_option_type
+from ..utils.option_symbols import occ_root, strict_option_type
 
 logger = structlog.get_logger(__name__)
 
@@ -344,6 +344,12 @@ def covered_underlyings(positions: Iterable[Dict[str, Any]]) -> set:
     Classification goes through ``strict_option_type`` — the canonical OCC
     parser.  Six instances of substring-matching an OCC symbol
     (FC-041/043/045/048/052) say do not hand-roll this.
+
+    Returns **OCC roots** (``BRKB``), not equity symbols (``BRK.B``) — they are
+    parsed off contract symbols. Any comparison against a holding's ``symbol``
+    must therefore normalize both sides through :func:`occ_root`;
+    ``UncoveredDaysResolver.resolve`` is the one such comparison today and does
+    exactly that.
     """
     covered = set()
     for pos in positions or []:
@@ -502,12 +508,26 @@ class UncoveredDaysResolver:
 
     def resolve(self, symbols: Sequence[str],
                 covered: Optional[set] = None) -> Dict[str, Optional[int]]:
-        """``{symbol: trading days uncovered}``; ``0`` when covered today."""
-        covered = covered or set()
-        wanted = [s for s in dict.fromkeys(symbols) if s]
-        result: Dict[str, Optional[int]] = {s: 0 for s in wanted if s in covered}
+        """``{symbol: trading days uncovered}``; ``0`` when covered today.
 
-        to_lookup = [s for s in wanted if s not in covered]
+        ``symbols`` are *equity* symbols as Alpaca renders them (``BRK.B``);
+        ``covered`` holds OCC roots parsed off contract symbols (``BRKB``).
+        FC-041 normalizes **at the membership test** — both sides through
+        :func:`occ_root` right here — rather than normalizing either input.
+        That choice is deliberate: the returned dict must stay keyed on the
+        caller's own spelling, because ``scan_for_covered_call_opportunities``
+        looks the result up as ``uncovered_days.get(symbol)`` with the equity
+        symbol, and a normalized key would silently return ``None`` (rendered
+        as "never covered") for every class-share holding. Normalizing the
+        ``covered`` set instead would fix this call site and leave the next
+        caller of ``covered_underlyings`` to rediscover the same mismatch.
+        """
+        covered_roots = {occ_root(c) for c in (covered or set())}
+        wanted = [s for s in dict.fromkeys(symbols) if s]
+        result: Dict[str, Optional[int]] = {
+            s: 0 for s in wanted if occ_root(s) in covered_roots}
+
+        to_lookup = [s for s in wanted if occ_root(s) not in covered_roots]
         if not to_lookup:
             return result
 

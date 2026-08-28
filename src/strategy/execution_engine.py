@@ -9,7 +9,9 @@ into independently testable methods:
   - Sequential order execution
 """
 
+import re
 from typing import Dict, List, Any, Optional, Set, Tuple
+
 import structlog
 
 from ..api.alpaca_client import AlpacaClient
@@ -35,10 +37,14 @@ DROP_SIZING_FAILED = "sizing_failed"
 # opposite responses -- one is a normal, expected outcome, the other is an
 # outage that silently halts every covered call in the fleet.
 DROP_POSITIONS_UNAVAILABLE = "positions_unavailable"
-# FC-041: the execution-stage belt. Emitted only when the parser-independent
-# recount in execute_batch disagrees with _available_shares -- i.e. never, unless
-# one of them is wrong. A non-zero count here is a defect report, not a normal
-# batch-contention outcome like the five above.
+# FC-041: the execution-stage belt. Unlike the five above it is NOT raised by
+# `select_batch` -- it fires in `execute_batch`, either when the
+# parser-independent recount disagrees with `_available_shares` or when a short
+# option on the underlying cannot be classified at all. Both mean a defect or a
+# corporate action, never ordinary batch contention. It is in this enum because
+# it rides the same `selection_dropped` event and must carry a bucket in the
+# backtest rejection tally; it is deliberately NOT in `select_batch`'s
+# drop-count summary, where it could only ever be a structural zero.
 DROP_NAKED_CALL_INVARIANT = "naked_call_invariant"
 
 DROP_REASONS = (
@@ -207,32 +213,61 @@ class ExecutionEngine:
     def _invariant_shares(
         underlying: Optional[str],
         positions: List[Dict[str, Any]],
-    ) -> Tuple[int, int]:
-        """``(owned, committed)`` recomputed **without** ``parse_option_symbol``.
+    ) -> Tuple[int, int, List[str]]:
+        """``(owned, committed, unclassifiable)`` — **no** ``parse_option_symbol``.
 
-        FC-041. This is deliberately a second, independent implementation of the
+        FC-041. A deliberately second, independent implementation of the
         arithmetic in :meth:`_available_shares` — belt to that method's braces.
         A single shared helper cannot catch its own bug; two implementations
         that must agree can.
 
-        Independence is the whole point, so it uses only the two primitives
-        whose answers are fully anchored: :func:`strict_option_type` (which
-        proves the symbol is an exact ``ROOT+YYMMDD+C/P+STRIKE8`` contract) and
+        Independence is the point, so it uses only the two primitives whose
+        answers are fully anchored: :func:`strict_option_type` (which proves the
+        symbol is an exact ``ROOT+YYMMDD+C/P+STRIKE8`` contract) and
         :func:`occ_root`. Because ``strict_option_type`` has already proven the
         shape, the root is exactly the first ``len - 15`` characters — no
-        heuristic, no leading-letters fallback, no regex of its own.
+        heuristic, no leading-letters fallback, no regex of its own for the
+        classified case.
 
-        Fails closed on every unreadable input: a position it cannot parse
-        contributes nothing to ``owned``, and a malformed short call is skipped
-        by ``strict_option_type`` returning ``None`` (that position also
-        surfaces via the regression monitor's ``risk_unclassifiable_option``).
+        **``unclassifiable`` is what makes this gate fail CLOSED.**
+        ``strict_option_type`` returns ``None`` for an *adjusted* contract
+        (``AAPL1260821C00250000`` — a split or special-dividend root) and for
+        anything else off-shape (``AAPL260724C00340000X``). Counting those as
+        "commits 0 shares" is exactly the naked write this gate exists to stop:
+        an adjusted short call is a real obligation against real shares. So any
+        short ``us_option`` this method cannot classify, whose leading-alpha
+        prefix normalizes to the target root, is collected here instead, and
+        the caller refuses the write. Deliberate consequences:
+
+        - It is **type-blind** on that path. An unclassifiable short *put* on
+          the underlying also blocks. We cannot prove it is not a call, and the
+          cost of being wrong is one skipped covered call against writing naked.
+        - It is **root-prefix scoped**, so unrelated garbage (``NOT_AN_OCC``)
+          does not block every underlying in the account.
+        - The share arithmetic is deliberately *not* attempted on an adjusted
+          contract: its deliverable is not 100 shares, so any number we
+          computed would be wrong. Refusing is the only honest answer.
+
+        A non-string ``symbol`` is skipped outright rather than collected: the
+        prefix rule cannot tell whether it is even on this underlying, and
+        blocking every call in the account on one unreadable field is a blast
+        radius out of proportion to a shape Alpaca does not produce. It matches
+        :meth:`_available_shares` exactly (which skips it via ``TypeError``),
+        and the position still surfaces within the hour as the regression
+        monitor's ``risk_unclassifiable_option`` warn finding.
+
+        What this method does NOT see, on purpose: it reads one positions
+        snapshot, so a *working order* not yet filled commits nothing here
+        (FC-061), and it cannot detect a position that changed between the
+        snapshot and the order landing at the exchange.
         """
         if not underlying:
-            return 0, 0
+            return 0, 0, []
 
         root = occ_root(underlying)
         owned = 0
         committed = 0
+        unclassifiable: List[str] = []
         for pos in positions or []:
             try:
                 asset_class = pos.get('asset_class')
@@ -243,15 +278,24 @@ class ExecutionEngine:
                     qty = float(pos.get('qty') or 0)
                     if qty >= 0:
                         continue
-                    sym = (pos.get('symbol') or '').strip().upper()
-                    if strict_option_type(sym) != 'call':
+                    raw = pos.get('symbol')
+                    if not isinstance(raw, str):
+                        continue
+                    sym = raw.strip().upper()
+                    opt_type = strict_option_type(sym)
+                    if opt_type is None:
+                        prefix = re.match(r'^[A-Z]+', sym)
+                        if prefix and occ_root(prefix.group(0)) == root:
+                            unclassifiable.append(raw)
+                        continue
+                    if opt_type != 'call':
                         continue
                     if occ_root(sym[:-15]) == root:
                         committed += abs(int(qty)) * 100
             except (TypeError, ValueError):
                 continue
 
-        return owned, committed
+        return owned, committed, unclassifiable
 
     def _positions_snapshot(
         self,
@@ -578,18 +622,31 @@ class ExecutionEngine:
             A tuple of (selected_opportunities, remaining_buying_power).
         """
         selected: List[Dict[str, Any]] = []
-        selected_underlyings: Set[str] = set()
+        selected_underlyings: Set[str] = set()   # OCC roots, not equity symbols
         remaining_bp = available_buying_power
-        drop_counts: Dict[str, int] = {reason: 0 for reason in DROP_REASONS}
+        # Every reason selection can actually raise. DROP_NAKED_CALL_INVARIANT
+        # is excluded on purpose: it belongs to `execute_batch`, which does not
+        # run this counter, so a key for it here could only ever report a
+        # structural zero -- a field that looks like a control's health metric
+        # and is not one. If selection ever tried to raise it, the KeyError is
+        # the correct, loud answer.
+        drop_counts: Dict[str, int] = {
+            reason: 0 for reason in DROP_REASONS
+            if reason != DROP_NAKED_CALL_INVARIANT
+        }
         selected_counts: Dict[str, int] = {'call': 0, 'put': 0}
 
         def drop(item: Dict[str, Any], reason: str, **fields: Any) -> None:
             drop_counts[reason] += 1
             self._log_drop(item['opportunity'], reason, stage="selection", **fields)
 
-        def select(item: Dict[str, Any], underlying: Optional[str], **fields: Any) -> None:
+        def select(item: Dict[str, Any], underlying: Optional[str],
+                   key: str, **fields: Any) -> None:
             selected.append(item['opportunity'])
-            selected_underlyings.add(underlying)
+            # The event reports the equity spelling the producer used; the
+            # one-position-per-underlying set is keyed on the OCC root
+            # (FC-041), so the two never drift apart on a class share.
+            selected_underlyings.add(key)
             selected_counts['call' if self._item_type(item) == 'call' else 'put'] += 1
             self.logger.info(
                 "Selected opportunity for batch execution",
@@ -618,30 +675,37 @@ class ExecutionEngine:
         for item in calls:
             opp = item['opportunity']
             underlying = opp.get('symbol')
+            # FC-041: both per-batch keys are the OCC root, so `BRK.B` and
+            # `BRKB` are one underlying to the duplicate rule and to the share
+            # ledger. Keyed on the raw symbol, two spellings of the same
+            # company would each get their own 100-share budget out of the
+            # same 100 shares. `select()` still reports the equity spelling.
+            key = occ_root(underlying)
 
-            if underlying in selected_underlyings:
+            if key in selected_underlyings:
                 drop(item, DROP_DUPLICATE_UNDERLYING)
                 continue
 
-            if underlying not in share_ledger:
-                share_ledger[underlying] = self._available_shares(underlying, positions)[0]
+            if key not in share_ledger:
+                share_ledger[key] = self._available_shares(underlying, positions)[0]
 
             required_shares = int(opp.get('contracts') or 1) * 100
-            if share_ledger[underlying] < required_shares:
+            if share_ledger[key] < required_shares:
                 drop(
                     item,
                     self._share_drop_reason(positions),
                     required_shares=required_shares,
-                    available_shares=share_ledger[underlying],
+                    available_shares=share_ledger[key],
                 )
                 continue
 
-            share_ledger[underlying] -= required_shares
+            share_ledger[key] -= required_shares
             select(
                 item,
                 underlying,
+                key,
                 required_shares=required_shares,
-                remaining_shares=share_ledger[underlying],
+                remaining_shares=share_ledger[key],
                 remaining_bp=remaining_bp,
             )
 
@@ -649,8 +713,9 @@ class ExecutionEngine:
         for item in puts:
             opp = item['opportunity']
             underlying = opp.get('symbol')
+            key = occ_root(underlying)
 
-            if underlying in selected_underlyings:
+            if key in selected_underlyings:
                 drop(item, DROP_DUPLICATE_UNDERLYING)
                 continue
 
@@ -668,6 +733,7 @@ class ExecutionEngine:
             select(
                 item,
                 underlying,
+                key,
                 roi=f"{item.get('roi', 0):.4f}",
                 remaining_bp=remaining_bp,
             )
@@ -685,10 +751,11 @@ class ExecutionEngine:
             dropped_insufficient_buying_power=drop_counts[DROP_INSUFFICIENT_BP],
             dropped_duplicate_underlying=drop_counts[DROP_DUPLICATE_UNDERLYING],
             dropped_positions_unavailable=drop_counts[DROP_POSITIONS_UNAVAILABLE],
-            # FC-041: selection never raises this one -- it is the execution
-            # stage's belt. Reported here so the field exists at 0 in every
-            # batch, which is what makes a 1 legible.
-            dropped_naked_call_invariant=drop_counts[DROP_NAKED_CALL_INVARIANT],
+            # FC-041's `naked_call_invariant` is deliberately absent: it fires
+            # in `execute_batch`, after selection is over, so a field here
+            # could only ever be a structural zero. Its real signals are the
+            # `naked_call_invariant_blocked` error event and
+            # `selection_dropped{reason=naked_call_invariant, stage=execution}`.
             initial_bp=available_buying_power,
             bp_to_use=available_buying_power - remaining_bp,
         )
@@ -875,18 +942,20 @@ class ExecutionEngine:
                     # know which — so we fail closed and say so loudly. Silence
                     # here is a naked call; a false positive here is one
                     # skipped covered call.
-                    inv_owned, inv_committed = self._invariant_shares(
-                        underlying, snapshot
+                    inv_owned, inv_committed, inv_unclassifiable = (
+                        self._invariant_shares(underlying, snapshot)
                     )
-                    if inv_committed + required_shares > inv_owned:
+                    if (inv_unclassifiable
+                            or inv_committed + required_shares > inv_owned):
                         log_error_event(
                             self.logger,
                             error_type="naked_call_invariant_blocked",
                             error_message=(
                                 f"Naked-call invariant violated for {underlying}: "
                                 f"committed {inv_committed} + requested "
-                                f"{required_shares} > owned {inv_owned}; "
-                                f"refusing to write the call"
+                                f"{required_shares} vs owned {inv_owned}, "
+                                f"unclassifiable short options "
+                                f"{inv_unclassifiable}; refusing to write the call"
                             ),
                             component="execution_engine",
                             recoverable=True,
@@ -895,6 +964,10 @@ class ExecutionEngine:
                             owned=inv_owned,
                             committed=inv_committed,
                             requested=required_shares,
+                            # Which limb fired. A non-empty list means the
+                            # arithmetic was never reached: there is a short
+                            # option on this underlying we refuse to classify.
+                            unclassifiable_short_options=inv_unclassifiable,
                             # What the primary ledger said, so the disagreement
                             # itself is in the record and diagnosable.
                             available_shares_helper=available_shares,
@@ -910,6 +983,7 @@ class ExecutionEngine:
                             owned_shares=inv_owned,
                             committed_to_calls=inv_committed,
                             required_shares=required_shares,
+                            unclassifiable_short_options=inv_unclassifiable,
                         )
                         # Not added to _failed_symbols: like naked_call_blocked,
                         # share ownership is transient and the same contract can
@@ -922,7 +996,8 @@ class ExecutionEngine:
                                 'message': (
                                     f'Call blocked by naked-call invariant: '
                                     f'{inv_committed} committed + {required_shares} '
-                                    f'requested > {inv_owned} owned'
+                                    f'requested vs {inv_owned} owned, '
+                                    f'unclassifiable {inv_unclassifiable}'
                                 ),
                             },
                             'success': False,

@@ -1183,7 +1183,14 @@ class RegressionMonitor:
         # floor source (FC-065 Phase 1). The previous derivation, cost_basis/qty,
         # returns 0 for assigned positions, so the `> 0` guard skipped exactly
         # the assigned lots this check exists to protect.
-        stock_by_symbol = {p.get("symbol"): p for p in stock_positions if p.get("symbol")}
+        # Keyed on the OCC root for the same reason check 7 is (FC-041): the
+        # lookup below is by the contract's parsed underlying (`BRKB`) and the
+        # equity renders as `BRK.B`. A raw-string key finds no stock position,
+        # the loop `continue`s, and the floor goes UNVERIFIED for exactly the
+        # tickers check 7 had just started reporting correctly -- a silent hole
+        # opened by half-fixing the file.
+        stock_by_symbol = {occ_root(p.get("symbol")): p
+                           for p in stock_positions if p.get("symbol")}
 
         for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
@@ -1197,7 +1204,7 @@ class RegressionMonitor:
             if strike <= 0:
                 continue
 
-            stock_pos = stock_by_symbol.get(underlying)
+            stock_pos = stock_by_symbol.get(occ_root(underlying))
             if not stock_pos:
                 continue  # naked — check 7's finding, not this one's
 

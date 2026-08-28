@@ -635,3 +635,61 @@ class TestNakedCallOnClassShareTickers:
             _option("AAPL260821C00250000", -1),
         ])
         assert statuses(res, "risk_naked_call") == "pass"
+
+
+# ---------------------------------------------------------------------------
+# FC-041(2) review finding F2 — check 8's join, on class-share tickers
+#
+# Check 8 keyed `stock_by_symbol` on the raw equity symbol and looked it up by
+# the contract's parsed underlying. On a class share it found no stock
+# position, `continue`d, and the cost-basis floor went UNVERIFIED — a silent
+# hole that only opened once check 7 stopped reporting those calls as naked.
+# ---------------------------------------------------------------------------
+
+class TestCostBasisProtectionOnClassShareTickers:
+
+    def test_a_class_share_call_below_basis_is_caught(self, monkeypatch):
+        """THE F2 REGRESSION. Pre-fix: check 8 silently skips this position and
+        reports `pass` for the account."""
+        res = run_checks(monkeypatch, [
+            _stock("BRK.B", 100, 400.0, 45_000.0),
+            _option("BRKB260918C00300000", -1),   # $300 strike vs $400 basis
+        ])
+        r = res["risk_cost_basis_protection"]
+        assert r.status == "fail"
+        assert r.details["strike"] == 300.0
+        assert r.details["cost_basis"] == 400.0
+
+    def test_a_class_share_call_above_basis_passes(self, monkeypatch):
+        res = run_checks(monkeypatch, [
+            _stock("BRK.B", 100, 400.0, 45_000.0),
+            _option("BRKB260918C00450000", -1),
+        ])
+        assert statuses(res, "risk_cost_basis_protection") == "pass"
+
+    def test_an_unusable_basis_on_a_class_share_is_a_finding_not_a_skip(
+            self, monkeypatch):
+        """The FC-029 lesson has to survive the rekey: a resolvable position
+        with no usable `avg_entry_price` is reported, never silently dropped."""
+        res = run_checks(monkeypatch, [
+            _stock("BRK.B", 100, 0.0, 45_000.0),
+            _option("BRKB260918C00450000", -1),
+        ])
+        r = res["risk_cost_basis_protection"]
+        assert r.status == "fail"
+        assert "no usable avg_entry_price" in r.message
+
+    def test_a_naked_class_share_call_is_still_check_sevens_finding(
+            self, monkeypatch):
+        """No equity leg at all means check 7 owns it; check 8 must not also
+        fire and double-count the same position."""
+        res = run_checks(monkeypatch, [_option("BRKB260918C00300000", -1)])
+        assert statuses(res, "risk_naked_call") == "fail"
+        assert statuses(res, "risk_cost_basis_protection") == "pass"
+
+    def test_plain_tickers_are_unchanged(self, monkeypatch):
+        res = run_checks(monkeypatch, [
+            _stock("AAPL", 100, 300.0, 25_000.0),
+            _option("AAPL260821C00250000", -1),
+        ])
+        assert statuses(res, "risk_cost_basis_protection") == "fail"
