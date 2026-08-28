@@ -811,7 +811,7 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ### FC-072: call-side limit pricing never received the put side's spread-aware improvement
 
-**Status:** Consideration — filed 2026-08-01 (spin-off from `docs/plans/fc-065.md` §Spin-offs, deliberately excluded from FC-069 so its economics get reviewed on their own)
+**Status:** Executing — plan `docs/plans/fc-072.md` **rev 2** (execute-time re-quote on both legs, tick snapping, corrected economics); PR #97; rev-2 reviews → REQUEST_CHANGES ×2 → fix round in progress. **The premise of this entry was falsified in review:** the `mid×0.95` call limit sat ≈ at the bid, and realized Σ(mid − fill) on 66 journaled call fills was −$87 — the discount was never money; quote staleness (`/scan` :00 → `/run` :15) is the variable. See the plan's §Context. **Real-money precondition surfaced:** the account's option quotes are Alpaca's *indicative* feed (OPRA agreement unsigned) — operator decision before any live account.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1052,6 +1052,48 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 **Fix direction:** either persist `_processed_activity_ids` (a small durable set — the FC-039/069 standing rule applies: a configured-but-unresolvable persistence target must fail loudly) or shrink the replay window to "since the last successful `/run`" derived from Alpaca order history; and delete or repoint the dead view. Decide deliberately per the FC-069 precedent (delete fiction, don't polish it).
 
 **Links:** FC-079 (PR #98 review), FC-069 item 8, FC-046, `src/strategy/wheel_engine.py` `reconcile_positions`.
+
+---
+
+### FC-088: the roller's and `/monitor`'s limit prices are still off-tick above $3 — rejected on a live account
+
+**Scope:** shared
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-072 rev 2 snaps sell-to-open limits to Alpaca's tick rule (penny-program classes: $0.01 below $3, $0.05 at/above; SPY/QQQ/IWM penny everywhere). Three other live limit paths do not: `CallRoller` STO (`mid − 0.05` / bid, `call_roller.py` ~:539-543), the roller's BTC leg, and `/monitor`'s buy-to-close `round(ask × 0.95, 2)` (`deploy/cloud_run_server.py` ~:1108). The paper simulator does not enforce increments (46 off-tick ≥$3 orders were "accepted"), so these are invisible today; on a live account Alpaca routes non-conforming limits to NOM if possible, **otherwise rejects them** — a rejected BTC leaves a position unmanaged. Same rule as `limit_pricing.py` (reuse `snap_to_tick`), buy side rounds DOWN.
+
+**Links:** FC-072 (PR #97 rev 2 reviews), `src/strategy/limit_pricing.py`, FC-009 (`/monitor` close path).
+
+---
+
+### FC-089: `AlpacaClient` HTTP calls have no socket timeout — a hung data call holds `strategy_lock` for 300 s
+
+**Scope:** shared
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reliability review)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** alpaca-py passes no `timeout` to `requests` (it retries only 429/504, 3× with 3 s sleep). A hung socket to `data.alpaca.markets` stalls the calling endpoint until Cloud Run's 300 s cutoff; the request thread then still holds `strategy_lock` (shared by `/scan`, `/run`, `/monitor`, `/roll`), so every later endpoint on that instance queues. Pre-existing for every wrapper call (`/monitor` and the roller already call `get_option_quote` under the lock); FC-072 adds one such call per order to `/run`. Fix direction: a `requests.Session` with `(connect, read)` timeouts on all three alpaca-py clients, and a lock-timeout/abandon guard on the endpoints.
+
+**Links:** `src/api/alpaca_client.py` (`__init__`), `deploy/cloud_run_server.py` (`strategy_lock`), FC-072.
+
+---
+
+### FC-090: execute-time quote drift — guard the fresh mid against the scan-time premium floor; fill-or-reprice at :30
+
+**Scope:** shared
+**Status:** Filed 2026-08-28 (FC-072 rev 2 plan critique)
+**Size estimate:** M (research + a small gate)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-072 rev 2 re-quotes at execute time, which corrects the *price* but not the *decision*: delta band, `min_*_premium`, and ranking ran on the :00 book, and the fresh :15 mid can sit below the premium floor the scanner enforced while the write still goes out. Both `premium` (scan) and `mid` (execute) are on the `*_sale_executing` events, so drift is measurable from day one. Evaluate: (a) a `premium_drift` guard (skip the write when fresh mid < the profile's floor or drops > X% from scan), (b) fill-or-reprice — a second `/run` pass at :30 that steps `spread_fraction` down for unfilled DAY orders, (c) DAY vs GTC. Decide from the two-week readout that FC-072's rollout specifies (fill rate by `quote_source` × leg; realized fill − mid; baseline 75–80%).
+
+**Links:** FC-072 (rollout step 3), `src/strategy/limit_pricing.py`, FC-088.
 
 ---
 
