@@ -55,7 +55,17 @@ def test_no_undefined_names_in_production_code():
 # *mention* the pattern (there are several) do not trip it — only real code,
 # where `'C'`, `in`, and the option-symbol name are separate tokens, does.
 
-# Legacy files still carrying the pattern in live code, pending FC-079's sweep.
+# FC-079 DRAINED THIS ALLOWLIST. It listed five files when this gate shipped;
+# four of them (wheel_engine, regression_monitor, and the two ad-hoc analysis
+# scripts) were rewired onto `strict_option_type` / `parse_option_symbol` and
+# removed from it. Only the canonical parser remains, and only because its
+# documented last-resort heuristic is the one deliberate home of the idiom.
+#
+# Do not re-add a file here. `tests/test_no_occ_substring.py` (FC-079) is the
+# wider gate — it also catches the positional `[-9]` / `[-8:]` reads and any
+# variable whose name contains "sym" — and it allow-lists per *line*, via a
+# `# occ-substring-allowed` marker, precisely so a whole file can never again be
+# exempted to buy time.
 #
 # SCOPE (honest): this gate catches the bareword substring form
 # `'C'|'P' in <name>` where <name> is one of _OPTION_VARS — the exact shape every
@@ -68,10 +78,6 @@ _OCC_SUBSTRING_ALLOWLIST = {
     # The canonical parser itself: its documented last-resort tolerant heuristic
     # (`'C' if 'C' in symbol ...`) is the ONE intentional home of the pattern.
     "src/utils/option_symbols.py",
-    "src/strategy/wheel_engine.py",              # :304/:306/:408 (FC-054/FC-079)
-    "tools/testing/regression_monitor.py",       # :628
-    "tools/testing/debug_expired_put_analysis.py",       # :23/:26 (analysis script)
-    "tools/testing/detailed_expired_options_analysis.py",  # :183/:186 (analysis script)
 }
 
 _OPTION_VARS = {"symbol", "opt_sym", "option_symbol", "occ_symbol", "contract_symbol"}
@@ -125,9 +131,31 @@ def test_no_occ_substring_routing_outside_allowlist():
     )
 
 
-def test_occ_gate_actually_sees_the_known_legacy_sites():
-    """Guard the guard: if tokenization stopped finding the known sites, the gate
-    above would pass vacuously. Assert it still detects them in the allowlisted
-    wheel_engine (which FC-079 will later drain — update this when it does)."""
-    sites = _occ_substring_sites(REPO_ROOT / "src/strategy/wheel_engine.py")
-    assert len(sites) >= 2, sites
+PROBE = (
+    "def f(option_symbol, opt_sym, unrelated):\n"
+    "    a = 'C' in option_symbol\n"
+    "    b = 'P' in opt_sym\n"
+    "    c = 'C' in unrelated       # not an option var: not a site\n"
+    "    return a, b, c\n"
+)
+
+
+def test_occ_gate_still_detects_the_pattern(tmp_path):
+    """Guard the guard: if tokenization stopped finding sites, the gate above
+    would pass vacuously.
+
+    This used to assert against the real `wheel_engine.py`, which was on the
+    allowlist and still carried the idiom. FC-079 drained it, so the guard now
+    runs on a synthetic probe — a guard that depends on live technical debt
+    stops working the moment the debt is paid, which is exactly backwards.
+    """
+    probe = tmp_path / "probe.py"
+    probe.write_text(PROBE, encoding="utf-8")
+
+    sites = _occ_substring_sites(probe)
+    assert [lineno for lineno, _ in sites] == [2, 3], sites
+
+
+def test_the_allowlist_is_down_to_the_canonical_parser():
+    """FC-079's contract: exactly one file may carry the idiom."""
+    assert _OCC_SUBSTRING_ALLOWLIST == {"src/utils/option_symbols.py"}

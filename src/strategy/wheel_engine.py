@@ -10,7 +10,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_trade_event, log_error_event
 from ..utils.positions import get_stock_positions
-from ..utils.option_symbols import parse_option_symbol
+from ..utils.option_symbols import parse_option_symbol, strict_option_type
 from .call_roller import CallRoller
 from .wheel_state_manager import WheelStateManager
 from ..risk.risk_manager import RiskManager
@@ -106,6 +106,70 @@ class WheelEngine:
         parsed = parse_option_symbol(option_symbol)
         underlying = parsed.get('underlying')
         return underlying if underlying else None
+
+    def _count_option_legs(self, option_positions: list) -> Dict[str, Dict[str, int]]:
+        """Tally Alpaca option positions per underlying, by leg.
+
+        Returns ``{underlying: {'puts': n, 'calls': n, 'unclassified': n}}``,
+        counted in contracts (short positions carry a negative qty; the sign is
+        dropped — this is an inventory count, not a signed exposure).
+
+        FC-079. This used to classify with ``'P' in option_symbol`` / ``elif
+        'C' in option_symbol``, testing the whole contract string rather than
+        the type character. Every underlying whose root carries a P or a C was
+        misread — AAPL, SPY and PFE all contain a ``'P'``, so the put branch
+        fired first and every one of their *calls* was counted as a put. These
+        counts feed the position-diff assignment fallback in
+        ``reconcile_positions``, so on a third of the universe a call
+        assignment could never be detected on that path.
+
+        Classification is strict, and it never guesses: a symbol that is not an
+        exact OCC contract (an adjusted root after a split, e.g.
+        ``AAPL1260918C00230000``) is counted under ``unclassified`` and warned
+        once per symbol per run — not dropped, and not attributed to a leg.
+        Guessing a leg here would feed a fabricated assignment into
+        ``handle_put_assignment`` / ``handle_call_assignment``; dropping it
+        would make the position vanish from the diff, which reads as an
+        assignment that did not happen.
+
+        Args:
+            option_positions: Alpaca option positions (``asset_class`` already
+                filtered to ``us_option``)
+
+        Returns:
+            Per-underlying leg counts
+        """
+        counts: Dict[str, Dict[str, int]] = {}
+        warned = set()
+
+        for pos in option_positions:
+            option_symbol = pos['symbol']
+            qty = int(float(pos['qty']))
+            underlying = self._extract_underlying_from_option_symbol(option_symbol)
+            if not underlying:
+                continue
+            if underlying not in counts:
+                counts[underlying] = {'puts': 0, 'calls': 0, 'unclassified': 0}
+            # Short positions have negative qty
+            contracts = abs(qty)
+            option_type = strict_option_type(option_symbol)
+            if option_type == 'put':
+                counts[underlying]['puts'] += contracts
+            elif option_type == 'call':
+                counts[underlying]['calls'] += contracts
+            else:
+                counts[underlying]['unclassified'] += contracts
+                if option_symbol not in warned:
+                    warned.add(option_symbol)
+                    logger.warning(
+                        "Option position is not a strict OCC contract - not counted as a leg",
+                        event_category="reconciliation",
+                        event_type="reconcile_unclassifiable_option",
+                        symbol=option_symbol,
+                        underlying=underlying,
+                        contracts=contracts)
+
+        return counts
 
     def reconcile_positions(self) -> Dict[str, Any]:
         """Reconcile tracked wheel state against actual Alpaca positions.
@@ -290,21 +354,7 @@ class WheelEngine:
                 if shares > 0:
                     alpaca_stock_shares[symbol] = shares
 
-            alpaca_option_counts: Dict[str, Dict[str, int]] = {}  # symbol -> {'puts': n, 'calls': n}
-            for pos in option_positions:
-                option_symbol = pos['symbol']
-                qty = int(float(pos['qty']))
-                underlying = self._extract_underlying_from_option_symbol(option_symbol)
-                if not underlying:
-                    continue
-                if underlying not in alpaca_option_counts:
-                    alpaca_option_counts[underlying] = {'puts': 0, 'calls': 0}
-                # Short positions have negative qty
-                contracts = abs(qty)
-                if 'P' in option_symbol:
-                    alpaca_option_counts[underlying]['puts'] += contracts
-                elif 'C' in option_symbol:
-                    alpaca_option_counts[underlying]['calls'] += contracts
+            alpaca_option_counts = self._count_option_legs(option_positions)
 
             # --- Compare Alpaca state vs wheel state and reconcile ---
 
@@ -319,7 +369,8 @@ class WheelEngine:
                 tracked_calls = state_summary['active_calls']
 
                 actual_shares = alpaca_stock_shares.get(symbol, 0)
-                actual_opts = alpaca_option_counts.get(symbol, {'puts': 0, 'calls': 0})
+                actual_opts = alpaca_option_counts.get(
+                    symbol, {'puts': 0, 'calls': 0, 'unclassified': 0})
                 actual_puts = actual_opts['puts']
                 actual_calls = actual_opts['calls']
 
@@ -400,15 +451,26 @@ class WheelEngine:
                     # Trigger wheel state transition: SELLING_CALLS -> cycle complete
                     # This fires wheel_cycle_complete if all shares are called away
                     try:
-                        # Estimate strike from option positions (approximate)
+                        # Estimate strike from option positions (approximate).
+                        # FC-079: ``'C' in opt_sym`` matched the first option
+                        # whose *symbol text* contained a C — for PFE that is
+                        # every PFE contract, puts included — and the strike
+                        # then came off a blind ``[-8:]`` slice. Classify with
+                        # strict_option_type and read the strike from the
+                        # parser. An unclassifiable symbol is skipped, which
+                        # falls through to the current-price fallback below
+                        # rather than inventing a strike.
                         strike_price = 0.0
                         for pos in option_positions:
                             opt_sym = pos.get('symbol', '')
+                            if strict_option_type(opt_sym) != 'call':
+                                continue
                             underlying_of_opt = self._extract_underlying_from_option_symbol(opt_sym)
-                            if underlying_of_opt == symbol and 'C' in opt_sym:
+                            if underlying_of_opt == symbol:
                                 try:
-                                    strike_price = float(opt_sym[-8:]) / 1000.0
-                                except (ValueError, IndexError):
+                                    strike_price = float(
+                                        parse_option_symbol(opt_sym).get('strike_price') or 0.0)
+                                except (TypeError, ValueError):
                                     pass
                                 break
                         if strike_price == 0.0:
@@ -492,7 +554,8 @@ class WheelEngine:
             for symbol in all_alpaca_symbols - all_tracked_symbols:
                 stats['discrepancies_found'] += 1
                 actual_shares = alpaca_stock_shares.get(symbol, 0)
-                actual_opts = alpaca_option_counts.get(symbol, {'puts': 0, 'calls': 0})
+                actual_opts = alpaca_option_counts.get(
+                    symbol, {'puts': 0, 'calls': 0, 'unclassified': 0})
 
                 logger.warning("Position exists in Alpaca but not in wheel state — adding",
                               event_category="reconciliation",

@@ -232,11 +232,11 @@ class OptionSymbolGenerator:
                 return False
             
             # Should end with 8 digits
-            if not symbol[-8:].isdigit():
+            if not symbol[-8:].isdigit():  # occ-substring-allowed
                 return False
             
             # Should have C or P before the strike
-            if symbol[-9] not in ['C', 'P']:
+            if symbol[-9] not in ['C', 'P']:  # occ-substring-allowed
                 return False
             
             # Date part should be 6 digits  
@@ -342,7 +342,12 @@ def parse_option_symbol(option_symbol: str, underlying_hint: Optional[str] = Non
                 # Last-resort partial extraction
                 date_match = re.search(r'(\d{6})[PC]', symbol)
                 date_str = date_match.group(1) if date_match else None
-                type_char = 'C' if 'C' in symbol else ('P' if 'P' in symbol else None)
+                # occ-substring-allowed — the documented last-resort heuristic.
+                # This is the *only* blessed instance of the idiom in the
+                # tree (FC-079 / tests/test_no_occ_substring.py). It exists so
+                # messy historical input degrades instead of raising; callers
+                # that must not inherit the guess use strict_option_type().
+                type_char = 'C' if 'C' in symbol else ('P' if 'P' in symbol else None)  # occ-substring-allowed
                 strike_match = re.search(r'[PC](\d{8})$', symbol)
                 strike_str = strike_match.group(1) if strike_match else None
 

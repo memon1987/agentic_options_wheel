@@ -760,28 +760,44 @@ class RegressionMonitor:
             if p.get("asset_class") != "us_option"
         }
 
-        import re
+        # FC-079. This block used to ask ``"C" in symbol`` and root the
+        # contract with a bare ``^([A-Z]+)`` match. Both are wrong for a root
+        # that contains a C or a P: every ``PFE...P...`` put was treated as a
+        # call and warned as an orphan (PFE holds no stock while the put is
+        # open — by design), and an adjusted root was mis-parsed. Classify
+        # with strict_option_type and root with the canonical parser.
+        #
+        # A symbol that is not a strict OCC contract is neither passed nor
+        # warned on here: it is listed under ``unclassifiable`` for the
+        # operator. The dedicated ``risk_unclassifiable_option`` check already
+        # alerts on those, and a second alarm for the same fact is how an
+        # alarm layer gets muted.
         orphaned = []
+        unclassifiable = []
         for opt in option_positions:
             symbol = opt.get("symbol", "")
+            option_type = strict_option_type(symbol)
+            if option_type is None:
+                unclassifiable.append(symbol)
+                continue
             # Call options should have corresponding stock
-            if "C" in symbol:
-                match = re.match(r"^([A-Z]+)", symbol)
-                if match:
-                    underlying = match.group(1)
-                    if underlying not in stock_symbols:
-                        orphaned.append(symbol)
+            if option_type != "call":
+                continue
+            underlying = parse_option_symbol(symbol).get("underlying")
+            if underlying and underlying not in stock_symbols:
+                orphaned.append(symbol)
 
         if orphaned:
             checks.append(CheckResult(
                 "reconcile_orphaned", "warn",
                 f"Orphaned call positions (no underlying stock): {orphaned}",
-                {"orphaned_symbols": orphaned},
+                {"orphaned_symbols": orphaned, "unclassifiable": unclassifiable},
             ))
         else:
             checks.append(CheckResult(
                 "reconcile_orphaned", "pass",
                 "No orphaned call positions",
+                {"unclassifiable": unclassifiable},
             ))
 
         self.results.extend(checks)
