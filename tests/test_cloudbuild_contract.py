@@ -51,6 +51,19 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cloudbuild_contract.js
 
 SERVICES = ("options-wheel-strategy", "covered-call-engine", "options-wheel-dashboard")
 
+# The image each chain deploys, as it must appear in that promote's MY_IMAGE. The
+# `:$COMMIT_SHA` tag is the load-bearing half: MY_IMAGE decides whether a revision this
+# build did NOT create gets promoted, so an untagged (or `:latest`) value would match
+# any revision built from this repo — including an older commit's — and the
+# env-only-change branch would wave through code this build never tested. The
+# covered-call engine deliberately runs the STRATEGY image (FC-075: one image, the
+# profile is selected by STRATEGY_CONFIG).
+PROMOTE_IMAGE = {
+    "options-wheel-strategy": "options-wheel-strategy:$COMMIT_SHA",
+    "covered-call-engine": "options-wheel-strategy:$COMMIT_SHA",
+    "options-wheel-dashboard": "options-wheel-dashboard:$COMMIT_SHA",
+}
+
 CHAINS = {
     "options-wheel-strategy": {
         "deploy": "deploy-bot-canary",
@@ -179,6 +192,26 @@ def simulate_substitution(text):
     return "".join(out)
 
 
+def if_branch_body(script, opener):
+    """The body of the `if <opener> ...; then` block, up to its matching `fi`.
+
+    Assertions about *ordering* in the script text are not enough for branch
+    behaviour: code on a path the branch skips still appears later in the file.
+    """
+    lines = script.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines) if opener in ln), None
+    )
+    assert start is not None, f"no line containing {opener!r}"
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].strip()
+        cur_indent = len(lines[j]) - len(lines[j].lstrip())
+        if stripped == "fi" and cur_indent == indent:
+            return "\n".join(lines[start + 1:j])
+    raise AssertionError(f"unterminated if-block for {opener!r}")
+
+
 def retry_loop_body(script):
     """The body of the `for attempt in 1 2 3; do ... done` loop in a script.
 
@@ -232,9 +265,8 @@ def test_serialize_builds_gate_exists_and_gates_every_deploy(by_id):
     assert gate.get("waitFor") == [GATE_WAITS_FOR], (
         f"`serialize-builds` must waitFor ['{GATE_WAITS_FOR}']. Running it there rather "
         "than at ['-'] means a build that has to wait for an older one has already done "
-        "its own test/build/push work, so only the deploy chain is serialized — and the "
-        "gate's own 15-minute wait cap stays wider than any legitimate wait. It must not "
-        "gain edges that would delay it behind the deploy chain either."
+        "its own test/build/push work, so only the deploy chain is serialized. It must "
+        "not gain edges that would delay it behind the deploy chain either."
     )
 
     for service, roles in CHAINS.items():
@@ -374,8 +406,29 @@ def test_promote_promotes_an_env_only_change_on_this_builds_image(service, by_id
         f"{step_id} must log PROMOTING ... (env-only change on this build's image) "
         "when it promotes a revision it did not create because the image matches."
     )
-    assert 'MY_IMAGE=' in script, (
-        f"{step_id} must pin the image it expects in MY_IMAGE."
+    expected_image = PROMOTE_IMAGE[service]
+    m = re.search(r'MY_IMAGE="([^"]+)"', script)
+    assert m, f"{step_id} must pin the expected image in a double-quoted MY_IMAGE."
+    assert m.group(1).endswith(expected_image), (
+        f"{step_id}'s MY_IMAGE is {m.group(1)!r}; it must end with {expected_image!r}. "
+        "Without the :$COMMIT_SHA tag the comparison matches any revision built from "
+        "this repo — including an older commit's — so the env-only-change branch would "
+        "promote code this build never tested."
+    )
+
+    # Match the LATEST assignment itself, not just any `services describe` — the
+    # failure branch issues one too (for the serving revision), and matching that
+    # would let a hoisted LATEST read slip through.
+    read = "LATEST=$(gcloud run services describe"
+    assert read in loop, (
+        f"{step_id} must issue the `{read} ... latestReadyRevisionName` READ inside "
+        "the `for attempt in 1 2 3` loop. Hoisting it above the loop means a retry "
+        "reuses a stale answer and can promote a revision that appeared in between — "
+        "which is retrying --to-latest blind, the thing this rule exists to prevent."
+    )
+    assert script.count(read) == 1, (
+        f"{step_id} must read latestReadyRevisionName in exactly one place (inside "
+        "the retry loop); a second copy outside it defeats the re-evaluation."
     )
     assert f"update-traffic {service} --to-latest" in script, (
         f"{step_id}'s failure message must give the operator the one-line remedy "
@@ -422,6 +475,32 @@ def test_deploy_retries_conflict_and_tolerates_existing_revision(service, by_id)
         f"{step_id} retries with the SAME --revision-suffix. If the first attempt "
         "created the revision before erroring, the retry fails with 'already exists' "
         "— that is success, not failure, and must fall through to the existence check."
+    )
+
+    # The already-exists branch must CONTINUE into the shared verify-and-record path,
+    # not finish the step itself. A branch that exits there leaves rev-<svc>.txt
+    # unwritten, so the smoke test reads an empty revision name and polls nothing —
+    # a green deploy step followed by a baffling downstream failure. Checking the
+    # BRANCH BODY, not just text order: the clean path's describe/write appear later
+    # in the script either way, so an ordering check alone passes on the broken code.
+    branch = if_branch_body(script, "if grep -q 'already exists'")
+    assert "exit" not in branch, (
+        f"{step_id}'s 'already exists' branch must not exit — it must fall through to "
+        f"the existence check and the /workspace/rev-{service}.txt write, which every "
+        f"later step in the {service} chain depends on. Branch body:\n{branch}"
+    )
+    assert 'DEPLOYED="yes"' in branch and "break" in branch, (
+        f"{step_id}'s 'already exists' branch must mark the deploy successful and "
+        f"leave the retry loop. Branch body:\n{branch}"
+    )
+
+    # ...and the shared path it falls into does verify before recording.
+    describe_at = script.index('run revisions describe "$${REV}"')
+    write_at = script.index("> /workspace/rev-%s.txt" % service)
+    assert describe_at < write_at, (
+        f"{step_id} must confirm the revision exists BEFORE writing "
+        f"/workspace/rev-{service}.txt; recording a revision that was never created "
+        "just moves the failure to the smoke test."
     )
 
 
@@ -478,6 +557,23 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
         f"{step_id} gained unreviewed deploy flag(s): "
         f"{sorted(added_names - ALLOWED_NEW_DEPLOY_FLAGS)}. Add it to the fixture in "
         "the same PR that introduces it, so the change is reviewed rather than absorbed."
+    )
+
+
+def test_gate_status_filter_covers_pending_builds(by_id):
+    """A build sitting in PENDING is a real competitor and must be counted.
+
+    Filtering only QUEUED/WORKING makes a PENDING sibling invisible: this build sees
+    itself alone, PROCEEDs, and deploys straight into the race the gate exists to
+    remove.
+    """
+    script = script_of(by_id[GATE_ID])
+    m = re.search(r"status:\(([^)]*)\)", script)
+    assert m, "serialize-builds must filter `gcloud builds list` on build status"
+    statuses = {x.strip() for x in m.group(1).split(",")}
+    assert {"PENDING", "QUEUED", "WORKING"} <= statuses, (
+        f"gate status filter is {sorted(statuses)}; it must include PENDING, QUEUED "
+        "and WORKING — every state in which another build may still deploy."
     )
 
 
@@ -593,10 +689,12 @@ def gate_program(by_id):
     return extract_gate_program(script_of(by_id[GATE_ID]))
 
 
-# Real values: gcloud builds list --format=json returns RFC3339 with a `Z` suffix
-# and fixed-width microseconds, so string comparison orders builds correctly.
-# (`--format='value(createTime)'` does NOT — it renders `2026-08-28T16:43:45+00:00`,
-# dropping the microseconds that separate builds pushed seconds apart.)
+# Real values: gcloud builds list --format=json returns RFC3339 with a `Z` suffix and
+# a fraction whose WIDTH VARIES (protobuf JSON emits 0/3/6/9 digits), which is why the
+# gate parses to a datetime instead of comparing strings — see
+# test_gate_orders_mixed_precision_timestamps_correctly for the inversion that causes.
+# (`--format='value(createTime)'` is worse still: it renders
+# `2026-08-28T16:43:45+00:00` and drops the fraction entirely.)
 ME = {"id": "a7c941ff-356b-44a1", "createTime": "2026-08-28T15:08:01.500000Z"}
 OLDER = {"id": "9aaf7d27-1111-2222", "createTime": "2026-08-28T15:07:01.500000Z"}
 NEWER = {"id": "7ab1f0a1-3333-4444", "createTime": "2026-08-28T16:43:45.221420Z"}
@@ -637,7 +735,8 @@ def test_gate_breaks_createtime_ties_deterministically(gate_program):
 
     Sub-second `createTime` collisions are unlikely but not impossible, and both
     failure modes are bad: two PROCEEDs is the race this FC removes, two WAITs hangs
-    both builds until the 15-minute gate timeout fails them. Ties break on build id,
+    both builds until the gate's deadline (startTime + BUILD_TIMEOUT_SECONDS - 90)
+    fails them. Ties break on build id,
     so the pair resolves exactly like any older/newer pair — one SUPERSEDED, one
     waiting for it to finish.
     """

@@ -702,8 +702,9 @@ PENDING/QUEUED/WORKING builds of the same trigger:
   **exit 0**. Newer code wins. This is not a failure and must not trip the
   build-failure alert, so the exit code stays 0 — grep the logs for the literal
   `SUPERSEDED` to count them.
-- **An older build is still running** → wait (20 s poll, 15 min cap, then fail
-  loudly).
+- **An older build is still running** → wait (20 s poll; the cap is
+  `startTime + BUILD_TIMEOUT_SECONDS − 90`, i.e. ~23.5 min at the current 1500 s
+  timeout — see the timing budget below — then fail loudly).
 - **Alone and newest** → proceed.
 
 Cloud Build has no conditional steps, so the marker is the mechanism: **every
@@ -805,9 +806,12 @@ build*, so it wins the gate and deploys the older code on purpose; a forward
 build racing it is superseded. Ordering is by build `createTime`, never by git
 ancestry — the Cloud Build checkout is shallow, and "newest build wins" is what
 makes a deliberate rollback work. Read `createTime` from `--format=json`
-(`2026-08-28T16:43:45.221420Z`, fixed-width microseconds, always `Z`), **not**
-`--format='value(createTime)'`, which renders `2026-08-28T16:43:45+00:00` and
-drops the microseconds that separate two builds pushed seconds apart.
+(`2026-08-28T16:43:45.221420Z`) and **parse it to a datetime** — the gate does.
+Protobuf JSON emits 0, 3, 6 or 9 fractional digits, so widths differ between
+builds and lexicographic order is wrong across them (`…:45Z` is *earlier* than
+`…:45.221420Z` but sorts *after* it). Do **not** use
+`--format='value(createTime)'` either: it renders `2026-08-28T16:43:45+00:00`
+and drops the fraction that separates two builds pushed in the same second.
 
 Deploy and promote both retry 3× / 20 s on Cloud Run's optimistic-concurrency
 error (`Conflict for resource ...: version 'X' was specified but current version

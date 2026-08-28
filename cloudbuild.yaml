@@ -95,9 +95,10 @@ steps:
   # step) wait on this gate, which is a cycle.
   # waitFor: ['push-bot-image'] rather than ['-']: a build that has to wait for an
   # older one has by then already run its own tests/build/push in parallel, so the
-  # serialized window is just the deploy chain. It also keeps the gate's own 15-minute
-  # wait cap comfortably wider than any legitimate wait. Only the deploy steps wait
-  # on this step, so nothing else in the graph is delayed.
+  # serialized window is just the deploy chain. Only the deploy steps wait on this
+  # step, so nothing else in the graph is delayed. The gate's own cap is derived from
+  # the build timeout (startTime + BUILD_TIMEOUT_SECONDS - 90, i.e. ~23.5 min at
+  # 1500s), not a flat number, so it always outlasts any legitimate wait.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     env:
