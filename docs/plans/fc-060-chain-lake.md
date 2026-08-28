@@ -115,10 +115,9 @@ test 5 fails; drop the post-download coverage check → test 7 fails.
    service account (`gcloud run jobs describe backtest-screen --format='value(spec.template.spec.template.spec.serviceAccountName)'`,
    likely `799970961417-compute@…`) `roles/storage.objectAdmin` on the bucket; grant the
    `claude-operator` SA the same so the seed can run from here.
-2. Merge (no live-path change; deploy is a no-op for the services).
+2. Merge (no live-path change for the services; the JOB does not auto-deploy — see step 4).
 3. Seed: `python tools/diagnostics/chain_lake_seed.py --cache-dir cache/backtest/chains --bucket options-wheel-chain-lake` from the dev machine. Record counts in §Execution.
-4. `gcloud run jobs update backtest-screen --region us-central1 --update-env-vars CHAIN_LAKE_BUCKET=options-wheel-chain-lake`
-   (Jobs: `--update-env-vars` is additive — verify the three secrets survive with `jobs describe`).
+4. **The Job is SHA-pinned** (`…:4e810c45…`, FC-059) and `cloudbuild.yaml` has no `jobs update` step, so an env-only update would run old code (review finding). Run: `gcloud run jobs update backtest-screen --region us-central1 --image us-central1-docker.pkg.dev/gen-lang-client-0607444019/options-wheel/options-wheel-strategy:<merged full SHA> --update-env-vars CHAIN_LAKE_BUCKET=options-wheel-chain-lake` (Jobs: `--update-env-vars` is additive — verify the three secrets survive with `jobs describe`).
 5. Trigger one manual execution (`gcloud run jobs execute backtest-screen`) off-hours; confirm
    `chain_lake_summary` shows hits ≫ puts and the runtime drops from ~1h47m. Record the number.
 6. §Execution + FC-060 entry note ("Layer 1 live; Layer 2 next").
