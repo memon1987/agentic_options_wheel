@@ -66,7 +66,7 @@ _List active plans here as they are added._
 - [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: done
 - [fc-010.md](fc-010.md) — FC-010: Disable call stop-losses, status: done
 - [fc-012.md](fc-012.md) — FC-012: Shift dashboard logging to Alpaca queries, status: done
-- [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: draft
+- [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: done (PR #81, merged 2026-08-03)
 - [fc-018.md](fc-018.md) — FC-018: Wheel-centric dashboard rebuild (frontend only), status: draft
 - [fc-019.md](fc-019.md) — FC-019: True P&L reconciliation (JNLC + OPTRD ingest), status: done
 - [fc-020.md](fc-020.md) — FC-020: FIFO cycle pairing for overlapping share lots, status: draft
