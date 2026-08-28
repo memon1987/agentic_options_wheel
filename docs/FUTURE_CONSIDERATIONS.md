@@ -306,7 +306,7 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 
 ### FC-041: Naked-call share guard misparses OCC symbols and can fail open
 
-**Status:** Consideration — **narrowed 2026-08-28**: defect (1) (`'C' in opt_sym` substring) was fixed by FC-038 (PR #73, canonical parsers in `_available_shares`) and FC-052 (PR #60). **Only defect (2) remains**: dotted/class-share tickers (`BRK.B` ↔ `BRKB…`) — `OCC_STRICT_RE` excludes dotted roots, no normalization exists, so the guard still fails open (committed=0) for such a symbol. Latent in both universes today, but the covered-call account has no configured universe by design. Fix: dotted-root normalization + a parser-independent `short_calls × 100 ≤ shares_owned` pre-submit assertion.
+**Status:** CLOSED 2026-08-28 — defect (2) fixed by PR #96 (`f98e45a`), plan `docs/plans/fc-041.md` §Execution: `occ_root` normalization at every equity↔OCC-root join + a fail-closed execute-time invariant that blocks a covered call when any unclassifiable short option sits on the underlying. Defect (1) was fixed earlier by FC-038/FC-052. Both open questions answered: `option_symbols.py` now carries the normalization; the parser-independent assertion exists (gate 20 in `docs/gates.md`), with its stated limits (shared snapshot; unfilled orders → FC-061).
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** `docs/plans/fc-041.md` (2026-08-28; PR #96)
