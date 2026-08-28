@@ -91,7 +91,7 @@ _All plan files, regenerated 2026-08-28 from each file's `**Status:**` line (pr-
 - [fc-065.md](fc-065.md) — One floor, one path, one decision record — the covered-call gating layer, status: Done
 - [fc-068.md](fc-068.md) — Delete the dead engine call path; repoint the backtest to the real pipeline, status: Done
 - [fc-069.md](fc-069.md) — FC-069 — the decommission sweep. 15 decision cards for operator sign-off, status: DONE
-- [fc-071.md](fc-071.md) — FC-071 — at-floor scoring bonus aligned to the gate (`>=`), status: Approved by operator 2026-08-02
+- [fc-071.md](fc-071.md) — FC-071 — at-floor scoring bonus aligned to the gate (`>=`), status: Done
 - [fc-075-cc-deploy-step.md](fc-075-cc-deploy-step.md) — FC-075 follow-on — CC service deploy step in cloudbuild + first tunables iteration (14 DTE), status: DONE
 - [fc-075-phase-2.md](fc-075-phase-2.md) — FC-075 Phase 2 — the covered-call engine (file-level build spec), status: DONE
 - [fc-075-seam-4.md](fc-075-seam-4.md) — FC-075 Seam 4 — BigQuery write-side dataset threading (+ `strategy_id` column, DD-7 removal), status: DONE
