@@ -35,6 +35,24 @@ strategy:
   # See docs/plans/fc-029.md and docs/investigations/strategy-review-2026-05-07.md.
   call_delta_range: [0.15, 0.25]
 
+  # FC-072: how far past mid a sell-to-open is priced, as a fraction of the
+  # bid/ask spread, off a quote REFRESHED at execution time (the :00 scan /
+  # :15 run gap, not the spread, is what moved these orders historically).
+  # 0.0 = rest exactly at mid; 0.5 = sit on the ask. Validated to [0.0, 0.5].
+  # Consumers: CallSeller.execute_call_sale / PutSeller.execute_put_sale.
+  #
+  # The call leg's old `premium * 0.95` sat about AT THE BID on this book, so
+  # it was marketable rather than a donation (realised sum(mid - fill) over the
+  # journaled call fills: -$87). Moving to mid trades fill rate for price:
+  # expect ~75-80% fills at mid against ~90% marketable, worth ~+$5/write
+  # gross. Do not flip either knob without the two-week readout in
+  # docs/plans/fc-072.md.
+  call_limit_spread_fraction: 0.0
+  # 0.10 is the value the put leg has always used (was hardcoded). Keeping it
+  # here reproduces today's price on any normal book; the key exists so both
+  # legs are configured the same way.
+  put_limit_spread_fraction: 0.10
+
   # CRITICAL: Cost basis protection for covered calls
   # Never sell calls below stock cost basis to avoid guaranteed losses
   # This is automatically enforced in code - strikes below cost basis are rejected

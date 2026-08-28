@@ -718,6 +718,12 @@ class OptionsScanner:
                 'volume': volume,
                 'open_interest': open_interest,
                 'implied_volatility': put_option.get('implied_volatility', 0),
+                # FC-072 also reads this at execute time: `quote_age_s` on
+                # `put_sale_executing` is now - scan_timestamp, which is what
+                # separates a limit priced off a fresh book from one priced off
+                # a 15-minute-old blob. `clock.now()` is naive local time (UTC
+                # in Cloud Run); limit_pricing.quote_age_seconds compares like
+                # with like rather than assuming a zone.
                 'scan_timestamp': clock.now().isoformat()
             }
             
@@ -861,6 +867,12 @@ class OptionsScanner:
                 'volume': volume,
                 'open_interest': open_interest,
                 'implied_volatility': call_option.get('implied_volatility', 0),
+                # FC-072 also reads this at execute time: `quote_age_s` on
+                # `call_sale_executing` is now - scan_timestamp, which is what
+                # separates a limit priced off a fresh book from one priced off
+                # a 15-minute-old blob. `clock.now()` is naive local time (UTC
+                # in Cloud Run); limit_pricing.quote_age_seconds compares like
+                # with like rather than assuming a zone.
                 'scan_timestamp': clock.now().isoformat()
             }
             

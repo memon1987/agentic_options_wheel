@@ -257,3 +257,88 @@ class TestTheRollerEnvOverrides:
         path = _settings(tmp_path)
         monkeypatch.setenv("ROLLER_DRY_RUN", "sometimes")
         assert Config(path).roller_dry_run is False
+
+# Sentinel for "delete this key", distinct from any legal yaml value.
+_ABSENT = object()
+
+
+def _settings_strategy(tmp_path, **strategy_overrides):
+    """The shipped wheel config with `strategy` keys overridden or removed.
+
+    A value of ``_ABSENT`` deletes the key, which is how the "profile omits the
+    knob entirely" case is exercised against the real config rather than a
+    hand-rolled stub.
+    """
+    with open(REPO / 'config' / 'settings.yaml') as fh:
+        data = yaml.safe_load(fh)
+    for key, value in strategy_overrides.items():
+        if value is _ABSENT:
+            data['strategy'].pop(key, None)
+        else:
+            data['strategy'][key] = value
+    path = tmp_path / 'settings.yaml'
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+class TestLimitSpreadFractionsFC072:
+    """FC-072: one sell-to-open pricing knob per leg, same bounds.
+
+    The bounds are the point. Below 0.0 means "price under mid" — deliberately
+    marketable, which is what the pre-FC-072 call formula did in effect, and
+    reversing that decision must be a code change with a plan behind it rather
+    than a config flip. Above 0.5 is a limit outside the book: at f=0.5 the
+    limit sits exactly on the ask, and beyond it the order cannot fill until
+    the market moves to it.
+    """
+
+    KEYS = ('call_limit_spread_fraction', 'put_limit_spread_fraction')
+    SHIPPED = {'call_limit_spread_fraction': 0.0,
+               'put_limit_spread_fraction': 0.10}
+
+    def test_both_shipped_profiles_carry_both_keys(self):
+        """A knob added to one profile and forgotten on the other is this
+        repo's documented failure mode (FC-069 S1 found six such keys)."""
+        for profile in ('settings.yaml', 'covered_call.yaml'):
+            with open(REPO / 'config' / profile) as fh:
+                strategy = yaml.safe_load(fh)['strategy']
+            for key in self.KEYS:
+                assert key in strategy, f"{profile} is missing {key}"
+                assert strategy[key] == self.SHIPPED[key], f"{profile}:{key}"
+
+    def test_the_shipped_wheel_config_reads_back_both_knobs(self):
+        config = Config(str(REPO / 'config' / 'settings.yaml'))
+        assert config.call_limit_spread_fraction == 0.0
+        assert config.put_limit_spread_fraction == 0.10
+
+    @pytest.mark.parametrize("key,expected", [
+        ('call_limit_spread_fraction', 0.0),
+        ('put_limit_spread_fraction', 0.10),
+    ])
+    def test_each_default_applies_when_its_key_is_absent(self, tmp_path, key,
+                                                         expected):
+        """A profile that omits a knob prices at its documented default rather
+        than failing to load."""
+        config = Config(_settings_strategy(tmp_path, **{key: _ABSENT}))
+        assert getattr(config, key) == expected
+
+    @pytest.mark.parametrize("key", KEYS)
+    @pytest.mark.parametrize("bad", [0.6, 1.0, -0.01, -0.10, 'mid', None, True])
+    def test_out_of_bounds_values_are_refused_at_load(self, tmp_path, key, bad):
+        """Refused at load, not clamped at use: a config that means something
+        other than what it says must not start."""
+        with pytest.raises(ValueError, match=key):
+            Config(_settings_strategy(tmp_path, **{key: bad}))
+
+    @pytest.mark.parametrize("key", KEYS)
+    @pytest.mark.parametrize("ok", [0.0, 0.05, 0.10, 0.5])
+    def test_the_inclusive_bounds_load(self, tmp_path, key, ok):
+        config = Config(_settings_strategy(tmp_path, **{key: ok}))
+        assert getattr(config, key) == ok
+
+    def test_a_configured_value_is_read_back(self, tmp_path):
+        config = Config(_settings_strategy(tmp_path,
+                                           call_limit_spread_fraction=0.10,
+                                           put_limit_spread_fraction=0.25))
+        assert config.call_limit_spread_fraction == 0.10
+        assert config.put_limit_spread_fraction == 0.25

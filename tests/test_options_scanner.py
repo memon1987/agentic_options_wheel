@@ -5,6 +5,7 @@ from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 
 from src.data.options_scanner import OptionsScanner
+from src.strategy.limit_pricing import quote_age_seconds
 from src.utils.config import Config
 
 # Sentinel for "the key is not present at all", which is a distinct failure
@@ -2223,3 +2224,114 @@ class TestPutSideSkipHandlesClassShareTickers:
 
         assert emitted == ['BRK.B', 'MSFT']
         assert _events(mock_logger, 'put_scan_skipped_existing_position') == []
+
+
+class TestOpportunityCarriesItsScanStampFC072:
+    """FC-072: `quote_age_s` is computed from the opportunity's `scan_timestamp`.
+
+    The stamp is not new — the scanner has always written it on both
+    opportunity dicts — but FC-072 gave it a second consumer on the execute
+    path, so it is now load-bearing rather than decoration. `/scan` runs at :00
+    and `/run` at :15; without the stamp there is no way to tell, from the logs,
+    a limit priced off a fresh book from one priced off a 15-minute-old blob,
+    and the two-week readout in `docs/plans/fc-072.md` needs exactly that split.
+
+    A deliberate note for the reader: rev 2 of the plan asked for a NEW
+    `scanned_at` key. `scan_timestamp` already carries that value on both dicts,
+    is already in the committed blob fixtures, and a synonym would be a second
+    name for one fact — this repo's documented config/knob failure mode. The
+    existing key is used instead.
+    """
+
+    def _scanner(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        config = Mock(spec=Config)
+        config.strategy_id = 'wheel'
+        config.excluded_symbols = set()
+        config.min_open_interest = None
+        config.max_spread_pct = None
+        config.bigquery_dataset = 'options_wheel'
+        config.stock_symbols = ['AAPL']
+        config.put_target_dte = 7
+        config.call_target_dte = 7
+        self.mock_alpaca.get_positions.return_value = []
+        return OptionsScanner(self.mock_alpaca, self.mock_market_data, config)
+
+    def _put_opportunity(self):
+        scanner = self._scanner()
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'AAPL', 'current_price': 175.0},
+        ]
+        self.mock_market_data.find_suitable_puts.return_value = [{
+            'symbol': 'AAPL250117P00170000',
+            'strike_price': 170.0,
+            'expiration_date': '2025-01-17',
+            'dte': 7,
+            'delta': -0.15,
+            'mid_price': 2.50,
+            'bid': 2.45,
+            'ask': 2.55,
+            'volume': 1500,
+            'open_interest': 5000,
+            'implied_volatility': 0.25,
+        }]
+        results = scanner.scan_for_put_opportunities()
+        assert len(results) == 1
+        return results[0]
+
+    def _call_opportunity(self):
+        scanner = self._scanner()
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL',
+            'qty': '100',
+            'cost_basis': '16000.0',
+            'avg_entry_price': '160.0',
+            'asset_class': 'us_equity',
+            'side': 'long',
+        }]
+        self.mock_market_data.get_stock_metrics.return_value = {
+            'current_price': 175.0,
+        }
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'AAPL250117C00185000',
+            'strike_price': 185.0,
+            'expiration_date': '2025-01-17',
+            'dte': 7,
+            'delta': 0.15,
+            'mid_price': 1.80,
+            'bid': 1.75,
+            'ask': 1.85,
+            'volume': 2000,
+            'open_interest': 8000,
+            'implied_volatility': 0.22,
+        }]
+        results = scanner.scan_for_call_opportunities()
+        assert len(results) == 1
+        return results[0]
+
+    def test_the_put_opportunity_carries_a_readable_scan_stamp(self):
+        opportunity = self._put_opportunity()
+        assert 'scan_timestamp' in opportunity
+        assert quote_age_seconds(opportunity['scan_timestamp']) is not None
+
+    def test_the_call_opportunity_carries_a_readable_scan_stamp(self):
+        """Symmetry: the call leg re-quotes too, so it needs the same stamp."""
+        opportunity = self._call_opportunity()
+        assert 'scan_timestamp' in opportunity
+        assert quote_age_seconds(opportunity['scan_timestamp']) is not None
+
+    def test_a_fresh_stamp_reads_as_a_near_zero_age(self):
+        """The stamp is written at scan time, so age at scan time is ~0. A
+        wrong-zone or wrong-unit stamp shows up here as hours, not seconds."""
+        for opportunity in (self._put_opportunity(), self._call_opportunity()):
+            age = quote_age_seconds(opportunity['scan_timestamp'])
+            assert 0 <= age < 60, f"implausible scan age {age}s"
+
+    def test_both_legs_also_carry_the_book_the_stamp_describes(self):
+        """The blob fallback needs bid/ask AND the stamp; a stamp without a
+        book, or a book without a stamp, is half a fallback."""
+        for opportunity in (self._put_opportunity(), self._call_opportunity()):
+            assert opportunity['bid'] > 0
+            assert opportunity['ask'] > opportunity['bid']
+            assert opportunity['premium'] > 0

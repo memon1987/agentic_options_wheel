@@ -303,6 +303,83 @@ verified 2026-08-04:
 - **Premium floors**: `min_put_premium: 0.50`, `min_call_premium: 0.30`. The put
   floor is a real universe constraint, not a formality — several configured
   symbols cannot clear it at all.
+- **Sell-to-open limit pricing** (FC-072, both legs, both profiles — the shared
+  implementation is `src/strategy/limit_pricing.py`):
+  - **The quote is refreshed at execution time.** `/scan` quotes at `:00` and
+    `/run` places at `:15`; nothing on the execute path used to re-quote, so
+    every limit was priced off a book up to 15 minutes old. **That staleness,
+    not the spread, is the dominant variable** in where these orders landed: of
+    66 filled calls, 17 filled below the *scan-time* bid and 28 at or above
+    scan-time mid. A refresh that fails never fails the order — it falls back
+    to the scan-time quote and logs `quote_refresh_failed`; the
+    `*_sale_executing` event carries `quote_source` (`live` / `blob`) and
+    `quote_age_s` so the two populations can be told apart.
+  - **Formula**: `mid + f × (ask − bid)`, `mid` recomputed from whichever book
+    was used. `f` is `strategy.call_limit_spread_fraction` (**0.0** — rest at
+    mid) and `strategy.put_limit_spread_fraction` (**0.10** — the put leg's
+    historical bias toward the ask, unchanged). Both validated `[0.0, 0.5]`;
+    `0.5` sits exactly on the ask.
+  - **Usable book** = `bid > 0 and ask > 0 and ask >= bid`. A **locked** book
+    (`ask == bid`) is usable and prices at the bid — never 5% *through* a
+    locked market. A **wide** book is usable with no cap: wide means illiquid,
+    not stale, and discounting it further concedes most where the mid is least
+    informative. Only **one-sided** and **crossed** books fall back, to the
+    historical `premium × 0.95`.
+  - **Tick increments are a broker rule, not a preference.** Two regimes, and
+    the distinction matters: **always-penny** names (`ALWAYS_PENNY_SYMBOLS` —
+    SPY/QQQ/IWM) tick $0.01 at *every* price level, while **penny-program**
+    roots tick $0.01 below $3.00 and **$0.05 at and above**. All 14 configured
+    roots were verified `ppind=True` on 2026-08-28 and are listed in
+    `VERIFIED_PENNY_PROGRAM_ROOTS`; an unrecognised root is priced under the
+    penny-program rule and logged once per process as `tick_class_unverified`.
+    A genuine **non-penny class ticks $0.05/$0.10** — increments this code
+    deliberately **cannot emit**, because no such root is tradeable here and an
+    untested third regime is worse than a loud warning. A non-conforming limit
+    is rejected when no exchange accepts it, and sell limits snap **up** — with
+    one exception: on a book straddling $3.00 the next legal $0.05 tick can
+    sit *above the ask* (2.98/3.03 prices a raw 3.005, whose next legal price
+    is 3.05), and a sell limit above the ask can never fill, so it rounds
+    **down** to the last legal tick inside the book instead — marketable beats
+    unfillable.
+    **The paper simulator does not enforce increments**, so paper history is
+    not evidence that a live account would accept an off-tick limit. Below the
+    $0.05 regime the cent rounding is `ROUND_HALF_UP` on the exact decimal, not
+    `round()` — banker's rounding over floats put a half-cent mid on the bid or
+    the ask by luck.
+  - **A one-tick book prices at the bid**, flagged `one_tick_book`, **on both
+    legs**. When the spread is exactly one tick — measured at the *bid*, since a
+    book straddling $3.00 is five ticks wide, not one — there is no midpoint to
+    rest at and "mid rounded half-up" is the ask by another name; resting there
+    on a DAY order risks a full cycle of theta to gain a cent. On a 0.15–0.25Δ
+    call that is ≈−$30 in missed cycles against ≈+$6 of spread. The put leg
+    inherits the rule by Symmetry, at a measured cost of −$1/contract on 5 of
+    118 journaled rows — accepted deliberately (see `docs/plans/fc-072.md`).
+  - **These are INDICATIVE quotes, not NBBO.** `alpaca_client.OPTION_QUOTE_FEED`
+    is `"indicative"` and is passed explicitly on every option quote, because
+    the **OPRA agreement is not signed**. Indicative is an *adjusted* BBO: fine
+    for paper and for the FC-072 readout, not fine for real money, since a limit
+    priced off it can rest away from the true market with nothing in the logs to
+    say so. **Signing the OPRA agreement is a precondition before this code
+    prices a real-money order.** The feed is echoed back on every quote and
+    logged as `quote_feed` so that precondition is auditable rather than
+    remembered.
+  - **Only the opening writes are tick-correct.** The roller's STO/BTC limits
+    and `/monitor`'s `ask × 0.95` buy-to-close still round to the cent and are
+    therefore **off-tick above $3.00**. Harmless on paper (the simulator does
+    not enforce increments), a rejected order on a live account — its own FC.
+  - **Economics, corrected** (rev 1 of the plan got this wrong and the reviews
+    caught it): the call leg's old `premium × 0.95` was **not** a 5% donation.
+    On this book 5% of mid ≈ half a spread, so the limit sat about **at the
+    bid** — marketable, filling at the bid. Realised `Σ(mid − fill)` over the
+    journaled call fills was **−$87**. What the change buys is resting at mid
+    instead of crossing, ≈ **+$5/write gross**, against an expected **75–80%**
+    fill rate (vs ≈90% marketable). Do not repeat the retired "$2.3k" /
+    "5% donated" framing. `docs/plans/fc-072.md` holds the two-week readout
+    that decides whether the trade was worth it.
+  - **The roller is deliberately not routed through this module.** `CallRoller`
+    prices its sell-to-open **at the bid** (or `mid − $0.05` on imminence)
+    because a credit-only defensive roll must execute in the same session as
+    its buy-to-close leg. Opening writes can afford to rest; rolls cannot.
 - **Universe**: 14 symbols in `stocks.symbols`. The **effective** universe is
   smaller: the `$400` price ceiling and the premium floors exclude several
   symbols entirely, so a symbol that never trades is a *filter* result, not a

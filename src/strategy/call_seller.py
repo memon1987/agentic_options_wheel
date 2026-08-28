@@ -15,6 +15,12 @@ from .cost_basis import (
     opportunity_shares_covered,
     opportunity_total_return_if_called,
 )
+from .limit_pricing import (
+    executing_quote_fields as _executing_quote_fields,
+    pricing_log_fields as _pricing_log_fields,
+    refresh_quote,
+    sell_limit_price,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -155,15 +161,50 @@ class CallSeller:
             contracts = opportunity['contracts']
             premium = opportunity['premium']
             
-            # Calculate limit price (slightly below mid to improve fill probability)
-            limit_price = round(premium * 0.95, 2)  # 5% below mid price
-            
+            # Limit price (FC-072 rev 2). Two things happen here, both in
+            # src/strategy/limit_pricing.py so the put leg cannot drift from
+            # this one:
+            #
+            # 1. RE-QUOTE. `/scan` quotes at :00 and `/run` places at :15, and
+            #    nothing on this path used to refresh in between — every limit
+            #    was computed from a quote up to 15 minutes old. Of 66 filled
+            #    calls, 17 filled below the scan-time bid and 28 at or above
+            #    scan-time mid: pricing off a stale quote is selection, not
+            #    spread capture. The refresh NEVER fails the order; an
+            #    unavailable quote falls back to the scan-time book and says so
+            #    in the log (`quote_source`, `quote_age_s`).
+            # 2. PRICE at `mid + f * spread`, `f` =
+            #    `strategy.call_limit_spread_fraction` (default 0.0 -> at mid),
+            #    then round to a legal tick ($0.05 at/above $3.00 except
+            #    penny-program names; half-up to the cent below).
+            #
+            # On the old formula, `round(premium * 0.95, 2)` was NOT a 5%
+            # donation: on this book it sat about at the bid, and realised
+            # sum(mid - fill) over the journaled call fills was -$87. What
+            # changes is resting at mid instead of crossing to the bid —
+            # ~+$5/write gross against an expected ~75-80% fill rate (vs ~90%
+            # marketable). It survives only if the two-week readout in
+            # docs/plans/fc-072.md says so.
+            #
+            # The re-quote happens AFTER the cost-basis floor above, on purpose:
+            # a refreshed quote must never be able to bypass the floor.
+            quote = refresh_quote(self.alpaca, option_symbol, opportunity, logger)
+            priced = sell_limit_price(
+                bid=quote.bid,
+                ask=quote.ask,
+                fallback_premium=premium,
+                spread_fraction=self.config.call_limit_spread_fraction,
+                underlying=opportunity.get('symbol') or '',
+            )
+            limit_price = priced.limit_price
+
             logger.info("Executing covered call sale",
                        event_category="trade",
                        event_type="call_sale_executing",
                        symbol=option_symbol,
                        contracts=contracts,
-                       limit_price=limit_price)
+                       premium=premium,
+                       **_pricing_log_fields(quote, priced))
             
             # Place the sell order
             order_result = self.alpaca.place_option_order(
@@ -183,7 +224,13 @@ class CallSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_call',
-                    'timestamp': clock.now().isoformat()
+                    'timestamp': clock.now().isoformat(),
+                    # FC-072: the book this order was PRICED off, so the trade
+                    # journal records the :15 execute-time quote rather than
+                    # the :00 scan blob sitting next to a live-priced limit.
+                    # `execution_engine.execute_batch` merges these into the
+                    # journal row; see `_executing_quote_fields`.
+                    **_executing_quote_fields(quote, priced),
                 }
 
                 # Enhanced logging for BigQuery analytics.

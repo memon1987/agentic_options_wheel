@@ -10,6 +10,12 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
+from .limit_pricing import (
+    executing_quote_fields as _executing_quote_fields,
+    pricing_log_fields as _pricing_log_fields,
+    refresh_quote,
+    sell_limit_price,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -230,16 +236,29 @@ class PutSeller:
                         'timestamp': clock.now().isoformat()
                     }
 
-            # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
-            bid = opportunity.get('bid')
-            ask = opportunity.get('ask')
-
-            if bid and ask:
-                spread = ask - bid
-                limit_price = round(premium + (spread * 0.10), 2)
-            else:
-                # Fallback if bid/ask not available
-                limit_price = round(premium * 0.95, 2)
+            # Limit price (FC-072 rev 2). Same two steps as the call leg, same
+            # module, by the Symmetry Principle: re-quote at execute time (the
+            # 15-minute :00-scan/:15-run gap is the dominant variable in where
+            # these orders land), then price `mid + f * spread` off whichever
+            # book was used and round to a legal tick.
+            #
+            # `f` here is `strategy.put_limit_spread_fraction`, default 0.10 —
+            # the value this leg has always used — so a normal book below $3.00
+            # prices exactly as it did before FC-072. The knob exists so the two
+            # legs are configured the same way, not to change this one; the
+            # tick rounding at/above $3.00 is the only intended behaviour change
+            # on the put leg, and this leg averages $1.44, so it is rare.
+            #
+            # The re-quote sits after the buying-power gate above, on purpose.
+            quote = refresh_quote(self.alpaca, option_symbol, opportunity, logger)
+            priced = sell_limit_price(
+                bid=quote.bid,
+                ask=quote.ask,
+                fallback_premium=premium,
+                spread_fraction=self.config.put_limit_spread_fraction,
+                underlying=opportunity.get('symbol') or '',
+            )
+            limit_price = priced.limit_price
 
             logger.info("Executing put sale",
                        event_category="trade",
@@ -247,10 +266,7 @@ class PutSeller:
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
-                       bid=bid,
-                       ask=ask,
-                       spread=round(ask - bid, 2) if bid and ask else None,
-                       limit_price=limit_price,
+                       **_pricing_log_fields(quote, priced),
                        collateral_required=collateral_required)
 
             # Place the sell order
@@ -272,7 +288,10 @@ class PutSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_put',
-                    'timestamp': clock.now().isoformat()
+                    'timestamp': clock.now().isoformat(),
+                    # FC-072: the book this order was PRICED off — see the call
+                    # leg. Merged into the trade journal by execute_batch.
+                    **_executing_quote_fields(quote, priced),
                 }
 
                 # Enhanced logging for BigQuery analytics

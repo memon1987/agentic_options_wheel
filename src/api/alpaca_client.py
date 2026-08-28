@@ -32,6 +32,21 @@ from ..utils.option_symbols import parse_option_symbol
 
 logger = structlog.get_logger(__name__)
 
+# Options quote feed, passed explicitly on every option quote request (FC-072).
+#
+# "indicative" is an ADJUSTED best-bid/offer, NOT the NBBO. It is what this
+# account is entitled to: the OPRA agreement has not been signed. Every
+# sell-to-open limit is therefore computed from a non-NBBO book, which is
+# acceptable for paper and for the FC-072 fill-rate readout and is NOT
+# acceptable for real money -- a limit priced off an adjusted book can rest
+# away from the real market with nothing in the logs to say so.
+#
+# SIGNING THE OPRA AGREEMENT IS A PRECONDITION BEFORE THIS PRICES REAL MONEY.
+# Do not flip this constant to "opra" as a way of getting better quotes: the
+# entitlement, not the parameter, is what is missing, and the request would
+# simply fail. Flip it when the agreement is signed, and only then.
+OPTION_QUOTE_FEED = "indicative"
+
 
 class CircuitBreaker:
     """Simple circuit breaker for API calls.
@@ -366,14 +381,23 @@ class AlpacaClient:
     def get_option_quote(self, option_symbol: str) -> Dict[str, Any]:
         """Get latest bid/ask quote for a specific option contract.
 
+        The feed is passed EXPLICITLY (FC-072) rather than left to the SDK's
+        default, and echoed back in the payload. This account is on the
+        indicative feed because the OPRA agreement is not signed, so every
+        limit priced off this quote is priced off an adjusted BBO rather than
+        the NBBO -- see ``OPTION_QUOTE_FEED``. Callers log the returned ``feed``
+        so that fact is auditable per order instead of remembered.
+
         Args:
             option_symbol: Full OCC option symbol (e.g., AAPL250117C00185000)
 
         Returns:
-            Dict with bid, ask, mid_price, or empty dict on failure.
+            Dict with bid, ask, mid_price, feed and timestamp, or empty dict on
+            failure. Never raises.
         """
         try:
-            request = OptionLatestQuoteRequest(symbol_or_symbols=[option_symbol])
+            request = OptionLatestQuoteRequest(symbol_or_symbols=[option_symbol],
+                                               feed=OPTION_QUOTE_FEED)
             quotes = self.option_data_client.get_option_latest_quote(request)
             quote = quotes.get(option_symbol)
             if not quote:
@@ -390,6 +414,11 @@ class AlpacaClient:
                 'mid_price': mid,
                 'bid_size': int(quote.bid_size) if quote.bid_size else 0,
                 'ask_size': int(quote.ask_size) if quote.ask_size else 0,
+                'feed': OPTION_QUOTE_FEED,
+                # The BROKER's stamp, not ours: FC-072 measures a live quote's
+                # age from it, because a halted or thin name's "latest" quote
+                # can be hours old and must not read as fresh.
+                'timestamp': getattr(quote, 'timestamp', None),
             }
         except Exception as e:
             logger.debug("Could not get option quote",

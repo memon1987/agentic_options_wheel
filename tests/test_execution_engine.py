@@ -7,11 +7,14 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 
+from src.data.trade_journal import _TABLE_SCHEMA
 from src.strategy.execution_engine import (
     DROP_REASONS, ExecutionEngine, PositionsUnavailable)
 from src.strategy.put_seller import PutSeller
 from src.strategy.call_seller import CallSeller
 from src.utils.config import Config
+
+TRADE_SCHEMA_FIELD_NAMES = {field.name for field in _TABLE_SCHEMA}
 
 
 class TestFilterDuplicateOpportunities:
@@ -1969,3 +1972,158 @@ class TestSelectBatchDedupesOnTheOccRoot:
 
         assert [e["symbol"] for e in _select_events(self.engine.logger)] == [
             BRK_EQUITY]
+
+
+class TestJournalRecordsTheExecutingQuoteFC072:
+    """N1: `options_wheel.trades` must record the book the order was PRICED off.
+
+    `execute_batch` built its journal row from ``{**opp, "limit_price": ...}``.
+    Since FC-072 the limit is priced off a quote refreshed at execution time,
+    while ``opp`` still carries the :00 scan blob — so every row showed a
+    :15 live-priced limit sitting next to a 15-minute-old bid/ask, and
+    ``mid_price`` was NULL because no opportunity dict has ever had that key.
+    Any "where did we price relative to the market" question — which is exactly
+    the question the FC-072 two-week readout asks — read the wrong book.
+    """
+
+    BLOB = {"bid": 1.20, "ask": 1.40}
+    LIVE = {"bid": 1.30, "ask": 1.50, "mid": 1.40}
+
+    def setup_method(self):
+        from src.strategy.execution_engine import clear_failed_symbols
+        clear_failed_symbols()
+        self.alpaca = Mock()
+        self.alpaca.get_positions.return_value = [
+            {"symbol": "AAPL", "qty": "500", "asset_class": "us_equity",
+             "side": "long"}
+        ]
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.trade_journal = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+        self.call_seller = Mock(spec=CallSeller)
+
+    def _result(self, **kw):
+        """The shape both sellers return post-FC-072."""
+        result = {
+            "success": True,
+            "order_id": "o1",
+            "limit_price": 1.40,
+            "bid": self.LIVE["bid"],
+            "ask": self.LIVE["ask"],
+            "mid": self.LIVE["mid"],
+            "quote_source": "live",
+            "quote_age_s": 0.4,
+            "tick_snapped": False,
+        }
+        result.update(kw)
+        return result
+
+    def _opportunity(self, option_symbol=PUT_SYM, **kw):
+        opp = {
+            "symbol": "AAPL",
+            "option_symbol": option_symbol,
+            "type": "call" if "C00" in option_symbol else "put",
+            "contracts": 1,
+            "premium": 1.30,
+            "strike_price": 170,
+            "shares_covered": 100,
+            "stock_cost_basis": 150.0,
+            "bid": self.BLOB["bid"],
+            "ask": self.BLOB["ask"],
+        }
+        opp.update(kw)
+        return opp
+
+    def _row(self, opp=None, result=None, call=False):
+        result = result or self._result()
+        opp = opp or self._opportunity(CALL_SYM if call else PUT_SYM)
+        if call:
+            self.call_seller.execute_call_sale.return_value = result
+        else:
+            self.put_seller.execute_put_sale.return_value = result
+        # Reset so a test may journal more than one order and assert on each.
+        self.engine.trade_journal.reset_mock()
+        self.engine.execute_batch([opp], self.put_seller,
+                                  call_seller=self.call_seller)
+        assert self.engine.trade_journal.record_trade.call_count == 1
+        return self.engine.trade_journal.record_trade.call_args.args[0]
+
+    def test_the_row_carries_the_live_book_not_the_scan_blob(self):
+        """THE regression. Pre-fix: bid 1.20 / ask 1.40 / mid_price None."""
+        row = self._row()
+        assert row["bid"] == 1.30
+        assert row["ask"] == 1.50
+        assert row["mid_price"] == 1.40
+        assert row["limit_price"] == 1.40
+
+    def test_the_call_leg_journals_the_same_way(self):
+        row = self._row(call=True)
+        assert (row["bid"], row["ask"], row["mid_price"]) == (1.30, 1.50, 1.40)
+
+    def test_journal_mid_price_is_the_executing_mid_else_the_scan_mid(self):
+        """`mid_price` was never NULL, and an earlier version of this test said
+        it was. `rank_opportunities` backfills `opp['mid_price'] =
+        opp['premium']` before execution, and all 193 journaled rows carry
+        `mid_price == premium`. So the column always held the SCAN-time mid.
+
+        What FC-072 changes is that it now holds the EXECUTING mid when one
+        exists. When none does — the premium fallback, where no midpoint priced
+        the order — the scan-time mid is kept rather than overwritten with a
+        hole, which is what a bare `result.get("mid")` would have done on every
+        such write.
+        """
+        # Branch 1: a live quote priced the order -> the executing mid wins.
+        assert self._row()["mid_price"] == 1.40
+
+        # Branch 2: the premium fallback priced it -> the scan mid survives.
+        row = self._row(
+            opp=self._opportunity(mid_price=1.30),
+            result=self._result(mid=None, bid=self.BLOB["bid"],
+                                ask=self.BLOB["ask"], quote_source="blob",
+                                limit_price=1.24))
+        assert row["mid_price"] == 1.30, (
+            "a fallback write must not blank the scan-time mid")
+
+    def test_the_scan_mid_is_not_used_when_an_executing_mid_exists(self):
+        """Mutation guard for the branch above: the fallback must not win."""
+        row = self._row(opp=self._opportunity(mid_price=99.0))
+        assert row["mid_price"] == 1.40
+
+    def test_a_blob_priced_order_journals_the_blob_book_it_actually_used(self):
+        """The point is provenance, not liveness: whatever priced the order is
+        what gets recorded."""
+        row = self._row(result=self._result(
+            bid=self.BLOB["bid"], ask=self.BLOB["ask"], mid=1.30,
+            quote_source="blob", quote_age_s=900.0, limit_price=1.30))
+        assert (row["bid"], row["ask"], row["mid_price"]) == (1.20, 1.40, 1.30)
+
+    def test_a_result_without_the_new_fields_degrades_to_the_scan_quote(self):
+        """A producer that predates FC-072 must not write NULLs over a usable
+        scan-time book."""
+        row = self._row(result={"success": True, "order_id": "o1",
+                                "limit_price": 1.24})
+        assert (row["bid"], row["ask"]) == (1.20, 1.40)
+
+    def test_the_opportunitys_other_fields_still_reach_the_row(self):
+        """The merge must not have dropped everything `**opp` carried."""
+        row = self._row()
+        assert row["symbol"] == "AAPL"
+        assert row["contracts"] == 1
+        assert row["strike_price"] == 170
+        assert row["status"] == "submitted"
+
+    def test_quote_source_rides_the_event_and_gets_no_new_column(self):
+        """Provenance is worth a log field, not a schema migration on the
+        canonical trades table — it joins back by order_id."""
+        with patch("src.strategy.execution_engine.log_system_event") as logged:
+            self._row()
+        executed = [c.kwargs for c in logged.call_args_list
+                    if c.kwargs.get("event_type") == "trade_executed"]
+        assert len(executed) == 1
+        assert executed[0]["quote_source"] == "live"
+        assert executed[0]["quote_age_s"] == 0.4
+        assert executed[0]["tick_snapped"] is False
+
+        row = self.engine.trade_journal.record_trade.call_args.args[0]
+        assert "quote_source" not in TRADE_SCHEMA_FIELD_NAMES
+        assert row.get("quote_source") is None
