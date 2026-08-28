@@ -304,42 +304,6 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 
 ---
 
-### FC-041: Naked-call share guard misparses OCC symbols and can fail open
-
-**Status:** CLOSED 2026-08-28 — defect (2) fixed by PR #96 (`f98e45a`), plan `docs/plans/fc-041.md` §Execution: `occ_root` normalization at every equity↔OCC-root join + a fail-closed execute-time invariant that blocks a covered call when any unclassifiable short option sits on the underlying. Defect (1) was fixed earlier by FC-038/FC-052. Both open questions answered: `option_symbols.py` now carries the normalization; the parser-independent assertion exists (gate 20 in `docs/gates.md`), with its stated limits (shared snapshot; unfilled orders → FC-061).
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** `docs/plans/fc-041.md` (2026-08-28; PR #96)
-
-**Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:333` (on `main`)) identifies short calls with a hand-rolled parser:
-
-```python
-for ch in opt_sym:
-    if ch.isdigit(): break
-    opt_underlying += ch
-if opt_underlying == underlying and 'C' in opt_sym:
-    committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
-```
-
-Two defects:
-
-1. **`'C' in opt_sym` is a substring test over the whole OCC symbol, including the ticker.** `CRWD250718P00150000` contains a `C`, so a short *put* on any C-containing ticker is counted as committing 100 shares to calls — over-blocking legitimate call sales. The current wheel universe (AAPL, MSFT, GOOGL, AMZN, NVDA, AMD, QQQ, SPY, IWM, UNH, F, PFE, KMI, VZ) contains no `C` ticker, so the wheel is safe **by luck, not by design**. Adding CSCO, CVX, KO-adjacent names, or C itself would trigger it.
-2. **The digit-break underlying parser breaks on class shares.** `BRK.B` has position symbol `BRK.B` but OCC symbol `BRKB250718C...`, which parses to `BRKB` ≠ `BRK.B`. No match → `committed_shares = 0` → `available_shares = owned` → **the guard fails open and the bot writes calls against already-committed shares. That is a naked call.**
-
-`src/utils/option_symbols.py` already exists and should be used instead; the option type is at a fixed offset in the OCC layout, not a substring.
-
-**Consequence.** Defect (1) is currently latent and costs premium when triggered. Defect (2) is a genuine naked-call path — an uncovered short call has unbounded upside risk. Both become materially more likely under the covered-call **extensibility** proposal (a concurrent 07-18 project formerly numbered FC-038; must refile — see the FC-038 numbering note), which introduces a covered-call account with **no configured symbol universe by design**, where the operator buys arbitrary tickers through the Alpaca UI. That proposal's Phase 2 explicitly relies on this guard as the primitive for committed-share accounting. (Today's FC-038 — two-pool selection — also leans on committed-share accounting, but only for the configured universe, and reuses the FC-052-fixed canonical parsers.)
-
-**Open questions:**
-- Replace the parser with `src/utils/option_symbols.py`, or is that module's coverage incomplete for class-share tickers too? Check before assuming.
-- Add a hard pre-submit assertion that `short_calls × 100 ≤ shares_owned` per underlying, independent of the parser, so a parsing bug cannot produce a naked call?
-- Are there other places that infer option type or underlying by substring? Sweep for `'C' in` / `'P' in` over option symbols.
-- Regression tests must include a short put on a C-containing ticker and a `BRK.B`-style class-share position.
-
-**Links:** found during the covered-call-**extensibility** two-reviewer plan pass (project formerly numbered FC-038; review doc `fc-038-plan-review-2026-07-18.md` never landed on `main`), HIGH H1; flagged independently by both reviewers. Related: the extensibility refile (Phase 2 depends on this guard).
-
----
-
 ### FC-044: Daily execution grid — per-run decision telemetry + at-a-glance day view
 
 **Status:** Consideration — **Phase 1 (telemetry) DELIVERED by FC-065 Phase 4** (PR #78, `decision_events` table + `run_id`; consumed by the dashboard's uncovered-positions card). **Open: Phase 2 (the day grid)** and the ride-along that the dashboard still queries the dead `scans` table (`dashboard/backend/services/bigquery.py` gate heatmap + `gate_full_block_streak`).
@@ -809,21 +773,6 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ---
 
-### FC-072: call-side limit pricing never received the put side's spread-aware improvement
-
-**Status:** CLOSED 2026-08-28 — merged PR #97 (`90ad3e5`), plan `docs/plans/fc-072.md` §Execution (rev 2). **The premise of this entry was falsified in review:** the `mid×0.95` call limit sat ≈ at the bid and realized Σ(mid − fill) on 66 journaled call fills was −$87 — the discount was never money; quote staleness (`/scan` :00 → `/run` :15) was the variable. What shipped: execute-time re-quote on both legs, tick snapping (a live-account correctness fix), journal consistency, corrected economics. Readout due 2026-09-11 (fill rate by `quote_source` × leg vs a 75–80% baseline). **Real-money precondition:** the account's option quotes are Alpaca's *indicative* feed (OPRA unsigned).
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem:** the put side prices sell-to-open limits spread-aware — `mid + 10% of spread`, biased toward the ask for premium collection (`put_seller.py:318-327`, falling back to `mid × 0.95` only when bid/ask are unusable). The call side never got that improvement: every covered-call open is priced at a blunt `mid × 0.95` (`call_seller.py:393`) — roughly 5% of mid donated per open, plus half the spread. A Symmetry Principle violation with a direct, recurring premium cost across every call write (~88 historical writes and counting).
-
-**Fix direction:** port the put side's spread-aware formula to `execute_call_sale`'s limit calculation, with the same unusable-quote fallback. Behavior change on a money path → plan file + two-reviewer gate per ~/CLAUDE.md; the economics (expected $/write recovered, fill-rate risk of pricing closer to the ask) should be estimated from fill history before shipping.
-
-**Links:** `docs/plans/fc-065.md` §Context item 4 + §Spin-offs, `src/strategy/call_seller.py:393`, `src/strategy/put_seller.py:318-327`, FC-069 (explicitly out of its scope), Symmetry Principle (`docs/CLAUDE.md`).
-
----
-
 ### FC-074: should an account-level kill switch exist? (decide deliberately — the dead one is being deleted)
 
 **Status:** Consideration — filed 2026-08-01 by operator decision (FC-069 item 7 sub-decision, option 2)
@@ -907,23 +856,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
-### FC-079: OCC-substring bugs survive on reconcile paths — call assignments structurally undetectable for P-containing underlyings
-
-**Status:** CLOSED 2026-08-28 — merged PR #98 (`49f9f21`), plan `docs/plans/fc-079.md` §Execution. **Severity reframed by review:** the position-diff reconcile branch is dead in production (per-request state), so the live consequence was one wrong telemetry field for AAPL; the PR's value is the gate + `reconcile_orphaned` + backtest fidelity. **Absorbs FC-054** (closed 2026-08-28 as a duplicate — same site). Sites verified live 2026-08-28: `src/strategy/wheel_engine.py:304,306` (reconcile option counts), `:408,410` (`'C' in opt_sym` + `opt_sym[-8:]` strike estimate on call-away), `tools/testing/regression_monitor.py:696` (`reconcile_orphaned`, warn-only).
-**Size estimate:** S (canonical-parser rewire + tests; behavior change on live reconcile → own PR, two-reviewer gate)
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem:** `src/strategy/wheel_engine.py` `reconcile_positions`'s position-diff fallback classifies option legs with `if 'P' in option_symbol … elif 'C' in option_symbol` over the **full OCC symbol** (currently `:306-309`). Every leg on an underlying whose ticker contains a `P` — AAPL, PFE, SPY, PG — classifies as a put, so the position-diff path can never detect a **call** assignment for those symbols. The activity-driven path (OPASN) is unaffected, which is why this has not visibly misfired — but the position-diff branch exists precisely as the fallback when the activities path misses, and it is silently disabled for roughly a third of the universe. Discovered during FC-069 S2 when a new test using AAPL failed with a wrong classification; the S2 tests deliberately use MSFT (no `P`) — a future symbol swap to AAPL in those tests will fail until this FC lands.
-
-**Second site, same family:** `tools/testing/regression_monitor.py` `reconcile_positions`/`reconcile_orphaned` (~`:628`) still uses `"C" in symbol` plus a hand-rolled leading-alpha parser (noted by the S1 confirmation pass; warn-only surface). FC-069 S1 rewired `check_risk_parameters` to the canonical parsers but scoped out this sibling.
-
-**Fix direction:** `strict_option_type` / `parse_option_symbol` (`src/utils/option_symbols.py`) at both sites, with tests pinning AAPL call-assignment detection on the position-diff path (must FAIL pre-fix). Family lineage: FC-041/043/045/048/052, FC-069 item 12 (S1 monitor sync, S3 scanner rewire). Not fixed inside FC-069's sweep because both S2 reviews agreed a live reconcile behavior change cannot ride a behaviorally-inert retirement PR.
-
-**Ride-along from the S3 review (PR #85, trader LOW — accepted in writing there, deferred here):** give `OptionsScanner._has_existing_position`'s skip event a third `reason` value, `unparseable_position`, so a fail-closed skip caused by a garbage option symbol is distinguishable from a genuine holding. Today both emit `reason='option_position'`, which means a symbol we could not parse tallies as "already holds this underlying". Expected live frequency is **zero** (Alpaca returns well-formed OCC symbols; the branch exists as posture, not as an observed case), which is why it was not worth a second round on S3 — but it belongs with this FC's parser work, since the same rewire touches how an unparseable symbol is recognized.
-
----
-
 ### FC-080: roller duration drift — consecutive rolls compound the horizon; evaluate roll-count and absolute-DTE controls
 
 **Status:** Consideration — **bookmark filed 2026-08-04 by operator** after the first live occurrence; revisit deliberately, not presumed a bug
@@ -950,49 +882,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 **Research before deciding:** realized outcomes of multi-roll chains vs. taking assignment (backtest + the live chain as it plays out); how often trending weeks would trigger 3+ consecutive rolls; whether max-net-credit vs. max-strike selection changes the drift; interaction with the documented re-pin-near-the-money behavior (rolled positions generate daily roll candidates while trending — the noise and the ratchet share a cause).
 
 **Links:** FC-078 (the rails as built: credit-only, `old_expiry+14`, Δ ≤ 0.60, span gate, max-net-credit), docs/releases/RELEASE_2026-08-04.md (first roll), the 2026-08-04 `call_roll_completed` events (both rolls), FC-072 (call-side pricing — touches the same economics).
-
----
-
-### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
-
-**Scope:** shared (deploy pipeline, all services)
-**Status:** CLOSED 2026-08-28 — the freshness check shipped: PR #94 (`0910192`), plan `docs/plans/fc-081.md`. `deploy_freshness` check group in `/regression` on both services compares `GIT_COMMIT` (now set by all three deploy steps) against GitHub `main`; drift > 2h → `fail` + page; a GitHub **redirect** (rename — the FC-081 mode) → `fail`; every degraded state → daily `deploy_freshness_degraded` nag. Repo is public → runs unauthenticated until the token is provisioned (recommended, not required). Two policies created 2026-08-28 (ids in the plan §Execution). Original entry preserved below.
-**Size estimate:** S
-**Owner:** zeshan + Claude
-**Plan file:** not needed (infra repair; documented here)
-
-**Problem:** the wheel service was running revision `options-wheel-strategy-00498-qen`, built 2026-08-05 from `f84b50a`. Four commits merged to main on 2026-08-21 — **including FC-067 (#88) and FC-075 Phase 2 (#89), production code** — produced **no Cloud Build at all**. The trigger `deploy-options-wheel-strategy` (`^main$`, `cloudbuild.yaml`) was present, enabled, unfiltered. This is the FC-031 failure class escalated: FC-031 was a red build nobody saw and got build-failure alerting as its fix; **a build that never starts fires no failure alert**, so the existing channel is structurally blind to this mode.
-
-**Root cause (diagnosed 2026-08-21):** the repo was renamed on GitHub. Git pushes, PRs, `gh` API calls all follow GitHub's automatic old-name redirect — so nothing *looked* broken — but Cloud Build 1st-gen triggers match the literal `github.owner/name` pair in the trigger config, and webhook events arrive stamped with the **new** name. They matched no trigger and were dropped with zero errors anywhere: zero `CreateBuild` audit-log entries after 08-05 04:02 UTC, zero check-runs on post-rename commits (every built commit has one from the `google-cloud-build` app — that asymmetry was the conclusive evidence). The GitHub App connection itself was intact the whole time.
-
-**Fix applied (2026-08-21):** (1) operator re-ran the console "Connect repository" flow for `memon1987/agentic_options_wheel` (1st-gen mapping is keyed by repo name and console-only; until it existed, both trigger update and create returned bare `INVALID_ARGUMENT`/`FAILED_PRECONDITION`); (2) trigger rebound to the new name via `gcloud beta builds triggers export`/`import` (same trigger id `5f4caa43`, history preserved); (3) local git remote repointed. End-to-end verification: the commit recording this entry auto-fired a build on push (see below for result).
-
-**Consequences while broken:** production journal rows were written with FC-067's poisoned put-labels for 16 extra days (mislabeled call rows grew 29 → 62 — the count in `docs/plans/fc-075-seam-4.md` DD-5); Phase 2's wheel-side changes sat unverified in prod.
-
-**Coda (same evening) — the repair itself triggered false "build failure" emails, and the alert filter is now fixed:** the failed trigger-update/create API calls during diagnosis (7 audit-log ERRORs, 19:32–20:24 UTC) log under `resource.type="build"`, which the FC-030-era "Cloud Build failure — options-wheel" policy matched wholesale (`severity>=ERROR` with no method discrimination) — config-management noise masquerading as build failures. Investigation of a real failed build (`17ff3495`, 2026-08-04) showed its **only** ERROR entry is the audit-log `CloudBuild.CreateBuild` completion — the `cloudbuild` logName stays INFO even on failure — so the obvious tweak (`logName:"cloudbuild"`) would have silenced the alert for every real failure. Fix applied (policy `12432709964222363712` patched via API): exclusion polarity — `AND NOT protoPayload.methodName:"BuildTrigger"/"GitHubInstallation"/"GlobalTriggerSettings"` — validated both directions against live logs (today's 7 noise entries: 0 matches; the 08-04 real failure: still matches). Policy JSON now versioned at `deploy/monitoring/build_failure_alert_policy.json`. Note `CreateBuild` is a prefix of `CreateBuildTrigger` — positive matching would need exact equality; exclusion avoids the trap and fails open toward alerting.
-
-**Lessons / follow-ups:**
-- **[OPEN — the durable fix] Merged-vs-deployed freshness alert:** a scheduled check comparing latest-push age vs. latest-build age (or `origin/main` HEAD vs. the serving revision's commit), alerting on drift > N hours via the FC-030 channel. FC-031's build-failure alert watches builds that *start*; this failure mode needs a check that watches for builds that *don't*. A rename like this would have been caught in hours, not 16 days.
-- **Redirect-masking:** GitHub's old-name redirects are exactly what made this silent. ~~Sweep docs/scripts for old-name URLs~~ **done 2026-08-27** (28 files, all docs-layer, mechanical).
-- **Rename checklist:** any future repo rename must same-day update: Cloud Build repo connection + trigger, local remotes, and any webhook-keyed integration.
-
-**Links:** FC-031 (the 11-days-undeployed precedent + build-failure alerting), FC-030 (the notification channel to reuse), `docs/plans/fc-075-seam-4.md` (rollout steps R3–R5 that this gated).
-
----
-
-### FC-084: cloudbuild canary chains assume "newest revision = my canary" — races under concurrent builds
-
-**Status:** CLOSED 2026-08-28 — PR #95 (`9a8f863`), plan `docs/plans/fc-084.md`. Mechanism: per-trigger build serialization (newer build → SUPERSEDED exit 0; older still running → wait), deterministic `--revision-suffix=<sha7>-<buildid8>`, promote `--to-latest` after asserting `latestReadyRevisionName` is this build's revision (or an env-only revision on its image). Live drill passed the same day. Note: the fix direction this entry originally proposed (`--to-revisions` pinning) was rejected in review — it permanently breaks `--update-env-vars` kill switches.
-**Scope:** shared (all three services' deploy chains: wheel, dashboard, covered-call)
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem:** every smoke-test step identifies the canary it just deployed as `gcloud run revisions list --limit=1` (newest-first) and every promote step runs `update-traffic --to-latest` — neither is pinned to the revision *this build* created. Two concurrent builds on the same service can cross-validate and cross-promote each other's revisions. Not hypothetical: on 2026-08-27 two main builds started **3 seconds apart** (`88a6288`, `861a473` — the FC-083 fix-merge and its bookkeeping push). Consequences today are benign (both builds carry the same code ±docs), but a rollback-build racing a forward-build could promote the wrong revision. Also noted: the polls read `status.conditions[0].status` assuming Ready is first — true in practice, not contractual.
-
-**Fix direction:** capture the deployed revision name at deploy time (deploy step writes it to a workspace file, or resolve the `canary` tag) and pin both the readiness poll and the promote (`update-traffic --to-revisions=REV=100`) to it, in all three chains. Alternatively serialize builds (Cloud Build concurrency control / queue-ttl) — cruder but one line.
-
-**Links:** `cloudbuild.yaml` (all `smoke-test-*` / `promote-*` steps), `docs/plans/fc-075-cc-deploy-step.md` §Review disposition, FC-031/FC-081 (the deploy-pipeline incident lineage).
 
 ---
 
@@ -1127,6 +1016,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
+
+_2026-08-28 (evening): 5 more entries closed today moved here (FC-041/072/079/081/084); full bodies at `cd70fc8`._
 
 _2026-08-28 status sweep: 28 entries moved here from Active in one pass (condensed to this section's convention). Their full original bodies are in git history at `571ecf7`._
 
@@ -1400,3 +1291,28 @@ _2026-08-28 status sweep: 28 entries moved here from Active in one pass (condens
 ### FC-083: earnings-calendar cache tests are date-sensitive — went red on main with zero code changes
 - PR: https://github.com/memon1987/agentic_options_wheel/pull/92 (merged 2026-08-27, `88a6288`)
 - Notes: `clock.frozen` applied to both tests; suite 1341 green; deploy pipeline unblocked. Residual (file-wide `now()` audit, conftest guard) folds into future test-hermeticity work.
+
+### FC-041: Naked-call share guard misparses OCC symbols and can fail open
+- Plan: `docs/plans/fc-041.md` (defect 2); defect 1 fixed earlier by FC-038 / FC-052
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/96 (merged 2026-08-28, `f98e45a`)
+- Notes: `occ_root()` normalizes equity symbols to OCC roots (`BRK.B` ↔ `BRKB`, verified against Alpaca) at every equity↔root join (share ledger, roller `stock_by_symbol`, `risk_cost_basis_protection`, `uncovered_days` covered-set, `select_batch` keys); new execute-time invariant (gate 20) blocks a covered call when any unclassifiable short option sits on the underlying — fail-closed, type-blind by design (review caught that the first version shared the ledger's adjusted-root blind spot and failed OPEN). Two reviews → fixes → confirmation → rebase over FC-079 → re-confirmation. Live books had no affected symbol; the limb arms itself on the first corporate action.
+
+### FC-072: call-side limit pricing never received the put side's spread-aware improvement
+- Plan: `docs/plans/fc-072.md` (rev 2)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/97 (merged 2026-08-28, `90ad3e5`; deployed via build `b9e6dd52`)
+- Notes: **The entry's premise was falsified in review** — the `mid×0.95` call limit sat ≈ at the bid; realized Σ(mid − fill) on 66 journaled fills was −$87 (a below-bid sell fills at the current bid); quote staleness (`/scan` :00 → `/run` :15) was the real variable. Shipped: execute-time re-quote on both legs (after the cost-basis floor), `mid + f×spread` (calls f=0.0, puts 0.10 unchanged), locked/one-tick books at the bid (put-leg cost accepted in writing: 5/118 rows, −$1/contract), tick snapping (penny-program $0.05 ≥ $3; SPY/QQQ/IWM penny; never above the ask — a live-account correctness fix), journal rows carry the executing quote, `quote_feed`/`quote_source`/`quote_age_s` logged. Real-money precondition: the account's option quotes are Alpaca's *indicative* feed (OPRA unsigned). Readout due 2026-09-11 (fill rate by `quote_source` × leg vs 75–80%). Follow-ups: FC-088, FC-089, FC-090.
+
+### FC-079: OCC-substring bugs survive on reconcile paths (absorbs FC-054)
+- Plan: `docs/plans/fc-079.md`
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/98 (merged 2026-08-28, `49f9f21`); live-verified on the 15:15 ET `/run` (AAPL `calls=1 puts=0`)
+- Notes: The three sites rewired to `strict_option_type` / `parse_option_symbol`; a name-agnostic AST gate (`tests/test_no_occ_substring.py`) walks `src/deploy/tools/main.py` with a single allow-listed marker; dead `OptionSymbolGenerator` + `validate_symbol_format` deleted (−200 lines); call-away with no strike source now refuses the transition instead of writing `exit_price=0.0`. Severity reframed by review: the position-diff reconcile branch is dead in production (per-request state; zero `*_assignment_detected` rows ever), so the live consequence was one wrong telemetry field; PFE contains no C, so sites 2/3 were latent. FC-087 filed.
+
+### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
+- Plan: `docs/plans/fc-081.md` (the follow-up); the trigger repair itself was same-day on 2026-08-21
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/94 (merged 2026-08-28, `0910192`)
+- Notes: `deploy_freshness` check group in `/regression` on both services compares `GIT_COMMIT` (now set by all three deploy steps, echoed by `/health`) against GitHub `main`: drift > 2h → page (`2971611045188297543`); a GitHub **redirect** (rename — the FC-081 mode; a naive check following redirects would pass) → page; every degraded state → daily nag (`3353852324684868529`). Repo is public → runs unauthenticated until the token exists (token wired 2026-08-28 evening). First live run 14:45 ET behaved as designed. Authenticated run + negative drill: Mon 2026-08-31 10:45 ET.
+
+### FC-084: cloudbuild canary chains assume "newest revision = my canary" — races under concurrent builds
+- Plan: `docs/plans/fc-084.md` (rev 2)
+- PR: https://github.com/memon1987/agentic_options_wheel/pull/95 (merged 2026-08-28, `9a8f863`); live drill PASSED the same evening; first organic supersede 22:48 UTC
+- Notes: Rev 1 (`--to-revisions` pinning + timestamp guard) was rejected by two reviews: `latestCreatedRevisionName` can name another build's revision, revision-creation order promotes the OLDER commit when the deploy retry fires, and pinned traffic permanently breaks `--update-env-vars` kill switches. Rev 2: per-trigger build serialization (newer build exists → SUPERSEDED exit 0; older still running → wait; deadline from `startTime`), deterministic `--revision-suffix=<sha7>-<buildid8>`, promote `--to-latest` after asserting `latestReadyRevisionName` is this build's revision (or an env-only revision on its image), Conflict retries with the check inside the loop, `timeout` 1500 s. IAM: the trigger runs as the compute SA, which lacked `cloudbuild.builds.list` (probe-proven); operator granted Cloud Build Viewer. Merge-spacing discipline retired.
