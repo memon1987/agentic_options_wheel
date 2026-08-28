@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.utils.config import Config
+from src.utils.option_symbols import (
+    parse_option_symbol as parse_occ_symbol,
+    strict_option_type,
+)
 from alpaca.data import OptionHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import OptionBarsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -166,7 +170,13 @@ class DetailedExpiredOptionsAnalyzer:
             return pd.DataFrame()
 
     def parse_option_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Parse option symbol to extract details.
+        """Parse an option symbol via the canonical OCC parsers (FC-079).
+
+        This used to split on the first ``'P'`` / ``'C'`` found anywhere in the
+        string, which mis-parses every root containing one (AAPL, SPY, PFE).
+        Kept as a thin adapter so the script's existing call sites and dict
+        shape are unchanged; the parsing itself is now
+        ``src/utils/option_symbols``.
 
         Args:
             symbol: Option symbol (e.g., UNH250926P00340000)
@@ -174,53 +184,21 @@ class DetailedExpiredOptionsAnalyzer:
         Returns:
             Dict with parsed details or None
         """
-        try:
-            # Format: UNH250926P00340000
-            if len(symbol) < 15:
-                return None
-
-            # Find the P or C
-            if 'P' in symbol:
-                parts = symbol.split('P')
-                option_type = 'PUT'
-            elif 'C' in symbol:
-                parts = symbol.split('C')
-                option_type = 'CALL'
-            else:
-                return None
-
-            if len(parts) != 2:
-                return None
-
-            # Extract underlying and date
-            prefix = parts[0]
-            strike_str = parts[1]
-
-            # Extract underlying (first part before date)
-            if len(prefix) >= 9:  # UNH250926 (minimum)
-                underlying = prefix[:-6]  # Remove YYMMDD
-                date_str = prefix[-6:]   # Last 6 digits
-
-                # Parse date
-                year = 2000 + int(date_str[:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-                exp_date = datetime(year, month, day)
-
-                # Parse strike (divide by 1000)
-                strike_price = float(strike_str) / 1000.0
-
-                return {
-                    'underlying': underlying,
-                    'expiration': exp_date,
-                    'option_type': option_type,
-                    'strike_price': strike_price
-                }
-
+        option_type = strict_option_type(symbol)
+        if option_type is None:
             return None
 
-        except Exception as e:
+        parsed = parse_occ_symbol(symbol)
+        expiration = parsed.get('expiration_date')
+        if not expiration:
             return None
+
+        return {
+            'underlying': parsed['underlying'],
+            'expiration': datetime.strptime(expiration, '%Y-%m-%d'),
+            'option_type': option_type.upper(),
+            'strike_price': parsed['strike_price'],
+        }
 
     def analyze_options_data(self, df: pd.DataFrame, stock_price: float,
                            analysis_date: str) -> Dict[str, Any]:

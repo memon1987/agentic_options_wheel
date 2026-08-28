@@ -220,7 +220,13 @@ this is the inventory:
   `unknown`.
 - Existing-position skip: the put leg skips any symbol already holding a stock
   or option position (parse-exact since FC-069 S3 — it used to be an OCC
-  substring test that suppressed every F put because `PFE…` contains `F`).
+  substring test that suppressed every F put because `PFE…` contains `F`). The
+  skip event carries a `reason` naming which limb fired — `stock_position`,
+  `option_position`, or, since **FC-079**, `unparseable_position`: the
+  fail-closed limb for a held option symbol with no contract structure. The
+  posture is unchanged (it still skips); only the label is new. Sharing one
+  bucket made a scan suppressed by garbage position data indistinguishable
+  from one that was simply already invested.
 - Cost-basis floor, scan side: a call opportunity is not created when the
   resolved basis is unresolved or diverges from the cross-check.
 
@@ -453,6 +459,19 @@ anything:
 - **A manual `gcloud builds submit` supplies no `$COMMIT_SHA`**, so the revision
   comes up with an empty `GIT_COMMIT` and reports `deploy_freshness_no_commit` —
   a degraded warn on the *nag* policy, never drift on the paging one.
+
+`position_reconciliation`'s **`reconcile_orphaned`** check (a short call with
+no covering shares) classifies with `strict_option_type` and roots with
+`parse_option_symbol` since **FC-079**. It used to ask `"C" in symbol` over the
+whole OCC symbol, which reads a *put* on any root containing a C as a call and
+warns it as an orphan — a short put holds no shares by design, so that is a
+false alarm by construction. No root in either configured universe contains a C
+today (the `'P'` roots — AAPL, SPY, PFE — are what broke the *reconcile
+counting loop*, a separate site), so the defect was latent rather than live.
+Option symbols that are not strict OCC contracts are neither passed nor warned
+on there: they are listed in the check's `unclassifiable` detail field, because
+`risk_unclassifiable_option` below is already their alarm and a second one for
+the same fact is how an alarm layer gets muted.
 
 `check_risk_parameters` was synced to the real policy set by FC-069 S1 — four
 checks that mirrored deleted knobs (global position count, cash reserve,

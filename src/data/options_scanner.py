@@ -1000,8 +1000,16 @@ class OptionsScanner:
             logger.error("Failed to calculate call attractiveness score", event_category="error", event_type="call_score_calculation_failed", error=str(e))
             return 0
     
-    def _option_position_matches(self, position_symbol: str, symbol: str) -> bool:
+    def _option_position_matches(self, position_symbol: str, symbol: str) -> str:
         """Whether an option position is written on ``symbol``.
+
+        Returns one of three verdicts, not a bool (FC-079): ``'match'`` (the
+        parsed underlying is ``symbol``), ``'no_match'`` (it is a different
+        underlying), or ``'unparseable'`` (no contract structure at all). The
+        caller treats ``'unparseable'`` exactly like ``'match'`` — it still
+        skips — but the two are now *told apart in the log*, because "we hold
+        a put on this symbol" and "we hold something we cannot identify" are
+        different operator facts that used to file under one reason string.
 
         FC-069 item 12. This used to be ``symbol in position['symbol']`` — a
         substring test over the whole OCC contract symbol, the 7th member of
@@ -1011,7 +1019,8 @@ class OptionsScanner:
         answers the actual question — same primitive and same idiom as
         ``ExecutionEngine._available_shares``.
 
-        Fail-closed on an unparseable symbol (returns ``True``): an option
+        Fail-closed on an unparseable symbol (``'unparseable'``, which the
+        caller still skips on): an option
         position we cannot identify might be on ``symbol``, and this method's
         whole error posture is "when in doubt, do not write another position."
         Under-blocking here would break the per-underlying invariant; the cost
@@ -1030,8 +1039,8 @@ class OptionsScanner:
         except (TypeError, ValueError, AttributeError):
             underlying, structured = '', False
         if not underlying or not structured:
-            return True
-        return underlying == symbol
+            return 'unparseable'
+        return 'match' if underlying == symbol else 'no_match'
 
     def _has_existing_position(self, symbol: str) -> bool:
         """Check if we already have positions in a stock. Emits the skip event.
@@ -1053,11 +1062,15 @@ class OptionsScanner:
                     return True
 
                 # Option positions — parsed, never substring-matched (item 12).
-                if (position['asset_class'] == 'us_option'
-                        and self._option_position_matches(position['symbol'], symbol)):
-                    self._log_existing_position_skip(
-                        symbol, position['symbol'], 'option_position')
-                    return True
+                if position['asset_class'] == 'us_option':
+                    verdict = self._option_position_matches(
+                        position['symbol'], symbol)
+                    if verdict != 'no_match':
+                        self._log_existing_position_skip(
+                            symbol, position['symbol'],
+                            'option_position' if verdict == 'match'
+                            else 'unparseable_position')
+                        return True
 
             return False
 
@@ -1081,8 +1094,11 @@ class OptionsScanner:
         tally as blind to it "until FC-069 item 12 rewires that check". A gate
         on the money path that logs nothing cannot be counted, replayed, or
         argued with. ``reason`` says which limb fired: ``stock_position`` (the
-        exact equity match) or ``option_position`` (the parsed-underlying
-        match).
+        exact equity match), ``option_position`` (the parsed-underlying match),
+        or ``unparseable_position`` (FC-079 — an option symbol with no contract
+        structure; the skip is the same fail-closed skip, but it is a data
+        problem rather than a holding, and conflating the two made the
+        fail-closed limb invisible in the tally).
         """
         logger.info("Skipping put scan - existing position",
                     event_category="trade",

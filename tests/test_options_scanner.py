@@ -2006,7 +2006,13 @@ class TestPutSideExistingPositionSkip:
         """Documented decision: a held option we cannot identify is treated as
         potentially-matching, the same posture as the API-error path. The cost
         is a skipped put; the alternative is writing a second position on an
-        underlying we may already hold."""
+        underlying we may already hold.
+
+        FC-079 changed the *label*, never the posture: this limb used to file
+        under ``option_position``, indistinguishable in the tally from a
+        genuine holding. It is now ``unparseable_position``. The skip itself is
+        identical — `emitted == []`.
+        """
         emitted, mock_logger = self._scan([
             {'symbol': held, 'asset_class': 'us_option', 'qty': -1},
         ])
@@ -2014,7 +2020,51 @@ class TestPutSideExistingPositionSkip:
         assert emitted == []
         skips = _events(mock_logger, 'put_scan_skipped_existing_position')
         assert [(s['symbol'], s['reason']) for s in skips] == [
-            ('F', 'option_position'), ('MSFT', 'option_position')]
+            ('F', 'unparseable_position'), ('MSFT', 'unparseable_position')]
+
+    def test_the_three_skip_reasons_are_told_apart(self):
+        """FC-079 — one scan, all three limbs, three distinct reason strings.
+
+        Before this, "we hold an option on this symbol" and "we hold something
+        we cannot identify" shared one bucket, so the fail-closed limb was
+        invisible: a run where every put was suppressed by garbage position
+        data looked exactly like a run where the wheel was simply already
+        fully invested.
+        """
+        self.mock_config.stock_symbols = ['F', 'MSFT', 'GOOGL']
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'F', 'current_price': 11.0},
+            {'symbol': 'MSFT', 'current_price': 400.0},
+            {'symbol': 'GOOGL', 'current_price': 180.0},
+        ]
+
+        _emitted, mock_logger = self._scan([
+            {'symbol': 'F', 'asset_class': 'us_equity', 'qty': 100},
+            {'symbol': 'MSFT260821P00380000', 'asset_class': 'us_option',
+             'qty': -1},
+            {'symbol': 'NOT_AN_OCC', 'asset_class': 'us_option', 'qty': -1},
+        ])
+
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('F', 'stock_position'),
+            ('MSFT', 'option_position'),
+            ('GOOGL', 'unparseable_position'),
+        ]
+
+    def test_option_position_matches_returns_the_three_verdicts(self):
+        """The helper's contract, directly. It is a str now, not a bool — and
+        a truthiness test on it would treat ``'no_match'`` as a match."""
+        assert self.scanner._option_position_matches(
+            'F260821P00010000', 'F') == 'match'
+        assert self.scanner._option_position_matches(
+            'MSFT260821P00380000', 'F') == 'no_match'
+        assert self.scanner._option_position_matches('NOT_AN_OCC', 'F') == 'unparseable'
+        assert self.scanner._option_position_matches('', 'F') == 'unparseable'
+        # Adjusted roots still resolve — the parser's leading-letters fallback
+        # gives the answer we want, so this is a real match, not a guess.
+        assert self.scanner._option_position_matches(
+            'AAPL1260821C00230000', 'AAPL') == 'match'
 
     def test_a_held_short_CALL_blocks_puts_on_the_same_underlying(self):
         """Review fix 3 — pin the option-type dimension.

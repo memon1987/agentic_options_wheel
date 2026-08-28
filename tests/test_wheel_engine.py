@@ -661,39 +661,59 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
              patch.object(wheel_engine_module, 'logger') as engine_logger:
             stats = engine.reconcile_positions()
 
+        self._last_warnings = [call.kwargs
+                               for call in engine_logger.warning.call_args_list]
         swallowed = [
-            call.kwargs.get('event_type')
-            for call in engine_logger.warning.call_args_list
-            if str(call.kwargs.get('event_type', '')).endswith(
-                '_state_update_failed')
+            w.get('event_type') for w in self._last_warnings
+            if str(w.get('event_type', '')).endswith('_state_update_failed')
         ]
         return stats, events, swallowed
 
-    def test_a_call_away_on_a_seeded_entry_still_emits_its_events(self):
+    def _warned(self, event_type):
+        return [w for w in getattr(self, '_last_warnings', [])
+                if w.get('event_type') == event_type]
+
+    def test_a_call_away_with_a_surviving_leg_still_emits_its_events(self):
         """The end-to-end path: reconcile seeds the entry from Alpaca, then a
-        later reconcile on the same instance sees the shares called away and
-        must transition that entry — emitting the assignment telemetry rather
-        than dying inside the swallowed try/except.
+        later reconcile on the same instance sees shares called away and must
+        transition that entry — emitting the assignment telemetry rather than
+        dying inside the swallowed try/except.
+
+        FC-079 changed this fixture. It used to have Alpaca return NOTHING on
+        the second pass, which left the strike estimate with no source at all;
+        the engine passed 0.0 through and this test asserted the transition
+        happened anyway. That is now refused (see
+        `test_a_call_away_with_no_strike_source_refuses_the_transition`), so
+        the fixture keeps one surviving leg — a partial call-away, 2 contracts
+        down to 1 — which is what the branch is actually for and which leaves a
+        real strike to read.
         """
         engine, state, alpaca = self._engine(self._held_stock_and_call())
         engine.reconcile_positions()
         assert state.symbol_states['MSFT']['active_calls'] == 1
 
-        # The call is exercised: both legs vanish from Alpaca.
-        alpaca.get_positions.return_value = []
+        # A second contract is written, then one of the two is exercised: 200
+        # shares -> 100, 2 calls -> 1. The surviving leg carries the strike.
+        state.symbol_states['MSFT']['active_calls'] = 2
+        state.symbol_states['MSFT']['stock_shares'] = 200
+        alpaca.get_positions.return_value = [
+            {'symbol': 'MSFT', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '18000', 'current_price': '185.0'},
+            {'symbol': self.HELD_CALL, 'qty': '-1', 'asset_class': 'us_option'},
+        ]
         stats, events, swallowed = self._reconcile_capturing_events(engine)
 
         assert 'error' not in stats, stats
         assert swallowed == [], (
             f"reconcile swallowed a state-update failure: {swallowed}. The "
             "seeded entry is missing a key handle_call_assignment reads.")
+        assert self._warned('call_assignment_strike_unresolved') == []
 
         assigned = [e for e in events if e['event_type'] == 'call_assignment']
         assert len(assigned) == 1, events
         assert assigned[0]['shares'] == 100
-        assert assigned[0]['remaining_shares'] == 0
+        assert assigned[0]['remaining_shares'] == 100
         assert assigned[0]['phase_before'] == 'selling_calls'
-        assert assigned[0]['phase_after'] == 'selling_puts'
         # Seeded entries carry no wheel_cycle_start (reconcile cannot know when
         # the lot was acquired), so the cycle event correctly does NOT fire.
         assert assigned[0]['cycle_duration_days'] == 0
@@ -701,7 +721,47 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
                     if e['event_type'] == 'wheel_cycle_complete']
 
         assert stats['call_assignments_detected'] == 1
-        assert state.symbol_states['MSFT']['stock_shares'] == 0
+
+    def test_a_call_away_with_no_strike_source_refuses_the_transition(self):
+        """FC-079 review fix: never transition on a fabricated 0.0 strike.
+
+        The shape: the last lot is called away, so Alpaca reports neither a
+        surviving call leg nor a stock position — there is nothing to estimate
+        the strike from. The old code passed `strike_price=0.0` into
+        `handle_call_assignment`, which writes `exit_price=0.0` into
+        `wheel_cycle_complete` — the one wheel event with a live BigQuery
+        consumer — i.e. a fabricated 100% loss on the cycle, indistinguishable
+        from a real one downstream.
+
+        The transition is now skipped and the refusal is named. State stays in
+        SELLING_CALLS: visibly wrong, and therefore fixable, rather than
+        silently wrong and permanent.
+        """
+        engine, state, alpaca = self._engine(self._held_stock_and_call())
+        engine.reconcile_positions()
+        assert state.symbol_states['MSFT']['active_calls'] == 1
+
+        # Everything vanishes from Alpaca: no call leg, no shares.
+        alpaca.get_positions.return_value = []
+        stats, events, _swallowed = self._reconcile_capturing_events(engine)
+
+        assert 'error' not in stats, stats
+
+        warned = self._warned('call_assignment_strike_unresolved')
+        assert len(warned) == 1, self._last_warnings
+        assert warned[0]['symbol'] == 'MSFT'
+        assert warned[0]['shares_called'] == 100
+        assert stats['strike_unresolved'] == 1
+
+        # The detection still happened and is still counted — what is refused
+        # is the state transition built on a made-up number.
+        assert stats['call_assignments_detected'] == 1
+        assert [e['event_type'] for e in events
+                if e['event_type'] in ('call_assignment',
+                                       'wheel_cycle_complete')] == []
+        assert not [e for e in events
+                    if e['event_type'] == 'wheel_cycle_complete'
+                    and e.get('exit_price') == 0.0]
 
     def test_a_call_away_after_a_put_assignment_completes_the_cycle(self):
         """The other seeding route — `handle_put_assignment` creates the entry
@@ -710,17 +770,386 @@ class TestTheUntrackedPositionSweepSeedsAUsableEntry:
         live BigQuery consumer (`options_wheel_logs.wheel_cycles`).
         """
         engine, state, alpaca = self._engine([])
-        state.handle_put_assignment('MSFT', 100, 180.0, datetime(2026, 7, 1))
+        state.handle_put_assignment('MSFT', 200, 180.0, datetime(2026, 7, 1))
         assert set(state.symbol_states['MSFT']) == self.SEEDED_KEYS, (
             "handle_put_assignment and reconcile's seeding dict must agree on "
             "the entry shape — reconcile reads both through the same code")
-        state.symbol_states['MSFT']['active_calls'] = 1
+        state.symbol_states['MSFT']['active_calls'] = 2
 
-        alpaca.get_positions.return_value = []
+        # FC-079: one of two contracts is exercised, so a call leg survives to
+        # supply the strike. Draining Alpaca entirely would now (correctly)
+        # refuse the transition rather than complete the cycle at exit_price
+        # 0.0 — see
+        # `test_a_call_away_with_no_strike_source_refuses_the_transition`.
+        alpaca.get_positions.return_value = [
+            {'symbol': self.HELD_CALL, 'qty': '-1', 'asset_class': 'us_option'},
+        ]
         stats, events, swallowed = self._reconcile_capturing_events(engine)
 
         assert 'error' not in stats, stats
         assert swallowed == []
+        assert self._warned('call_assignment_strike_unresolved') == []
         cycle = [e for e in events if e['event_type'] == 'wheel_cycle_complete']
         assert len(cycle) == 1, events
         assert cycle[0]['cost_basis'] == 180.0
+        # The strike came off the surviving leg, not a fallback or a zero.
+        assert cycle[0]['exit_price'] == 190.0
+
+
+# =========================================================================== #
+# FC-079 — the reconcile path stops classifying OCC symbols by substring.
+#
+# `reconcile_positions` counted legs with `'P' in option_symbol` / `elif 'C' in
+# option_symbol`, over the WHOLE contract string. Every configured underlying
+# whose root contains a 'P' — AAPL, SPY, PFE — therefore had its *calls*
+# counted as puts, because the put branch tested first and matched on the root.
+# The counts feed the position-diff assignment fallback, so on those symbols a
+# call assignment could not be detected on that path at all. The strike
+# estimate on the called-away transition had the same defect plus a blind
+# `[-8:]` slice.
+#
+# These tests fail on pre-FC-079 code. `tests/test_no_occ_substring.py` is the
+# structural half — it stops the idiom coming back.
+#
+# Plan: docs/plans/fc-079.md
+# =========================================================================== #
+
+
+class TestReconcileClassifiesLegsStrictly:
+    """The counting loop (`_count_option_legs`) and what reconcile does with it."""
+
+    def _engine(self, positions, *, state=None):
+        """A real WheelStateManager: the seeded entry is the observable."""
+        config = Mock(spec=Config)
+        alpaca = Mock()
+        alpaca.get_account_activities.return_value = []
+        alpaca.get_positions.return_value = positions
+
+        wheel_state = WheelStateManager()
+        if state:
+            wheel_state.symbol_states.update(state)
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca,
+                                 wheel_state=wheel_state)
+        return engine, wheel_state
+
+    # -- test 1: the headline regression ------------------------------------ #
+
+    def test_an_aapl_call_is_counted_as_a_call_not_a_put(self):
+        """AAPL contains a 'P'. Pre-fix this asserted active_puts == 1.
+
+        End-to-end through `reconcile_positions`: the untracked-position sweep
+        seeds wheel state straight off the leg counts, so the seeded entry is
+        the counting loop's verdict made observable.
+        """
+        engine, state = self._engine([
+            {'symbol': 'AAPL', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '23000', 'current_price': '232.0'},
+            {'symbol': 'AAPL260918C00230000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ])
+
+        stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+        assert state.symbol_states['AAPL']['active_calls'] == 1
+        assert state.symbol_states['AAPL']['active_puts'] == 0
+
+    def test_count_option_legs_returns_the_exact_leg_dict(self):
+        """The plan's literal assertion, on the extracted helper."""
+        engine, _ = self._engine([])
+
+        counts = engine._count_option_legs([
+            {'symbol': 'AAPL260918C00230000', 'qty': '-1'},
+        ])
+
+        assert counts == {'AAPL': {'puts': 0, 'calls': 1, 'unclassified': 0}}
+
+    # -- test 2: the rest of the affected roots ----------------------------- #
+
+    def test_pfe_put_counts_as_a_put_and_spy_call_counts_as_a_call(self):
+        """PFE and SPY both carry a 'P' in the root, like AAPL."""
+        engine, _ = self._engine([])
+
+        counts = engine._count_option_legs([
+            {'symbol': 'PFE260918P00025000', 'qty': '-2'},
+            {'symbol': 'SPY260918C00600000', 'qty': '-3'},
+        ])
+
+        assert counts == {
+            'PFE': {'puts': 2, 'calls': 0, 'unclassified': 0},
+            'SPY': {'puts': 0, 'calls': 3, 'unclassified': 0},
+        }
+
+    def test_a_root_with_neither_letter_is_unchanged(self):
+        """The MSFT/GOOGL/NVDA half of the universe must not move."""
+        engine, _ = self._engine([])
+
+        counts = engine._count_option_legs([
+            {'symbol': 'MSFT260918C00500000', 'qty': '-1'},
+            {'symbol': 'GOOGL260918P00180000', 'qty': '-1'},
+        ])
+
+        assert counts == {
+            'MSFT': {'puts': 0, 'calls': 1, 'unclassified': 0},
+            'GOOGL': {'puts': 1, 'calls': 0, 'unclassified': 0},
+        }
+
+    # -- test 3: adjusted contracts are counted, never guessed --------------- #
+
+    def test_an_adjusted_symbol_lands_in_unclassified_with_one_warning(self):
+        """`AAPL1…` (post-split adjusted root) is not a strict OCC contract.
+
+        It must not be dropped (the position would vanish from the diff, which
+        reads as an assignment that did not happen) and must not be guessed
+        into a leg (which fabricates one).
+        """
+        engine, _ = self._engine([])
+        adjusted = 'AAPL1260918C00230000'
+
+        with patch.object(wheel_engine_module, 'logger') as log:
+            counts = engine._count_option_legs([
+                {'symbol': adjusted, 'qty': '-1'},
+            ])
+
+        assert counts['AAPL']['unclassified'] == 1
+        assert counts['AAPL']['puts'] == 0
+        assert counts['AAPL']['calls'] == 0
+
+        warnings = [c.kwargs for c in log.warning.call_args_list
+                    if c.kwargs.get('event_type')
+                    == 'reconcile_unclassifiable_option']
+        assert len(warnings) == 1, log.warning.call_args_list
+        assert warnings[0]['symbol'] == adjusted
+        assert warnings[0]['underlying'] == 'AAPL'
+
+    def test_the_unclassifiable_warning_fires_once_per_symbol_per_run(self):
+        """Two legs of the same adjusted contract: one warning, count of 2."""
+        engine, _ = self._engine([])
+        adjusted = 'AAPL1260918C00230000'
+
+        with patch.object(wheel_engine_module, 'logger') as log:
+            counts = engine._count_option_legs([
+                {'symbol': adjusted, 'qty': '-1'},
+                {'symbol': adjusted, 'qty': '-1'},
+            ])
+
+        assert counts['AAPL']['unclassified'] == 2
+        warnings = [c.kwargs for c in log.warning.call_args_list
+                    if c.kwargs.get('event_type')
+                    == 'reconcile_unclassifiable_option']
+        assert len(warnings) == 1
+
+    def test_the_untracked_position_events_carry_the_unclassified_count(self):
+        """FC-079 review fix (G5). `untracked_position_found` and its
+        `reconciliation_untracked_position` twin are the only telemetry that
+        carries the leg counts. Without `unclassified`, a symbol whose legs did
+        not classify reads as `puts=0 calls=0` — identical to a bare equity
+        holding, on exactly the positions where the operator needs to know the
+        engine abstained.
+        """
+        engine, _state = self._engine([
+            {'symbol': 'AAPL', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '23000', 'current_price': '232.0'},
+            {'symbol': 'AAPL1260918C00230000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ])
+
+        system_events = []
+        with patch.object(wheel_engine_module, 'logger') as log, \
+             patch('src.strategy.wheel_engine.log_system_event',
+                   side_effect=lambda logger, **kw: system_events.append(kw)):
+            stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+
+        found = [c.kwargs for c in log.warning.call_args_list
+                 if c.kwargs.get('event_type') == 'untracked_position_found']
+        assert len(found) == 1, log.warning.call_args_list
+        assert found[0]['symbol'] == 'AAPL'
+        assert (found[0]['puts'], found[0]['calls']) == (0, 0)
+        assert found[0]['unclassified'] == 1
+
+        twin = [e for e in system_events
+                if e.get('event_type') == 'reconciliation_untracked_position']
+        assert len(twin) == 1, system_events
+        assert twin[0]['unclassified'] == 1
+
+    def test_an_adjusted_symbol_does_not_break_reconciliation(self):
+        """No exception, and the pass still completes."""
+        engine, state = self._engine([
+            {'symbol': 'AAPL', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '23000', 'current_price': '232.0'},
+            {'symbol': 'AAPL1260918C00230000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ])
+
+        stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+        # Neither leg was credited — the adjusted contract is not a known leg.
+        assert state.symbol_states['AAPL']['active_calls'] == 0
+        assert state.symbol_states['AAPL']['active_puts'] == 0
+        assert state.symbol_states['AAPL']['stock_shares'] == 100
+
+
+class TestCallAwayStrikeEstimate:
+    """Test 4: the strike read on the SELLING_CALLS -> complete transition.
+
+    NOTE ON THE PLAN. `docs/plans/fc-079.md` §Context says this site misfires
+    "for `PFE` — that is any PFE option". That is wrong, and it was checked
+    against the tree rather than taken on trust: the pre-fix predicate is
+    `'C' in opt_sym`, and **PFE contains no C** — nor does any other root in
+    either configured universe (AAPL/SPY/PFE are the `'P'` roots, which is what
+    breaks the *counting* loop, a separate site). So on today's config this
+    site is a LATENT defect, not a live one, and a PFE test cannot demonstrate
+    it. What does: any root containing a C. `CVX` below stands in for the day
+    someone adds one — the whole point of the FC-041/043/045/048/052/054
+    family is that this class of bug arrives with a config change, silently.
+    The PFE case is pinned too, as the unaffected control.
+    """
+
+    def _engine(self, positions, state):
+        config = Mock(spec=Config)
+        alpaca = Mock()
+        alpaca.get_account_activities.return_value = []
+        alpaca.get_positions.return_value = positions
+
+        wheel_state = Mock()
+        wheel_state.symbol_states = state
+        wheel_state.get_position_summary.side_effect = lambda sym: {
+            'symbol': sym,
+            'stock_shares': state.get(sym, {}).get('stock_shares', 0),
+            'stock_cost_basis': state.get(sym, {}).get('stock_cost_basis', 0),
+            'active_puts': state.get(sym, {}).get('active_puts', 0),
+            'active_calls': state.get(sym, {}).get('active_calls', 0),
+        }
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca,
+                                 wheel_state=wheel_state)
+        return engine, wheel_state
+
+    def _called_away(self, root, extra_positions, price):
+        positions = [
+            {'symbol': root, 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '10000', 'current_price': price},
+        ] + extra_positions
+        state = {root: {'stock_shares': 200, 'stock_cost_basis': 100.0,
+                        'active_puts': 1, 'active_calls': 2}}
+        engine, wheel_state = self._engine(positions, state)
+        with patch('src.strategy.wheel_engine.log_trade_event'):
+            stats = engine.reconcile_positions()
+        assert 'error' not in stats, stats
+        wheel_state.handle_call_assignment.assert_called_once()
+        return wheel_state.handle_call_assignment.call_args.kwargs
+
+    def test_a_c_bearing_root_reads_the_strike_off_the_call_not_the_put(self):
+        """Pre-fix this returns 150.0 — the PUT's strike.
+
+        `'C' in 'CVX260918P00150000'` is true (the root supplies the C), so the
+        pre-fix loop stopped on the first CVX contract it saw and sliced its
+        last eight digits. The put is listed first here deliberately: Alpaca
+        promises no ordering, so pre-fix the answer depended on it.
+        """
+        kwargs = self._called_away('CVX', [
+            {'symbol': 'CVX260918P00150000', 'qty': '-1',
+             'asset_class': 'us_option'},
+            {'symbol': 'CVX260918C00160000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ], price='155.0')
+
+        assert kwargs['symbol'] == 'CVX'
+        assert kwargs['strike_price'] == 160.0
+
+    def test_pfe_the_unaffected_control_is_unchanged(self):
+        """PFE has no C, so this site was already correct for it. Pinned so a
+        future 'simplification' cannot regress the roots that did work."""
+        kwargs = self._called_away('PFE', [
+            {'symbol': 'PFE260918P00025000', 'qty': '-1',
+             'asset_class': 'us_option'},
+            {'symbol': 'PFE260918C00030000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ], price='29.0')
+
+        assert kwargs['strike_price'] == 30.0
+
+    def test_an_adjusted_leg_falls_through_to_the_price_estimate(self):
+        """Unclassifiable => skipped, not guessed; the fallback takes over."""
+        positions = [
+            {'symbol': 'PFE', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '2800', 'current_price': '29.5'},
+            {'symbol': 'PFE1260918C00030000', 'qty': '-1',
+             'asset_class': 'us_option'},
+        ]
+        state = {'PFE': {'stock_shares': 200, 'stock_cost_basis': 28.0,
+                         'active_puts': 0, 'active_calls': 2}}
+        engine, wheel_state = self._engine(positions, state)
+
+        with patch('src.strategy.wheel_engine.log_trade_event'):
+            stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+        kwargs = wheel_state.handle_call_assignment.call_args.kwargs
+        assert kwargs['strike_price'] == 29.5   # current_price fallback
+
+
+class TestPositionDiffCallAssignmentOnAffectedRoots:
+    """Test 5: the S2 position-diff branch, re-run on AAPL instead of MSFT.
+
+    `TestReconcileCallAssignmentAfterWheelCyclesRemoval` above pins this branch
+    on MSFT — a root with no P and no C, so it passed throughout the bug's
+    life. On AAPL the identical scenario could not fire at all pre-fix: the
+    surviving call counted as a put, so `tracked_calls > actual_calls` was
+    false and the branch never ran. The MSFT class is deliberately left in
+    place; this is the same contract on an affected root.
+    """
+
+    ASSIGNED_CALL = 'AAPL260918C00230000'   # AAPL, call, strike 230.0
+
+    def _diff_engine(self):
+        config = Mock(spec=Config)
+        alpaca = Mock()
+        alpaca.get_account_activities.return_value = []
+        alpaca.get_positions.return_value = [
+            {'symbol': 'AAPL', 'qty': '100', 'asset_class': 'us_equity'},
+            {'symbol': self.ASSIGNED_CALL, 'qty': '-1',
+             'asset_class': 'us_option'},
+        ]
+
+        state = {'AAPL': {'stock_shares': 200, 'stock_cost_basis': 220.0,
+                          'active_puts': 0, 'active_calls': 2}}
+        wheel_state = Mock()
+        wheel_state.symbol_states = state
+        wheel_state.get_position_summary.side_effect = lambda sym: {
+            'symbol': sym,
+            'stock_shares': state.get(sym, {}).get('stock_shares', 0),
+            'stock_cost_basis': state.get(sym, {}).get('stock_cost_basis', 0),
+            'active_puts': state.get(sym, {}).get('active_puts', 0),
+            'active_calls': state.get(sym, {}).get('active_calls', 0),
+        }
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca,
+                                 wheel_state=wheel_state)
+        return engine, wheel_state
+
+    def test_position_diff_branch_fires_on_aapl(self):
+        engine, wheel_state = self._diff_engine()
+
+        events = []
+        with patch('src.strategy.wheel_engine.log_trade_event',
+                   side_effect=lambda logger, **kw: events.append(kw)):
+            stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+        assert stats['call_assignments_detected'] == 1
+        wheel_state.handle_call_assignment.assert_called_once()
+        kwargs = wheel_state.handle_call_assignment.call_args.kwargs
+        assert kwargs['symbol'] == 'AAPL'
+        assert kwargs['shares'] == 100
+        assert kwargs['strike_price'] == 230.0
+
+        detected = [e for e in events
+                    if e.get('event_type') == 'call_assignment_detected']
+        assert len(detected) == 1
+        assert detected[0]['contracts'] == 1
+        assert wheel_state.symbol_states['AAPL']['active_calls'] == 1

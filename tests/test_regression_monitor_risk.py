@@ -467,3 +467,116 @@ def test_healthy_account_produces_no_failures(monkeypatch):
     for name in ("risk_duplicate_underlying", "risk_max_position_size",
                  "risk_naked_call", "risk_cost_basis_protection"):
         assert res[name].status == "pass", f"{name}: {res[name].message}"
+
+
+# ---------------------------------------------------------------------------
+# FC-079 — `reconcile_orphaned` (check group 4, not the risk group above)
+#
+# The check asked `"C" in symbol` and rooted the contract with a bare
+# `^([A-Z]+)` match. Both are substring reasoning over an OCC symbol: a put on
+# a root containing a C is read as a call and warned as an orphan (a short put
+# holds no shares by design — that is the whole strategy), and an adjusted root
+# is mis-rooted rather than surfaced.
+#
+# NOTE ON THE PLAN. `docs/plans/fc-079.md` §Context says this "treats PFE…P…
+# puts as calls". Checked against the tree: **PFE contains no C**, so PFE puts
+# were never mis-read here, and no root in either configured universe contains
+# a C today. On current config this is a LATENT defect that arrives with a
+# config change — which is precisely the recurrence pattern of the
+# FC-041/043/045/048/052/054 family. `CVX` below is the affected shape; PFE is
+# kept as the unaffected control.
+#
+# Plan: docs/plans/fc-079.md
+# ---------------------------------------------------------------------------
+
+class TestReconcileOrphaned:
+
+    ADJUSTED = "AAPL1260821C00250000"
+
+    def _run(self, monkeypatch, positions):
+        """Drive check_position_reconciliation, keyed by check name.
+
+        Both sides of the comparison get the same list, so `reconcile_positions`
+        always passes and only the orphan scan is under test.
+        """
+        monitor = RegressionMonitor(service_url="http://test", api_key="k")
+
+        def fake_get(path, timeout=30):
+            assert path == "/positions", path
+            return _Resp({"positions": positions})
+
+        monkeypatch.setattr(monitor, "_get", fake_get)
+
+        class _FakeClient:
+            def __init__(self, config):
+                pass
+
+            def get_positions(self_inner):
+                return positions
+
+        monkeypatch.setattr("src.utils.config.Config", lambda *a, **k: object())
+        monkeypatch.setattr("src.api.alpaca_client.AlpacaClient", _FakeClient)
+
+        return {r.name: r for r in monitor.check_position_reconciliation()}
+
+    # -- puts are never orphans ------------------------------------------- #
+
+    def test_a_pfe_put_with_no_pfe_stock_passes(self, monkeypatch):
+        """A short put holds no shares by design. The control case."""
+        res = self._run(monkeypatch, [_option("PFE260821P00025000", -1)])
+        assert res["reconcile_orphaned"].status == "pass"
+
+    def test_a_c_bearing_root_put_with_no_stock_passes(self, monkeypatch):
+        """Pre-fix this warned: `"C" in "CVX260821P00150000"` is true."""
+        res = self._run(monkeypatch, [_option("CVX260821P00150000", -1)])
+        assert res["reconcile_orphaned"].status == "pass", (
+            res["reconcile_orphaned"].message)
+
+    # -- calls without shares still warn ----------------------------------- #
+
+    def test_a_pfe_call_with_no_stock_warns(self, monkeypatch):
+        res = self._run(monkeypatch, [_option("PFE260821C00030000", -1)])
+        r = res["reconcile_orphaned"]
+        assert r.status == "warn"
+        assert "PFE260821C00030000" in r.details["orphaned_symbols"]
+
+    def test_a_call_with_its_shares_present_passes(self, monkeypatch):
+        res = self._run(monkeypatch, [
+            _stock("PFE", 100, 28.0, 2_900.0),
+            _option("PFE260821C00030000", -1),
+        ])
+        assert res["reconcile_orphaned"].status == "pass"
+
+    def test_the_root_comes_from_the_parser_not_a_letter_prefix(self, monkeypatch):
+        """`^([A-Z]+)` and the parser agree on plain roots; pin that the check
+        keys off the underlying it actually holds shares in."""
+        res = self._run(monkeypatch, [
+            _stock("GOOGL", 100, 180.0, 18_000.0),
+            _option("GOOGL260821C00200000", -1),
+            _option("AAPL260821C00250000", -1),     # no AAPL shares
+        ])
+        r = res["reconcile_orphaned"]
+        assert r.status == "warn"
+        assert r.details["orphaned_symbols"] == ["AAPL260821C00250000"]
+
+    # -- adjusted contracts are surfaced, not guessed ---------------------- #
+
+    def test_an_adjusted_symbol_is_listed_under_unclassifiable(self, monkeypatch):
+        res = self._run(monkeypatch, [
+            _option(self.ADJUSTED, -1),
+            _option("AAPL260821C00250000", -1),     # a real orphan, to warn
+        ])
+        r = res["reconcile_orphaned"]
+        assert r.status == "warn"
+        assert r.details["unclassifiable"] == [self.ADJUSTED]
+        # It is NOT counted as an orphan — the check cannot know its deliverable.
+        assert r.details["orphaned_symbols"] == ["AAPL260821C00250000"]
+
+    def test_an_adjusted_symbol_alone_does_not_flip_the_status(self, monkeypatch):
+        """`risk_unclassifiable_option` already alerts on these. A second alarm
+        for the same fact is how an alarm layer gets muted — but the symbol is
+        still carried in details so the operator sees it here too."""
+        res = self._run(monkeypatch, [_option(self.ADJUSTED, -1)])
+        r = res["reconcile_orphaned"]
+        assert r.status == "pass"
+        assert r.details["unclassifiable"] == [self.ADJUSTED]
