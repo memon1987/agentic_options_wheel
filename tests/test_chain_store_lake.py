@@ -32,7 +32,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 import structlog
-from google.api_core.exceptions import NotFound, PreconditionFailed
+from google.api_core.exceptions import Forbidden, NotFound, PreconditionFailed
 
 from src.backtesting.data import chain_store as chain_store_module
 from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
@@ -41,6 +41,7 @@ from src.backtesting.data.chain_store import (
     MAX_CONSECUTIVE_LAKE_ERRORS,
     ChainLake,
     ChainLakePreconditionFailed,
+    ChainLakeUnavailable,
     ChainStore,
 )
 
@@ -68,6 +69,9 @@ class FakeLake(ChainLake):
         return [c[0] for c in self.calls]
 
     def _record(self, op, underlying, as_of):
+        # The real class refuses at `_bucket`; the fake never gets there, so it
+        # calls the same inherited guard rather than reimplementing it.
+        self._ensure_usable()
         self.calls.append((op, underlying.upper(), as_of))
         if op in self.raise_on:
             raise RuntimeError(f"fake lake failure on {op}")
@@ -167,11 +171,11 @@ class FakeBlob:
 
 
 class FakeBucket:
-    def __init__(self, name, present=True, exists_raises=None,
+    def __init__(self, name, present=True, list_raises=None,
                  download_raises=None):
         self.name = name
         self.present = present
-        self.exists_raises = exists_raises
+        self.list_raises = list_raises
         self.download_raises = download_raises
         self.objects = {}
         self.calls = []
@@ -182,10 +186,13 @@ class FakeBucket:
         return self._gen
 
     def exists(self, **kwargs):
+        # `Bucket.exists()` is GET /b/<bucket> and needs storage.buckets.get,
+        # which roles/storage.objectAdmin does NOT grant. Under the IAM this
+        # lake is designed to run with, calling it is a 403 — so the fake makes
+        # it one, and any code path that reaches for it fails loudly here
+        # instead of silently disabling the lake in production.
         self.calls.append(("bucket_exists", self.name))
-        if self.exists_raises is not None:
-            raise self.exists_raises
-        return self.present
+        raise Forbidden("storage.buckets.get denied on " + self.name)
 
     def blob(self, name):
         return FakeBlob(self, name)
@@ -209,6 +216,16 @@ class FakeClient:
     def bucket(self, name):
         self.bucket_calls += 1
         return self._bucket
+
+    def list_blobs(self, bucket, prefix=None, max_results=None, **kwargs):
+        """The startup probe: storage.objects.list, which objectAdmin grants."""
+        bucket.calls.append(("list_blobs", prefix))
+        if bucket.list_raises is not None:
+            raise bucket.list_raises
+        if not bucket.present:
+            raise NotFound(bucket.name)
+        names = [n for n in bucket.objects if prefix is None or n.startswith(prefix)]
+        return iter(names[: max_results or len(names)])
 
 
 # --------------------------------------------------------------------------- #
@@ -482,9 +499,37 @@ class TestOverwriteIsCoverageMonotone:
         store = ChainStore(str(tmp_path), lake=lake)
         store.put(_snapshot(), **WIDE)
         assert store.lake_puts == 0 and store.lake_skipped == 1
-        assert _events(captured_events, "chain_lake_overwrite_skipped")[0][
-            "reason"] == "remote_provenance_unknown"
+        assert store.lake_skipped_unreadable_remote == 1, (
+            "a poisoned object is a different operational problem from a "
+            "benign narrowing and must be countable on its own"
+        )
+        event = _events(captured_events, "chain_lake_overwrite_skipped")[0]
+        assert event["reason"] == "remote_provenance_unknown"
+        assert "--force" in event["remedy"], "the log must name the escape hatch"
         assert lake.bytes_of("XYZ", AS_OF) == b"not a parquet at all"
+
+    def test_an_unreadable_remote_is_probed_once_not_once_per_put(self, tmp_path):
+        """Otherwise a poisoned object costs a stat + a download on every put."""
+        lake = FakeLake()
+        lake.put_object("XYZ", AS_OF, b"not a parquet at all")
+        store = ChainStore(str(tmp_path), lake=lake)
+
+        store.put(_snapshot(), **WIDE)
+        after_first = list(lake.ops())
+        for _ in range(4):
+            store.put(_snapshot(), **WIDE)
+
+        assert lake.ops() == after_first, "the refusal must be remembered"
+        assert store.lake_skipped == 5
+        assert store.lake_skipped_unreadable_remote == 5
+
+    def test_a_benign_narrowing_does_not_count_as_unreadable(self, tmp_path):
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, WIDE)
+        store = ChainStore(str(tmp_path / "n"), lake=lake)
+        store.put(_snapshot(), **NARROW)
+        assert store.lake_skipped == 1
+        assert store.lake_skipped_unreadable_remote == 0
 
     def test_a_generation_race_skips_rather_than_clobbers(self, tmp_path):
         """Someone else wrote between our check and our upload."""
@@ -725,6 +770,53 @@ class TestCircuitBreaker:
         assert len(lake.calls) == calls, "a disabled lake is never called again"
         assert store.lake_puts == 0
 
+    def test_the_client_failure_latch_is_sticky_on_its_own(self, monkeypatch):
+        """Pinned independently of `disabled`, which is a second, outer gate.
+
+        Removing `self._client_failed = True` leaves the store's `_lake_active`
+        check still suppressing calls, so a store-level test cannot see the
+        regression. This one talks to the lake directly and clears `disabled`
+        first, so the latch is the only thing that can stop a second ADC
+        attempt.
+        """
+        built = []
+
+        def _boom():
+            built.append(1)
+            raise RuntimeError("could not determine default credentials")
+
+        monkeypatch.setattr(chain_store_module, "_storage_client", _boom)
+        lake = ChainLake("some-bucket")
+
+        with pytest.raises(ChainLakeUnavailable):
+            lake.stat("XYZ", AS_OF)
+        assert lake._client_failed is True
+
+        # Pretend the outer gate was never set: only the latch is left.
+        lake.disabled, lake.disabled_reason = False, None
+        with pytest.raises(ChainLakeUnavailable) as exc:
+            lake.stat("XYZ", AS_OF)
+        assert exc.value.reason == "credentials"
+        assert len(built) == 1, "a second ADC attempt means the latch is gone"
+
+    def test_a_disabled_lake_refuses_direct_callers_too(self, tmp_path,
+                                                        monkeypatch):
+        """The seed tool has no ChainStore in front of it to check the flag."""
+        bucket = FakeBucket("b")
+        monkeypatch.setattr(chain_store_module, "_storage_client",
+                            lambda: FakeClient(bucket))
+        lake = ChainLake("b")
+        lake.disable("consecutive_errors")
+
+        for op in (
+            lambda: lake.stat("XYZ", AS_OF),
+            lambda: lake.download("XYZ", AS_OF, tmp_path / "x.parquet"),
+            lambda: lake.upload(tmp_path / "x", "XYZ", AS_OF, if_generation_match=0),
+        ):
+            with pytest.raises(ChainLakeUnavailable):
+                op()
+        assert bucket.calls == [], "a disabled lake issues no RPCs at all"
+
     def test_a_failing_client_factory_is_called_exactly_once(self, tmp_path,
                                                              monkeypatch):
         """No credential appears mid-run; retrying ADC 5,400 times is pure latency."""
@@ -757,11 +849,49 @@ class TestRealLakeAgainstAFakeClient:
         monkeypatch.setattr(chain_store_module, "_storage_client", lambda: client)
         return client
 
+    def test_the_startup_probe_never_calls_bucket_exists(self, tmp_path,
+                                                         monkeypatch):
+        """`Bucket.exists()` needs storage.buckets.get, which objectAdmin lacks.
+
+        The planned grant for the Job's SA and for claude-operator is
+        `roles/storage.objectAdmin` — objects only. A bucket-level health check
+        would 403 on the first call of EVERY run and disable the lake
+        permanently, i.e. the feature would never once work in production. The
+        fake bucket raises Forbidden from `exists()` precisely so that any
+        return to that pattern fails here.
+        """
+        bucket = FakeBucket("b")
+        self._wire(monkeypatch, bucket)
+        store = ChainStore(str(tmp_path), lake=ChainLake("b"))
+
+        store.put(_snapshot(), **WIDE)
+        assert store.lake_puts == 1
+        assert store.get("XYZ", AS_OF, universe_dte=7, underlying_price=100.0,
+                         model="m1") is not None
+
+        ops = [c[0] for c in bucket.calls]
+        assert "bucket_exists" not in ops, (
+            "the whole flow must work under object-scoped permissions alone"
+        )
+        assert ops.count("list_blobs") == 1, "probe once, at startup"
+
+    def test_an_empty_bucket_is_a_healthy_lake_not_a_dead_one(self, tmp_path,
+                                                              monkeypatch):
+        """Day one, before the seed runs: zero objects, everything still works."""
+        bucket = FakeBucket("b")
+        self._wire(monkeypatch, bucket)
+        lake = ChainLake("b")
+        store = ChainStore(str(tmp_path), lake=lake)
+
+        assert store.get("XYZ", AS_OF) is None
+        assert not lake.disabled
+        assert store.lake_misses == 1, "an empty lake misses; it does not disable"
+
     def test_a_missing_bucket_disables_the_lake_loudly(
         self, tmp_path, monkeypatch, captured_events
     ):
         """A typo'd bucket must not read as 'the lake is simply empty'."""
-        bucket = FakeBucket("typo-bucket", present=False)
+        bucket = FakeBucket("typo-bucket", present=False)  # list -> NotFound
         self._wire(monkeypatch, bucket)
         lake = ChainLake("typo-bucket")
         store = ChainStore(str(tmp_path), lake=lake)
@@ -773,15 +903,25 @@ class TestRealLakeAgainstAFakeClient:
         assert [c for c in bucket.calls if c[0] == "download"] == []
 
         store.get("XYZ", AS_OF)
-        assert len([c for c in bucket.calls if c[0] == "bucket_exists"]) == 1
+        assert len([c for c in bucket.calls if c[0] == "list_blobs"]) == 1
 
     def test_an_unreachable_bucket_disables_the_lake(self, tmp_path, monkeypatch):
-        bucket = FakeBucket("b", exists_raises=RuntimeError("network down"))
+        bucket = FakeBucket("b", list_raises=RuntimeError("network down"))
         self._wire(monkeypatch, bucket)
         lake = ChainLake("b")
         store = ChainStore(str(tmp_path), lake=lake)
         assert store.get("XYZ", AS_OF) is None
         assert lake.disabled and lake.disabled_reason == "bucket_unreachable"
+
+    def test_a_permission_error_on_the_probe_is_unreachable_not_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """403 != 404. Both disable, but the reason is what an operator acts on."""
+        bucket = FakeBucket("b", list_raises=Forbidden("storage.objects.list denied"))
+        self._wire(monkeypatch, bucket)
+        lake = ChainLake("b")
+        assert ChainStore(str(tmp_path), lake=lake).get("XYZ", AS_OF) is None
+        assert lake.disabled_reason == "bucket_unreachable"
 
     def test_not_found_is_a_miss_and_not_an_error(self, tmp_path, monkeypatch):
         bucket = FakeBucket("b")
@@ -790,8 +930,8 @@ class TestRealLakeAgainstAFakeClient:
 
         assert store.get("XYZ", AS_OF) is None
         assert store.lake_misses == 1 and store.lake_errors == 0
-        assert [c[0] for c in bucket.calls] == ["bucket_exists", "download"], (
-            "one RPC for a miss: no exists() probe before the download"
+        assert [c[0] for c in bucket.calls] == ["list_blobs", "download"], (
+            "the startup probe, then one RPC for the miss — no exists() probe"
         )
 
     def test_a_download_that_fails_midway_leaves_nothing_behind(
@@ -989,6 +1129,28 @@ class TestSeedTool:
         seed(root, lake)
         assert list(lake.objects) == ["chains/v1/XYZ/2025-01-06.parquet"]
 
+    def test_an_unusable_lake_aborts_instead_of_failing_every_file(self, tmp_path):
+        """One diagnosis beats 5,400 identical failures."""
+        from tools.diagnostics.chain_lake_seed import seed
+
+        root = self._cache_with(tmp_path)
+        lake = FakeLake()
+        lake.disable("credentials")
+
+        with pytest.raises(ChainLakeUnavailable):
+            seed(root, lake)
+
+    def test_main_reports_an_unusable_lake_as_exit_2(self, tmp_path, monkeypatch):
+        from tools.diagnostics import chain_lake_seed as tool
+
+        root = self._cache_with(tmp_path, days=(6,))
+
+        def _dead(*_a, **_k):
+            raise ChainLakeUnavailable("bucket_missing", "no such bucket")
+
+        monkeypatch.setattr(tool, "seed", _dead)
+        assert tool.main(["--cache-dir", str(root), "--bucket", "b"]) == 2
+
     def test_missing_cache_dir_is_a_clean_exit_not_a_traceback(self, tmp_path):
         from tools.diagnostics.chain_lake_seed import main
 
@@ -1095,8 +1257,8 @@ class TestWiring:
         assert set(summary) == {
             "lake_enabled", "lake_bucket", "lake_prefix",
             "lake_hits", "lake_misses", "lake_rejected",
-            "lake_puts", "lake_skipped", "lake_errors",
-            "lake_disabled", "lake_disabled_reason",
+            "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
+            "lake_errors", "lake_disabled", "lake_disabled_reason",
         }
         assert "symbol" not in summary, "must not collide with the log's symbol key"
 

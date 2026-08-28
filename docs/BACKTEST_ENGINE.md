@@ -263,6 +263,7 @@ cache, and `ChainStore` uses it write-through:
 | | |
 |---|---|
 | Bucket | `gs://options-wheel-chain-lake` (operator-provisioned; versioning on) |
+| IAM | **`roles/storage.objectAdmin` on the bucket, and nothing bucket-level.** The lake only lists, reads and writes *objects* — including its startup health probe, which lists one object rather than calling `Bucket.exists()` (that is `storage.buckets.get`, which objectAdmin does **not** grant; using it would 403 and disable the lake on the first call of every run). Do not widen IAM to make a health check work. |
 | Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, same bytes |
 | Env | `CHAIN_LAKE_BUCKET` (unset ⇒ **no lake, no GCS client, behaviour identical to before**), `CHAIN_LAKE_PREFIX` (default `chains/v1`) |
 | Read by | `ChainStore.from_env()` — the Job (`screen.py`, which builds **one** lake for the whole run), `main.py --command backtest` via `evaluate_symbol`, and the `fc034` / `fc036` diagnostics. A `ChainStore()` constructed directly anywhere else bypasses the lake by design. |
@@ -296,7 +297,11 @@ cache, and `ChainStore` uses it write-through:
   timeout and a 60s retry deadline. Five consecutive failures — or a credentials failure, or
   a bucket that is missing/unreachable on the one-time startup probe — switch the lake off
   for the rest of the run (`chain_lake_disabled` / `chain_lake_unavailable`), so an outage
-  costs the run once rather than 5,400 times.
+  costs the run once rather than 5,400 times. The disable is sticky and one-way: every later
+  operation refuses without an RPC, direct callers (the seed tool) included.
+- **The startup probe lists one object.** A missing bucket surfaces as `NotFound`
+  (`bucket_missing`); anything else — 403, DNS, TLS, timeout — is `bucket_unreachable`; zero
+  objects is a healthy *empty* lake, which is the day-one state before the seed runs.
 - **Measure it from the logs.** Each symbol emits one `chain_lake_summary`; the run emits
   one `chain_lake_run_summary` with the totals, plus a `chain_lake_degraded` **warning** if
   anything errored or the lake was disabled. The failure mode of this feature is silence —
@@ -308,7 +313,8 @@ cache, and `ChainStore` uses it write-through:
 | `lake_misses` | object absent |
 | `lake_rejected` | downloaded, then failed the coverage check (should be rare; persistent non-zero means the window is thrashing) |
 | `lake_puts` | object written |
-| `lake_skipped` | upload declined — would have narrowed coverage, or lost a generation race |
+| `lake_skipped` | upload declined, all reasons — would have narrowed coverage, changed model, or lost a generation race |
+| `lake_skipped_unreadable_remote` | **subset of `lake_skipped`**: the existing object's provenance could not be read, so coverage could not be compared. The other skips are the guard working; this one is a poisoned object that only `chain_lake_seed.py --force` will clear |
 | `lake_errors` | operation failed; the run continued local-only |
 
 - **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.

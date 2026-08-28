@@ -248,9 +248,13 @@ class ChainLake:
     one store per symbol over a single shared lake, and a dead bucket must be
     discovered once for the run rather than fourteen times.
 
-    Operations are allowed to raise. Failure *policy* lives in ``ChainStore``,
-    which counts and logs and continues local-only — one place, so no call site
-    can accidentally make a lake outage fatal.
+    Operations are allowed to raise, and *how a failure is absorbed* is
+    ``ChainStore``'s job — it counts, logs and continues local-only, in one
+    place, so no call site can accidentally make a lake outage fatal. What this
+    class does own is *availability*: once disabled, every operation refuses
+    immediately with ``ChainLakeUnavailable`` rather than issuing an RPC. That
+    matters for direct callers such as the seed tool, which have no
+    ``ChainStore`` in front of them to check the flag.
 
     There is deliberately **no delete**. An unreadable local file is a
     reader-side event (``pyarrow`` version skew, ``MemoryError``, a hit
@@ -284,7 +288,14 @@ class ChainLake:
 
     # ------------------------------ availability ------------------------- #
     def disable(self, reason: str) -> None:
-        """Switch the lake off for the rest of its life. Logs exactly once."""
+        """Switch the lake off for the rest of its life. Logs exactly once.
+
+        Sticky and one-way: every subsequent ``stat``/``download``/``upload``
+        raises ``ChainLakeUnavailable`` without an RPC (see ``_bucket``). There
+        is no re-enable — a lake that failed its probe or burned through the
+        error budget does not recover inside one process, and retrying it is
+        the latency this exists to avoid.
+        """
         if self.disabled:
             return
         self.disabled = True
@@ -312,11 +323,15 @@ class ChainLake:
         return f"{self.prefix}/{underlying.upper()}/{as_of.isoformat()}.parquet"
 
     def _bucket(self):
-        """Client + one-time bucket probe. Raises ChainLakeUnavailable if dead."""
-        if self._client_failed:
-            raise ChainLakeUnavailable(
-                "credentials", "GCS client construction already failed"
-            )
+        """Client + one-time startup probe. Raises ChainLakeUnavailable if dead.
+
+        Sticky in both directions: a lake that has been disabled, or whose
+        client construction has already failed, refuses every operation from
+        here on. That guard lives at this chokepoint rather than in each method
+        so a direct caller (the seed tool) gets the same protection the store's
+        ``_lake_active`` gate gives the engine.
+        """
+        self._ensure_usable()
         if self._client is None:
             try:
                 self._client = _storage_client()
@@ -331,13 +346,63 @@ class ChainLake:
         bucket = self._client.bucket(self.bucket_name)
         if not self._probed:
             self._probed = True
-            try:
-                present = bucket.exists(timeout=LAKE_TIMEOUT_S, retry=_retry())
-            except Exception as exc:
-                self._unavailable("bucket_unreachable", str(exc))
-            if not present:
-                self._unavailable("bucket_missing", "bucket does not exist")
+            self._probe(bucket)
         return bucket
+
+    def _ensure_usable(self) -> None:
+        """Refuse, without an RPC, once this lake is known to be unusable.
+
+        Both latches are one-way. ``disabled`` is set by the probe, by a
+        credentials failure or by the error budget; ``_client_failed`` is set
+        only by the former and is checked separately so that it survives even
+        if something clears ``disabled`` — they are independent guards on
+        purpose, because the store's own ``_lake_active`` check is a third and
+        a direct caller (the seed tool) has neither.
+        """
+        if self.disabled:
+            raise ChainLakeUnavailable(
+                self.disabled_reason or "disabled",
+                f"chain lake is disabled ({self.disabled_reason})",
+            )
+        if self._client_failed:
+            raise ChainLakeUnavailable(
+                "credentials", "GCS client construction already failed"
+            )
+
+    def _probe(self, bucket) -> None:
+        """One object-scoped RPC to prove the lake is actually reachable.
+
+        **Deliberately not ``bucket.exists()``.** That is ``GET /b/<bucket>``
+        and needs ``storage.buckets.get``, which ``roles/storage.objectAdmin``
+        — the grant the Job's service account and ``claude-operator`` get —
+        does NOT carry. The probe would 403 on the first call of every run and
+        disable the lake permanently. Listing one object needs only
+        ``storage.objects.list``, which objectAdmin does carry, so this asks
+        the same question ("can I reach this bucket?") within the permissions
+        the lake is meant to run under. Widening IAM to make a health check
+        work would be the wrong fix.
+
+        A missing bucket surfaces as ``NotFound`` from the list; anything else
+        (403, DNS, TLS, timeout) is ``bucket_unreachable``. Zero objects is a
+        healthy *empty* lake — the day-one state before the seed runs.
+        """
+        try:
+            next(
+                iter(
+                    self._client.list_blobs(
+                        bucket,
+                        prefix=f"{self.prefix}/",
+                        max_results=1,
+                        timeout=LAKE_TIMEOUT_S,
+                        retry=_retry(),
+                    )
+                ),
+                None,
+            )
+        except _not_found():
+            self._unavailable("bucket_missing", "bucket does not exist")
+        except Exception as exc:
+            self._unavailable("bucket_unreachable", f"{type(exc).__name__}: {exc}")
 
     def _unavailable(self, reason: str, detail: str):
         logger.error(
@@ -499,11 +564,19 @@ def _unknown_pair(new: float, old: float) -> bool:
 
 @dataclass
 class _RemoteState:
-    """What this store last learned about one object in the lake."""
+    """What this store last learned about one object in the lake.
+
+    ``probed`` records that a full metadata+download probe has already been
+    paid for this key. Without it, an object whose provenance cannot be read
+    (an unreadable remote parquet — the one case nothing in this module will
+    overwrite) would be re-stat'd and re-downloaded on every single put for the
+    rest of the run, to reach the same refusal every time.
+    """
 
     present: bool
     generation: Optional[int] = None
     window: Optional[_Window] = None
+    probed: bool = False
 
 
 class ChainStore:
@@ -523,7 +596,12 @@ class ChainStore:
         self.lake_misses = 0      # object absent
         self.lake_rejected = 0    # downloaded, then failed the coverage check
         self.lake_puts = 0        # object written
-        self.lake_skipped = 0     # upload declined (would narrow, or lost a race)
+        self.lake_skipped = 0     # upload declined (all reasons; total)
+        # Subset of lake_skipped: the remote object's provenance could not be
+        # read, so coverage could not be compared. Broken out because the other
+        # skips are the guard working as designed, while this one is a poisoned
+        # object that only `chain_lake_seed.py --force` can clear.
+        self.lake_skipped_unreadable_remote = 0
         self.lake_errors = 0      # operation failed; run continued local-only
         # Remembers what the lake held for a key, so ``put`` can check coverage
         # against the object it is about to replace without re-downloading it.
@@ -564,6 +642,7 @@ class ChainStore:
             "lake_rejected": self.lake_rejected,
             "lake_puts": self.lake_puts,
             "lake_skipped": self.lake_skipped,
+            "lake_skipped_unreadable_remote": self.lake_skipped_unreadable_remote,
             "lake_errors": self.lake_errors,
             "lake_disabled": bool(getattr(self.lake, "disabled", False)),
             "lake_disabled_reason": getattr(self.lake, "disabled_reason", None),
@@ -675,8 +754,16 @@ class ChainStore:
         remote: Optional[_RemoteState]
         if seen is not None and not seen.present:
             remote = None  # we looked this run and it was not there
-        elif seen is not None and seen.window is not None and seen.generation is not None:
-            remote = seen  # downloaded this run; provenance already read
+        elif (
+            seen is not None
+            and seen.generation is not None
+            and (seen.window is not None or seen.probed)
+        ):
+            # Already known this run: either downloaded (provenance read) or
+            # fully probed and found unreadable. Either way, do not pay for it
+            # again — a poisoned object would otherwise cost a stat plus a
+            # download on every put for the rest of the run.
+            remote = seen
         else:
             ok, remote = self._probe_remote(underlying, as_of)
             if not ok:
@@ -687,6 +774,7 @@ class ChainStore:
             if remote.window is None:
                 # Object exists but we could not establish what it covers.
                 # Fail closed: never overwrite what we cannot compare against.
+                self.lake_skipped_unreadable_remote += 1
                 self._skip_overwrite(underlying, as_of, new_window, None,
                                      "remote_provenance_unknown")
                 return
@@ -749,7 +837,8 @@ class ChainStore:
                     # docstring; the seed tool's --force is the escape hatch.
                     window = None
             state = _RemoteState(
-                got is not None, generation=obj.generation, window=window
+                got is not None, generation=obj.generation, window=window,
+                probed=True,
             )
         finally:
             if tmp.exists():
@@ -760,11 +849,19 @@ class ChainStore:
     def _skip_overwrite(self, underlying: str, as_of: date, new: _Window,
                         old: Optional[_Window], reason: str) -> None:
         self.lake_skipped += 1
+        remedy = (
+            "the existing object could not be read, so coverage could not be "
+            "compared; clear it deliberately with "
+            "`tools/diagnostics/chain_lake_seed.py --force`"
+            if reason == "remote_provenance_unknown"
+            else "the existing object covers more than this rebuild does"
+        )
         logger.warning(
             "Chain lake upload skipped: it would not cover the object it replaces",
             event_category="backtest_data",
             event_type="chain_lake_overwrite_skipped",
             reason=reason,
+            remedy=remedy,
             symbol=underlying,
             as_of=as_of.isoformat(),
             bucket=self.lake.bucket_name,
@@ -872,8 +969,11 @@ class ChainStore:
         An unreadable file is treated as a miss and deleted rather than raised:
         it is a corrupt cache entry, and the caller can always rebuild from the
         provider. Propagating the error instead would wedge every future run.
-        When a lake is configured the mirror is deleted too, so the corrupt
-        bytes are not simply re-downloaded on the next run.
+        The deletion is **local only** — the lake object is never touched,
+        because this path cannot tell genuine corruption from a reader-side
+        failure (pyarrow skew, MemoryError, an exhausted fd limit) and must not
+        destroy history on that signal. A rebuild replaces the object through
+        the coverage-guarded mirror path instead.
 
         **With a lake configured**, a local miss first tries to download the
         day's object. The coverage check, the narrowing and the corrupt-file

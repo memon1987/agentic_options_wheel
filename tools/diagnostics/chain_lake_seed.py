@@ -28,7 +28,10 @@ How to re-run
     python tools/diagnostics/chain_lake_seed.py --bucket <b> --force
 
 Needs write access to the bucket (ADC or GOOGLE_APPLICATION_CREDENTIALS) —
-`roles/storage.objectAdmin`.
+`roles/storage.objectAdmin` on the bucket, and nothing bucket-level: the lake
+only ever lists, reads and writes *objects*. If the lake reports itself
+unusable the run aborts immediately (exit 2) rather than reporting one failure
+per file.
 
 Safety
 ------
@@ -74,6 +77,7 @@ from src.backtesting.data.chain_store import (  # noqa: E402
     DEFAULT_CACHE_DIR,
     DEFAULT_LAKE_PREFIX,
     ChainLake,
+    ChainLakeUnavailable,
 )
 
 
@@ -177,6 +181,11 @@ def seed(
                 if_generation_match=(0 if existing is None else existing.generation),
             )
             counts.uploaded += 1
+        except ChainLakeUnavailable:
+            # The lake itself is unusable — bad credentials, wrong bucket, no
+            # permission. Every remaining file would fail identically, so
+            # reporting 5,400 failures instead of one diagnosis is noise.
+            raise
         except Exception as exc:  # noqa: BLE001 - one bad file must not stop the seed
             counts.failed += 1
             counts.errors.append(f"{label}: {type(exc).__name__}: {exc}")
@@ -211,8 +220,14 @@ def main(argv=None) -> int:
     print(f"Seeding gs://{args.bucket}/{lake.prefix} from {root}"
           f"{' (DRY RUN)' if args.dry_run else ''}"
           f"{' (FORCE)' if args.force else ''}")
-    counts = seed(args.cache_dir, lake, force=args.force,
-                  dry_run=args.dry_run, progress_every=250)
+    try:
+        counts = seed(args.cache_dir, lake, force=args.force,
+                      dry_run=args.dry_run, progress_every=250)
+    except ChainLakeUnavailable as exc:
+        print(f"Chain lake unusable ({exc.reason}): {exc}", file=sys.stderr)
+        print("Nothing was uploaded. Check the bucket name and that this "
+              "identity has roles/storage.objectAdmin on it.", file=sys.stderr)
+        return 2
     print(counts.as_line())
     if counts.unparseable:
         print(f"note: {counts.unparseable} file(s) skipped — filename is not a date")
