@@ -1,0 +1,71 @@
+{
+  "step_ids": [
+    "run-tests",
+    "build-bot-image",
+    "build-dashboard-image",
+    "push-bot-image",
+    "push-dashboard-image",
+    "deploy-bot-canary",
+    "smoke-test-bot",
+    "promote-bot",
+    "deploy-cc-canary",
+    "smoke-test-cc",
+    "promote-cc",
+    "deploy-dashboard-canary",
+    "smoke-test-dashboard",
+    "promote-dashboard"
+  ],
+  "wait_for": {
+    "run-tests": null,
+    "build-bot-image": [
+      "run-tests"
+    ],
+    "build-dashboard-image": [
+      "run-tests"
+    ],
+    "push-bot-image": [
+      "build-bot-image"
+    ],
+    "push-dashboard-image": [
+      "build-dashboard-image"
+    ],
+    "deploy-bot-canary": [
+      "push-bot-image"
+    ],
+    "smoke-test-bot": [
+      "deploy-bot-canary"
+    ],
+    "promote-bot": [
+      "smoke-test-bot"
+    ],
+    "deploy-cc-canary": [
+      "promote-bot"
+    ],
+    "smoke-test-cc": [
+      "deploy-cc-canary"
+    ],
+    "promote-cc": [
+      "smoke-test-cc"
+    ],
+    "deploy-dashboard-canary": [
+      "push-dashboard-image"
+    ],
+    "smoke-test-dashboard": [
+      "deploy-dashboard-canary"
+    ],
+    "promote-dashboard": [
+      "smoke-test-dashboard"
+    ]
+  },
+  "set_env_vars": {
+    "deploy-bot-canary": [
+      "ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID"
+    ],
+    "deploy-cc-canary": [
+      "ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml"
+    ],
+    "deploy-dashboard-canary": [
+      "TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7"
+    ]
+  }
+}

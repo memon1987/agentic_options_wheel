@@ -682,6 +682,33 @@ After any change:
 3. Test the full data flow from bot to dashboard display
 4. Confirm metrics and aggregations are unaffected by display-only changes
 
+## Deploy / CI — `cloudbuild.yaml`
+
+One Cloud Build trigger on `main` builds two images and runs three identical
+canary chains — `options-wheel-strategy`, `covered-call-engine`,
+`options-wheel-dashboard` — each `deploy → smoke-test → promote`. **Since FC-084
+every chain is pinned to the revision that build created.** The deploy step runs
+`gcloud run deploy --format='value(status.latestCreatedRevisionName)'` and writes
+the name to `/workspace/rev-<service>.txt`; the smoke test polls *that* revision
+by name (`revisions describe --format=json`, reading the condition whose
+`type == "Ready"` — Ready-first ordering in `status.conditions` is observed, not
+contractual); the promote step routes with `--to-revisions=$REV=100`. **Never
+reintroduce `--to-latest` or `revisions list --limit=1`** — both mean "whatever
+is newest", which under two overlapping builds is the *other* build's revision.
+Promote also carries a **superseded guard**: if the revision currently serving
+traffic was created after this build's canary, the step logs `SUPERSEDED` and
+**exits 0** — newer code keeps serving, and a superseded build is not a failure,
+so it must not trip the build-failure alert. Ordering is by
+`metadata.creationTimestamp`, not git ancestry: the Cloud Build checkout is
+shallow, and a deliberate rollback (re-running an older commit's trigger) creates
+a newer revision and should win. The deploy step also retries up to 3 times, 20 s
+apart, on Cloud Run's optimistic-concurrency error (`Conflict for resource ...:
+version 'X' was specified but current version is 'Y'`), which is what a
+concurrently-merging build produces. `tests/test_cloudbuild_contract.py` pins all
+of this, plus the must-not-change list (step ids, `waitFor` edges,
+`--set-env-vars` values) against a frozen fixture — that suite is step 1 of the
+build itself, so a regression fails before anything deploys.
+
 ## Development Notes
 
 **Alpaca Setup**: requires options trading approval and the paper trading endpoint

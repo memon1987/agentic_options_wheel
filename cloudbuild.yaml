@@ -1,5 +1,13 @@
 # Cloud Build configuration for Options Wheel Strategy
 # Automatically builds and deploys to Cloud Run when code is pushed to GitHub
+#
+# FC-084 — every canary/promote chain below is pinned to the revision THIS build
+# created. The deploy step writes that revision name to /workspace/rev-<service>.txt;
+# the smoke test polls that revision by name and the promote step routes traffic to
+# it by name (never --to-latest). Two overlapping builds therefore each promote only
+# their own revision, and a promote whose serving revision is *newer* than this
+# build's canary logs SUPERSEDED and exits 0 (a superseded build is not a failure).
+# See docs/plans/fc-084.md.
 
 steps:
   # Step 1: Run critical tests only (faster)
@@ -59,68 +67,123 @@ steps:
     waitFor: ['build-dashboard-image']
 
   # Step 6: Deploy trading bot to Cloud Run (canary - no traffic)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    args:
-      - 'gcloud'
-      - 'run'
-      - 'deploy'
-      - 'options-wheel-strategy'
-      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA'
-      - '--region=us-central1'
-      - '--memory=512Mi'
-      - '--concurrency=10'
-      - '--max-instances=1'
-      - '--min-instances=0'
-      - '--timeout=300'
-      - '--set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA'
-      - '--no-traffic'
-      - '--tag=canary'
-    id: 'deploy-bot-canary'
-    waitFor: ['push-bot-image']
-
-  # Step 7: Verify the trading bot canary revision is healthy
-  # Cannot curl authenticated Cloud Run from Cloud Build, so verify via API
-  # that the revision is ready and serving on the canary tag.
+  # Captures the created revision name to /workspace/rev-options-wheel-strategy.txt so
+  # the smoke test and promote below act on THIS revision, not "whatever is newest".
+  # Retries the deploy on Cloud Run's optimistic-concurrency error
+  # ("Conflict for resource ...: version 'X' was specified but current version is 'Y'"),
+  # which is exactly what a concurrently-merging build produces (observed 2026-08-28).
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        echo "Verifying canary revision is ready..."
+        REV=""
+        for attempt in 1 2 3; do
+          if gcloud run deploy options-wheel-strategy \
+            --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+            --region=us-central1 \
+            --memory=512Mi \
+            --concurrency=10 \
+            --max-instances=1 \
+            --min-instances=0 \
+            --timeout=300 \
+            --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA \
+            --no-traffic \
+            --tag=canary \
+            --format='value(status.latestCreatedRevisionName)' \
+            > /workspace/deploy-out-options-wheel-strategy.txt \
+            2> /workspace/deploy-err-options-wheel-strategy.txt; then
+            cat /workspace/deploy-err-options-wheel-strategy.txt
+            REV=$(tr -d '[:space:]' < /workspace/deploy-out-options-wheel-strategy.txt)
+            break
+          fi
+          cat /workspace/deploy-err-options-wheel-strategy.txt
+          if grep -q 'Conflict for resource' /workspace/deploy-err-options-wheel-strategy.txt; then
+            if [ "$${attempt}" = "3" ]; then
+              echo "attempt 3/3 — Cloud Run version conflict, no retries left"
+              break
+            fi
+            echo "attempt $${attempt}/3 — Cloud Run version conflict (an overlapping build wrote this service); retrying in 20s"
+            sleep 20
+            continue
+          fi
+          echo "FAIL: deploy of options-wheel-strategy failed"
+          exit 1
+        done
+        if [ -z "$${REV}" ]; then
+          echo "FAIL: deploy of options-wheel-strategy produced no revision after 3 attempts"
+          exit 1
+        fi
+        echo "$${REV}" > /workspace/rev-options-wheel-strategy.txt
+        echo "Deployed canary revision: $${REV}"
+    id: 'deploy-bot-canary'
+    waitFor: ['push-bot-image']
+
+  # Step 7: Verify the trading bot canary revision is healthy
+  # Cannot curl authenticated Cloud Run from Cloud Build, so verify via API
+  # that THIS build's revision (from /workspace/rev-options-wheel-strategy.txt)
+  # is ready. Reads the condition whose type == "Ready": Ready-first ordering in
+  # `status.conditions` is observed, not contractual (FC-084).
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        REV=$(cat /workspace/rev-options-wheel-strategy.txt)
+        echo "Verifying canary revision $${REV} is ready..."
         # Poll rather than sample once: a revision still coming up reports
         # "Unknown", and a single-shot check turns that race into a false
         # build failure (observed 2026-07-18 — the deploy had succeeded).
         # "False" is a genuine failure and exits immediately.
         for i in $(seq 1 30); do
-          STATUS=$(gcloud run revisions list --service=options-wheel-strategy \
-            --region=us-central1 --limit=1 \
-            --format="value(status.conditions[0].status)")
-          echo "attempt $${i}/30 — Bot canary status: $${STATUS}"
+          STATUS=$(gcloud run revisions describe "$${REV}" --region=us-central1 --format=json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin).get('status') or {};print(next((c.get('status','') for c in (d.get('conditions') or []) if c.get('type')=='Ready'),''))")
+          echo "attempt $${i}/30 — Bot canary $${REV} status: $${STATUS}"
           if [ "$${STATUS}" = "True" ]; then
-            echo "PASS: Canary revision is ready"
+            echo "PASS: Canary revision $${REV} is ready"
             exit 0
           fi
           if [ "$${STATUS}" = "False" ]; then
-            echo "FAIL: Canary revision failed to become ready"
+            echo "FAIL: Canary revision $${REV} failed to become ready"
             exit 1
           fi
           sleep 5
         done
-        echo "FAIL: timed out after 150s waiting for Bot canary revision"
+        echo "FAIL: timed out after 150s waiting for Bot canary revision $${REV}"
         exit 1
     id: 'smoke-test-bot'
     waitFor: ['deploy-bot-canary']
 
-  # Step 8: Shift traffic to new trading bot revision
+  # Step 8: Shift traffic to this build's trading bot revision (by name, never
+  # --to-latest). Superseded guard: if the revision currently serving traffic was
+  # created AFTER this build's canary, a later build (or a deliberate rollback) has
+  # already won — leave traffic alone and exit 0 so the build-failure alert stays quiet.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
     args:
-      - 'gcloud'
-      - 'run'
-      - 'services'
-      - 'update-traffic'
-      - 'options-wheel-strategy'
-      - '--to-latest'
-      - '--region=us-central1'
+      - '-c'
+      - |
+        REV=$(cat /workspace/rev-options-wheel-strategy.txt)
+        # The serving revision is the traffic target with the largest non-zero
+        # percent — NOT status.traffic[0], which can be the 0%-weighted `canary`
+        # tag entry (same "index 0 is not contractual" reasoning as the Ready
+        # condition above).
+        SERVING=$(gcloud run services describe options-wheel-strategy --region=us-central1 --format=json \
+          | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+        echo "This build's revision: $${REV}; currently serving: $${SERVING}"
+        if [ -n "$${SERVING}" ] && [ "$${SERVING}" != "$${REV}" ]; then
+          MINE=$(gcloud run revisions describe "$${REV}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          THEIRS=$(gcloud run revisions describe "$${SERVING}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          if [ -n "$${THEIRS}" ] && [ -n "$${MINE}" ] && [ "$${THEIRS}" \> "$${MINE}" ]; then
+            echo "SUPERSEDED: serving revision $${SERVING} ($${THEIRS}) is newer than this build's $${REV} ($${MINE}) — leaving traffic alone"
+            exit 0
+          fi
+        fi
+        gcloud run services update-traffic options-wheel-strategy \
+          --to-revisions=$${REV}=100 \
+          --region=us-central1
     id: 'promote-bot'
     waitFor: ['smoke-test-bot']
 
@@ -132,130 +195,216 @@ steps:
   # -cc secrets, FINNHUB_API_KEY) are a separate list that --set-env-vars does
   # not touch; do NOT add --set-secrets here (a typo'd name would break the
   # service — bindings persist from provisioning, docs/plans/fc-075-cc-deploy-step.md).
+  # Revision capture + conflict retry as in deploy-bot-canary (FC-084).
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
     args:
-      - 'gcloud'
-      - 'run'
-      - 'deploy'
-      - 'covered-call-engine'
-      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA'
-      - '--region=us-central1'
-      - '--memory=512Mi'
-      - '--concurrency=10'
-      - '--max-instances=1'
-      - '--min-instances=0'
-      - '--timeout=300'
-      - '--set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml,GIT_COMMIT=$COMMIT_SHA'
-      - '--no-traffic'
-      - '--tag=canary'
+      - '-c'
+      - |
+        REV=""
+        for attempt in 1 2 3; do
+          if gcloud run deploy covered-call-engine \
+            --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+            --region=us-central1 \
+            --memory=512Mi \
+            --concurrency=10 \
+            --max-instances=1 \
+            --min-instances=0 \
+            --timeout=300 \
+            --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml,GIT_COMMIT=$COMMIT_SHA \
+            --no-traffic \
+            --tag=canary \
+            --format='value(status.latestCreatedRevisionName)' \
+            > /workspace/deploy-out-covered-call-engine.txt \
+            2> /workspace/deploy-err-covered-call-engine.txt; then
+            cat /workspace/deploy-err-covered-call-engine.txt
+            REV=$(tr -d '[:space:]' < /workspace/deploy-out-covered-call-engine.txt)
+            break
+          fi
+          cat /workspace/deploy-err-covered-call-engine.txt
+          if grep -q 'Conflict for resource' /workspace/deploy-err-covered-call-engine.txt; then
+            if [ "$${attempt}" = "3" ]; then
+              echo "attempt 3/3 — Cloud Run version conflict, no retries left"
+              break
+            fi
+            echo "attempt $${attempt}/3 — Cloud Run version conflict (an overlapping build wrote this service); retrying in 20s"
+            sleep 20
+            continue
+          fi
+          echo "FAIL: deploy of covered-call-engine failed"
+          exit 1
+        done
+        if [ -z "$${REV}" ]; then
+          echo "FAIL: deploy of covered-call-engine produced no revision after 3 attempts"
+          exit 1
+        fi
+        echo "$${REV}" > /workspace/rev-covered-call-engine.txt
+        echo "Deployed canary revision: $${REV}"
     id: 'deploy-cc-canary'
     waitFor: ['promote-bot']
 
   # Verify the covered-call canary revision is ready (same poll-not-sample
-  # pattern as the wheel's smoke test — a single-shot check races startup).
+  # pattern as the wheel's smoke test — a single-shot check races startup),
+  # pinned to this build's revision and reading the type == "Ready" condition.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        echo "Verifying covered-call canary revision is ready..."
+        REV=$(cat /workspace/rev-covered-call-engine.txt)
+        echo "Verifying covered-call canary revision $${REV} is ready..."
         for i in $(seq 1 30); do
-          STATUS=$(gcloud run revisions list --service=covered-call-engine \
-            --region=us-central1 --limit=1 \
-            --format="value(status.conditions[0].status)")
-          echo "attempt $${i}/30 — CC canary status: $${STATUS}"
+          STATUS=$(gcloud run revisions describe "$${REV}" --region=us-central1 --format=json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin).get('status') or {};print(next((c.get('status','') for c in (d.get('conditions') or []) if c.get('type')=='Ready'),''))")
+          echo "attempt $${i}/30 — CC canary $${REV} status: $${STATUS}"
           if [ "$${STATUS}" = "True" ]; then
-            echo "PASS: CC canary revision is ready"
+            echo "PASS: CC canary revision $${REV} is ready"
             exit 0
           fi
           if [ "$${STATUS}" = "False" ]; then
-            echo "FAIL: CC canary revision failed to become ready"
+            echo "FAIL: CC canary revision $${REV} failed to become ready"
             exit 1
           fi
           sleep 5
         done
-        echo "FAIL: timed out after 150s waiting for CC canary revision"
+        echo "FAIL: timed out after 150s waiting for CC canary revision $${REV}"
         exit 1
     id: 'smoke-test-cc'
     waitFor: ['deploy-cc-canary']
 
-  # Shift traffic to the new covered-call revision
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    args:
-      - 'gcloud'
-      - 'run'
-      - 'services'
-      - 'update-traffic'
-      - 'covered-call-engine'
-      - '--to-latest'
-      - '--region=us-central1'
-    id: 'promote-cc'
-    waitFor: ['smoke-test-cc']
-
-  # Step 9: Deploy dashboard to Cloud Run (canary - no traffic)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    args:
-      - 'gcloud'
-      - 'run'
-      - 'deploy'
-      - 'options-wheel-dashboard'
-      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
-      - '--region=us-central1'
-      - '--memory=512Mi'
-      - '--cpu=1'
-      - '--max-instances=2'
-      - '--min-instances=0'
-      - '--timeout=300'
-      # NOTE: --set-env-vars REPLACES the entire env set. Anything applied
-      # out-of-band via --update-env-vars is wiped on the next deploy, so
-      # every persistent dashboard env var must be declared here.
-      - '--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA'
-      - '--no-traffic'
-      - '--tag=canary'
-    id: 'deploy-dashboard-canary'
-    waitFor: ['push-dashboard-image']
-
-  # Step 10: Verify the dashboard canary revision is healthy
+  # Shift traffic to this build's covered-call revision (by name + superseded guard)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        echo "Verifying dashboard canary revision is ready..."
+        REV=$(cat /workspace/rev-covered-call-engine.txt)
+        SERVING=$(gcloud run services describe covered-call-engine --region=us-central1 --format=json \
+          | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+        echo "This build's revision: $${REV}; currently serving: $${SERVING}"
+        if [ -n "$${SERVING}" ] && [ "$${SERVING}" != "$${REV}" ]; then
+          MINE=$(gcloud run revisions describe "$${REV}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          THEIRS=$(gcloud run revisions describe "$${SERVING}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          if [ -n "$${THEIRS}" ] && [ -n "$${MINE}" ] && [ "$${THEIRS}" \> "$${MINE}" ]; then
+            echo "SUPERSEDED: serving revision $${SERVING} ($${THEIRS}) is newer than this build's $${REV} ($${MINE}) — leaving traffic alone"
+            exit 0
+          fi
+        fi
+        gcloud run services update-traffic covered-call-engine \
+          --to-revisions=$${REV}=100 \
+          --region=us-central1
+    id: 'promote-cc'
+    waitFor: ['smoke-test-cc']
+
+  # Step 9: Deploy dashboard to Cloud Run (canary - no traffic)
+  # Revision capture + conflict retry as in deploy-bot-canary (FC-084).
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        REV=""
+        for attempt in 1 2 3; do
+          # NOTE: --set-env-vars REPLACES the entire env set. Anything applied
+          # out-of-band via --update-env-vars is wiped on the next deploy, so
+          # every persistent dashboard env var must be declared here.
+          if gcloud run deploy options-wheel-dashboard \
+            --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA \
+            --region=us-central1 \
+            --memory=512Mi \
+            --cpu=1 \
+            --max-instances=2 \
+            --min-instances=0 \
+            --timeout=300 \
+            --set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA \
+            --no-traffic \
+            --tag=canary \
+            --format='value(status.latestCreatedRevisionName)' \
+            > /workspace/deploy-out-options-wheel-dashboard.txt \
+            2> /workspace/deploy-err-options-wheel-dashboard.txt; then
+            cat /workspace/deploy-err-options-wheel-dashboard.txt
+            REV=$(tr -d '[:space:]' < /workspace/deploy-out-options-wheel-dashboard.txt)
+            break
+          fi
+          cat /workspace/deploy-err-options-wheel-dashboard.txt
+          if grep -q 'Conflict for resource' /workspace/deploy-err-options-wheel-dashboard.txt; then
+            if [ "$${attempt}" = "3" ]; then
+              echo "attempt 3/3 — Cloud Run version conflict, no retries left"
+              break
+            fi
+            echo "attempt $${attempt}/3 — Cloud Run version conflict (an overlapping build wrote this service); retrying in 20s"
+            sleep 20
+            continue
+          fi
+          echo "FAIL: deploy of options-wheel-dashboard failed"
+          exit 1
+        done
+        if [ -z "$${REV}" ]; then
+          echo "FAIL: deploy of options-wheel-dashboard produced no revision after 3 attempts"
+          exit 1
+        fi
+        echo "$${REV}" > /workspace/rev-options-wheel-dashboard.txt
+        echo "Deployed canary revision: $${REV}"
+    id: 'deploy-dashboard-canary'
+    waitFor: ['push-dashboard-image']
+
+  # Step 10: Verify the dashboard canary revision is healthy (this build's
+  # revision, by name; type == "Ready" condition)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        REV=$(cat /workspace/rev-options-wheel-dashboard.txt)
+        echo "Verifying dashboard canary revision $${REV} is ready..."
         # Poll rather than sample once: a revision still coming up reports
         # "Unknown", and a single-shot check turns that race into a false
         # build failure (observed 2026-07-18 — the deploy had succeeded).
         # "False" is a genuine failure and exits immediately.
         for i in $(seq 1 30); do
-          STATUS=$(gcloud run revisions list --service=options-wheel-dashboard \
-            --region=us-central1 --limit=1 \
-            --format="value(status.conditions[0].status)")
-          echo "attempt $${i}/30 — Dashboard canary status: $${STATUS}"
+          STATUS=$(gcloud run revisions describe "$${REV}" --region=us-central1 --format=json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin).get('status') or {};print(next((c.get('status','') for c in (d.get('conditions') or []) if c.get('type')=='Ready'),''))")
+          echo "attempt $${i}/30 — Dashboard canary $${REV} status: $${STATUS}"
           if [ "$${STATUS}" = "True" ]; then
-            echo "PASS: Dashboard canary revision is ready"
+            echo "PASS: Dashboard canary revision $${REV} is ready"
             exit 0
           fi
           if [ "$${STATUS}" = "False" ]; then
-            echo "FAIL: Dashboard canary revision failed to become ready"
+            echo "FAIL: Dashboard canary revision $${REV} failed to become ready"
             exit 1
           fi
           sleep 5
         done
-        echo "FAIL: timed out after 150s waiting for Dashboard canary revision"
+        echo "FAIL: timed out after 150s waiting for Dashboard canary revision $${REV}"
         exit 1
     id: 'smoke-test-dashboard'
     waitFor: ['deploy-dashboard-canary']
 
-  # Step 11: Shift traffic to new dashboard revision
+  # Step 11: Shift traffic to this build's dashboard revision (by name + superseded guard)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
     args:
-      - 'gcloud'
-      - 'run'
-      - 'services'
-      - 'update-traffic'
-      - 'options-wheel-dashboard'
-      - '--to-latest'
-      - '--region=us-central1'
+      - '-c'
+      - |
+        REV=$(cat /workspace/rev-options-wheel-dashboard.txt)
+        SERVING=$(gcloud run services describe options-wheel-dashboard --region=us-central1 --format=json \
+          | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+        echo "This build's revision: $${REV}; currently serving: $${SERVING}"
+        if [ -n "$${SERVING}" ] && [ "$${SERVING}" != "$${REV}" ]; then
+          MINE=$(gcloud run revisions describe "$${REV}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          THEIRS=$(gcloud run revisions describe "$${SERVING}" --region=us-central1 \
+            --format='value(metadata.creationTimestamp)')
+          if [ -n "$${THEIRS}" ] && [ -n "$${MINE}" ] && [ "$${THEIRS}" \> "$${MINE}" ]; then
+            echo "SUPERSEDED: serving revision $${SERVING} ($${THEIRS}) is newer than this build's $${REV} ($${MINE}) — leaving traffic alone"
+            exit 0
+          fi
+        fi
+        gcloud run services update-traffic options-wheel-dashboard \
+          --to-revisions=$${REV}=100 \
+          --region=us-central1
     id: 'promote-dashboard'
     waitFor: ['smoke-test-dashboard']
 
