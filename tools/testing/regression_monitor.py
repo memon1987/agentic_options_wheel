@@ -39,7 +39,7 @@ from src.utils.logging_events import log_system_event, log_error_event, log_perf
 # Canonical OCC parsing. FC-069 S1 (item 12 family) replaced this module's
 # hand-rolled leading-alpha underlying extraction and its `"C" in symbol`
 # short-call test with these — the eighth site in the OCC-substring family.
-from src.utils.option_symbols import parse_option_symbol, strict_option_type
+from src.utils.option_symbols import occ_root, parse_option_symbol, strict_option_type
 
 logger = structlog.get_logger(__name__)
 
@@ -1141,11 +1141,17 @@ class RegressionMonitor:
             ))
 
         # --- 7. Naked call detection (short calls must have underlying shares) ---
+        # Keyed on the OCC root, not the raw equity symbol (FC-041): Alpaca
+        # renders Berkshire's B shares as `BRK.B` and the contracts on them as
+        # `BRKB...`, so a raw-string join reads 0 owned shares and reports a
+        # fully covered call as naked. This mirrors the preventive join in
+        # `ExecutionEngine._available_shares` -- the detective and the control
+        # must agree on what "the same underlying" means.
         stock_qty: Dict[str, int] = {}
         for p in stock_positions:
             sym = p.get("symbol")
             if sym:
-                stock_qty[sym] = int(float(p.get("qty", 0)))
+                stock_qty[occ_root(sym)] = int(float(p.get("qty", 0)))
 
         for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
@@ -1158,7 +1164,7 @@ class RegressionMonitor:
                 continue  # long calls commit no shares
 
             underlying = parsed.get("underlying", "")
-            owned_shares = stock_qty.get(underlying, 0)
+            owned_shares = stock_qty.get(occ_root(underlying), 0)
             required_shares = qty * 100
 
             if owned_shares < required_shares:

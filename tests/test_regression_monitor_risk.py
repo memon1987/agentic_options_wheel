@@ -580,3 +580,58 @@ class TestReconcileOrphaned:
         r = res["reconcile_orphaned"]
         assert r.status == "pass"
         assert r.details["unclassifiable"] == [self.ADJUSTED]
+
+# ---------------------------------------------------------------------------
+# FC-041 — check 7's join, on class-share tickers
+#
+# The detective must agree with the preventive about what "the same
+# underlying" means. Alpaca renders the equity as `BRK.B` and the contracts on
+# it as `BRKB...` (verified against the paper API 2026-08-28), so a raw-string
+# lookup found 0 owned shares and reported a fully covered call as naked —
+# a `fail` status, which 500s the hourly `/regression` endpoint.
+# ---------------------------------------------------------------------------
+
+class TestNakedCallOnClassShareTickers:
+
+    def test_class_share_call_is_covered_by_the_dotted_equity(self, monkeypatch):
+        """THE FC-041 REGRESSION here. Pre-fix: `fail`, owned_shares 0."""
+        res = run_checks(monkeypatch, [
+            _stock("BRK.B", 100, 400.0, 45_000.0),
+            _option("BRKB260918C00450000", -1),
+        ])
+        assert statuses(res, "risk_naked_call") == "pass"
+
+    def test_a_class_share_call_with_no_equity_still_fails(self, monkeypatch):
+        """The normalization must not make the check blind — the real naked
+        case on a dotted ticker is still caught."""
+        res = run_checks(monkeypatch, [_option("BRKB260918C00450000", -1)])
+        r = res["risk_naked_call"]
+        assert r.status == "fail"
+        assert r.details["required_shares"] == 100
+        assert r.details["owned_shares"] == 0
+
+    def test_a_different_share_class_does_not_cover_it(self, monkeypatch):
+        """BRKA shares back BRKA calls, not BRKB ones — dropping separators
+        must not manufacture a match between distinct underlyings."""
+        res = run_checks(monkeypatch, [
+            _stock("BRK.A", 100, 700_000.0, 70_000_000.0),
+            _option("BRKB260918C00450000", -1),
+        ])
+        assert statuses(res, "risk_naked_call") == "fail"
+
+    def test_partial_coverage_on_a_class_share_still_fails(self, monkeypatch):
+        res = run_checks(monkeypatch, [
+            _stock("BRK.B", 100, 400.0, 45_000.0),
+            _option("BRKB260918C00450000", -2),
+        ])
+        r = res["risk_naked_call"]
+        assert r.status == "fail"
+        assert (r.details["required_shares"], r.details["owned_shares"]) == (200, 100)
+
+    def test_plain_tickers_are_unchanged(self, monkeypatch):
+        """The behavior contract: the live universe does not move."""
+        res = run_checks(monkeypatch, [
+            _stock("AAPL", 100, 200.0, 25_000.0),
+            _option("AAPL260821C00250000", -1),
+        ])
+        assert statuses(res, "risk_naked_call") == "pass"

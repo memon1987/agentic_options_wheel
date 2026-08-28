@@ -166,6 +166,19 @@ midnight, so neither can change value in that window.
 | 17 | Wrong-seller routing | `PutSeller.execute_put_sale`, `CallSeller.execute_call_sale` | — | `call_rejected_by_put_seller`, `put_rejected_by_call_seller` | closed |
 | 18 | Execute-time cost-basis floor | `CallSeller`, via `opportunity_floor_per_share` | — | rejection before order submit | closed (FC-050 restored this; it reads the floor off the opportunity so scan and execute enforce the same number) |
 | 19 | Naked-call block | `ExecutionEngine.execute_batch` | — | `naked_call_blocked` | closed |
+| 20 | Naked-call invariant (FC-041) | `ExecutionEngine.execute_batch`, immediately before `execute_call_sale` | — | `naked_call_invariant_blocked` + `selection_dropped{naked_call_invariant}` | closed |
+
+Gate 20 is **belt to gate 19's braces, not a duplicate of it.** Gate 19 asks
+`_available_shares` (which uses `parse_option_symbol`, whose leading-letters
+fallback is a heuristic); gate 20 recounts the same positions snapshot with an
+independent implementation that uses only `strict_option_type` and `occ_root`,
+and requires `committed + about-to-sell <= owned`. Two implementations that must
+agree; when they disagree we do not know which is right, so the order is refused
+and the disagreement is logged with both answers. A non-zero
+`dropped_naked_call_invariant` in `batch_selection_completed` — or any
+`naked_call_invariant_blocked` error event — is a **defect report**, not a normal
+batch outcome. Neither gate marks the contract non-retryable: share ownership is
+transient.
 
 ---
 

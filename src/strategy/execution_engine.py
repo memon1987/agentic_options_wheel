@@ -17,7 +17,7 @@ from ..api.market_data import MarketDataManager
 from ..data.trade_journal import TradeJournal
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_error_event
-from ..utils.option_symbols import parse_option_symbol, strict_option_type
+from ..utils.option_symbols import occ_root, parse_option_symbol, strict_option_type
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 
@@ -35,6 +35,11 @@ DROP_SIZING_FAILED = "sizing_failed"
 # opposite responses -- one is a normal, expected outcome, the other is an
 # outage that silently halts every covered call in the fleet.
 DROP_POSITIONS_UNAVAILABLE = "positions_unavailable"
+# FC-041: the execution-stage belt. Emitted only when the parser-independent
+# recount in execute_batch disagrees with _available_shares -- i.e. never, unless
+# one of them is wrong. A non-zero count here is a defect report, not a normal
+# batch-contention outcome like the five above.
+DROP_NAKED_CALL_INVARIANT = "naked_call_invariant"
 
 DROP_REASONS = (
     DROP_INSUFFICIENT_SHARES,
@@ -42,6 +47,7 @@ DROP_REASONS = (
     DROP_DUPLICATE_UNDERLYING,
     DROP_SIZING_FAILED,
     DROP_POSITIONS_UNAVAILABLE,
+    DROP_NAKED_CALL_INVARIANT,
 )
 
 
@@ -162,24 +168,33 @@ class ExecutionEngine:
 
         Single implementation shared by call sizing, batch selection and the
         execution-time oversell guard.
+
+        FC-041: both legs meet on :func:`occ_root`. ``underlying`` arrives from
+        the scanner as the *equity* symbol (``BRK.B``) and the equity position
+        renders the same way, but the short call's parsed underlying is the OCC
+        root (``BRKB``). Comparing the raw strings made ``committed`` read 0 for
+        every dotted ticker — available == owned — and the engine would write a
+        second call over shares already committed. Plain tickers normalize to
+        themselves, so nothing else moves.
         """
         if not underlying:
             return 0, 0, 0
 
+        root = occ_root(underlying)
         owned = 0
         committed = 0
         for pos in positions or []:
             try:
                 asset_class = pos.get('asset_class')
                 if asset_class == 'us_equity':
-                    if pos.get('symbol') == underlying:
+                    if occ_root(pos.get('symbol')) == root:
                         owned += int(float(pos.get('qty') or 0))
                 elif asset_class == 'us_option':
                     qty = float(pos.get('qty') or 0)
                     if qty >= 0:  # only SHORT calls commit shares
                         continue
                     opt_sym = pos.get('symbol') or ''
-                    if (parse_option_symbol(opt_sym).get('underlying') == underlying
+                    if (parse_option_symbol(opt_sym).get('underlying') == root
                             and strict_option_type(opt_sym) == 'call'):
                         committed += abs(int(qty)) * 100
             except (TypeError, ValueError):
@@ -187,6 +202,56 @@ class ExecutionEngine:
                 continue
 
         return owned - committed, owned, committed
+
+    @staticmethod
+    def _invariant_shares(
+        underlying: Optional[str],
+        positions: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """``(owned, committed)`` recomputed **without** ``parse_option_symbol``.
+
+        FC-041. This is deliberately a second, independent implementation of the
+        arithmetic in :meth:`_available_shares` — belt to that method's braces.
+        A single shared helper cannot catch its own bug; two implementations
+        that must agree can.
+
+        Independence is the whole point, so it uses only the two primitives
+        whose answers are fully anchored: :func:`strict_option_type` (which
+        proves the symbol is an exact ``ROOT+YYMMDD+C/P+STRIKE8`` contract) and
+        :func:`occ_root`. Because ``strict_option_type`` has already proven the
+        shape, the root is exactly the first ``len - 15`` characters — no
+        heuristic, no leading-letters fallback, no regex of its own.
+
+        Fails closed on every unreadable input: a position it cannot parse
+        contributes nothing to ``owned``, and a malformed short call is skipped
+        by ``strict_option_type`` returning ``None`` (that position also
+        surfaces via the regression monitor's ``risk_unclassifiable_option``).
+        """
+        if not underlying:
+            return 0, 0
+
+        root = occ_root(underlying)
+        owned = 0
+        committed = 0
+        for pos in positions or []:
+            try:
+                asset_class = pos.get('asset_class')
+                if asset_class == 'us_equity':
+                    if occ_root(pos.get('symbol')) == root:
+                        owned += int(float(pos.get('qty') or 0))
+                elif asset_class == 'us_option':
+                    qty = float(pos.get('qty') or 0)
+                    if qty >= 0:
+                        continue
+                    sym = (pos.get('symbol') or '').strip().upper()
+                    if strict_option_type(sym) != 'call':
+                        continue
+                    if occ_root(sym[:-15]) == root:
+                        committed += abs(int(qty)) * 100
+            except (TypeError, ValueError):
+                continue
+
+        return owned, committed
 
     def _positions_snapshot(
         self,
@@ -620,6 +685,10 @@ class ExecutionEngine:
             dropped_insufficient_buying_power=drop_counts[DROP_INSUFFICIENT_BP],
             dropped_duplicate_underlying=drop_counts[DROP_DUPLICATE_UNDERLYING],
             dropped_positions_unavailable=drop_counts[DROP_POSITIONS_UNAVAILABLE],
+            # FC-041: selection never raises this one -- it is the execution
+            # stage's belt. Reported here so the field exists at 0 in every
+            # batch, which is what makes a 1 legible.
+            dropped_naked_call_invariant=drop_counts[DROP_NAKED_CALL_INVARIANT],
             initial_bp=available_buying_power,
             bp_to_use=available_buying_power - remaining_bp,
         )
@@ -790,6 +859,72 @@ class ExecutionEngine:
                         execution_results.append({
                             'opportunity': opp,
                             'result': {'success': False, 'message': f'Call blocked: {available_shares} available shares ({owned_shares} owned - {committed_shares} committed), need {required_shares}'},
+                            'success': False,
+                        })
+                        continue
+
+                    # FC-041 — the parser-independent invariant. Last thing
+                    # before the order goes out.
+                    #
+                    # _available_shares just answered "enough". This recounts
+                    # the SAME snapshot with a different implementation
+                    # (`_invariant_shares`: strict_option_type + occ_root only,
+                    # no parse_option_symbol) and requires
+                    #     committed + about-to-sell <= owned.
+                    # If the two disagree, one of them is wrong and we do not
+                    # know which — so we fail closed and say so loudly. Silence
+                    # here is a naked call; a false positive here is one
+                    # skipped covered call.
+                    inv_owned, inv_committed = self._invariant_shares(
+                        underlying, snapshot
+                    )
+                    if inv_committed + required_shares > inv_owned:
+                        log_error_event(
+                            self.logger,
+                            error_type="naked_call_invariant_blocked",
+                            error_message=(
+                                f"Naked-call invariant violated for {underlying}: "
+                                f"committed {inv_committed} + requested "
+                                f"{required_shares} > owned {inv_owned}; "
+                                f"refusing to write the call"
+                            ),
+                            component="execution_engine",
+                            recoverable=True,
+                            symbol=underlying,
+                            option_symbol=opp.get('option_symbol'),
+                            owned=inv_owned,
+                            committed=inv_committed,
+                            requested=required_shares,
+                            # What the primary ledger said, so the disagreement
+                            # itself is in the record and diagnosable.
+                            available_shares_helper=available_shares,
+                            owned_shares_helper=owned_shares,
+                            committed_shares_helper=committed_shares,
+                            positions_unavailable=isinstance(
+                                snapshot, PositionsUnavailable),
+                        )
+                        self._log_drop(
+                            opp,
+                            DROP_NAKED_CALL_INVARIANT,
+                            stage="execution",
+                            owned_shares=inv_owned,
+                            committed_to_calls=inv_committed,
+                            required_shares=required_shares,
+                        )
+                        # Not added to _failed_symbols: like naked_call_blocked,
+                        # share ownership is transient and the same contract can
+                        # be legitimate next cycle.
+                        execution_results.append({
+                            'opportunity': opp,
+                            'result': {
+                                'success': False,
+                                'error_type': 'naked_call_invariant',
+                                'message': (
+                                    f'Call blocked by naked-call invariant: '
+                                    f'{inv_committed} committed + {required_shares} '
+                                    f'requested > {inv_owned} owned'
+                                ),
+                            },
                             'success': False,
                         })
                         continue

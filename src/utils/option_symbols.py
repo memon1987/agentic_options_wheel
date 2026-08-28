@@ -68,6 +68,36 @@ def coerce_expiry_date(value) -> Optional[date]:
 OCC_STRICT_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
 
 
+def occ_root(equity_symbol: Optional[str]) -> str:
+    """The OCC contract root for an equity symbol (FC-041).
+
+    Class shares are the whole reason this exists. Alpaca renders Berkshire's
+    B shares as the equity symbol ``BRK.B`` (verified 2026-08-28 against the
+    paper API: ``get_asset('BRK.B').symbol == 'BRK.B'``), while the listed
+    contracts on it carry the root ``BRKB``
+    (``get_option_contracts(underlying_symbols=['BRK.B'])`` ->
+    ``BRKB260828C00270000``, ``root_symbol='BRKB'``). Any join that compares an
+    equity ``symbol`` to a parsed OCC underlying therefore silently misses on
+    every dotted ticker — which, in ``ExecutionEngine._available_shares``, made
+    committed shares read as 0 and the next covered call naked.
+
+    Normalization is: uppercase, drop all whitespace, drop ``.``/``/``/``-``.
+    ``BRK.B`` -> ``BRKB``, ``BRK/B`` -> ``BRKB``, ``BF-B`` -> ``BFB``,
+    ``AAPL`` -> ``AAPL`` (plain tickers are byte-identical, by construction).
+
+    Deliberately NOT a loosening of :data:`OCC_STRICT_RE`: a dotted OCC symbol
+    does not exist, so the equity side is the side that needs normalizing.
+    Use this on **both** sides of any equity-to-contract comparison — applying
+    it to one side only reintroduces the same asymmetry it exists to remove.
+    """
+    if not isinstance(equity_symbol, str):
+        return ''
+    normalized = equity_symbol.upper()
+    for ch in ('.', '/', '-'):
+        normalized = normalized.replace(ch, '')
+    return ''.join(normalized.split())
+
+
 def strict_option_type(option_symbol: str) -> Optional[str]:
     """``'put'`` / ``'call'`` from a fully-anchored OCC symbol, else ``None``.
 
