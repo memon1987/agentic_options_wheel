@@ -309,7 +309,7 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 **Status:** Consideration — **narrowed 2026-08-28**: defect (1) (`'C' in opt_sym` substring) was fixed by FC-038 (PR #73, canonical parsers in `_available_shares`) and FC-052 (PR #60). **Only defect (2) remains**: dotted/class-share tickers (`BRK.B` ↔ `BRKB…`) — `OCC_STRICT_RE` excludes dotted roots, no normalization exists, so the guard still fails open (committed=0) for such a symbol. Latent in both universes today, but the covered-call account has no configured universe by design. Fix: dotted-root normalization + a parser-independent `short_calls × 100 ≤ shares_owned` pre-submit assertion.
 **Size estimate:** S
 **Owner:** unassigned
-**Plan file:** not needed (single-file fix), but it changes runtime behavior of a risk control, so branch + PR
+**Plan file:** `docs/plans/fc-041.md` (2026-08-28; PR #96)
 
 **Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:333` (on `main`)) identifies short calls with a hand-rolled parser:
 
@@ -909,7 +909,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-079: OCC-substring bugs survive on reconcile paths — call assignments structurally undetectable for P-containing underlyings
 
-**Status:** Filed 2026-08-04 (from FC-069 S2 review; flagged in PR #84). **Absorbs FC-054** (closed 2026-08-28 as a duplicate — same site). Sites verified live 2026-08-28: `src/strategy/wheel_engine.py:304,306` (reconcile option counts), `:408,410` (`'C' in opt_sym` + `opt_sym[-8:]` strike estimate on call-away), `tools/testing/regression_monitor.py:696` (`reconcile_orphaned`, warn-only).
+**Status:** Executing — PR #98, plan `docs/plans/fc-079.md`. **Severity reframed by review 2026-08-28:** the position-diff reconcile branch is dead in production (per-request state), so the live consequence was one wrong telemetry field for AAPL; the PR's value is the gate + `reconcile_orphaned` + backtest fidelity. **Absorbs FC-054** (closed 2026-08-28 as a duplicate — same site). Sites verified live 2026-08-28: `src/strategy/wheel_engine.py:304,306` (reconcile option counts), `:408,410` (`'C' in opt_sym` + `opt_sym[-8:]` strike estimate on call-away), `tools/testing/regression_monitor.py:696` (`reconcile_orphaned`, warn-only).
 **Size estimate:** S (canonical-parser rewire + tests; behavior change on live reconcile → own PR, two-reviewer gate)
 **Owner:** unassigned
 **Plan file:** not yet
@@ -956,7 +956,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-081: Cloud Build trigger silently stopped firing — main is merged-but-undeployed
 
 **Scope:** shared (deploy pipeline, all services)
-**Status:** RESOLVED 2026-08-21 (trigger rebound; closure verified end-to-end — see below). **Narrowed 2026-08-28 to the one open follow-up: the merged-vs-deployed freshness alert** (scheduled check comparing `origin/main` HEAD vs the serving revision's commit, alerting on drift via the FC-030 channel). Two incidents of this class so far (FC-031: 11 days, FC-081: 16 days); nothing today detects a build that never starts.
+**Status:** CLOSED 2026-08-28 — the freshness check shipped: PR #94 (`0910192`), plan `docs/plans/fc-081.md`. `deploy_freshness` check group in `/regression` on both services compares `GIT_COMMIT` (now set by all three deploy steps) against GitHub `main`; drift > 2h → `fail` + page; a GitHub **redirect** (rename — the FC-081 mode) → `fail`; every degraded state → daily `deploy_freshness_degraded` nag. Repo is public → runs unauthenticated until the token is provisioned (recommended, not required). Two policies created 2026-08-28 (ids in the plan §Execution). Original entry preserved below.
 **Size estimate:** S
 **Owner:** zeshan + Claude
 **Plan file:** not needed (infra repair; documented here)
@@ -1036,6 +1036,22 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 - Does the backtest engine (FC-056 caveat: call premiums ~0.676×) support ladder-shape comparison well enough to pre-validate, or is this live-data-only?
 
 **Links:** `docs/plans/fc-075-cc-deploy-step.md` §Review disposition (the band-cliff finding + written acceptance), `src/strategy/call_seller.py` (`_get_profit_target_for_dte`, the `dte > 7` fallback, `_parse_dte_from_symbol`), `config/settings.yaml` + `config/covered_call.yaml` `risk.profit_taking`, FC-015 (early-close validation history, commit `1c26b43`), FC-010 (stop-loss removal — the close path IS the risk management), OQ-1 (tunables iteration).
+
+---
+
+### FC-087: reconcile's 7-day activity replay re-emits assignment events on every `/run`; the `options_wheel_logs.wheel_cycles` view is all-NULL
+
+**Scope:** wheel
+**Status:** Filed 2026-08-28 (PR #98 review, reconciliation persona)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `WheelEngine.reconcile_positions` replays the last 7 days of Alpaca activities on every `/run` with a per-request, empty `WheelStateManager`, so each assignment is re-detected and re-logged on every cycle until it ages out of the window: BigQuery shows `put_assignment` / `put_assignment_from_activity` **30 rows for one June AAPL assignment, 60 for AMZN, 22 and counting for IWM**. Any consumer counting assignment events over-counts by ~6×/day × 7 days. Separately, `options_wheel_logs.wheel_cycles` (view) selects `shares` / `strike_price` / `premium` — none of which the post-FC-069 `wheel_cycle_complete` event carries — so the view is all-NULL by construction (FC-046 family).
+
+**Fix direction:** either persist `_processed_activity_ids` (a small durable set — the FC-039/069 standing rule applies: a configured-but-unresolvable persistence target must fail loudly) or shrink the replay window to "since the last successful `/run`" derived from Alpaca order history; and delete or repoint the dead view. Decide deliberately per the FC-069 precedent (delete fiction, don't polish it).
+
+**Links:** FC-079 (PR #98 review), FC-069 item 8, FC-046, `src/strategy/wheel_engine.py` `reconcile_positions`.
 
 ---
 

@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-060 (Layer 1 of four; Layers 2–4 get their own plans)
 **Plan file:** `docs/plans/fc-060-chain-lake.md`
 **Scope:** shared (backtest engine only — no live trading path is touched)
-**Status:** Published — build-ready (bucket provisioning is an operator step, see Rollout)
+**Status:** Executing — PR #99 (`7744944`); two adversarial reviews in flight. Bucket provisioning is an operator step (Rollout step 1).
 **Size:** S (one storage adapter + wiring + a seed tool); backtest-only → two adversarial reviews still apply (it writes a canonical data asset)
 **Author:** Fable (plan), for Opus (build)
 **Last updated:** 2026-08-28
