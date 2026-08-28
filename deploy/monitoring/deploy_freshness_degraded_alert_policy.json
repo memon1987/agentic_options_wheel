@@ -1,0 +1,26 @@
+{
+  "displayName": "Deploy freshness — check degraded (not actually watching)",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "The deploy-freshness check could not do its full job",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=(\"options-wheel-strategy\" OR \"covered-call-engine\") AND (jsonPayload.event_type=\"deploy_freshness_degraded\" OR textPayload:\"deploy_freshness_degraded\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The deploy-freshness check ran but could not fully do its job. It is reporting `warn` on the /regression report, which is NOT the same as watching.\n\nThis policy exists because a detective control that degrades quietly is indistinguishable from one that is working. The FC-081 lesson is that the dangerous state is not \"alarm fired and was wrong\" — it is \"nothing fired, and nothing was watching.\" A `warn` row nobody reads is the same silence in a different colour.\n\nThis is a NAG, NOT A PAGE: the notification rate limit is 24h, so a persistent degradation mails once a day rather than six times a day. It does not mean production is broken. It means the check watching for production being broken is impaired.\n\nRead the `reason` field on the log entry:\n\n- `no_commit` — GIT_COMMIT is not set on the revision. Expected before the env var rolls out, and after any manual `gcloud builds submit` (which supplies no $COMMIT_SHA). Fix: redeploy through the trigger.\n- `unauthenticated` — GITHUB_TOKEN is empty, so the request goes out unauthenticated. The repo is public, so the check STILL WORKS and still returns a real pass/fail verdict; the risk is the unauthenticated rate limit (shared per source IP), which shows up as `http_error` on a 429. Fix: provision the token secret.\n- `bad_repo` — GITHUB_REPO is not a valid `owner/name` pair. The check sent nothing to GitHub and is fully blind. Fix the env var.\n- `bad_window` — DEPLOY_FRESHNESS_MAX_HOURS is not a usable number (unparseable, NaN, infinite, or negative). The default 2h is in force. Note NaN would otherwise disable drift detection entirely, since every comparison against NaN is false.\n- `http_error` — GitHub returned 401/403/429/5xx. A token problem or a GitHub outage. The status code is in the check message.\n- `request_failed` — the HTTP call raised (timeout, DNS, TLS, malformed header). Only the exception CLASS is recorded, never its text: `requests` echoes header values into InvalidHeader messages, which would put the GitHub token in the log.\n- `bad_json` / `bad_sha` / `bad_date` — GitHub answered 200 with a body the check could not read. Rare; suspect a proxy or an API change.\n- `future_commit_date` — the HEAD commit is dated in the future (clock skew on the committer, or a forward-dated rebase). The age is clamped to zero for the window comparison, which means drift cannot be detected for that commit until a later one lands.\n\nIf the reason is `no_commit` or `unauthenticated` and the rollout is still in progress, this is expected and self-clearing at the next step. Anything else that persists past a day means the freshness alert is not protecting you.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "86400s"
+    },
+    "autoClose": "86400s"
+  }
+}

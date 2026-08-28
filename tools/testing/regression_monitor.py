@@ -14,12 +14,16 @@ Checks performed:
     5. Performance baseline comparison (rolling 7-day metric deviations)
     6. Risk parameter validation (duplicate underlyings, position sizing,
        naked calls, cost-basis floor) — see `check_risk_parameters`
+    7. Deploy freshness (what is serving vs. what is on GitHub `main`) —
+       see `check_deploy_freshness` (FC-081 follow-up)
 """
 
 import os
+import re
 import sys
 import time
 import json
+import math
 import traceback
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -50,6 +54,39 @@ SERVICE_URL = os.environ.get(
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "gen-lang-client-0607444019")
 BQ_TABLE = os.environ.get("BQ_TABLE", "trades")
 
+# ---------------------------------------------------------------------------
+# Deploy freshness (FC-081 follow-up)
+# ---------------------------------------------------------------------------
+# The repo whose `main` is the authority on "what should be serving". This is a
+# named constant, and env-overridable, precisely because FC-081 was caused by a
+# repo RENAME that silently detached the build trigger for 16 days: a repo name
+# buried in an f-string is a repo name nobody edits when the repo moves.
+GITHUB_REPO = "memon1987/agentic_options_wheel"
+
+# A repo reference is `owner/name`. Anything else (a full URL, a path
+# traversal, an empty half) is an operator typo, not a repo — the check says so
+# rather than sending it to GitHub and interpreting whatever comes back.
+GITHUB_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+# GitHub commit SHAs are 40 lowercase hex characters. Validated because every
+# downstream use (prefix match, `[:7]` in the message) assumes a string of at
+# least that shape, and a malformed body must warn, not raise.
+GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+# A RENAMED repo does not 404 — GitHub 301s to the new name, and `requests`
+# follows redirects by default, which would return a cheerful 200 from the
+# renamed repo and hide the exact failure FC-081 was. The check therefore
+# disables redirect-following and treats any redirect as the rename signal.
+GITHUB_REDIRECT_STATUSES = (301, 302, 307, 308)
+
+# How long `main` may sit ahead of the deployed commit before it counts as
+# drift rather than a build in flight. A build takes 10-12 minutes; 2 hours
+# absorbs a Cloud Build queue or a retried deploy without paging. Float hours,
+# overridable by env `DEPLOY_FRESHNESS_MAX_HOURS`.
+DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT = 2.0
+
+GITHUB_API_TIMEOUT_SECONDS = 10
+
 # Thresholds
 ERROR_WARNING_THRESHOLD = 5
 ERROR_CRITICAL_THRESHOLD = 20
@@ -60,6 +97,16 @@ METRIC_DEVIATION_THRESHOLD = 2.0  # standard deviations
 
 # Sort sentinel for trade rows whose timestamp cell is missing or unparseable.
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _utcnow() -> datetime:
+    """Current UTC time, as a single patchable seam.
+
+    The deploy-freshness window is a strict inequality on a duration, so its
+    boundary (age exactly == window) is only testable against a clock the test
+    controls. Everything else in this module reads wall-clock directly.
+    """
+    return datetime.now(timezone.utc)
 
 # Error patterns that indicate critical issues
 CRITICAL_ERROR_PATTERNS = [
@@ -193,6 +240,31 @@ class RegressionMonitor:
     def _post(self, path: str, payload: Optional[Dict] = None, timeout: int = 60) -> requests.Response:
         url = f"{self.service_url}{path}"
         return requests.post(url, headers=self._headers(), json=payload or {}, timeout=timeout)
+
+    def _github_get(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        timeout: int = GITHUB_API_TIMEOUT_SECONDS,
+    ) -> requests.Response:
+        """GET against the GitHub REST API, WITHOUT following redirects.
+
+        A separate seam from ``_get`` (which is service-relative and carries
+        the strategy API key): this is absolute-URL, optionally carries a
+        GitHub token, and is the single point tests stub so the freshness check
+        never touches the network.
+
+        ``allow_redirects=False`` is load-bearing, not a default carried over.
+        A renamed GitHub repo answers 301 with the new name in ``Location``;
+        with the library default the redirect is followed and the caller sees a
+        200 from the renamed repo. That is precisely the FC-081 failure
+        mode — the Cloud Build trigger keys on the OLD literal name and stops
+        firing — so following the redirect would make the check report `pass`
+        on the one condition it exists to catch.
+        """
+        return requests.get(
+            url, headers=headers, timeout=timeout, allow_redirects=False,
+        )
 
     # ------------------------------------------------------------------
     # 1. Endpoint health checks
@@ -1197,6 +1269,299 @@ class RegressionMonitor:
 
         return checks
 
+    # ------------------------------------------------------------------
+    # 7. Deploy freshness — merged vs. deployed (FC-081 follow-up)
+    # ------------------------------------------------------------------
+
+    def check_deploy_freshness(self) -> List[CheckResult]:
+        """Compare the commit this service is running against GitHub `main`.
+
+        The build-failure alert (FC-030/FC-031) watches builds that *start*.
+        This watches for builds that never start: FC-081 was a repo rename that
+        detached the Cloud Build trigger, so `main` ran 16 days ahead of
+        production with no red build and therefore no alert. Cloud Build's own
+        history cannot tell a quiet week from a dead trigger — only GitHub can.
+
+        Exactly one ``CheckResult`` per run:
+
+        ==================================================  ======  =================================
+        Condition                                           status  name
+        ==================================================  ======  =================================
+        drift beyond the window                             fail    deploy_freshness_drift
+        GitHub redirect (repo RENAMED — the FC-081 mode)    fail    deploy_freshness_repo_unreachable
+        GitHub 404 (deleted / private / access lost)        fail    deploy_freshness_repo_unreachable
+        ``GIT_COMMIT`` unset                                warn    deploy_freshness_no_commit
+        ``GITHUB_REPO`` malformed                           warn    deploy_freshness_unconfigured
+        401/403/429/5xx, timeout, bad JSON, bad sha/date    warn    deploy_freshness_github_error
+        in flight / match                                   pass    deploy_freshness
+        ==================================================  ======  =================================
+
+        ``fail`` makes ``/regression`` return HTTP 500, so it is reserved for
+        the conditions that genuinely mean "production is not running `main`".
+        A GitHub outage must never 500 the monitor.
+
+        **Every degraded (`warn`) path also emits a `deploy_freshness_degraded`
+        log event.** A detective control that quietly reports `warn` forever is
+        indistinguishable from one that is working, which is how an hourly
+        report's warn rows become wallpaper. The degraded event has its own
+        alert policy with a 24h rate limit — a once-a-day nag, not a page.
+
+        The repo is public, so **no token is required**: with ``GITHUB_TOKEN``
+        empty the request goes out unauthenticated and the check still returns
+        a real verdict, flagging itself degraded (``authenticated=False``)
+        because the unauthenticated rate limit is shared per source IP.
+        """
+        repo = os.environ.get("GITHUB_REPO") or GITHUB_REPO
+        git_commit = (os.environ.get("GIT_COMMIT") or "").strip()
+        token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+        details: Dict[str, Any] = {
+            "git_commit": git_commit or None,
+            "head_sha": None,
+            "head_age_minutes": None,
+            "max_hours": DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT,
+            "repo": repo,
+            "authenticated": bool(token),
+        }
+
+        def _degraded(reason: str, check: str) -> None:
+            """Announce that the check could not do its full job, and why."""
+            logger.warning(
+                "Deploy freshness check degraded",
+                event_category="system",
+                event_type="deploy_freshness_degraded",
+                reason=reason,
+                check=check,
+                repo=repo,
+            )
+
+        def _one(name: str, status: str, message: str) -> List[CheckResult]:
+            result = CheckResult(name, status, message, dict(details))
+            self.results.append(result)
+            return [result]
+
+        def _warn(name: str, message: str, reason: str) -> List[CheckResult]:
+            _degraded(reason, name)
+            return _one(name, "warn", message)
+
+        # --- operator input, validated before anything is sent anywhere ---
+        if not GITHUB_REPO_PATTERN.match(repo):
+            return _warn(
+                "deploy_freshness_unconfigured",
+                f"GITHUB_REPO {repo!r} is not a valid owner/name pair — "
+                f"deploy freshness cannot be checked",
+                "bad_repo",
+            )
+
+        raw_max_hours = os.environ.get("DEPLOY_FRESHNESS_MAX_HOURS")
+        if raw_max_hours:
+            try:
+                candidate = float(raw_max_hours)
+            except (TypeError, ValueError):
+                candidate = None
+            # NaN loses every comparison, so an unguarded NaN window would make
+            # drift unreachable — the check would report "in flight" forever.
+            # inf and negatives are equally not-a-window. All fall back to the
+            # default rather than silently disabling the control. Zero is
+            # legal: it is the documented negative-drill setting.
+            if candidate is None or not math.isfinite(candidate) or candidate < 0:
+                _degraded("bad_window", "deploy_freshness")
+            else:
+                details["max_hours"] = candidate
+        max_hours = details["max_hours"]
+
+        if not git_commit:
+            return _warn(
+                "deploy_freshness_no_commit",
+                "GIT_COMMIT is not set on this service — cannot compare the "
+                "deployed commit against GitHub main. Expected before the env "
+                "var rolls out, and after a manual `gcloud builds submit` "
+                "(which supplies no $COMMIT_SHA).",
+                "no_commit",
+            )
+
+        # --- the request ---
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            # Not terminal: the repo is public. Degraded, and it keeps going.
+            _degraded("unauthenticated", "deploy_freshness")
+
+        url = f"https://api.github.com/repos/{repo}/commits/main"
+
+        try:
+            resp = self._github_get(
+                url, headers=headers, timeout=GITHUB_API_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            # ONLY the exception class, never str(exc): `requests` echoes header
+            # VALUES into InvalidHeader messages, so interpolating the exception
+            # would copy the GitHub token into a CheckResult that /regression
+            # returns over HTTP and writes to Cloud Logging.
+            return _warn(
+                "deploy_freshness_github_error",
+                f"GitHub request failed ({type(exc).__name__})",
+                "request_failed",
+            )
+
+        status_code = getattr(resp, "status_code", None)
+        details["status_code"] = status_code
+
+        if status_code in GITHUB_REDIRECT_STATUSES:
+            # THE FC-081 detector. GitHub keeps a rename redirect alive
+            # indefinitely, so the API half of the system keeps working while
+            # the Cloud Build trigger — which matches the old literal name and
+            # has no such forwarding — silently stops firing.
+            try:
+                location = (getattr(resp, "headers", None) or {}).get("Location") or ""
+            except Exception:
+                location = ""
+            details["redirect_location"] = location
+            message = (
+                f"GITHUB_REPO '{repo}' is stale — GitHub redirected to "
+                f"'{location}'; the Cloud Build trigger keys on the same "
+                f"literal name — repoint both (FC-081 failure mode)"
+            )
+            log_error_event(
+                logger,
+                error_type="deploy_freshness_repo_unreachable",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                repo=repo,
+                redirect_location=location,
+                status_code=status_code,
+                git_commit=git_commit,
+            )
+            return _one("deploy_freshness_repo_unreachable", "fail", message)
+
+        if status_code == 404:
+            message = (
+                f"GitHub returned 404 for '{repo}': repo not found — deleted, "
+                f"made private, or the token lost access. (A RENAMED repo "
+                f"redirects instead of 404ing, so this is not the rename case.)"
+            )
+            log_error_event(
+                logger,
+                error_type="deploy_freshness_repo_unreachable",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                repo=repo,
+                status_code=404,
+                git_commit=git_commit,
+            )
+            return _one("deploy_freshness_repo_unreachable", "fail", message)
+
+        if status_code != 200:
+            # 401/403 (bad or unscoped token), 429 (rate limit — likelier on
+            # the shared unauthenticated pool), 5xx (GitHub outage). None of
+            # these say anything about what is deployed, so none may fail.
+            return _warn(
+                "deploy_freshness_github_error",
+                f"GitHub returned HTTP {status_code} for '{repo}'",
+                "http_error",
+            )
+
+        # --- the body ---
+        try:
+            body = resp.json()
+            head_sha = body["sha"]
+            head_date_raw = body["commit"]["committer"]["date"]
+        except Exception as exc:
+            return _warn(
+                "deploy_freshness_github_error",
+                f"Could not read sha/date from the GitHub response "
+                f"({type(exc).__name__})",
+                "bad_json",
+            )
+
+        if not isinstance(head_sha, str) or not GIT_SHA_PATTERN.match(head_sha):
+            # Validated before use: every line below assumes a 40-hex string,
+            # and an unchecked None/int would raise out of the check group as a
+            # `fail` — a 500 on the hourly monitor caused by a bad response body.
+            return _warn(
+                "deploy_freshness_github_error",
+                "GitHub response `sha` is not a 40-character hex commit id",
+                "bad_sha",
+            )
+        details["head_sha"] = head_sha
+
+        try:
+            head_date = datetime.fromisoformat(
+                str(head_date_raw).replace("Z", "+00:00")
+            )
+        except Exception as exc:
+            return _warn(
+                "deploy_freshness_github_error",
+                f"Could not parse the committer date ({type(exc).__name__})",
+                "bad_date",
+            )
+
+        if head_date.tzinfo is None:
+            head_date = head_date.replace(tzinfo=timezone.utc)
+
+        head_age_minutes = round(
+            (_utcnow() - head_date).total_seconds() / 60.0, 1
+        )
+        details["head_age_minutes"] = head_age_minutes
+
+        # A commit dated in the future (skewed committer clock, or a rebase
+        # that forward-dated it) would otherwise make `age > window` false
+        # forever, i.e. permanent "in flight" — drift that can never be seen.
+        # Clamp to zero and say so.
+        effective_age_minutes = head_age_minutes
+        if head_age_minutes < 0:
+            _degraded("future_commit_date", "deploy_freshness")
+            effective_age_minutes = 0.0
+
+        # $COMMIT_SHA is full-length, so the common case is a 40-char compare.
+        # A hand-set short GIT_COMMIT is tolerated by prefix, but only at >= 7
+        # characters — shorter prefixes collide often enough to mask real drift.
+        matched = (
+            git_commit == head_sha
+            or (len(git_commit) >= 7 and head_sha.startswith(git_commit))
+        )
+
+        if matched:
+            return _one(
+                "deploy_freshness", "pass",
+                f"Deployed commit matches {repo}@main ({head_sha[:7]})",
+            )
+
+        # Strictly greater: age exactly at the window is still a build in
+        # flight. The window is the grace period, not the deadline.
+        if effective_age_minutes / 60.0 > max_hours:
+            message = (
+                f"Deployed commit {git_commit[:7]} does not match "
+                f"{repo}@main {head_sha[:7]}, which was committed "
+                f"{head_age_minutes:.0f}m ago (> {max_hours}h). main is merged "
+                f"but NOT deployed — check the Cloud Build trigger."
+            )
+            log_error_event(
+                logger,
+                error_type="deploy_freshness_drift",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                repo=repo,
+                git_commit=git_commit,
+                head_sha=head_sha,
+                head_age_minutes=head_age_minutes,
+                max_hours=max_hours,
+            )
+            return _one("deploy_freshness_drift", "fail", message)
+
+        return _one(
+            "deploy_freshness", "pass",
+            f"build in flight ({head_age_minutes:.0f}m): {repo}@main "
+            f"{head_sha[:7]} is newer than the deployed {git_commit[:7]}",
+        )
+
     def run_all_checks(self) -> Dict[str, Any]:
         """Execute all regression checks and return a consolidated report."""
         self.results = []
@@ -1209,6 +1574,7 @@ class RegressionMonitor:
             "position_reconciliation": self.check_position_reconciliation,
             "performance_baseline": self.check_performance_baseline,
             "risk_parameters": self.check_risk_parameters,
+            "deploy_freshness": self.check_deploy_freshness,
         }
 
         group_results: Dict[str, List[Dict]] = {}
