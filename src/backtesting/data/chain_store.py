@@ -21,14 +21,44 @@ exactly like a day on which those strikes did not trade.
 
 Today's session is excluded from the cache upstream — see
 ``chain_builder._is_cacheable``.
+
+**The lake (FC-060 Layer 1).** The local cache is thrown away every month: the
+``backtest-screen`` Cloud Run Job runs on an ephemeral filesystem, so every
+monthly screen is cold. ``ChainLake`` mirrors each file to a GCS object at
+``gs://<bucket>/<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet``, and ``ChainStore``
+uses it write-through: a local miss tries the lake before the provider, and a
+newly built chain is uploaded after it lands on disk. The lake is optional and
+purely additive — a lake failure is logged and degraded to local-only, never
+raised, because a GCS hiccup must not turn a two-hour screen into a failed
+execution. With no ``CHAIN_LAKE_BUCKET`` configured, no GCS client is ever
+constructed and behaviour is byte-identical to the pre-lake store.
+
+**A lake object is coverage-monotone, not immutable.** A *chain* for a settled
+session is immutable, but the *file* is not: it records the window it was built
+under, and the window is path-dependent (``cost_basis`` and ``low_anchor`` move
+it, so the bid pass rebuilds the same session under a different window than the
+mid pass, and another machine holding different positions gets a third). So an
+object may only ever be replaced by a file whose request is a **superset** —
+same model, at least the DTE reach, at least the strike window. A narrowing is
+refused and logged (``chain_lake_overwrite_skipped``) because the wider file is
+shared: losing it turns hits into misses for every machine, and the coverage it
+proved is not recoverable without re-fetching from the vendor. Merging two
+partial windows into their union on write is the Layer-2 follow-up; Layer 1
+deliberately only ever widens. Uploads carry an ``if_generation_match``
+precondition so two writers cannot resolve that race by luck.
+
+**Nothing here ever deletes.** See ``ChainLake``'s docstring: an unreadable
+local file is a reader-side event as often as it is corruption, and the lake
+exists precisely because the vendor may not serve these chains again.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 import pandas as pd
 import structlog
@@ -84,16 +114,770 @@ def _close(a: float, b: float) -> bool:
     return abs(a - b) <= _PRICE_TOL * max(1.0, abs(a), abs(b))
 
 
-class ChainStore:
-    """Local parquet cache of ChainSnapshots."""
+# Default cache root. Named so ``ChainStore`` and ``from_env`` cannot drift.
+DEFAULT_CACHE_DIR = "cache/backtest/chains"
 
-    def __init__(self, cache_dir: str = "cache/backtest/chains") -> None:
+# Object-name prefix inside the lake bucket. The parquet schema (``_COLUMNS``
+# plus the provenance columns) *is* the format contract for these objects, and
+# the ``model`` provenance column is part of it: bump this prefix whenever the
+# schema OR the pricing model changes, so two generations of file can never be
+# read as each other. An object is never overwritten by a file carrying a
+# different model fingerprint (see ``_window_regression``), so without a prefix
+# bump a model change simply stops populating the lake.
+DEFAULT_LAKE_PREFIX = "chains/v1"
+
+# Env wiring. Deployment configuration, not strategy configuration — the
+# backtest Job is configured by env, so this deliberately is not a settings.yaml
+# key (see docs/plans/fc-060-chain-lake.md).
+LAKE_BUCKET_ENV = "CHAIN_LAKE_BUCKET"
+LAKE_PREFIX_ENV = "CHAIN_LAKE_PREFIX"
+
+# Per-RPC ceiling and overall retry deadline. Without these, google-cloud-storage
+# retries a stalled request until the *task* timeout: a degraded GCS turns a
+# 1h47m screen into a killed execution, which is precisely the failure the
+# degrade-to-local-only policy exists to prevent. A timeout is what makes that
+# policy reachable.
+LAKE_TIMEOUT_S = 30.0
+LAKE_RETRY_DEADLINE_S = 60.0
+
+# Consecutive failed lake operations before the lake is switched off for the
+# rest of the process. A backtest with a dead lake should pay the outage once,
+# not once per symbol-day: 5,400 timeouts x 30s is a run that never finishes.
+MAX_CONSECUTIVE_LAKE_ERRORS = 5
+
+_RETRY = None
+_NOT_FOUND = None
+_PRECONDITION_FAILED = None
+
+
+def _storage_client():
+    """Build a GCS client.
+
+    Indirected through a module-level function for two reasons: the import is
+    deferred so a process with no lake configured never imports the GCS stack,
+    and tests can monkeypatch this name to assert that no client is constructed
+    on paths that must not touch the network.
+    """
+    from google.cloud import storage  # imported lazily; see docstring
+
+    return storage.Client()
+
+
+def _retry():
+    """Bounded retry policy, resolved lazily (see ``_storage_client``)."""
+    global _RETRY
+    if _RETRY is None:
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        _RETRY = (
+            DEFAULT_RETRY.with_timeout(LAKE_RETRY_DEADLINE_S)
+            if hasattr(DEFAULT_RETRY, "with_timeout")
+            else DEFAULT_RETRY.with_deadline(LAKE_RETRY_DEADLINE_S)
+        )
+    return _RETRY
+
+
+def _not_found():
+    global _NOT_FOUND
+    if _NOT_FOUND is None:
+        from google.api_core.exceptions import NotFound
+
+        _NOT_FOUND = NotFound
+    return _NOT_FOUND
+
+
+def _precondition_failed():
+    global _PRECONDITION_FAILED
+    if _PRECONDITION_FAILED is None:
+        from google.api_core.exceptions import PreconditionFailed
+
+        _PRECONDITION_FAILED = PreconditionFailed
+    return _PRECONDITION_FAILED
+
+
+class ChainLakeUnavailable(Exception):
+    """The lake cannot be used at all — stop trying for the rest of the run.
+
+    Distinct from an operation failing: bad credentials or a missing bucket do
+    not get better on the next symbol-day, so retrying them 5,400 times is pure
+    latency. Carries the reason that goes into ``chain_lake_disabled``.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class ChainLakePreconditionFailed(Exception):
+    """Another writer changed the object since we read its generation.
+
+    Not an error: it means the write-once precondition did its job. The upload
+    is skipped rather than retried — the object under us was written by another
+    process running this same code, so it is already coverage-checked; blindly
+    re-uploading over it would be exactly the clobber the precondition exists
+    to prevent.
+    """
+
+
+@dataclass
+class LakeObject:
+    """What one metadata read tells us about an object in the lake."""
+
+    generation: Optional[int] = None
+    md5_hash: Optional[str] = None
+
+
+class ChainLake:
+    """GCS mirror of the local chain cache (FC-060 Layer 1).
+
+    Object layout mirrors the local one exactly:
+    ``gs://<bucket>/<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet``. One local file
+    is one object; nothing is repacked, so a lake round-trip cannot change a
+    chain — it only moves the file the local store would have read anyway, and
+    the store's coverage check then applies to it unchanged.
+
+    The client is constructed lazily on first use, so building a ``ChainLake``
+    is free and credential-less: unit tests and local runs that never reach a
+    lake operation never touch ``google.cloud.storage``. First use also probes
+    the bucket once, because a typo'd or unreachable bucket otherwise reads as
+    an *empty lake* — every read a clean miss, every run silently paying the
+    full cold cost while the logs say nothing is wrong.
+
+    This class holds the availability state (disabled / reason) because that
+    state belongs to the bucket, not to any one ``ChainStore``: a screen builds
+    one store per symbol over a single shared lake, and a dead bucket must be
+    discovered once for the run rather than fourteen times.
+
+    Operations are allowed to raise, and *how a failure is absorbed* is
+    ``ChainStore``'s job — it counts, logs and continues local-only, in one
+    place, so no call site can accidentally make a lake outage fatal. What this
+    class does own is *availability*: once disabled, every operation refuses
+    immediately with ``ChainLakeUnavailable`` rather than issuing an RPC. That
+    matters for direct callers such as the seed tool, which have no
+    ``ChainStore`` in front of them to check the flag.
+
+    There is deliberately **no delete**. An unreadable local file is a
+    reader-side event (``pyarrow`` version skew, ``MemoryError``, a hit
+    file-descriptor limit) at least as often as it is genuine corruption, and
+    deleting the remote object on that signal would destroy history that may not
+    be re-fetchable. Overwrite-on-rebuild, guarded by the coverage rule, is the
+    only mutation path this class offers; ``chain_lake_seed.py --force`` is the
+    deliberate, human-driven escape hatch for a genuinely bad object.
+    """
+
+    def __init__(self, bucket: str, prefix: str = DEFAULT_LAKE_PREFIX) -> None:
+        bucket = (bucket or "").strip()
+        if not bucket:
+            raise ValueError("ChainLake requires a bucket name")
+        prefix = (prefix or "").strip().strip("/")
+        if not prefix:
+            # An empty prefix would scatter bare <SYMBOL>/<date>.parquet objects
+            # across the bucket root with no format version left to bump.
+            raise ValueError("ChainLake requires a non-empty prefix")
+        self.bucket_name = bucket
+        self.prefix = prefix
+        self._client: Optional[Any] = None  # google.cloud.storage.Client
+        self._client_failed = False
+        self._probed = False
+        self.disabled = False
+        self.disabled_reason: Optional[str] = None
+        self._consecutive_errors = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"ChainLake(bucket={self.bucket_name!r}, prefix={self.prefix!r})"
+
+    # ------------------------------ availability ------------------------- #
+    def disable(self, reason: str) -> None:
+        """Switch the lake off for the rest of its life. Logs exactly once.
+
+        Sticky and one-way: every subsequent ``stat``/``download``/``upload``
+        raises ``ChainLakeUnavailable`` without an RPC (see ``_bucket``). There
+        is no re-enable — a lake that failed its probe or burned through the
+        error budget does not recover inside one process, and retrying it is
+        the latency this exists to avoid.
+        """
+        if self.disabled:
+            return
+        self.disabled = True
+        self.disabled_reason = reason
+        logger.warning(
+            "Chain lake disabled for the rest of this run; continuing local-only",
+            event_category="backtest_data",
+            event_type="chain_lake_disabled",
+            reason=reason,
+            bucket=self.bucket_name,
+            prefix=self.prefix,
+        )
+
+    def note_success(self) -> None:
+        self._consecutive_errors = 0
+
+    def note_failure(self) -> None:
+        """Count a failed operation; trip the breaker at the threshold."""
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= MAX_CONSECUTIVE_LAKE_ERRORS:
+            self.disable("consecutive_errors")
+
+    # -------------------------------- plumbing --------------------------- #
+    def object_name(self, underlying: str, as_of: date) -> str:
+        return f"{self.prefix}/{underlying.upper()}/{as_of.isoformat()}.parquet"
+
+    def _bucket(self):
+        """Client + one-time startup probe. Raises ChainLakeUnavailable if dead.
+
+        Sticky in both directions: a lake that has been disabled, or whose
+        client construction has already failed, refuses every operation from
+        here on. That guard lives at this chokepoint rather than in each method
+        so a direct caller (the seed tool) gets the same protection the store's
+        ``_lake_active`` gate gives the engine.
+        """
+        self._ensure_usable()
+        if self._client is None:
+            try:
+                self._client = _storage_client()
+            except Exception as exc:
+                # Never retried: no credential appears mid-run, and re-running
+                # ADC discovery per symbol-day is pure latency.
+                self._client_failed = True
+                self.disable("credentials")
+                raise ChainLakeUnavailable(
+                    "credentials", f"could not build a GCS client: {exc}"
+                )
+        bucket = self._client.bucket(self.bucket_name)
+        if not self._probed:
+            self._probed = True
+            self._probe(bucket)
+        return bucket
+
+    def _ensure_usable(self) -> None:
+        """Refuse, without an RPC, once this lake is known to be unusable.
+
+        Both latches are one-way. ``disabled`` is set by the probe, by a
+        credentials failure or by the error budget; ``_client_failed`` is set
+        only by the former and is checked separately so that it survives even
+        if something clears ``disabled`` — they are independent guards on
+        purpose, because the store's own ``_lake_active`` check is a third and
+        a direct caller (the seed tool) has neither.
+        """
+        if self.disabled:
+            raise ChainLakeUnavailable(
+                self.disabled_reason or "disabled",
+                f"chain lake is disabled ({self.disabled_reason})",
+            )
+        if self._client_failed:
+            raise ChainLakeUnavailable(
+                "credentials", "GCS client construction already failed"
+            )
+
+    def _probe(self, bucket) -> None:
+        """One object-scoped RPC to prove the lake is actually reachable.
+
+        **Deliberately not ``bucket.exists()``.** That is ``GET /b/<bucket>``
+        and needs ``storage.buckets.get``, which ``roles/storage.objectAdmin``
+        — the grant the Job's service account and ``claude-operator`` get —
+        does NOT carry. The probe would 403 on the first call of every run and
+        disable the lake permanently. Listing one object needs only
+        ``storage.objects.list``, which objectAdmin does carry, so this asks
+        the same question ("can I reach this bucket?") within the permissions
+        the lake is meant to run under. Widening IAM to make a health check
+        work would be the wrong fix.
+
+        A missing bucket surfaces as ``NotFound`` from the list; anything else
+        (403, DNS, TLS, timeout) is ``bucket_unreachable``. Zero objects is a
+        healthy *empty* lake — the day-one state before the seed runs.
+        """
+        try:
+            next(
+                iter(
+                    self._client.list_blobs(
+                        bucket,
+                        prefix=f"{self.prefix}/",
+                        max_results=1,
+                        timeout=LAKE_TIMEOUT_S,
+                        retry=_retry(),
+                    )
+                ),
+                None,
+            )
+        except _not_found():
+            self._unavailable("bucket_missing", "bucket does not exist")
+        except Exception as exc:
+            self._unavailable("bucket_unreachable", f"{type(exc).__name__}: {exc}")
+
+    def _unavailable(self, reason: str, detail: str):
+        logger.error(
+            "Chain lake bucket is not usable; disabling the lake",
+            event_category="backtest_data",
+            event_type="chain_lake_unavailable",
+            reason=reason,
+            bucket=self.bucket_name,
+            prefix=self.prefix,
+            detail=detail[:300],
+        )
+        self.disable(reason)
+        raise ChainLakeUnavailable(reason, f"{self.bucket_name}: {detail}")
+
+    # ------------------------------- operations -------------------------- #
+    def stat(self, underlying: str, as_of: date) -> Optional[LakeObject]:
+        """One metadata RPC. None when the object does not exist.
+
+        ``get_blob`` rather than ``exists``: the generation it returns is what
+        makes the upload precondition possible, and the md5 is what lets the
+        seed tool tell "already there, identical" from "already there, and
+        different from what I hold".
+        """
+        blob = self._bucket().get_blob(
+            self.object_name(underlying, as_of),
+            timeout=LAKE_TIMEOUT_S,
+            retry=_retry(),
+        )
+        if blob is None:
+            return None
+        return LakeObject(generation=blob.generation, md5_hash=blob.md5_hash)
+
+    def download(
+        self, underlying: str, as_of: date, local_path
+    ) -> Optional[LakeObject]:
+        """Fetch the object into ``local_path``; None if it does not exist.
+
+        Attempts the download directly and treats ``NotFound`` as the miss
+        rather than probing with ``exists`` first: half the RPCs on the miss
+        path, which is the common path on a cold run, and no exists→download
+        race.
+
+        Written to a temp file in the destination directory and then
+        ``os.replace``d, for the same reason ``ChainStore.put`` does — a partial
+        download must never be visible as a cache file, because the reader
+        cannot repair one and every later run would die on the same day.
+        """
+        blob = self._bucket().blob(self.object_name(underlying, as_of))
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = local_path.with_name(f"{local_path.name}.{os.getpid()}.lake.tmp")
+        try:
+            try:
+                blob.download_to_filename(
+                    str(tmp), timeout=LAKE_TIMEOUT_S, retry=_retry()
+                )
+            except _not_found():
+                return None
+            os.replace(tmp, local_path)  # atomic within a filesystem
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return LakeObject(generation=blob.generation, md5_hash=blob.md5_hash)
+
+    def upload(
+        self,
+        local_path,
+        underlying: str,
+        as_of: date,
+        *,
+        if_generation_match: Optional[int],
+    ) -> None:
+        """Mirror a completed local file, guarded by a generation precondition.
+
+        ``if_generation_match=0`` means "create only"; any other value means
+        "the object must still be the one whose provenance I checked". Without
+        it, two machines replaying the same window would race and the loser's
+        wider file could be replaced by the winner's narrower one *after* the
+        coverage check had already passed.
+        """
+        blob = self._bucket().blob(self.object_name(underlying, as_of))
+        try:
+            blob.upload_from_filename(
+                str(local_path),
+                if_generation_match=if_generation_match,
+                timeout=LAKE_TIMEOUT_S,
+                retry=_retry(),
+                checksum="crc32c",
+            )
+        except _precondition_failed() as exc:
+            raise ChainLakePreconditionFailed(str(exc))
+
+
+class _Window(NamedTuple):
+    """The request a chain file answers — its provenance columns, as a tuple."""
+
+    universe_dte: float
+    strike_gte: float
+    strike_lte: float
+    model: str
+
+    def as_log(self) -> dict:
+        return {
+            "universe_dte": None if pd.isna(self.universe_dte) else int(self.universe_dte),
+            "strike_gte": None if pd.isna(self.strike_gte) else round(float(self.strike_gte), 4),
+            "strike_lte": None if pd.isna(self.strike_lte) else round(float(self.strike_lte), 4),
+            "model": self.model,
+        }
+
+
+def _window_of(df) -> _Window:
+    """Read a file's provenance. Missing columns read as unknown."""
+    def col(name):
+        return df[name].iloc[0] if name in df.columns else _UNKNOWN
+
+    model = df["model"].iloc[0] if "model" in df.columns else ""
+    return _Window(
+        universe_dte=col("universe_dte"),
+        strike_gte=col("strike_gte"),
+        strike_lte=col("strike_lte"),
+        model="" if pd.isna(model) else str(model),
+    )
+
+
+def _window_regression(new: _Window, old: _Window) -> Optional[str]:
+    """Why ``new`` must not overwrite ``old``, or None if it may.
+
+    The rule is *coverage-monotone*: an object may only be replaced by a file
+    built from a request that is a superset — same model, at least the DTE
+    reach, at least the strike window. Anything else is a narrowing, and a
+    narrowing is silent data loss: the wider file is gone, and every future
+    bounded request that the wide file used to satisfy becomes a cache miss
+    (best case) for every machine sharing the lake.
+
+    Unknown provenance on either side fails closed. A file that cannot prove
+    what it covers cannot prove it covers what it would replace.
+    """
+    if new.model != old.model:
+        # Never an overwrite: a different pricing model is a different answer,
+        # not a wider one. A model change needs a CHAIN_LAKE_PREFIX bump.
+        return "model_changed"
+    if _unknown_pair(new.universe_dte, old.universe_dte) or _unknown_pair(
+        new.strike_gte, old.strike_gte
+    ) or _unknown_pair(new.strike_lte, old.strike_lte):
+        return "unknown_provenance"
+    if not pd.isna(old.universe_dte) and float(new.universe_dte) < float(old.universe_dte):
+        return "narrower_dte"
+    if not pd.isna(old.strike_gte) and float(new.strike_gte) > float(old.strike_gte) + _BOUND_TOL:
+        return "narrower_strikes"
+    if not pd.isna(old.strike_lte) and float(new.strike_lte) < float(old.strike_lte) - _BOUND_TOL:
+        return "narrower_strikes"
+    return None
+
+
+def _unknown_pair(new: float, old: float) -> bool:
+    """True when exactly one side is unknown — an unprovable comparison."""
+    return bool(pd.isna(new)) != bool(pd.isna(old))
+
+
+@dataclass
+class _RemoteState:
+    """What this store last learned about one object in the lake.
+
+    ``probed`` records that a full metadata+download probe has already been
+    paid for this key. Without it, an object whose provenance cannot be read
+    (an unreadable remote parquet — the one case nothing in this module will
+    overwrite) would be re-stat'd and re-downloaded on every single put for the
+    rest of the run, to reach the same refusal every time.
+    """
+
+    present: bool
+    generation: Optional[int] = None
+    window: Optional[_Window] = None
+    probed: bool = False
+
+
+class ChainStore:
+    """Local parquet cache of ChainSnapshots, optionally mirrored to a lake."""
+
+    def __init__(
+        self,
+        cache_dir: str = DEFAULT_CACHE_DIR,
+        lake: Optional[ChainLake] = None,
+    ) -> None:
         self._root = Path(cache_dir)
+        self.lake = lake
+        # Counters, not metrics plumbing: the first monthly warm run has to be
+        # measurable ("hits >> puts and the runtime dropped") from the Job's own
+        # logs, and there is no metrics sink in this process.
+        self.lake_hits = 0        # object downloaded and used
+        self.lake_misses = 0      # object absent
+        self.lake_rejected = 0    # downloaded, then failed the coverage check
+        self.lake_puts = 0        # object written
+        self.lake_skipped = 0     # upload declined (all reasons; total)
+        # Subset of lake_skipped: the remote object's provenance could not be
+        # read, so coverage could not be compared. Broken out because the other
+        # skips are the guard working as designed, while this one is a poisoned
+        # object that only `chain_lake_seed.py --force` can clear.
+        self.lake_skipped_unreadable_remote = 0
+        self.lake_errors = 0      # operation failed; run continued local-only
+        # Remembers what the lake held for a key, so ``put`` can check coverage
+        # against the object it is about to replace without re-downloading it.
+        self._lake_seen: Dict[tuple, _RemoteState] = {}
+
+    @classmethod
+    def lake_from_env(cls) -> Optional[ChainLake]:
+        """The lake the environment asks for, or None.
+
+        Separate from ``from_env`` so a screen can build ONE lake and share it
+        across its per-symbol stores: the client, the bucket probe and the
+        circuit breaker are then run-scoped rather than symbol-scoped.
+        """
+        bucket = os.environ.get(LAKE_BUCKET_ENV, "").strip()
+        if not bucket:
+            return None
+        prefix = os.environ.get(LAKE_PREFIX_ENV, "").strip() or DEFAULT_LAKE_PREFIX
+        return ChainLake(bucket, prefix)
+
+    @classmethod
+    def from_env(cls, cache_dir: str = DEFAULT_CACHE_DIR) -> "ChainStore":
+        """Build a store, wiring the lake from the environment if configured.
+
+        ``CHAIN_LAKE_BUCKET`` unset or empty => ``lake is None`` and behaviour is
+        identical to a plain ``ChainStore(cache_dir)``: no GCS client is ever
+        constructed and no lake event is ever logged.
+        """
+        return cls(cache_dir, lake=cls.lake_from_env())
+
+    def summary(self) -> dict:
+        """Lake usage for this store's lifetime; safe to call with no lake."""
+        return {
+            "lake_enabled": self.lake is not None,
+            "lake_bucket": getattr(self.lake, "bucket_name", None),
+            "lake_prefix": getattr(self.lake, "prefix", None),
+            "lake_hits": self.lake_hits,
+            "lake_misses": self.lake_misses,
+            "lake_rejected": self.lake_rejected,
+            "lake_puts": self.lake_puts,
+            "lake_skipped": self.lake_skipped,
+            "lake_skipped_unreadable_remote": self.lake_skipped_unreadable_remote,
+            "lake_errors": self.lake_errors,
+            "lake_disabled": bool(getattr(self.lake, "disabled", False)),
+            "lake_disabled_reason": getattr(self.lake, "disabled_reason", None),
+        }
+
+    # --------------------------- lake plumbing --------------------------- #
+    def _lake_active(self) -> bool:
+        """Whether a lake operation is worth attempting at all."""
+        return self.lake is not None and not self.lake.disabled
+
+    def _lake_call(self, op: str, underlying: str, as_of: date, fn):
+        """Run one lake operation, turning any failure into a counted no-op.
+
+        Returns ``(ok, value)``. A lake outage must degrade a backtest to
+        local-only, never fail it — a two-hour screen cannot be lost to a GCS
+        hiccup — so this catches broadly on purpose. The counters are what keep
+        "degraded silently" from being indistinguishable from "worked".
+
+        Three outcomes are separated because they mean different things to an
+        operator: the lake is *unusable* (stop trying), the write was *declined*
+        (the lake is healthy and protected itself), or the operation *failed*
+        (count it, and trip the breaker if they keep failing).
+        """
+        try:
+            value = fn()
+        except ChainLakeUnavailable:
+            # ChainLake has already logged chain_lake_unavailable /
+            # chain_lake_disabled and will refuse further work.
+            self.lake_errors += 1
+            return False, None
+        except ChainLakePreconditionFailed as exc:
+            self.lake_skipped += 1
+            self.lake.note_success()  # the RPC reached GCS; the lake is healthy
+            logger.info(
+                "Chain lake upload skipped: another writer got there first",
+                event_category="backtest_data",
+                event_type="chain_lake_overwrite_skipped",
+                reason="generation_mismatch",
+                symbol=underlying,
+                as_of=as_of.isoformat(),
+                bucket=self.lake.bucket_name,
+                detail=str(exc)[:200],
+            )
+            return False, None
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            self.lake_errors += 1
+            self.lake.note_failure()
+            logger.warning(
+                "Chain lake operation failed; continuing local-only",
+                event_category="backtest_data",
+                event_type="chain_lake_error",
+                op=op,
+                symbol=underlying,
+                as_of=as_of.isoformat(),
+                bucket=self.lake.bucket_name,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+            return False, None
+        self.lake.note_success()
+        return True, value
+
+    def _pull_from_lake(self, underlying: str, as_of: date, path: Path) -> bool:
+        """Try to satisfy a local miss from the lake. True if the file landed."""
+        if not self._lake_active():
+            return False
+        ok, obj = self._lake_call(
+            "download",
+            underlying,
+            as_of,
+            lambda: self.lake.download(underlying, as_of, path),
+        )
+        if not ok:
+            return False
+        key = self._key(underlying, as_of)
+        if obj is not None and path.exists():
+            # Window is filled in by ``get`` once the file has been read.
+            self._lake_seen[key] = _RemoteState(True, generation=obj.generation)
+            self.lake_hits += 1
+            return True
+        self._lake_seen[key] = _RemoteState(False)
+        self.lake_misses += 1
+        return False
+
+    @staticmethod
+    def _key(underlying: str, as_of: date) -> tuple:
+        return (underlying.upper(), as_of.isoformat())
+
+    def _remember_remote_window(self, underlying: str, as_of: date, df) -> None:
+        state = self._lake_seen.get(self._key(underlying, as_of))
+        if state is not None and state.present:
+            state.window = _window_of(df)
+
+    def _mirror_to_lake(
+        self, path: Path, underlying: str, as_of: date, new_window: "_Window"
+    ) -> None:
+        """Upload a freshly written local file, unless doing so would narrow.
+
+        The strike window is path-dependent — it moves with ``cost_basis`` and
+        ``low_anchor``, so the same session legitimately gets different windows
+        on the mid pass and the bid pass, and different windows again on a
+        machine holding different positions. A blind overwrite would therefore
+        let a narrower rebuild delete a wider object that other runs depend on.
+        """
+        if not self._lake_active():
+            return
+        key = self._key(underlying, as_of)
+        seen = self._lake_seen.get(key)
+        remote: Optional[_RemoteState]
+        if seen is not None and not seen.present:
+            remote = None  # we looked this run and it was not there
+        elif (
+            seen is not None
+            and seen.generation is not None
+            and (seen.window is not None or seen.probed)
+        ):
+            # Already known this run: either downloaded (provenance read) or
+            # fully probed and found unreadable. Either way, do not pay for it
+            # again — a poisoned object would otherwise cost a stat plus a
+            # download on every put for the rest of the run.
+            remote = seen
+        else:
+            ok, remote = self._probe_remote(underlying, as_of)
+            if not ok:
+                return
+
+        generation = 0
+        if remote is not None:
+            if remote.window is None:
+                # Object exists but we could not establish what it covers.
+                # Fail closed: never overwrite what we cannot compare against.
+                self.lake_skipped_unreadable_remote += 1
+                self._skip_overwrite(underlying, as_of, new_window, None,
+                                     "remote_provenance_unknown")
+                return
+            reason = _window_regression(new_window, remote.window)
+            if reason is not None:
+                self._skip_overwrite(underlying, as_of, new_window,
+                                     remote.window, reason)
+                return
+            generation = remote.generation  # None => no precondition available
+
+        ok, _ = self._lake_call(
+            "upload",
+            underlying,
+            as_of,
+            lambda: self.lake.upload(
+                path, underlying, as_of, if_generation_match=generation
+            ),
+        )
+        if ok:
+            self.lake_puts += 1
+            self._lake_seen[key] = _RemoteState(True, generation=None,
+                                                window=new_window)
+
+    def _probe_remote(self, underlying: str, as_of: date):
+        """Learn what the lake currently holds for a key: ``(ok, state|None)``.
+
+        One metadata RPC; if an object is there, a download to a temp path to
+        read its provenance, because the provenance lives inside the parquet
+        and there is no cheaper place to read it from. This is the price of
+        never clobbering a wider file, and it is paid only when a rebuild
+        happens over an object this run has not already downloaded.
+        """
+        ok, obj = self._lake_call(
+            "stat", underlying, as_of, lambda: self.lake.stat(underlying, as_of)
+        )
+        if not ok:
+            return False, None
+        if obj is None:
+            self._lake_seen[self._key(underlying, as_of)] = _RemoteState(False)
+            return True, None
+
+        tmp = self._root / underlying.upper() / (
+            f"{as_of.isoformat()}.{os.getpid()}.probe.tmp"
+        )
+        try:
+            ok, got = self._lake_call(
+                "download",
+                underlying,
+                as_of,
+                lambda: self.lake.download(underlying, as_of, tmp),
+            )
+            if not ok:
+                return False, None
+            window = None
+            if got is not None and tmp.exists():
+                try:
+                    window = _window_of(pd.read_parquet(tmp))
+                except Exception:
+                    # Unreadable remote object. Not deleted — see ChainLake's
+                    # docstring; the seed tool's --force is the escape hatch.
+                    window = None
+            state = _RemoteState(
+                got is not None, generation=obj.generation, window=window,
+                probed=True,
+            )
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        self._lake_seen[self._key(underlying, as_of)] = state
+        return True, (state if state.present else None)
+
+    def _skip_overwrite(self, underlying: str, as_of: date, new: _Window,
+                        old: Optional[_Window], reason: str) -> None:
+        self.lake_skipped += 1
+        remedy = (
+            "the existing object could not be read, so coverage could not be "
+            "compared; clear it deliberately with "
+            "`tools/diagnostics/chain_lake_seed.py --force`"
+            if reason == "remote_provenance_unknown"
+            else "the existing object covers more than this rebuild does"
+        )
+        logger.warning(
+            "Chain lake upload skipped: it would not cover the object it replaces",
+            event_category="backtest_data",
+            event_type="chain_lake_overwrite_skipped",
+            reason=reason,
+            remedy=remedy,
+            symbol=underlying,
+            as_of=as_of.isoformat(),
+            bucket=self.lake.bucket_name,
+            new_window=new.as_log(),
+            existing_window=None if old is None else old.as_log(),
+        )
 
     def _path(self, underlying: str, as_of: date) -> Path:
         return self._root / underlying.upper() / f"{as_of.isoformat()}.parquet"
 
     def has(self, underlying: str, as_of: date) -> bool:
+        """Whether the chain is present *locally*. Never consults the lake.
+
+        A lake probe is a network round-trip, and every caller of ``has`` wants
+        the cheap local question. ``get`` is the one that reaches for the lake.
+        """
         return self._path(underlying, as_of).exists()
 
     def put(
@@ -117,6 +901,9 @@ class ChainStore:
         later run would die on the same day until someone found and deleted it
         by hand. Parallel study runs over overlapping symbols (FC-042 Track B
         runs B1 and B2 concurrently) make that a routine event, not an exotic one.
+
+        When a lake is configured the completed file is then mirrored to it —
+        after ``os.replace``, so a torn write is never uploaded.
         """
         path = self._path(snapshot.underlying, snapshot.as_of)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +926,23 @@ class ChainStore:
         finally:
             if tmp.exists():
                 tmp.unlink()
+        # Mirror to the lake AFTER os.replace, never from the temp file: what is
+        # uploaded is exactly the bytes a local reader would read, so a torn
+        # write can never become a permanently poisoned object. The mirror is
+        # coverage-guarded — see ``_mirror_to_lake`` — because the local
+        # overwrite above is always safe (this machine rebuilt it) while the
+        # remote one is not (other machines read it).
+        self._mirror_to_lake(
+            path,
+            snapshot.underlying,
+            snapshot.as_of,
+            _Window(
+                provenance["universe_dte"],
+                provenance["strike_gte"],
+                provenance["strike_lte"],
+                provenance["model"],
+            ),
+        )
 
     def get(
         self,
@@ -165,10 +969,27 @@ class ChainStore:
         An unreadable file is treated as a miss and deleted rather than raised:
         it is a corrupt cache entry, and the caller can always rebuild from the
         provider. Propagating the error instead would wedge every future run.
+        The deletion is **local only** — the lake object is never touched,
+        because this path cannot tell genuine corruption from a reader-side
+        failure (pyarrow skew, MemoryError, an exhausted fd limit) and must not
+        destroy history on that signal. A rebuild replaces the object through
+        the coverage-guarded mirror path instead.
+
+        **With a lake configured**, a local miss first tries to download the
+        day's object. The coverage check, the narrowing and the corrupt-file
+        handling below then apply to the downloaded file exactly as they do to
+        a local one — which is what makes a lake-warmed run and a cold run
+        return the identical chain.
         """
         path = self._path(underlying, as_of)
+        # The lake is consulted BEFORE the read path, never instead of it: a
+        # downloaded file is then interrogated exactly like a local one.
+        # ``_pull_from_lake`` returns True only once the file is on disk.
+        from_lake = False
         if not path.exists():
-            return None
+            if not self._pull_from_lake(underlying, as_of, path):
+                return None
+            from_lake = True
         try:
             df = pd.read_parquet(path)
         except Exception:
@@ -180,11 +1001,25 @@ class ChainStore:
                 as_of=as_of.isoformat(),
                 path=str(path),
             )
+            # LOCAL ONLY. The lake object is deliberately left alone: this
+            # ``except`` fires on any reader-side failure — a pyarrow version
+            # skew, MemoryError, an exhausted file-descriptor limit — not only
+            # on genuine corruption, and one such failure must never delete
+            # history that may not be re-fetchable from the vendor. A rebuild
+            # replaces the object through the guarded mirror path instead.
             path.unlink(missing_ok=True)
             return None
+        if from_lake:
+            # Remember what the object claims to cover, so a rebuild later in
+            # this run can prove it would not narrow it.
+            self._remember_remote_window(underlying, as_of, df)
         if df.empty:
+            if from_lake:
+                self.lake_rejected += 1
             return None
         if not self._covers(df, universe_dte, strike_gte, strike_lte, model):
+            if from_lake:
+                self.lake_rejected += 1
             return None
 
         cached_price = float(df["underlying_price"].iloc[0])
@@ -192,6 +1027,8 @@ class ChainStore:
             # The file was built against a different close for the same session
             # (a restated bar, or a raw/adjusted mix). Every delta in it was
             # computed against that price, so it cannot answer this request.
+            if from_lake:
+                self.lake_rejected += 1
             return None
 
         puts, calls = [], []

@@ -759,17 +759,35 @@ def _broken_get_previous_close(self, symbol, current_time):
         return None
 
 
+# One chain lake per process, a fresh ChainStore per use — the same shape
+# `screen.py` uses (FC-060). A lake per call would mean a GCS client, a startup
+# probe and an independent circuit breaker for every simulated arm, so an
+# outage would be rediscovered instead of remembered.
+_CHAIN_LAKE = None
+_CHAIN_LAKE_RESOLVED = False
+
+
+def _chain_store():
+    global _CHAIN_LAKE, _CHAIN_LAKE_RESOLVED
+    from src.backtesting.data.chain_store import ChainStore
+
+    if not _CHAIN_LAKE_RESOLVED:
+        _CHAIN_LAKE = ChainStore.lake_from_env()
+        _CHAIN_LAKE_RESOLVED = True
+    return ChainStore(lake=_CHAIN_LAKE)
+
+
 def _run_sim(symbol: str, start: date, end: date, config):
     """Drive the Simulator directly so the raw ledger and equity curve are visible."""
     from src.backtesting.data.alpaca_provider import AlpacaDataProvider
     from src.backtesting.data.chain_builder import ChainBuilder
-    from src.backtesting.data.chain_store import ChainStore
     from src.backtesting.data.dividends import load_default_schedule
     from src.backtesting.engine.simulator import Simulator
 
     provider = AlpacaDataProvider.from_config(config)
-    store = ChainStore()
-    builder = ChainBuilder(provider, store=store)
+    # Shares the FC-060 chain lake when CHAIN_LAKE_BUCKET is set, so a study run
+    # warms (and contributes to) the same history the Job uses.
+    builder = ChainBuilder(provider, store=_chain_store())
     sim = Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=100_000.0, max_dte=getattr(config, "put_target_dte", 7),

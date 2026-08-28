@@ -254,12 +254,90 @@ deploy. Recorded because the same mistakes are easy to repeat:
 3. **Timeout.** It said `3600s`. The real run takes **1h47m**, so an hour would have timed
    out. Now `10800s`.
 
+### The chain lake (FC-060 Layer 1)
+
+Cloud Run's filesystem is ephemeral, so the local parquet chain cache is thrown away after
+every monthly run and every screen was cold. The **chain lake** is a GCS mirror of that
+cache, and `ChainStore` uses it write-through:
+
+| | |
+|---|---|
+| Bucket | `gs://options-wheel-chain-lake` (operator-provisioned; versioning on) |
+| IAM | **`roles/storage.objectAdmin` on the bucket, and nothing bucket-level.** The lake only lists, reads and writes *objects* — including its startup health probe, which lists one object rather than calling `Bucket.exists()` (that is `storage.buckets.get`, which objectAdmin does **not** grant; using it would 403 and disable the lake on the first call of every run). Do not widen IAM to make a health check work. |
+| Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, same bytes |
+| Env | `CHAIN_LAKE_BUCKET` (unset ⇒ **no lake, no GCS client, behaviour identical to before**), `CHAIN_LAKE_PREFIX` (default `chains/v1`) |
+| Read by | `ChainStore.from_env()` — the Job (`screen.py`, which builds **one** lake for the whole run), `main.py --command backtest` via `evaluate_symbol`, and the `fc034` / `fc036` diagnostics. A `ChainStore()` constructed directly anywhere else bypasses the lake by design. |
+| Seed | `python tools/diagnostics/chain_lake_seed.py --cache-dir cache/backtest/chains --bucket options-wheel-chain-lake` |
+
+- **A local miss tries the lake before the provider**; a chain built from the provider is
+  uploaded after the atomic local write. A miss is a single RPC (`NotFound`), not a probe
+  followed by a fetch.
+- **The coverage check is unchanged and still governs.** A lake-sourced file goes through
+  `_covers` and the narrowing read path exactly as a local file does, so a warm run and a
+  cold run return the identical chain. The lake moves files; it never answers questions.
+- **Objects are coverage-monotone, not immutable.** The *chain* for a settled session never
+  changes, but the *file* records the window it was built under, and that window is
+  path-dependent — the bid pass of `evaluate_symbol` rebuilds the same session under a
+  different `cost_basis`/`low_anchor` than the mid pass, and another machine gets a third.
+  An object is therefore replaced only by a file whose request is a **superset** (same
+  model, ≥ DTE reach, ⊇ strike window). A narrowing is refused and logged as
+  `chain_lake_overwrite_skipped`; every upload carries an `if_generation_match`
+  precondition so concurrent writers cannot clobber each other. Merging two partial windows
+  into their union on write is the **Layer 2** follow-up.
+- **A model change needs a prefix bump.** The `model` fingerprint is part of the format
+  contract, and a different model is never a *wider* answer — such an upload is skipped, so
+  without bumping `CHAIN_LAKE_PREFIX` a model change silently stops populating the lake.
+- **Nothing ever deletes an object.** An unreadable local file is discarded locally and the
+  mirror is left alone: `except Exception` around `read_parquet` fires on a pyarrow version
+  skew, a `MemoryError` or an exhausted fd limit as readily as on real corruption, and the
+  lake exists precisely because the vendor may not serve these chains again. The only way
+  to replace a genuinely bad object is `chain_lake_seed.py --force`, by hand.
+- **A lake failure is never fatal, and never unbounded.** Every call is wrapped: the failure
+  is logged as `chain_lake_error` and the run continues local-only. Every RPC carries a 30s
+  timeout and a 60s retry deadline. Five consecutive failures — or a credentials failure, or
+  a bucket that is missing/unreachable on the one-time startup probe — switch the lake off
+  for the rest of the run (`chain_lake_disabled` / `chain_lake_unavailable`), so an outage
+  costs the run once rather than 5,400 times. The disable is sticky and one-way: every later
+  operation refuses without an RPC, direct callers (the seed tool) included.
+- **The startup probe lists one object.** A missing bucket surfaces as `NotFound`
+  (`bucket_missing`); anything else — 403, DNS, TLS, timeout — is `bucket_unreachable`; zero
+  objects is a healthy *empty* lake, which is the day-one state before the seed runs.
+- **Measure it from the logs.** Each symbol emits one `chain_lake_summary`; the run emits
+  one `chain_lake_run_summary` with the totals, plus a `chain_lake_degraded` **warning** if
+  anything errored or the lake was disabled. The failure mode of this feature is silence —
+  a lake erroring on every call still produces a green run that took the full cold 1h47m.
+
+| counter | meaning |
+|---|---|
+| `lake_hits` | object downloaded and used |
+| `lake_misses` | object absent |
+| `lake_rejected` | downloaded, then failed the coverage check (should be rare; persistent non-zero means the window is thrashing) |
+| `lake_puts` | object written |
+| `lake_skipped` | upload declined, all reasons — would have narrowed coverage, changed model, or lost a generation race |
+| `lake_skipped_unreadable_remote` | **subset of `lake_skipped`**: the existing object's provenance could not be read, so coverage could not be compared. The other skips are the guard working; this one is a poisoned object that only `chain_lake_seed.py --force` will clear |
+| `lake_errors` | operation failed; the run continued local-only |
+
+- **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.
+- **Clock caveat.** What may be cached at all is decided by `chain_builder._is_cacheable`
+  and `alpaca_provider._is_settled`, both `date.today()` — the *process's local* date, not
+  an exchange calendar. That was previously a local-cache-only hazard; with the lake, a
+  machine with a skewed clock or a surprising timezone could publish a partial session to
+  storage everyone reads. The Job runs UTC at 02:00 ET, well after the close, so it is
+  correct today; treat it as a constraint on where the engine may be run, not as a
+  guarantee.
+
 ### Operating notes
 
-- **~5.5 min/symbol**, and the cache never warms — Cloud Run's filesystem is ephemeral, so
-  every run is cold. Roughly 16 of those minutes are spent building chains for F, PFE and VZ
+- **~5.5 min/symbol on a cold run.** Before FC-060 the cache never warmed — Cloud Run's
+  filesystem is ephemeral, so every run paid the full ~1h47m. With `CHAIN_LAKE_BUCKET` set
+  and the lake seeded, only the days since the previous run are fetched from Alpaca and the
+  rest are downloaded; the expected steady state is a small fraction of that. **Record the
+  measured runtime of the first warm execution here** — the number above is the cold-run
+  figure and should not be quoted as current once the lake is live.
+- Roughly 16 of those cold minutes are spent building chains for F, PFE and VZ
   only to discover no put clears the `$0.50` floor: they pass the price band, so the engine
-  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned.
+  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned. The
+  lake removes the *fetch* cost of those days, not the decision cost.
 - **Schedule is 02:00 ET deliberately.** A ~2h run must not overlap the trading session; the
   previous `0 12 1 * *` (08:00 ET) would have finished ~09:47 ET, on top of the open and
   contending with the live bot for the same Alpaca quota.

@@ -318,6 +318,24 @@ def _install_rate_limit_retry(max_tries: int = 10) -> None:
 # chain — the census, no engine
 # --------------------------------------------------------------------------- #
 
+# One chain lake per process, a fresh ChainStore per use — the same shape
+# `screen.py` uses (FC-060). A lake per call would mean a GCS client, a startup
+# probe and an independent circuit breaker for every simulated arm, so an
+# outage would be rediscovered instead of remembered.
+_CHAIN_LAKE = None
+_CHAIN_LAKE_RESOLVED = False
+
+
+def _chain_store():
+    global _CHAIN_LAKE, _CHAIN_LAKE_RESOLVED
+    from src.backtesting.data.chain_store import ChainStore
+
+    if not _CHAIN_LAKE_RESOLVED:
+        _CHAIN_LAKE = ChainStore.lake_from_env()
+        _CHAIN_LAKE_RESOLVED = True
+    return ChainStore(lake=_CHAIN_LAKE)
+
+
 def _decision_context(symbol: str, start: date, end: date):
     """Trading days, closes and the simulator's own strike anchors.
 
@@ -328,13 +346,13 @@ def _decision_context(symbol: str, start: date, end: date):
     """
     from src.backtesting.data.alpaca_provider import AlpacaDataProvider
     from src.backtesting.data.chain_builder import ChainBuilder
-    from src.backtesting.data.chain_store import ChainStore
     from src.backtesting.engine.simulator import Simulator
     from src.utils.config import Config
 
     config = Config()
     provider = AlpacaDataProvider.from_config(config)
-    builder = ChainBuilder(provider, store=ChainStore())
+    # See fc036_gap_gate_study — one lake per process, shared with the Job.
+    builder = ChainBuilder(provider, store=_chain_store())
     sim = Simulator(config, provider, builder, [symbol], start, end)
     stock_bars = sim._load_stock_bars()
     days = sim._trading_days(stock_bars)

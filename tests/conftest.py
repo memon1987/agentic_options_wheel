@@ -110,6 +110,25 @@ def _no_production_bigquery(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _no_chain_lake(monkeypatch):
+    """No test may reach the GCS chain lake, whatever is in the shell or .env.
+
+    `ChainStore.from_env()` (FC-060) reads CHAIN_LAKE_BUCKET, and a developer
+    with the seed variable exported would otherwise have the suite issuing real
+    GCS reads *and uploads* against the production lake. Same principle as
+    `_no_production_bigquery` and `_deterministic_alpaca_credentials`: a unit
+    test's behaviour must not depend on ambient environment, and the failure
+    here would write, not just read.
+
+    Tests that exercise lake wiring set the variable themselves with
+    monkeypatch and always inject a fake lake or a fake client factory.
+    """
+    monkeypatch.delenv("CHAIN_LAKE_BUCKET", raising=False)
+    monkeypatch.delenv("CHAIN_LAKE_PREFIX", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_alpaca_credentials(monkeypatch):
     """Every test sees the same fake Alpaca credentials.
 
