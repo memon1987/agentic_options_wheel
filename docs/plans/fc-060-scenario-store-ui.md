@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-060 (Layers 3 and 4; Layers 1–2 shipped 2026-08-28)
 **Plan file:** `docs/plans/fc-060-scenario-store-ui.md`
 **Scope:** shared (backtest engine + a new Cloud Run Job + dashboard backend/frontend + `cloudbuild.yaml`)
-**Status:** Executing — PR-A merged (`1ad06c8`, 2026-08-29); PR-B (#102) pending Job verification. Each PR got two adversarial reviews + confirmation.
+**Status:** Done — PR-A #103 (`1ad06c8`) + hotfix #104 (`1e42893`) + PR-B #102 (`8e98289`), all merged 2026-08-29; store + Job + API live-verified (`verify0829b`).
 **Size:** L (two M PRs)
 **Author:** Fable (plan), for Opus (build)
 **Last updated:** 2026-08-29
@@ -113,4 +113,6 @@ All four reviews (PR-A #103: security/reliability, data/BQ; PR-B #102: frontend,
 _Filled in after implementation is complete (PR-A, then PR-B)._
 
 - **PR-A:** https://github.com/memon1987/agentic_options_wheel/pull/103 · **Commit:** `1ad06c8` (squash of `344b1ac` → `a0b433b` → `0d1d4fd` → `77ff204`) · **Date:** 2026-08-29 · **Notes:** two adversarial reviews (security/reliability; data/BQ), both REQUEST_CHANGES; round 1 (13 items) → confirmation FIXES-INCOMPLETE (self-referential API dedup hash; SIGTERM before `run_sweep`); round 2 (6 items) → CONFIRMED-CLEAN; two LOW drifts fixed in `77ff204`. Design changes vs. the plan recorded in §Review addendum: the API never dedups; `done` requires persisted rows; SIGTERM handled end-to-end; `--task-timeout` 10800; `deploy-sweep-job` behind all promotes; `force`. Suite 2185 → 2478. Deferred residuals → FC-095.
-- **PR-B:** · **Commit:** · **Date:** · **Notes:**
+- **Hotfix:** https://github.com/memon1987/agentic_options_wheel/pull/104 · **Commit:** `1e42893` · **Date:** 2026-08-29 · **Notes:** the first real execution (`verify0829a`) failed at writer init — the round-1 type-mismatch guard compared the code's `BOOL` against the `BOOLEAN` the BigQuery API echoes (also `INTEGER`/`FLOAT`). Fake clients echoing the code's own `SchemaField`s could not catch it. Comparison-only canonicalisation; the Job's fail-closed exit (2, `sweep_store_unavailable`) behaved as designed.
+- **PR-B:** https://github.com/memon1987/agentic_options_wheel/pull/102 · **Commit:** `8e98289` (squash of `3cd79ae` → `e7ec810` → `dd56fd7` → `286d16c` → `1002394`) · **Date:** 2026-08-29 · **Notes:** two adversarial reviews (frontend; guardrails), both REQUEST_CHANGES — BLOCKER: list endpoint is a bare array (runs list would have been permanently empty); `unknown` cells rendered as green returns; non-done runs rendered as empty finished reports; medians recomputed in the browser. Confirmation found one regression (refetch blanked the list) → fixed. 96 → 228 vitest.
+- **Live verification (rollout step 3):** `verify0829b` — execution `backtest-sweep-z8vtc`, `running` 20:42:55Z → `done` 20:43:18Z, `cell_count=12`, `rows_persisted=12`, `error_cells=0`; windows fit 03-02→05-31 / holdout 06-01→07-31; NVDA holdout `insufficient` (2-month window). `GET /api/v2/sweeps` → bare array; detail payload flat with `windows`/`scenario_hashes`/`summary`; `POST` without token → 503. Rollout step 1 (`sweep-submit-token`) still with the operator; step 4 (first real sweep) after that.
