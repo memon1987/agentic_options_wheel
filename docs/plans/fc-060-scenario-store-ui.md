@@ -1,0 +1,101 @@
+# Plan: FC-060 Layers 3 + 4 — the scenario store, a sweep Job, and the dashboard "Simulations" page
+
+**FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-060 (Layers 3 and 4; Layers 1–2 shipped 2026-08-28)
+**Plan file:** `docs/plans/fc-060-scenario-store-ui.md`
+**Scope:** shared (backtest engine + a new Cloud Run Job + dashboard backend/frontend + `cloudbuild.yaml`)
+**Status:** Published — build-ready as **two PRs** (PR-A store + Job + API; PR-B UI). Each gets two adversarial reviews.
+**Size:** L (two M PRs)
+**Author:** Fable (plan), for Opus (build)
+**Last updated:** 2026-08-29
+
+## Context — what the research pass established (2026-08-29)
+
+| fact | detail |
+|---|---|
+| The dashboard is public | `options-wheel-dashboard` IAM: `roles/run.invoker` → `allUsers`; no app-level auth on any `/api/*` route (`dashboard/backend/main.py`, routers). `curl /api/health` → 200 unauthenticated. The bot service is not public. |
+| Who runs what | Dashboard SA = Job SA = Cloud Build SA = scheduler OAuth SA = `799970961417-compute@developer.gserviceaccount.com`. `run.jobs.run` proven (the scheduler executes `backtest-screen` as it); BQ `WRITER` on `options_wheel`; `objectAdmin` on the lake. `run.executions.get` unproven. Project IAM unreadable (CRM API disabled — console-only grants). |
+| The Job image is stale | `backtest-screen` is SHA-pinned to `5e98ff7` (Layer 1 only — no `sweep` command). `cloudbuild.yaml` never updates Jobs. |
+| Per-execution overrides exist | `gcloud run jobs execute --args … --update-env-vars …` (and REST v2 `overrides.containerOverrides`) — one Job definition can serve many specs. |
+| Sweep runtime needs | Alpaca secrets (the provider is constructed unconditionally), `CHAIN_LAKE_BUCKET`, writable `/app/cache`. Scenario spec is file-path-only today (`main.py:465`). Output is stdout + ephemeral files; never BigQuery. |
+| Store today | `backtest_runs` (44 cols, streaming insert, additive schema reconcile — `src/backtesting/reporting/bq_writer.py:152-243`). No dashboard consumer. The documented "current demotion candidates" query takes `run_kind='full' ORDER BY timestamp DESC LIMIT 1` — any sweep row with `run_kind='full'` would displace it. `config_hash` covers 9 keys; 12/19 sweepable keys + `fill_haircut` sit outside it. |
+| Layer 2 result shape | `ScenarioResult` (29 fields + `insufficient/low_activity/measured`), `SweepResult` (timing, provider counts, hashes, overrides), JSON report (`report.py:504-560`) — no run id, no engine version, no base-config snapshot. |
+| Frontend | React 18 + Vite + TS strict + Tailwind; `useApi(url, {refreshInterval})` GET-only with 3 retries (**must not be used for POST**); pages under `src/pages/v2/`, routes in `App.tsx`, nav in `LayoutV2.tsx`; vitest exists but **CI runs neither vitest nor eslint** — only `tsc` via the Docker build. Backend routers are untested in CI (FastAPI absent from the test image); `services/*` pure modules are tested. |
+| Latency on the Job | container start **~3–4 min**; warm materialise ≈ 25–40 s/symbol (lake download + bars + any unseeded days at ~1.3 s/day); replay ≈ 1–2 s/cell on 1 vCPU. A 6-symbol × 10-scenario sweep ≈ **6–8 min** wall (≈ 20 min while IWM still rebuilds cold — FC-091 lands on the 09-01 run). |
+
+## Scope
+
+**PR-A — Layer 3 + executor + API**
+1. **Store:** two tables in `options_wheel`: `scenario_sweeps` (one row per submitted sweep: identity, spec, status, timing, provenance) and `scenario_runs` (one row per scenario × symbol × split: every `ScenarioResult` field + provenance). Written by the Job; read by the dashboard. **Never `backtest_runs`.**
+2. **Job-side entry:** `main.py --command sweep --spec-env SWEEP_SPEC_JSON` (spec + run id from env, per-execution override) → runs `run_sweep` → writes `scenario_sweeps` status rows (`running` at start, `done`/`failed` at end) + `scenario_runs` rows. Dedup: an identical `(sweep_key)` already `done` → the Job exits 0 without replaying and marks the new row `deduplicated_to=<run_id>`.
+3. **A new Job `backtest-sweep`** (same image, same secrets/env as `backtest-screen`, `command: python main.py --command sweep --spec-env SWEEP_SPEC_JSON`), **auto-deployed by `cloudbuild.yaml`** (`gcloud run jobs deploy … --image …:$COMMIT_SHA`, creates-or-updates) so ad-hoc sweeps run current `main`. `backtest-screen` stays SHA-pinned (reproducible monthly screen) and untouched.
+4. **Dashboard backend:** `POST /api/v2/sweeps` (token-gated; validates the spec against the allowlist + caps; dedup lookup; launches the Job with env overrides via the Cloud Run v2 REST API using the SA's OAuth token; inserts the `submitted` row); `GET /api/v2/sweeps` (recent runs + status); `GET /api/v2/sweeps/{run_id}` (status + rows, shaped for the UI); `GET /api/v2/sweeps/allowlist` (the override keys, their descriptions, presets, the caps). Pure logic in `services/sweeps.py` (tested in CI); the router is thin.
+5. **Auth + limits:** `SWEEP_SUBMIT_TOKEN` (Secret Manager → dashboard env); submit requires `Authorization: Bearer <token>`; at most one sweep `running` at a time; caps: ≤ 12 symbols, ≤ 20 scenarios, ≤ 240 cells, window ≤ 730 days, holdout ≥ 60 days when present.
+
+**PR-B — Layer 4 UI**
+6. `/sims` page: submit form, runs list with live status, results view that **renders** the runner's report (grid, summary, fit/holdout + sign agreement, in-sample banner, bias footer, hashes, JSON export). Token entered once, kept in `sessionStorage`.
+
+Out of scope: locking down the whole dashboard (FC-094 — operator decision); parallel tasks; candidate-symbol onboarding (cold materialisation from the UI — Layer 3b later); editing the base config from the UI; a GCS-FUSE volume for the Job (unmeasured; the explicit lake I/O is fine at these sizes); the monthly screen (unchanged).
+
+## Design decisions (made — do not relitigate in the build)
+
+**D1. Tables.** `scenario_sweeps` (partition `submitted_at`): `run_id` (REQ, 16 hex), `sweep_key` (sha256[:16] of canonical spec + `engine_version` + `git_commit`), `status` (`submitted|running|done|failed|deduplicated`), `deduplicated_to`, `submitted_at`, `started_at`, `finished_at`, `submitted_via` (`dashboard|cli`), `execution_name`, `git_commit`, `engine_version`, `base_config_hash`, `base_config_json` (the `strategy`/`risk`/`earnings`/`rolling`/`universe` sections of the effective base config — the payload, not just the hash), `spec_json` (symbols, windows, scenarios with overrides + fill_haircut, starting_cash, run_sensitivity), `symbols[]`, `window_start`, `window_end`, `holdout_start`, `in_sample_only`, `scenario_count`, `cell_count`, `wall_seconds`, `materialise_seconds`, `replay_seconds`, `provider_fetches`, `bar_cache_hits`, `lake_summary_json`, `error`. `scenario_runs` (partition `submitted_at`, clustered `run_id`): `run_id`, `submitted_at`, `scenario_name`, `scenario_hash`, `config_hash`, `overrides_json`, `fill_haircut`, `symbol`, `split`, `window_start`, `window_end`, + every `ScenarioResult` field incl. `insufficient`, `low_activity`, `measured`, `replay_seconds`, `error`; plus `engine_version`, `git_commit`. Both created/reconciled by a `ScenarioRunWriter` modelled on `BacktestRunWriter` (additive schema reconcile, streaming insert). Insert-only.
+
+**D2. Spec transport = env override.** The dashboard passes `SWEEP_SPEC_JSON` (≤ 24 KB, validated) and `SWEEP_RUN_ID` as `containerOverrides[].env` on `jobs.run`; `main.py --command sweep --spec-env SWEEP_SPEC_JSON` reads it (file-path mode stays for the CLI). Rationale: no new dependency, no bucket write from the dashboard, atomic with the execution. Spec schema (JSON): `{symbols:[…], start, end, holdout_start?, starting_cash?, run_sensitivity?, scenarios:[{name, overrides:{dotted:value}, fill_haircut?}]}` — the `base` scenario is implicit.
+
+**D3. Status is BigQuery-based, not execution-polling.** The Job writes `running` (with `execution_name` from `CLOUD_RUN_EXECUTION`) immediately after `Config()` and `done`/`failed` in a `finally`. The dashboard's status reads are `SELECT … FROM scenario_sweeps WHERE run_id=@id ORDER BY submitted_at DESC LIMIT 1`-style over insert-only rows (latest status wins). Rationale: `run.executions.get` for the dashboard SA is unproven and console-only to grant; BQ is proven. `execution_name` is stored for operator debugging. A `submitted` row older than 10 min with no `running` row renders as "stuck — check the execution" (container start is 3–4 min; timeout is the operator's signal, not an automatic cancel).
+
+**D4. Dedup key** `sweep_key` = sha256 over the canonical spec (sorted symbols, windows, sorted scenarios by `(name, scenario_hash)`, starting_cash, run_sensitivity) + `engine_version` + `git_commit`. On submit: if a `done` row with that key exists, the API returns it (HTTP 200 with `deduplicated_to`) and launches nothing — goal 5 ("revisit, not recompute") at the API layer. `git_commit` comes from the Job image's `GIT_COMMIT` env (FC-081 wiring — add it to the Job's env in the cloudbuild step) — the dashboard uses its own `GIT_COMMIT` to compute the key; the two are equal whenever both deploy from the same build (both are auto-deployed by cloudbuild after this PR), and a mismatch simply means no dedup hit.
+
+**D5. Executor launch:** `POST https://run.googleapis.com/v2/projects/P/locations/us-central1/jobs/backtest-sweep:run` with body `{"overrides":{"containerOverrides":[{"env":[{"name":"SWEEP_SPEC_JSON","value":…},{"name":"SWEEP_RUN_ID","value":…}]}]}}`, bearer = `google.auth.default()` access token (cloud-platform scope; metadata server on Cloud Run; ADC locally). No new pip dependency (`google-auth` + `requests` are already transitive via bigquery). Response `metadata.name` → `execution_name` stored on the `submitted` row. A 403 here is the "SA lacks `run.jobs.run` on `backtest-sweep`" signal → HTTP 502 with the grant command in the error body (console: Cloud Run Invoker/Developer on the job to the compute SA).
+
+**D6. Auth:** `SWEEP_SUBMIT_TOKEN` env on the dashboard from Secret Manager (`sweep-submit-token`, operator-created; wired with `--update-secrets` like `GITHUB_TOKEN`); `POST /api/v2/sweeps` requires `Authorization: Bearer` equal (constant-time compare); missing token config → 503 "sweeps disabled" (fail closed); GETs stay public like the rest of the dashboard (results are not secret; they are also not the live book). Rate: refuse a submit while any sweep is `submitted|running` younger than 1 h (HTTP 409 with the running `run_id`). This is a minimal gate for a single-operator dashboard; the whole-dashboard exposure is FC-094.
+
+**D7. Validation (`services/sweeps.py`, pure):** reuse `src/backtesting/scenarios/overrides.py`'s allowlist/rejections **by import** (the dashboard image must include `src/backtesting/scenarios/overrides.py` — it is pure Python; add it to the dashboard Docker context the same way `services/pause_alert.py` is kept pure) so the API and the Job agree on legality; caps per §Scope 5; dates ISO, `start < holdout_start < end`; symbols upper-case `^[A-Z.]{1,6}$`; `starting_cash` 10k–1M; scenario names unique, `base` reserved. Every rejection returns HTTP 422 with the exact reason string the runner would give.
+
+**D8. Job-side changes** (`src/backtesting/scenarios/`): `runner.run_sweep` unchanged; new `persist.py` with `ScenarioRunWriter` + `rows_from_sweep(result, run_id, provenance)`; `main.py` `sweep` gains `--spec-env` and `--persist` (persist implied in spec-env mode); status writes as D3. `engine_version` = `screen.ENGINE_VERSION`. `lake_summary_json` from the store's `summary()` aggregated as `screen.py` does.
+
+**D9. cloudbuild.yaml:** new step `deploy-sweep-job` after `push-bot-image` (parallel with the service chains; it does not deploy traffic, so it is not gated by `serialize-builds` — but it must not run on a superseded build either: add the marker check): `gcloud run jobs deploy backtest-sweep --image …:$COMMIT_SHA --region us-central1 --command python --args main.py,--command,sweep,--spec-env,SWEEP_SPEC_JSON --set-env-vars ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA --set-secrets ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest --memory 1Gi --cpu 1 --task-timeout 3600 --max-retries 0 --service-account 799970961417-compute@developer.gserviceaccount.com`. `tests/test_cloudbuild_contract.py` + fixture updated (new step id; must-not-change lists untouched). The dashboard deploy step gains `SWEEP_JOB_NAME=backtest-sweep` in its `--set-env-vars` (secret wired out-of-band).
+
+**D10. UI (PR-B):** page `src/pages/v2/Simulations.tsx`, route `/sims`, nav "Sims". Three regions: (1) **Submit** — symbols (universe checkboxes from `/api/live/config` + free text), window (default: end = yesterday, start = end − 365 d), **holdout on by default** (start = end − 90 d; a toggle to disable shows the in-sample warning inline), scenarios (preset chips that append well-formed arms: delta bands, premium floors, price ceiling, position size, earnings off, roller off; plus a JSON editor with the allowlist fetched from `/allowlist` and client-side validation), fill haircut, `run_sensitivity` toggle; submit button disabled until valid and a token is present; 409/422/502 surfaced verbatim. (2) **Runs** — list with status pill, submitted time, cells, wall, `deduplicated_to` link; 15 s polling while any run is not terminal (a hand-written `useEffect` + `fetch`, not `useApi` retries for POST). (3) **Results** — the per-symbol grid (verdict glyph + return; `insuf`/`low-act N%`/`err` cells styled distinctly), per-scenario summary with `measured/insuf/low-act` counts and `Δ vs base (n=)`, fit vs holdout side-by-side with sign agreement, the in-sample banner when applicable, the bias footer verbatim from the API (`known_biases`, `cross_scenario_caveat`, `rejection_tally_caveat`), hashes, "download JSON". **No aggregate is rendered without the grid; no cell below the activity floor is ever styled as a return.** Types in `types/v2.ts`. Tests: vitest for the form validation state machine and the three result-cell renderings (run locally; note CI gap).
+
+**D11. Backend shaping** (`services/sweeps.py`): `shape_results(sweep_row, run_rows)` reproduces `report.py`'s derived structures server-side (grid, per-scenario summary with the partition counts, `delta_vs_base` over the common measured subset, sign agreement) so the UI renders, not recomputes — import `src/backtesting/scenarios/report.py`'s pure helpers if they are importable without the engine; otherwise re-implement with a shared test fixture asserting equality against `report.py` on a sample sweep JSON.
+
+**D12. Non-goals restated:** no BQ writes from the dashboard except the `submitted` row (via the bigquery client it already has); no Alpaca creds on the dashboard; no changes to `backtest_runs` or the monthly screen; no `--tasks` fan-out.
+
+## Files to touch
+
+PR-A: `src/backtesting/scenarios/persist.py` (new), `main.py` (`--spec-env`, `--persist`, status writes), `src/backtesting/screen.py` (export the lake-summary aggregation helper), `cloudbuild.yaml` (+ `deploy-sweep-job`, dashboard env), `tests/test_cloudbuild_contract.py` + fixture, `dashboard/backend/routers/v2.py` (4 endpoints), `dashboard/backend/services/sweeps.py` (new, pure), `dashboard/backend/services/bigquery.py` (sweep queries), `dashboard/Dockerfile` (copy `src/backtesting/scenarios/overrides.py` + `report.py` pure helpers), `docs/bigquery/scenario_runs.md` (new), `docs/BACKTEST_ENGINE.md`, `docs/CLAUDE.md` (dashboard section + data policy), tests: `tests/test_scenario_persist.py`, `tests/test_dashboard_sweeps.py`.
+PR-B: `dashboard/frontend/src/pages/v2/Simulations.tsx` + components, `App.tsx`, `LayoutV2.tsx`, `types/v2.ts`, `hooks/useSweeps.ts`, vitest specs.
+
+## Behavior contract
+
+- Monthly screen, `backtest_runs`, `--command sweep` with a file spec: unchanged (byte-identical report for the same inputs).
+- A UI submit → one `scenario_sweeps` row `submitted` → one Job execution → `running` → `done` with N `scenario_runs` rows (N = scenarios+1 × symbols × splits), or `failed` with `error`. A duplicate spec on the same commit → `deduplicated` row pointing at the prior `done` run, no execution.
+- No unauthenticated submit; no second concurrent sweep; caps enforced before launch.
+- The results view shows exactly what the CLI report shows for the same run (same partition counts, same medians, same banner/footers).
+
+## Tests
+
+PR-A: (1) `ScenarioRunWriter` row derivation from a fixture `SweepResult` — one row per cell, partition flags, provenance; (2) status sequence `submitted→running→done` and `→failed` on a raising sweep (`finally` path); (3) dedup key canonicalisation (order-independent; changes with any override/haircut/window/commit); (4) `--spec-env` parsing + validation errors; (5) `services/sweeps.py`: allowlist agreement with the runner (parametrised over every allowed and rejected key), caps, dates, 409 on a running sweep, token compare, launch body shape (mock `requests`), 502 mapping on 403; (6) `shape_results` equality vs `report.py` on a sample sweep JSON; (7) cloudbuild contract: `deploy-sweep-job` step present with the marker check, secrets and env, fixture parity for all pre-existing steps.
+PR-B: form validation state machine; result-cell renderings (`return`, `insuf`, `low-act`, `err`); banner shown iff `in_sample_only`; polling stops on terminal status.
+
+## Rollout
+
+1. ⚙ Operator: `gcloud secrets create sweep-submit-token --data-file=- …` (any 32+ char random string), bind `secretAccessor` to the compute SA, `gcloud run services update options-wheel-dashboard --update-secrets=SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`. (Same recipe as the GitHub token.)
+2. Merge PR-A. The merging build runs `deploy-sweep-job` → creates `backtest-sweep`. If the Cloud Build SA lacks `run.jobs.create`, the step fails loudly → grant Cloud Run Developer to the compute SA (console) and re-run.
+3. Verify from the CLI path first: `gcloud run jobs execute backtest-sweep --update-env-vars SWEEP_SPEC_JSON='…',SWEEP_RUN_ID=manual1` → `scenario_sweeps` shows `running`→`done`, `scenario_runs` has the rows. Then `POST /api/v2/sweeps` with the token → same. Record timings.
+4. Merge PR-B; open `/sims`; run the FC-055 ceiling sweep as the first real one (SPY/QQQ/AMD + `strategy.max_stock_price` arms, holdout on).
+5. FC-060 entry: Layers 3–4 shipped; Layer 3b (candidate-symbol onboarding) and the remaining open questions carried.
+
+## Open questions
+
+- **Blocking for PR-A rollout, not for the build:** does the compute SA hold `run.jobs.create` (for `jobs deploy` from Cloud Build) and `run.jobs.run` on the new job? Both are console-verifiable only; the plan fails loudly at the first build / first submit with the exact grant named.
+- **Non-blocking:** should GET results also require the token? Default no (consistent with the rest of the public dashboard); revisit under FC-094.
+- **Non-blocking:** a GCS-FUSE read-only mount of the lake for the sweep Job could cut materialise time from ~30 s to ~1 s per symbol; measure after PR-A on one execution before deciding.
+
+## Execution
+
+_Filled in after implementation is complete (PR-A, then PR-B)._
+
+- **PR-A:** · **Commit:** · **Date:** · **Notes:**
+- **PR-B:** · **Commit:** · **Date:** · **Notes:**
