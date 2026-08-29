@@ -195,7 +195,7 @@ def run_screen(
             # its lake usage — a run whose lake died mid-way is exactly the case
             # the run-level summary exists to make visible.
             if chain_store is not None:
-                _accumulate_lake(lake_totals, chain_store.summary())
+                accumulate_lake_summary(lake_totals, chain_store.summary())
 
     _log_lake_run_summary(lake, lake_totals, run_id)
 
@@ -218,7 +218,13 @@ def run_screen(
     return result
 
 
-_LAKE_COUNTERS = (
+# PUBLIC (FC-060 Layer 3): the sweep Job aggregates the same per-symbol counters
+# into the same run-level shape, so `scenario_sweeps.lake_summary_json` and the
+# screen's `chain_lake_run_summary` log line describe the lake the same way. A
+# second copy of this tuple in `scenarios/persist.py` would drift the day a
+# counter is added and nothing would notice — the sweep would just stop
+# reporting it.
+LAKE_COUNTERS = (
     "lake_hits", "lake_misses", "lake_rejected",
     "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
     "lake_merged", "lake_merge_gaps", "lake_merge_refused",
@@ -226,9 +232,16 @@ _LAKE_COUNTERS = (
 )
 
 
-def _accumulate_lake(totals: Dict[str, int], summary: Dict) -> None:
-    for key in _LAKE_COUNTERS:
+def accumulate_lake_summary(totals: Dict[str, int], summary: Dict) -> None:
+    """Add one ``ChainStore.summary()`` into a run-level total, in place."""
+    for key in LAKE_COUNTERS:
         totals[key] = totals.get(key, 0) + int(summary.get(key, 0))
+
+
+# Back-compat aliases. `tests/test_chain_store_lake.py` imports the private
+# names, and renaming a helper is not what this FC is for.
+_LAKE_COUNTERS = LAKE_COUNTERS
+_accumulate_lake = accumulate_lake_summary
 
 
 def _log_lake_run_summary(lake, totals: Dict[str, int], run_id: str) -> None:

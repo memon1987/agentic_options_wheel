@@ -1,7 +1,9 @@
 """Main entry point for Options Wheel Strategy."""
 
 import argparse
+import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 import json
 
@@ -46,6 +48,18 @@ def main():
                         help='sweep: comma-separated universe (default: config stocks.symbols)')
     parser.add_argument('--holdout-start',
                         help='sweep: split the window here into fit/holdout, YYYY-MM-DD')
+    # FC-060 Layer 3 — the Cloud Run Job's entry point. The spec arrives as a
+    # per-execution env override rather than a file because the dashboard has no
+    # writable shared filesystem with the Job and the override is atomic with
+    # the execution (D2). The file path stays for the CLI, unchanged.
+    parser.add_argument('--spec-env',
+                        help='sweep: read the JSON spec from this environment '
+                             'variable instead of --scenarios (Job mode; implies '
+                             '--persist)')
+    parser.add_argument('--persist', action='store_true',
+                        help='sweep: write results to '
+                             'options_wheel.scenario_sweeps / scenario_runs '
+                             '(NEVER backtest_runs)')
 
     args = parser.parse_args()
     
@@ -409,8 +423,6 @@ def load_scenarios(path: str):
     """
     import yaml
 
-    from src.backtesting.scenarios import Scenario
-
     with open(path) as fh:
         payload = yaml.safe_load(fh) or {}
     raw = payload.get('scenarios')
@@ -419,67 +431,342 @@ def load_scenarios(path: str):
             f"{path}: expected a top-level 'scenarios:' list "
             f"(got keys: {sorted(payload) or 'an empty file'})"
         )
+    return _scenarios_from_entries(raw, path)
+
+
+def _scenarios_from_entries(raw, where: str):
+    """Validate a list of scenario mappings into ``Scenario`` objects.
+
+    ``where`` names the source in every message — a YAML path for the CLI, the
+    literal ``'sweep spec'`` for the Job. Shared between the two entry shapes on
+    purpose (FC-060 Layer 3): the API and the file must be held to one standard,
+    or the dashboard eventually accepts an arm the Job then refuses three minutes
+    into a container start.
+    """
+    from src.backtesting.scenarios import Scenario
+    from src.backtesting.scenarios.identity import validate_scenario_name
+
     if not isinstance(raw, list):
-        raise SystemExit(f"{path}: 'scenarios' must be a list, got {type(raw).__name__}")
+        raise SystemExit(f"{where}: 'scenarios' must be a list, got {type(raw).__name__}")
 
     scenarios = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise SystemExit(f"{path}: scenario #{i + 1} must be a mapping")
+            raise SystemExit(f"{where}: scenario #{i + 1} must be a mapping")
         name = entry.get('name')
         if not name:
-            raise SystemExit(f"{path}: scenario #{i + 1} has no 'name'")
+            raise SystemExit(f"{where}: scenario #{i + 1} has no 'name'")
+        # The SAME rule the API applies (identity.validate_scenario_name).
+        # Without it a `--persist` CLI sweep could land a name the API would have
+        # refused, and the results view would then have to render a column header
+        # it was designed never to receive.
+        try:
+            validate_scenario_name(str(name), where)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
         overrides = entry.get('overrides') or {}
         if not isinstance(overrides, dict):
             raise SystemExit(
-                f"{path}: scenario '{name}' has a non-mapping 'overrides'"
+                f"{where}: scenario '{name}' has a non-mapping 'overrides'"
             )
         haircut = entry.get('fill_haircut')
         if haircut is not None:
-            haircut = float(haircut)
+            try:
+                haircut = float(haircut)
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    f"{where}: scenario '{name}' fill_haircut={haircut!r} is not "
+                    "a number"
+                )
             if not 0.0 <= haircut <= 1.0:
                 raise SystemExit(
-                    f"{path}: scenario '{name}' fill_haircut={haircut} is outside "
+                    f"{where}: scenario '{name}' fill_haircut={haircut} is outside "
                     "[0, 1] (0 = mid, 1 = at the bid)"
                 )
         unknown = set(entry) - {'name', 'overrides', 'fill_haircut'}
         if unknown:
             raise SystemExit(
-                f"{path}: scenario '{name}' has unknown field(s) "
+                f"{where}: scenario '{name}' has unknown field(s) "
                 f"{sorted(unknown)}. A misspelled field would silently do nothing."
             )
         scenarios.append(Scenario(str(name), dict(overrides), haircut))
     return scenarios
 
 
+# The sweep spec's top-level fields (FC-060 D2). A misspelled field must fail
+# loudly rather than be silently dropped: a spec whose `holdout_start` was typed
+# `holdout` would run IN-SAMPLE ONLY and report itself as validated.
+SPEC_FIELDS = frozenset({
+    'symbols', 'start', 'end', 'holdout_start', 'starting_cash',
+    'run_sensitivity', 'scenarios', 'force',
+})
+
+# Cloud Run caps a container's whole environment at 32 KiB and the spec is one
+# variable among several, so it gets a conservative slice of that. The dashboard
+# enforces the same ceiling before it launches; this is the Job-side backstop for
+# a spec that arrived some other way.
+MAX_SPEC_BYTES = 24 * 1024
+
+
+def load_spec_from_env(var: str) -> dict:
+    """Parse the JSON sweep spec out of environment variable ``var`` (D2).
+
+    Job mode. The spec travels as a per-execution ``containerOverrides`` env
+    entry rather than as a file because the dashboard shares no writable
+    filesystem with the Job, and because the override is atomic with the
+    execution — there is no window in which a launched execution has no spec, or
+    somebody else's.
+    """
+    raw = os.environ.get(var)
+    if not raw or not raw.strip():
+        raise SystemExit(
+            f"--spec-env {var}: the environment variable is unset or empty. In "
+            f"Job mode the spec arrives as a per-execution override; an "
+            f"execution launched without one has nothing to replay."
+        )
+    if len(raw.encode('utf-8')) > MAX_SPEC_BYTES:
+        raise SystemExit(
+            f"--spec-env {var}: spec is {len(raw.encode('utf-8'))} bytes, over "
+            f"the {MAX_SPEC_BYTES}-byte limit."
+        )
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--spec-env {var}: not valid JSON ({exc})")
+    if not isinstance(spec, dict):
+        raise SystemExit(
+            f"--spec-env {var}: expected a JSON object, got {type(spec).__name__}"
+        )
+    unknown = set(spec) - SPEC_FIELDS
+    if unknown:
+        raise SystemExit(
+            f"--spec-env {var}: unknown field(s) {sorted(unknown)}. "
+            f"Known fields: {sorted(SPEC_FIELDS)}."
+        )
+    return spec
+
+
+def scenarios_from_spec(spec: dict):
+    """``Scenario`` objects from the JSON spec's ``scenarios`` list.
+
+    Deliberately routed through the same validator as the YAML path
+    (``_scenarios_from_entries``) so a spec the dashboard accepted and a file an
+    operator wrote are held to one standard. The alternative — two parsers — is
+    how an API ends up accepting an arm the Job then refuses, three minutes into
+    a container start.
+    """
+    raw = spec.get('scenarios')
+    if raw is None:
+        raise SystemExit("sweep spec: expected a 'scenarios' list")
+    return _scenarios_from_entries(raw, 'sweep spec')
+
+
+def _spec_date(spec: dict, field: str):
+    """One ISO date out of the spec, or None. Raises SystemExit on a bad one."""
+    from datetime import datetime as _dt
+
+    value = spec.get(field)
+    if value in (None, ''):
+        return None
+    try:
+        return _dt.strptime(str(value), '%Y-%m-%d').date()
+    except ValueError:
+        raise SystemExit(
+            f"sweep spec: '{field}' must be YYYY-MM-DD, got {value!r}"
+        )
+
+
+class SweepTerminated(BaseException):
+    """Cloud Run asked this task to stop. Raised from the SIGTERM handler.
+
+    A ``BaseException`` rather than an ``Exception`` on purpose: it must not be
+    swallowed by any `except Exception` inside the replay loop — `run_sweep`
+    catches per-scenario failures broadly so one bad arm does not cost the others
+    their results, and a termination caught there would be recorded as "this arm
+    errored" while the container died around it.
+    """
+
+
+@contextmanager
+def terminate_on_sigterm(logger):
+    """Turn SIGTERM into an exception so the store's ``finally`` still runs.
+
+    Cloud Run sends SIGTERM and then SIGKILL **10 seconds later** — on a task
+    timeout, on a cancelled execution, on an infrastructure eviction. Python's
+    default SIGTERM handler exits the interpreter immediately: no `finally`, no
+    terminal status row. The sweep would then sit in the store as `running`
+    forever, block the next submission until the lock expires, and tell an
+    operator nothing about why.
+
+    **The ten seconds is the budget for the `finally`, not for this block.** A
+    signal arriving here raises immediately and unwinds; what has to fit inside
+    the grace period is `_finalise_sweep_status` — two streaming inserts, which
+    fit comfortably. That is the whole reason converting the signal is worth
+    doing rather than accepting the loss.
+
+    **Entered before the `running` row is written**, not just around the replay
+    (round-2 fix 2). The `running` insert, the dedup query (up to 60 s) and
+    `ChainStore.from_env()`'s bucket probe all happen before a single day is
+    replayed, and a cancel landing in that window used to kill the process
+    outright — leaving exactly the orphaned `running` row this mechanism exists
+    to prevent, in the minutes when a cancel is most likely.
+
+    Restores the previous handler on the way out, and no-ops off the main thread
+    (`signal.signal` raises there) so tests and library callers are unaffected.
+    """
+    import signal
+
+    def _raise(signum, _frame):
+        logger.warning(
+            "SIGTERM received — recording a terminal sweep status before the "
+            "container is killed",
+            event_category="backtest", event_type="sweep_sigterm", signal=signum)
+        raise SweepTerminated(
+            f"the container received signal {signum} (Cloud Run sends SIGTERM "
+            f"then SIGKILL 10s later): task timeout, cancelled execution, or "
+            f"eviction")
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _raise)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. Nothing to install
+        # and nothing to restore; the sweep runs exactly as before.
+        yield None
+        return
+    try:
+        yield _raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
+def ignore_sigterm_while_finalising(logger):
+    """Hold SIGTERM off for the duration of the terminal writes.
+
+    `terminate_on_sigterm` restores the previous handler when its block exits —
+    which is exactly when `_finalise_sweep_status` begins. A SIGTERM landing in
+    that window hits the default handler and kills the process mid-insert, with
+    no terminal row: the precise outcome the whole mechanism exists to prevent,
+    displaced by a few milliseconds into the one stretch of code that must not
+    be interrupted (round-2 fix 3).
+
+    SIG_IGN rather than another raising handler: there is nothing useful left to
+    do about a second signal, and the writes finish well inside Cloud Run's
+    10-second grace. If SIGKILL arrives anyway the row is lost either way, and
+    ignoring costs nothing.
+    """
+    import signal
+
+    try:
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (ValueError, OSError, AttributeError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError):  # pragma: no cover - defensive
+            logger.warning("could not restore the SIGTERM handler",
+                           event_category="backtest",
+                           event_type="sweep_sigterm_restore_failed")
+
+
+class SweepPersistence:
+    """Where a sweep was stored, handed to the renderers so they tell the truth.
+
+    Before FC-060 Layer 3 the report asserted "this report is the only record of
+    the run" unconditionally and the JSON hardcoded ``"persisted": false``. Both
+    became false statements the moment `--persist` existed, in the two places a
+    reader trusts most.
+    """
+
+    def __init__(self, *, persisted: bool, run_id: str, sweep_key: str,
+                 dataset: str) -> None:
+        self.persisted = persisted
+        self.run_id = run_id
+        self.sweep_key = sweep_key
+        self.dataset = dataset
+
+
 def run_sweep_cmd(args, config: Config, logger) -> int:
-    """Replay many scenarios over many symbols (FC-060 Layer 2). Returns an exit code."""
-    from datetime import date, datetime, timedelta
+    """Replay many scenarios over many symbols (FC-060 Layers 2/3).
 
+    Two entry shapes, one code path:
+
+    * ``--scenarios <yaml>`` — the operator CLI. Unchanged by Layer 3: it does
+      not persist unless ``--persist`` is passed, so the byte-identical-report
+      contract holds.
+    * ``--spec-env <VAR>`` — the ``backtest-sweep`` Cloud Run Job. The spec and
+      the run id arrive as per-execution env overrides, and persistence is
+      implied: an execution whose results nobody can read is an execution nobody
+      should have launched.
+
+    Returns an exit code.
+    """
+    import uuid
+    from datetime import date, datetime, timedelta, timezone
+
+    from src.backtesting.data.chain_store import ChainStore
+    from src.backtesting.reporting.bq_writer import config_hash
     from src.backtesting.scenarios import run_sweep
+    from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
     from src.backtesting.scenarios.report import render_json, render_markdown
-    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION
 
-    if not args.scenarios:
-        raise SystemExit("sweep requires --scenarios <yaml>")
+    spec_env = getattr(args, 'spec_env', None)
+    spec = None
+    if spec_env and args.scenarios:
+        raise SystemExit(
+            "sweep: pass either --scenarios <yaml> or --spec-env <VAR>, not "
+            "both — two sources of truth for one run is one too many."
+        )
 
-    scenarios = load_scenarios(args.scenarios)
-    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
-    start = (datetime.strptime(args.start, '%Y-%m-%d').date() if args.start
-             else end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    if spec_env:
+        spec = load_spec_from_env(spec_env)
+        scenarios = scenarios_from_spec(spec)
+        end = _spec_date(spec, 'end') or date.today()
+        start = (_spec_date(spec, 'start')
+                 or end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+        holdout_start = _spec_date(spec, 'holdout_start')
+        symbols = [str(x).strip().upper() for x in (spec.get('symbols') or [])
+                   if str(x).strip()]
+        starting_cash = float(spec.get('starting_cash') or args.starting_cash)
+        run_sensitivity = bool(spec.get('run_sensitivity', False))
+    else:
+        if not args.scenarios:
+            raise SystemExit("sweep requires --scenarios <yaml> or --spec-env <VAR>")
+        scenarios = load_scenarios(args.scenarios)
+        end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
+        start = (datetime.strptime(args.start, '%Y-%m-%d').date() if args.start
+                 else end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+        holdout_start = (datetime.strptime(args.holdout_start, '%Y-%m-%d').date()
+                         if args.holdout_start else None)
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
+        elif args.symbol:
+            symbols = [args.symbol.upper()]
+        else:
+            symbols = list(config.stock_symbols)
+        starting_cash = args.starting_cash
+        run_sensitivity = not args.no_sensitivity
+
     if end <= start:
         raise SystemExit(f"--end ({end}) must be after --start ({start})")
-    holdout_start = (datetime.strptime(args.holdout_start, '%Y-%m-%d').date()
-                     if args.holdout_start else None)
-
-    if args.symbols:
-        symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
-    elif args.symbol:
-        symbols = [args.symbol.upper()]
-    else:
-        symbols = list(config.stock_symbols)
     if not symbols:
         raise SystemExit("sweep has no symbols: pass --symbols or configure stocks.symbols")
+
+    # Validate every override BEFORE anything is written or launched.
+    # `run_sweep` validates too, but by then a `running` row exists and the
+    # operator has a failed sweep in the store for what is a typo. This costs
+    # microseconds and turns that into an immediate, explained refusal.
+    from src.backtesting.scenarios.overrides import validate_overrides
+
+    chain_reach = int(getattr(config, 'put_target_dte', 7))
+    for scenario in scenarios:
+        validate_overrides(scenario.overrides, chain_reach_dte=chain_reach)
 
     # `base` is implicit UNLESS the file already declares it, so the banner must
     # not blindly add one — a file with an explicit `base` would be announced as
@@ -500,14 +787,167 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         print("  NOTE: no --holdout-start, so this ranking will be IN-SAMPLE "
               "ONLY and unvalidated.\n")
 
-    result = run_sweep(
-        config, scenarios, symbols, start, end,
-        holdout_start=holdout_start,
-        starting_cash=args.starting_cash,
-        run_sensitivity=not args.no_sensitivity,
+    # ---------------------------------------------------------------- store --
+    # ONE canonical spec payload whichever entry shape was used, so a sweep run
+    # from a YAML file and the same sweep submitted from the dashboard produce
+    # the SAME `sweep_key` and dedup against each other. Building it from the
+    # RESOLVED values rather than from the raw input is what makes that true:
+    # defaults are already filled in on both paths.
+    spec_payload = {
+        'symbols': symbols,
+        'start': start.isoformat(),
+        'end': end.isoformat(),
+        'holdout_start': holdout_start.isoformat() if holdout_start else None,
+        'starting_cash': starting_cash,
+        'run_sensitivity': run_sensitivity,
+        'scenarios': [
+            {'name': s.name, 'overrides': dict(s.overrides),
+             'fill_haircut': s.fill_haircut}
+            for s in scenarios
+        ],
+    }
+
+    persist = bool(spec_env) or bool(getattr(args, 'persist', False))
+    # `force` is an instruction about THIS submission, not a property of the
+    # question being asked, so it is excluded from `sweep_key`
+    # (identity.NON_IDENTITY_FIELDS). Including it would give a forced re-run a
+    # different key from the run it deliberately reproduces.
+    force = bool((spec or {}).get('force', False)) if spec_env else False
+    run_id = os.environ.get('SWEEP_RUN_ID') or uuid.uuid4().hex[:16]
+    submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
+                    or datetime.now(timezone.utc).isoformat())
+    git_commit = os.environ.get('GIT_COMMIT') or None
+    key = compute_sweep_key(spec_payload, engine_version=ENGINE_VERSION,
+                            git_commit=git_commit)
+    snapshot = sweep_store.base_config_snapshot(config)
+    effective_hash = sweep_store.base_config_hash(snapshot)
+    provenance = dict(
+        run_id=run_id,
+        submitted_at=submitted_at,
+        sweep_key=key,
+        submitted_via=(os.environ.get('SWEEP_SUBMITTED_VIA')
+                       or ('dashboard' if spec_env else 'cli')),
+        engine_version=ENGINE_VERSION,
+        git_commit=git_commit,
+        # Cloud Run stamps this on every Job task. Stored for operator debugging
+        # only: D3 makes status BigQuery-based precisely because
+        # `run.executions.get` is unproven for the dashboard's service account.
+        execution_name=os.environ.get('CLOUD_RUN_EXECUTION'),
+        spec=spec_payload,
+        base_config=snapshot,
+        # The hash of the EFFECTIVE snapshot, not `config_hash`. `config_hash`
+        # covers nine strategy keys and cannot see an operator flipping
+        # EARNINGS_ENABLED or ROLLER_ENABLED on the Job between two otherwise
+        # identical submissions — and the dedup reads this column, so that blind
+        # spot would have served one experiment's numbers as another's. The
+        # engine hash is still stored, separately, for the `backtest_runs`
+        # linkage.
+        base_config_hash=sweep_store.base_config_hash(snapshot),
+        engine_config_hash=config_hash(config),
     )
 
-    markdown = render_markdown(result)
+    writer = None
+    if persist:
+        # Profile-derived, never hardcoded (the FC-075 DD-4 lesson): a
+        # covered-call profile running a sweep writes to its own dataset rather
+        # than into the wheel's store.
+        writer = sweep_store.ScenarioRunWriter(dataset_id=config.bigquery_dataset)
+        if not writer.enabled and spec_env:
+            # FAIL BEFORE REPLAYING, in Job mode only. An execution launched from
+            # the dashboard exists solely to put rows in the store: eight minutes
+            # of 1-vCPU compute whose output goes to a log nobody reads is worse
+            # than an immediate, loud failure, and the submitter would sit on
+            # `submitted` until the lock expired with no explanation anywhere.
+            # `--persist` from the CLI still degrades to "report only" — there a
+            # human is watching the report come out.
+            logger.error(
+                "Sweep store unavailable — refusing to replay in Job mode",
+                event_category="backtest",
+                event_type="sweep_store_unavailable",
+                run_id=run_id, dataset=config.bigquery_dataset)
+            print("\nFAILED: the scenario store is unavailable (no BigQuery "
+                  "client, no GCP project, or the tables could not be "
+                  "reconciled). Refusing to replay: a Job execution exists to "
+                  "produce rows, and there is nowhere to put them.")
+            return 2
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    result = None
+    failure = None
+    chain_store = None
+    rows_persisted = None
+    deduplicated_to = None
+    try:
+        # THE SIGNAL HANDLER GOES ON FIRST, before anything is written (round-2
+        # fix 2). The `running` insert, the dedup query (up to 60 s) and
+        # `ChainStore.from_env()`'s bucket probe all run before a single day is
+        # replayed, and a cancel landing in that window used to kill the process
+        # outright — leaving the orphaned `running` row this whole mechanism
+        # exists to prevent, in the minutes when a cancel is most likely.
+        #
+        # Everything from here is inside the try, so any raise reaches the
+        # `finally` and produces a terminal row.
+        with terminate_on_sigterm(logger):
+            if writer is not None:
+                # `running` FIRST, before the dedup query (D3). A `submitted` row
+                # with no `running` row after 10 minutes is the dashboard's
+                # "stuck — check the execution" signal, and a dedup lookup that
+                # hung would otherwise sit inside exactly that window and read as
+                # a dead container.
+                writer.write_status(sweep_store.status_row(
+                    status=sweep_store.STATUS_RUNNING, started_at=started_at,
+                    **provenance))
+
+                # THE dedup. The API deliberately does not do this (it cannot
+                # compute the effective config); it launches, and this is where
+                # the decision is actually made, against the config this process
+                # is holding.
+                prior = (None if force else
+                         writer.find_done_sweep(key,
+                                                base_config_hash=effective_hash))
+                if prior is not None and prior.get('run_id') != run_id:
+                    deduplicated_to = prior['run_id']
+
+            if deduplicated_to is None:
+                # `ChainStore.from_env()` builds a GCS client and probes the
+                # bucket, so it can raise; inside the try, that becomes a
+                # `failed` row rather than a silent orphan.
+                chain_store = ChainStore.from_env()
+                result = run_sweep(
+                    config, scenarios, symbols, start, end,
+                    holdout_start=holdout_start,
+                    starting_cash=starting_cash,
+                    run_sensitivity=run_sensitivity,
+                    chain_store=chain_store,
+                )
+    except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
+        failure = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if writer is not None:
+            rows_persisted = _finalise_sweep_status(
+                writer=writer, logger=logger, result=result, failure=failure,
+                chain_store=chain_store, started_at=started_at,
+                run_id=run_id, submitted_at=submitted_at,
+                engine_version=ENGINE_VERSION, git_commit=git_commit,
+                provenance=provenance, deduplicated_to=deduplicated_to,
+            )
+
+    if deduplicated_to is not None:
+        print(f"\nDEDUPLICATED: sweep_key {key} already completed as run "
+              f"{deduplicated_to}. Nothing was replayed; read that run's rows "
+              f"instead.")
+        logger.info("Sweep deduplicated against a completed run",
+                    event_category="backtest", event_type="sweep_deduplicated",
+                    run_id=run_id, sweep_key=key,
+                    deduplicated_to=deduplicated_to)
+        return 0
+
+    persistence = SweepPersistence(
+        persisted=bool(writer is not None and rows_persisted is not None),
+        run_id=run_id, sweep_key=key, dataset=config.bigquery_dataset)
+
+    markdown = render_markdown(result, persistence)
     print(markdown)
     if args.out:
         with open(args.out, 'w') as fh:
@@ -515,8 +955,19 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         print(f"\nMarkdown report -> {args.out}")
     if args.json_out:
         with open(args.json_out, 'w') as fh:
-            fh.write(render_json(result))
+            fh.write(render_json(result, persistence))
         print(f"JSON report -> {args.json_out}")
+    if persist:
+        if persistence.persisted:
+            print(f"\nStored as run_id {run_id} (sweep_key {key}) in "
+                  f"{config.bigquery_dataset}.{sweep_store.SWEEPS_TABLE} / "
+                  f"{sweep_store.RUNS_TABLE}.")
+        else:
+            # A `done` row is never written in this state (see
+            # `_finalise_sweep_status`), so the store and this message agree.
+            print(f"\nWARNING: results were NOT persisted for run_id {run_id}. "
+                  f"This report is the only record of the run.")
+            return 1
 
     # Exit non-zero when any cell never produced a verdict. A sweep that
     # half-ran reads as a complete one, and a missing cell is exactly where a
@@ -527,6 +978,117 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
               f"{', '.join(failed[:12])}{' ...' if len(failed) > 12 else ''}")
         return 1
     return 0
+
+
+def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
+                           started_at, run_id, submitted_at, engine_version,
+                           git_commit, provenance, deduplicated_to=None):
+    """Write the cells and the terminal status row. Returns rows persisted, or None.
+
+    Extracted from the `finally` because **every step in here can itself raise**,
+    and a raise inside a `finally` replaces the original exception with a
+    confusing one AND skips whatever the `finally` had not reached yet. The one
+    thing that must survive is the terminal status row: without it the sweep is
+    `running` for ever, blocks the next submission until the lock expires, and
+    says nothing about why.
+
+    So the lake summary and the cell write are each guarded independently, and
+    the status write is attempted last with its own guard. Worst case the row
+    says `failed` with a truthful reason; the unacceptable case is no row at all.
+
+    **`done` requires the cells to have landed** (review round 1). Previously the
+    status was chosen from `failure is None` alone, so a `write_runs` that
+    returned False still produced `done` — a run the dedup would then serve as a
+    cached answer whose grid is empty. `done` now means "the process finished AND
+    its rows are in the table"; anything else is `failed`.
+    """
+    from datetime import datetime, timezone
+
+    from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.screen import accumulate_lake_summary
+
+    with ignore_sigterm_while_finalising(logger):
+        return _finalise_sweep_status_inner(
+            writer=writer, logger=logger, result=result, failure=failure,
+            chain_store=chain_store, started_at=started_at, run_id=run_id,
+            submitted_at=submitted_at, engine_version=engine_version,
+            git_commit=git_commit, provenance=provenance,
+            deduplicated_to=deduplicated_to,
+            sweep_store=sweep_store,
+            accumulate_lake_summary=accumulate_lake_summary,
+            datetime=datetime, timezone=timezone)
+
+
+def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store,
+                                 started_at, run_id, submitted_at,
+                                 engine_version, git_commit, provenance,
+                                 deduplicated_to, sweep_store,
+                                 accumulate_lake_summary, datetime, timezone):
+    """The body of `_finalise_sweep_status`, run with SIGTERM ignored."""
+    lake_summary = None
+    try:
+        if chain_store is not None:
+            summary = chain_store.summary()
+            lake_totals: dict = {}
+            accumulate_lake_summary(lake_totals, summary)
+            lake_summary = dict(summary)
+            lake_summary.update(lake_totals)
+    except Exception:  # noqa: BLE001 - cosmetic beside the status row
+        logger.warning("Could not summarise chain-lake usage for this sweep",
+                       event_category="backtest",
+                       event_type="sweep_lake_summary_failed", exc_info=True)
+
+    # Cells BEFORE the terminal status row: a reader that sees `done` must be
+    # able to trust the rows are already there. The reverse order leaves a window
+    # in which a finished sweep has no results.
+    rows_ok = False
+    rows_written = 0
+    if result is not None:
+        try:
+            rows = sweep_store.rows_from_sweep(
+                result, run_id=run_id, submitted_at=submitted_at,
+                engine_version=engine_version, git_commit=git_commit)
+            rows_ok = writer.write_runs(rows)
+            rows_written = len(rows) if rows_ok else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Sweep cell rows could not be written",
+                         event_category="backtest",
+                         event_type="sweep_rows_write_failed",
+                         run_id=run_id, error=str(exc)[:300])
+            failure = failure or f"cell rows not persisted: {type(exc).__name__}: {exc}"
+
+    if result is not None and not rows_ok and failure is None:
+        failure = ("cell rows not persisted: the sweep completed but its "
+                   "scenario_runs insert did not land, so there are no results "
+                   "to read")
+
+    if deduplicated_to is not None and failure is None:
+        # The Job found a completed run under this key and did not replay. It is
+        # still a terminal row, and it still goes through this one path so a
+        # cancel arriving during the dedup lookup cannot leave the run orphaned.
+        status = sweep_store.STATUS_DEDUPLICATED
+    elif failure is None and result is not None and rows_ok:
+        status = sweep_store.STATUS_DONE
+    else:
+        status = sweep_store.STATUS_FAILED
+    try:
+        writer.write_status(sweep_store.status_row(
+            status=status, started_at=started_at,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            result=result, error=failure, lake_summary=lake_summary,
+            rows_persisted=(rows_written if rows_ok else None),
+            deduplicated_to=(deduplicated_to
+                             if status == sweep_store.STATUS_DEDUPLICATED
+                             else None),
+            **provenance))
+    except Exception:  # noqa: BLE001 - nothing left to fall back to
+        logger.error("Terminal sweep status row could not be written — this run "
+                     "will read as `running` until the lock expires",
+                     event_category="backtest",
+                     event_type="sweep_status_write_failed",
+                     run_id=run_id, status=status, exc_info=True)
+        return None
+    return rows_written if status == sweep_store.STATUS_DONE else None
 
 
 def _sensitivity_section(s: dict) -> str:

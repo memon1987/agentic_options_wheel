@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dashboard" / "backend"))
+# See tests/_dashboard_path.py: the backend is APPENDED and the repo root
+# kept ahead of it, so `import main` still resolves to the CLI rather than
+# to dashboard/backend/main.py for every module collected after this one.
+from tests._dashboard_path import add_dashboard_backend_to_path  # noqa: E402
+
+add_dashboard_backend_to_path()
 
 from services.lots import open_lot_basis, open_lots  # noqa: E402
 

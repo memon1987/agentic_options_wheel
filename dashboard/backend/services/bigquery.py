@@ -11,7 +11,7 @@ unchanged — they remain on ``AnalyticsWriter``-written tables.
 """
 
 from google.cloud import bigquery
-from google.cloud.exceptions import GoogleCloudError
+from google.cloud.exceptions import GoogleCloudError, NotFound
 from typing import Dict, Any, List, Optional
 import os
 import logging
@@ -1694,6 +1694,132 @@ class BigQueryService:
 
         result["uncovered"].sort(key=lambda r: r["uncovered_days"], reverse=True)
         return result
+
+    # ------------------------------------------------------------------
+    # FC-060 Layer 3 — the scenario store.
+    #
+    # The ONLY write this backend makes to BigQuery is the `submitted` row
+    # below. Everything else about a sweep is written by the Job. That
+    # boundary is the point: the dashboard has no Alpaca credentials, no
+    # engine and no business producing a result, and a backend that could
+    # write results could write them wrong.
+    #
+    # These read `scenario_sweeps` / `scenario_runs` and NEVER `backtest_runs`
+    # — the screen's table stays the screen's, so a hypothetical can never
+    # displace a real demotion candidate.
+    # ------------------------------------------------------------------
+
+    # The sweep tables are created by the JOB's writer, not here (one schema
+    # owner, and it is the side that knows every column). Between this PR's
+    # merge and the operator's first Job execution they therefore do not exist,
+    # and BigQuery answers a query against a missing table with `NotFound`,
+    # which `_run_query` re-raises as a bare Exception -> HTTP 500. A 500 says
+    # "the dashboard is broken"; the truth is "step 3 of the rollout has not
+    # been run yet", which is a completely different thing to hand an operator.
+    TABLES_MISSING_DETAIL = (
+        "scenario tables not created yet — run the CLI sweep with --persist "
+        "first (rollout step 3)"
+    )
+
+    def _sweep_query(self, sql: str, params) -> List[Dict[str, Any]]:
+        """Run a sweep-store query, translating a missing table into `NotFound`.
+
+        `_run_query` wraps every failure into a generic Exception, so the
+        NotFound has to be recognised before it gets there. The router turns it
+        into a 503 with `TABLES_MISSING_DETAIL`.
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            job = self.client.query(sql, job_config=job_config)
+            return [dict(row.items()) for row in job.result(timeout=60)]
+        except NotFound:
+            raise
+        except GoogleCloudError as e:
+            # BigQuery reports a missing table as a 404 whose message names it;
+            # some client paths surface that as a generic GoogleCloudError
+            # rather than NotFound, so the message is checked too.
+            if "Not found" in str(e) and ("scenario_sweeps" in str(e)
+                                          or "scenario_runs" in str(e)):
+                raise NotFound(str(e))
+            logger.error(f"BigQuery error: {e}")
+            raise Exception(f"Database query failed: {str(e)}")
+
+    def get_recent_sweeps(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Latest status per run, newest submission first."""
+        from services.sweeps import recent_sweeps_sql
+
+        return self._sweep_query(
+            recent_sweeps_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("limit", "INT64", int(limit))],
+        )
+
+    def get_sweep(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The latest status row for one run, or None."""
+        from services.sweeps import one_sweep_sql
+
+        rows = self._sweep_query(
+            one_sweep_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
+        )
+        return rows[0] if rows else None
+
+    def get_sweep_rows(self, run_id: str) -> List[Dict[str, Any]]:
+        """Every cell of one run."""
+        from services.sweeps import sweep_rows_sql
+
+        return self._sweep_query(
+            sweep_rows_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
+        )
+
+    def find_done_sweep(self, sweep_key: str,
+                        base_config_hash: Optional[str] = None
+                        ) -> Optional[Dict[str, Any]]:
+        """The most recent COMPLETED run under ``sweep_key``, or None.
+
+        **A HINT for this backend, not a decision** (round-2 fix 1). The API
+        never skips a launch on the strength of it: it cannot compute the Job's
+        effective configuration, so it passes no ``base_config_hash`` and its
+        answer cannot see a kill switch flipped on the Job. The run id goes into
+        the submit response as ``prior_done_run_id`` so an operator can open the
+        earlier run while the new one starts; the **Job** does the actual dedup,
+        against the config it is holding.
+
+        "Completed" still excludes a run whose cells never landed and a run every
+        arm of which errored — those are exact, and a hint that pointed at an
+        empty grid would be worse than none.
+        """
+        from services.sweeps import done_by_key_sql
+
+        if not sweep_key:
+            return None
+        rows = self._sweep_query(
+            done_by_key_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+             bigquery.ScalarQueryParameter("base_config_hash", "STRING",
+                                           base_config_hash)],
+        )
+        return rows[0] if rows else None
+
+    def insert_sweep_status(self, row: Dict[str, Any]) -> None:
+        """Insert one ``scenario_sweeps`` row. Raises on failure, deliberately.
+
+        The caller writes the ``submitted`` row BEFORE it launches the Job and
+        must abort if this fails: an execution with no row is a sweep the
+        dashboard can never show, can never dedup against, and can never count
+        towards the one-at-a-time limit. A swallowed failure here would look
+        like a dashboard bug and be an invisible-sweep bug.
+
+        The table is created by the Job's writer, not here. That is deliberate
+        too — one schema owner, and it is the side that knows every column.
+        A submit before the first Job run therefore fails loudly rather than
+        creating a table with half a schema.
+        """
+        table = f"{self.dataset}.scenario_sweeps"
+        errors = self.client.insert_rows_json(table, [row])
+        if errors:
+            raise Exception(f"scenario_sweeps insert failed: {str(errors)[:400]}")
+
 
 # Singleton instance
 _bq_service: Optional[BigQueryService] = None

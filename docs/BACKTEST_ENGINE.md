@@ -452,7 +452,56 @@ python main.py --command sweep \
     --start 2025-08-01 --end 2026-07-31 --no-sensitivity \
     --out sweep.md --json-out sweep.json
 # optional: --holdout-start 2026-02-01   --starting-cash 100000
+#           --persist   -> options_wheel.scenario_sweeps / scenario_runs (FC-060 Layer 3)
 ```
+
+**Two entry shapes, one code path** (FC-060 Layer 3). `--scenarios <yaml>` is the
+operator CLI above. `--spec-env <VAR>` is the `backtest-sweep` Cloud Run Job's entry
+point: the JSON spec and the run id arrive as per-execution container env overrides
+(`SWEEP_SPEC_JSON`, `SWEEP_RUN_ID`, `SWEEP_SUBMITTED_AT`, `SWEEP_SUBMITTED_VIA`), and
+persistence is implied — an execution whose results nobody can read is an execution
+nobody should have launched. Both shapes are normalised into the same spec payload
+before anything is hashed or replayed, so a sweep run from a YAML file and the same
+sweep submitted from the dashboard produce the same `sweep_key` and dedup against each
+other.
+
+```bash
+# what the dashboard does, by hand
+SPEC='{"symbols":["AAPL"],"start":"2025-08-01","end":"2026-07-31","scenarios":[{"name":"tighter","overrides":{"strategy.min_put_premium":0.75}}]}'
+gcloud run jobs execute backtest-sweep --region us-central1 \
+  --update-env-vars "^@^SWEEP_SPEC_JSON=$SPEC@SWEEP_RUN_ID=manual1"
+```
+
+**The `^@^` is not optional.** `gcloud`'s default list delimiter for
+`--update-env-vars` is the comma, and a JSON spec is full of commas — without an
+alternate delimiter gcloud parses the spec as a dozen malformed `KEY=VALUE`
+pairs and the execution starts with no usable spec. The dashboard is unaffected:
+it uses the REST `jobs.run` body, where the value is a JSON string and nothing
+is delimiter-parsed.
+
+**The Job is auto-deployed by `cloudbuild.yaml`** (`deploy-sweep-job`), so an ad-hoc
+sweep always runs current `main`. `backtest-screen` stays SHA-pinned and untouched: a
+monthly screen must be reproducible, and an ad-hoc sweep must answer a question about
+the code as it is now. Those are opposite requirements, which is why they are two Jobs.
+The step runs **last**, behind all three service promotes — it can fail because the
+build service account lacks `run.jobs.create`, and a measurement tool must not be able
+to strand a production deploy.
+
+**Persistence is recorded honestly.** With `--persist` (or in Job mode) the markdown
+report names the dataset, the `run_id` and the `sweep_key`, and the JSON carries
+`persisted: true` with the same three. Without it both say so. A `done` row is written
+only when the cell rows actually landed; a sweep whose insert failed is `failed`, and
+the CLI exits non-zero rather than printing a "Stored as" line that points at nothing.
+
+**`force: true`** in a spec skips the Job's dedup lookup — the only one that decides
+anything — for re-running a question whose answer you no longer trust; it suppresses the
+API's informational hint with it. It is excluded from `sweep_key`, so a forced run stays
+comparable with the run it reproduces.
+
+**The Job's `--task-timeout` is 10800s (3h)**, matching `backtest-screen`'s rationale:
+a cold window materialises at ~5.5 min/symbol. A task killed at the timeout receives
+SIGTERM, which the CLI turns into a recorded `failed` row rather than a sweep that
+sits as `running` for ever.
 
 **How it is affordable: materialise once, replay many.** Data assembly is
 config-independent — the chain model fingerprint takes no `settings.yaml` input and the
@@ -535,10 +584,17 @@ base. Before adding a key to the allowlist, sweep it once and check that it move
   `provider fetches N (0 during replays), bar-cache hits M`; conflating the two described a
   fully-offline sweep as having made six provider calls.
 
-**Results are never persisted.** `backtest_runs`'s documented "current demotion
+**Results never reach `backtest_runs`.** That table's documented "current demotion
 candidates" query takes the latest `run_kind='full'` row, so a persisted full-universe
-sweep would displace the production screen with a hypothetical. Layer 3 owns a store that
-cannot do that.
+sweep written into it would displace the production screen with a hypothetical.
+
+**Since FC-060 Layer 3 a sweep CAN be persisted — to its own tables.**
+`--persist` (and the `backtest-sweep` Cloud Run Job, which implies it) writes
+`options_wheel.scenario_sweeps` + `options_wheel.scenario_runs`, documented in
+`docs/bigquery/scenario_runs.md`. Neither table has a `run_kind` column, so the
+displacement above is unrepresentable rather than merely discouraged. **Without
+`--persist`, `--command sweep` still writes nothing and the report is still the only
+record of the run** — the Layer-2 behaviour is unchanged, byte for byte.
 
 That is a statement about *results*, not about I/O. A sweep over a **cold** window does
 write: chains land in the local parquet cache and, when `CHAIN_LAKE_BUCKET` is set, are

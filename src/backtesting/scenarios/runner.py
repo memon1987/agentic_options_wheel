@@ -70,7 +70,6 @@ dishonest-metric class, so the sweep does not carry one at all.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -91,6 +90,7 @@ from ..engine.simulator import Materialised, Simulator
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
+from .identity import scenario_arm_hash
 from .overrides import apply_overrides, validate_overrides
 
 logger = structlog.get_logger(__name__)
@@ -162,15 +162,14 @@ class Scenario:
         Both hashes are reported. ``config_hash`` keeps a sweep row comparable
         with a ``backtest_runs`` row; ``scenario_hash`` is what makes two rows of
         this sweep distinguishable from each other.
+
+        **The bytes are produced by ``identity.scenario_arm_hash``**, which is
+        stdlib-only and copied into the dashboard image (FC-060 Layer 3): the
+        API computes this exact hash to key its dedup lookup before it launches
+        anything, and a second implementation would be a second definition of
+        "the same arm".
         """
-        payload = json.dumps(
-            {
-                "overrides": {k: self.overrides[k] for k in sorted(self.overrides)},
-                "fill_haircut": self.fill_haircut,
-            },
-            sort_keys=True, default=str,
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return scenario_arm_hash(self.overrides, self.fill_haircut)
 
 
 @dataclass

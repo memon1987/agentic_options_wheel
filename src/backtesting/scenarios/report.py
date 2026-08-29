@@ -202,8 +202,57 @@ def _scenario_rows(result: SweepResult, scenario: str, split: str) -> List[Scena
     ]
 
 
-def render_markdown(result: SweepResult) -> str:
-    """The operator-facing sweep report."""
+# The persistence note, in both of its true forms (FC-060 Layer 3). It used to
+# have only one, asserting that nothing was stored — which stopped being true the
+# moment `--persist` and the `backtest-sweep` Job existed, and a report that says
+# "this report is the only record of the run" while the rows sit in BigQuery is
+# not a caveat, it is a false statement in the place a reader trusts most.
+_NOT_PERSISTED = (
+    "> **Results are not persisted.** This run was not given `--persist`, so "
+    "this report is the only record of it. A sweep never writes to "
+    "`options_wheel.backtest_runs` under any flag: that table's \"current "
+    "demotion candidates\" query takes the latest `run_kind='full'` row, so a "
+    "persisted sweep would displace the production screen with a hypothetical."
+)
+
+_PERSISTED = (
+    "> **Results are persisted** to `{dataset}.scenario_sweeps` / "
+    "`{dataset}.scenario_runs` as run `{run_id}`{key}. **Never to "
+    "`options_wheel.backtest_runs`**: that table's \"current demotion "
+    "candidates\" query takes the latest `run_kind='full'` row, and neither "
+    "sweep table has a `run_kind` column, so a hypothetical cannot displace the "
+    "production screen. See `docs/bigquery/scenario_runs.md`."
+)
+
+_COLD_WINDOW_NOTE = (
+    "(Either way, a sweep over a COLD window does write chains to the local "
+    "cache, and to the GCS chain lake when `CHAIN_LAKE_BUCKET` is set — that is "
+    "the shared chain mirror doing its job, and it is independent of anything "
+    "about these results.)"
+)
+
+
+def persistence_note(persistence) -> str:
+    """The stored-or-not paragraph, matching what actually happened."""
+    if persistence is None or not getattr(persistence, "persisted", False):
+        return f"{_NOT_PERSISTED} {_COLD_WINDOW_NOTE}"
+    key = (f" (`sweep_key` `{persistence.sweep_key}`)"
+           if getattr(persistence, "sweep_key", None) else "")
+    return (_PERSISTED.format(dataset=persistence.dataset,
+                              run_id=persistence.run_id, key=key)
+            + " " + _COLD_WINDOW_NOTE)
+
+
+def render_markdown(result: SweepResult, persistence=None) -> str:
+    """The operator-facing sweep report.
+
+    ``persistence`` is an optional ``main.SweepPersistence`` describing where
+    this run was stored. Omitted (the default, and the CLI's usual case) the
+    report says so; supplied, it names the dataset, the ``run_id`` and the
+    ``sweep_key`` so an operator reading a printed report can go and query it.
+    Duck-typed rather than imported: this module must stay importable without
+    ``main``.
+    """
     out: List[str] = []
     a = out.append
 
@@ -227,14 +276,7 @@ def render_markdown(result: SweepResult) -> str:
         # path — the reader has to trip over the caveat, not go looking for it.
         a(IN_SAMPLE_BANNER)
         a("")
-    a("> **Results are not persisted.** A sweep never writes to "
-      "`options_wheel.backtest_runs`: that table's \"current demotion "
-      "candidates\" query takes the latest `run_kind='full'` row, so a persisted "
-      "sweep would displace the production screen with a hypothetical. This "
-      "report is the only record of the run. (A sweep over a COLD window does "
-      "still write chains to the local cache, and to the GCS chain lake when "
-      "`CHAIN_LAKE_BUCKET` is set — that is the shared chain mirror doing its "
-      "job, and it is independent of anything about these results.)")
+    a(persistence_note(persistence))
     a("")
 
     if result.errors:
@@ -501,8 +543,14 @@ def _median_of(result: SweepResult, scenario: str, split: str) -> Optional[float
     return median(values) if values else None
 
 
-def render_json(result: SweepResult) -> str:
-    """Machine-readable form: the rows, plus everything needed to trust them."""
+def render_json(result: SweepResult, persistence=None) -> str:
+    """Machine-readable form: the rows, plus everything needed to trust them.
+
+    ``persisted`` was hardcoded ``False`` here. Since FC-060 Layer 3 it is the
+    truth, and a stored run additionally carries ``run_id`` / ``sweep_key`` /
+    ``dataset`` so the JSON export and the BigQuery rows can be joined by
+    anything that reads both.
+    """
     payload: Dict[str, Any] = {
         "scenarios": result.scenarios,
         "symbols": result.symbols,
@@ -555,6 +603,9 @@ def render_json(result: SweepResult) -> str:
         "rejection_tally_caveat": TALLY_CAVEAT,
         "in_sample_banner": IN_SAMPLE_BANNER if result.in_sample_only else None,
         "holdout_semantics": HOLDOUT_SEMANTICS if result.has_holdout else None,
-        "persisted": False,
+        "persisted": bool(getattr(persistence, "persisted", False)),
+        "run_id": getattr(persistence, "run_id", None),
+        "sweep_key": getattr(persistence, "sweep_key", None),
+        "dataset": getattr(persistence, "dataset", None),
     }
     return json.dumps(payload, indent=2, default=str)

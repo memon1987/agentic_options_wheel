@@ -7,12 +7,15 @@ will drop the `v2` prefix and retire any legacy endpoints that are no
 longer consumed.
 """
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, Header, HTTPException, Query
 from typing import List, Dict, Any, Optional
 
+import services.sweeps as sweeps
 from services.bigquery import get_bigquery_service
 from services.pause_alert import (
     CHECK_FAILED_MARKER,
@@ -375,3 +378,385 @@ async def pause_alert_check() -> Dict[str, Any]:
         "uncovered_total": len(result.get("uncovered", [])),
         "unknown_total": len(unknown),
     }
+
+
+# ----------------------------------------------------------------------
+# FC-060 Layer 3 — scenario sweeps.
+#
+# The router is deliberately THIN. Every decision worth getting wrong —
+# what the allowlist permits, what the caps are, whether a token matches,
+# whether another sweep is running, what the launch body looks like, how a
+# cell is classified — lives in `services/sweeps.py`, which the root test
+# suite exercises directly. FastAPI is absent from the bot's CI image, so
+# anything decided in this file is decided untested.
+#
+# THE GETs ARE PUBLIC, like every other route on this dashboard (which is
+# reachable by `allUsers` — FC-094 owns that decision). Sweep results are
+# hypotheticals over historical data, not the live book. Only the SUBMIT is
+# gated, because a submit spends money and Job time.
+# ----------------------------------------------------------------------
+
+SWEEP_JOB_NAME = os.getenv("SWEEP_JOB_NAME", "backtest-sweep")
+SWEEP_REGION = os.getenv("SWEEP_JOB_REGION", "us-central1")
+
+
+def _sweep_token() -> Optional[str]:
+    """The configured submit token, or None when sweeps are disabled.
+
+    Fails CLOSED: an unset `SWEEP_SUBMIT_TOKEN` disables submission entirely
+    rather than accepting anything. The secret is wired out-of-band
+    (`--update-secrets`, the same recipe as GITHUB_TOKEN), so "not configured
+    yet" is a state this endpoint will genuinely be in between the merge and
+    the operator's step 1.
+    """
+    return os.getenv("SWEEP_SUBMIT_TOKEN") or None
+
+
+def _project() -> str:
+    return (os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or "gen-lang-client-0607444019")
+
+
+def _service_account_email() -> str:
+    """Best effort, for the 403 message only. Never used for auth."""
+    return os.getenv("SWEEP_JOB_SERVICE_ACCOUNT",
+                     "799970961417-compute@developer.gserviceaccount.com")
+
+
+def _access_token() -> str:
+    """An ADC OAuth access token for the Cloud Run control plane.
+
+    NOT the identity token `routers/live.py` uses for service-to-service calls.
+    `run.googleapis.com` is the control plane and takes an OAuth access token
+    with the cloud-platform scope; an identity token is rejected there, and the
+    two are easy to confuse because the same service account issues both.
+
+    Synchronous on purpose — it is called through `run_in_threadpool`. Both
+    `google.auth.default()` and `credentials.refresh()` do blocking I/O (the
+    metadata server on Cloud Run, the filesystem locally); awaiting them inline
+    in an `async def` stalls the whole event loop, so a metadata-server hiccup
+    would freeze every other dashboard request, not just this one.
+    """
+    import google.auth
+    import google.auth.transport.requests
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    credentials.refresh(google.auth.transport.requests.Request())
+    return credentials.token
+
+
+async def _launch_job(body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST Cloud Run v2 `jobs.run`. Returns the operation, or raises HTTPException.
+
+    **Every failure leaves here as an HTTPException**, including a transport
+    error. `httpx` raises `ReadTimeout` / `ConnectError` rather than returning a
+    response, and an escaping one used to surface as a 500 — with the
+    `submitted` row already written and never terminalised, so the one-at-a-time
+    gate stayed locked and the operator got a stack trace instead of a reason.
+    The caller relies on that guarantee to record a `failed` row.
+    """
+    import httpx
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        token = await run_in_threadpool(_access_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=(f"could not obtain a Google credential to launch the sweep "
+                    f"Job: {type(exc).__name__}: {exc}"))
+
+    url = sweeps.job_run_url(_project(), SWEEP_JOB_NAME, SWEEP_REGION)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url, json=body,
+                headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        # A timeout is genuinely ambiguous: the execution may or may not have
+        # started. Said plainly rather than guessed at — and the run is recorded
+        # `failed`, so the gate reopens and the operator can look at Cloud Run
+        # and re-submit rather than waiting out a lock on an unknown.
+        raise HTTPException(
+            status_code=502,
+            detail=(f"could not reach Cloud Run to launch the sweep Job "
+                    f"({type(exc).__name__}: {exc}). The execution may or may "
+                    f"not have started — check `gcloud run jobs executions list "
+                    f"--job {SWEEP_JOB_NAME}` before re-submitting."))
+    except Exception as exc:  # noqa: BLE001 - nothing may escape as a 500
+        raise HTTPException(
+            status_code=502,
+            detail=(f"launching the sweep Job failed unexpectedly: "
+                    f"{type(exc).__name__}: {exc}"))
+
+    if response.status_code == 403:
+        # The one failure mode with a specific, actionable cause. Named in full
+        # rather than passed through as "403", because the grant is console-only
+        # on this project and an operator sent to the CLI will not get there.
+        raise HTTPException(
+            status_code=502,
+            detail=sweeps.forbidden_detail(_project(), SWEEP_JOB_NAME,
+                                           _service_account_email()))
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"Cloud Run has no Job named '{SWEEP_JOB_NAME}' in "
+                    f"{SWEEP_REGION}. It is created by cloudbuild.yaml's "
+                    f"`deploy-sweep-job` step — check that the merging build "
+                    f"ran it (a build lacking run.jobs.create fails that step "
+                    f"loudly). Nothing was launched."))
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"Cloud Run refused the launch ({response.status_code}): "
+                    f"{response.text[:400]}"))
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def _sweep_store_missing(exc: Exception) -> bool:
+    """Whether this failure is "the sweep tables do not exist yet"."""
+    from google.cloud.exceptions import NotFound
+    return isinstance(exc, NotFound)
+
+
+def _tables_missing() -> HTTPException:
+    return HTTPException(status_code=503,
+                         detail=sweeps_bq_missing_detail())
+
+
+def sweeps_bq_missing_detail() -> str:
+    from services.bigquery import BigQueryService
+    return BigQueryService.TABLES_MISSING_DETAIL
+
+
+@router.get("/sweeps/allowlist")
+async def sweeps_allowlist() -> Dict[str, Any]:
+    """The override keys, the refusals AND THEIR REASONS, presets, and caps.
+
+    Served from the engine's own `overrides.py` (copied into this image), so the
+    form cannot offer a key the Job would refuse. The refusals are served too:
+    "put_target_dte is not allowed" teaches nothing, "the cached chains store
+    universe_dte=8, so the arm would silently measure something else" tells the
+    operator what to do instead.
+
+    Static — no BigQuery, no auth — so the page can render its form before any
+    sweep has ever run.
+    """
+    return sweeps.allowlist_payload()
+
+
+@router.get("/sweeps")
+async def list_sweeps(
+    limit: int = Query(default=25, ge=1, le=100),
+) -> List[Dict[str, Any]]:
+    """Recent sweeps, latest status per run, newest first.
+
+    Each row carries `stuck: true` when it is still `submitted` past the
+    container-start window (D3). That is a LABEL and nothing more — this backend
+    cannot cancel an execution and does not pretend to; `execution_name` is on
+    the row so an operator can go and look.
+    """
+    bq = get_bigquery_service()
+    try:
+        rows = bq.get_recent_sweeps(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    for row in rows:
+        row["stuck"] = sweeps.is_stuck(row)
+    return rows
+
+
+@router.get("/sweeps/{run_id}")
+async def get_sweep(run_id: str) -> Dict[str, Any]:
+    """One sweep: its latest status, and — once it has any — its shaped results.
+
+    The shaping (grid, per-scenario summary, deltas over the COMMON measured
+    subset, sign agreement, the bias footer) happens server-side so the UI
+    renders rather than recomputes. Three reimplementations of "which cells
+    count" would be three chances to average an `insuf` cell into a ranking.
+    """
+    if not run_id or len(run_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid run_id")
+    bq = get_bigquery_service()
+    try:
+        row = bq.get_sweep(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No sweep {run_id}")
+        rows = bq.get_sweep_rows(run_id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    shaped = sweeps.shape_results(row, rows)
+    shaped["stuck"] = sweeps.is_stuck(row)
+    shaped["status"] = row.get("status")
+    shaped["run_id"] = run_id
+    return shaped
+
+
+@router.post("/sweeps", status_code=202)
+async def submit_sweep(
+    spec: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Validate, gate, launch, record. In that order, and the order matters.
+
+    * **503** when `SWEEP_SUBMIT_TOKEN` is unset — sweeps disabled, fail closed.
+    * **401** when the bearer does not match (constant-time compare).
+    * **422** with the runner's own reason for any spec the Job would refuse.
+    * **409** while another sweep is live. One 1-vCPU Job; two executions would
+      contend on one chain cache.
+    * **502** when Cloud Run refuses the launch, carrying the grant command for
+      the one cause that has a specific fix.
+    * **202** on success — *accepted*, not completed: the sweep runs for minutes
+      in a Job, and the caller polls `GET /api/v2/sweeps/{run_id}`.
+
+    **THIS ENDPOINT NEVER DEDUPLICATES** (round-2 fix 1). It always launches.
+
+    It used to short-circuit to a `deduplicated` row when `find_done_sweep`
+    matched, binding the config predicate to the last `base_config_hash` any run
+    on this commit had recorded. That was self-referential: after an operator
+    flipped `ROLLER_ENABLED` on the Job, a re-submitted spec matched the
+    *pre-flip* run's own hash, deduplicated to it, and — because nothing was
+    launched — the Job's exact check, the one that would have caught the flip,
+    never ran. The dedup became permanent and wrong, silently.
+
+    The API cannot compute the Job's effective configuration, so it does not get
+    to make that call. `find_done_sweep` is still consulted, purely as a HINT:
+    the earlier run id is returned as `prior_done_run_id` so an operator can open
+    it while the new execution starts. The **Job** deduplicates, against the
+    config it is actually holding, and writes the `deduplicated` row itself. The
+    cost of the change is one container start (~3-4 min) on a repeat submission,
+    which is the right price for never serving one experiment's numbers as
+    another's.
+
+    The `submitted` row is written BEFORE the launch. If the launch then fails,
+    the row is terminalised as `failed` with the reason — a visible failed sweep,
+    never a silent one. The reverse order has the worse failure: an execution
+    running with no row, which no reader can see and no dedup can find.
+    """
+    configured = _sweep_token()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
+                    "on this service. Create the `sweep-submit-token` secret and "
+                    "wire it with `gcloud run services update "
+                    "options-wheel-dashboard --update-secrets="
+                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
+    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
+        raise HTTPException(
+            status_code=401,
+            detail="a valid `Authorization: Bearer <token>` is required to submit")
+
+    try:
+        normalised = sweeps.validate_spec(spec)
+    except sweeps.SweepValidationError as exc:
+        # 422 carries the runner's exact reason. A generic "invalid spec" would
+        # send the operator to guess which of nineteen keys was the problem.
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    bq = get_bigquery_service()
+    git_commit = os.getenv("GIT_COMMIT") or None
+    key = sweeps.compute_sweep_key(normalised, git_commit)
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    force = bool(normalised.get("force"))
+
+    try:
+        # A HINT, never a decision — no `base_config_hash` is bound, so this
+        # cannot see a kill switch flipped on the Job. `force` suppresses even
+        # the hint, since the operator has already said they do not want one.
+        prior = None if force else bq.find_done_sweep(key)
+        history = bq.get_recent_sweeps(limit=25)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+
+    blocking = sweeps.blocking_sweep(history)
+    if blocking is not None:
+        # STATE-AWARE, because the two states expire on different clocks. One
+        # message quoting the task timeout told an operator blocked by a
+        # `submitted` row to wait three hours for a lock that frees in ten
+        # minutes — and "wait three hours" is exactly the advice that gets a
+        # feature abandoned.
+        status = blocking.get("status")
+        if status == sweeps.STATUS_SUBMITTED:
+            release = (f"it releases at most {sweeps.STUCK_AFTER_MINUTES} minutes "
+                       f"after that run's last update — a launch that has "
+                       f"produced no `running` row by then is not running")
+        else:
+            release = (f"it releases once that run is older than the Job's task "
+                       f"timeout ({sweeps.JOB_TASK_TIMEOUT_SECONDS // 3600}h + "
+                       f"{sweeps.STALE_GRACE_MINUTES}m), because Cloud Run has "
+                       f"killed the task by then; a cold sweep can legitimately "
+                       f"replay for that long")
+        raise HTTPException(
+            status_code=409,
+            detail=(f"sweep {blocking.get('run_id')} is {status}; "
+                    f"one sweep runs at a time (the Job is a single vCPU and two "
+                    f"executions would contend on one chain cache). Wait for it "
+                    f"— {release}."))
+
+    run_id = sweeps.new_run_id()
+    row = sweeps.submitted_row(
+        run_id=run_id, spec=normalised, sweep_key_value=key,
+        submitted_at=submitted_at, git_commit=git_commit)
+    bq.insert_sweep_status(row)
+
+    try:
+        operation = await _launch_job(sweeps.launch_body(
+            spec_json=json.dumps(normalised, sort_keys=True),
+            run_id=run_id, submitted_at=submitted_at))
+    except HTTPException as exc:
+        # The row already exists, so the failure has to be recorded on it —
+        # otherwise the submit shows as pending forever and holds the
+        # one-at-a-time lock until the stale cutoff for no reason. `_launch_job`
+        # guarantees every failure arrives here as an HTTPException, transport
+        # errors included, which is what makes this reachable at all.
+        try:
+            failed = dict(row)
+            failed.update(status=sweeps.STATUS_FAILED,
+                          written_at=datetime.now(timezone.utc).isoformat(),
+                          finished_at=datetime.now(timezone.utc).isoformat(),
+                          error=str(exc.detail)[:1000])
+            bq.insert_sweep_status(failed)
+        except Exception:  # noqa: BLE001 - the launch error is the one to report
+            logger.exception("could not record the failed sweep launch")
+        raise
+
+    execution_name = (operation or {}).get("metadata", {}).get("name")
+    if execution_name:
+        # A second `submitted` row carrying the execution name. Insert-only, so
+        # the reader's "latest row wins" picks this one up and an operator can
+        # find the execution in the console before the Job's own `running` row
+        # lands ~3-4 minutes later.
+        try:
+            stamped = dict(row)
+            stamped.update(written_at=datetime.now(timezone.utc).isoformat(),
+                           execution_name=execution_name)
+            bq.insert_sweep_status(stamped)
+        except Exception:  # noqa: BLE001 - cosmetic; the sweep is already running
+            logger.warning("could not record execution_name for sweep %s", run_id)
+
+    return {"run_id": run_id, "status": sweeps.STATUS_SUBMITTED,
+            "sweep_key": key, "launched": True,
+            "execution_name": execution_name,
+            "cell_count": sweeps.cell_count(normalised),
+            "forced": force,
+            # A HINT for the UI: an earlier run that completed under this
+            # `sweep_key`. The Job may or may not deduplicate to it — that
+            # depends on the effective config, which only the Job can see — so
+            # this is offered as "you may already have this answer", never as
+            # "nothing was run". `deduplicated_to` stays None here on purpose:
+            # if the Job dedups, ITS row carries it and the poll will show it.
+            "prior_done_run_id": (prior or {}).get("run_id"),
+            "deduplicated_to": None}

@@ -667,23 +667,34 @@ python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07
 python main.py --command screen            # whole universe -> options_wheel.backtest_runs
 python main.py --command sweep --scenarios examples/scenarios_example.yaml \
     --symbols AAPL,AMZN,GOOGL,IWM,NVDA,UNH --start 2025-08-01 --end 2026-07-31
+python main.py --command sweep --scenarios s.yaml --persist   # -> scenario_sweeps/runs
+python main.py --command sweep --spec-env SWEEP_SPEC_JSON      # the backtest-sweep Job
 ```
 
-**Scenario sweeps are local and are NEVER persisted (FC-060 Layer 2).**
-`--command sweep` replays many config variants over many symbols and writes
-markdown/JSON to disk only (a cold window does still populate the shared chain
+**Scenario sweeps have their OWN store, and it is never `backtest_runs`
+(FC-060 Layers 2-3).** `--command sweep` replays many config variants over many
+symbols. By default it writes markdown/JSON to disk only; with `--persist` — or
+run as the `backtest-sweep` Cloud Run Job, which implies it — it writes
+`options_wheel.scenario_sweeps` + `options_wheel.scenario_runs`
+(`docs/bigquery/scenario_runs.md`). A cold window also populates the shared chain
 cache and, when `CHAIN_LAKE_BUCKET` is set, the chain lake — that is vendor data,
-not results). It must stay that way while `backtest_runs` is the
-production screen's table: the documented "current demotion candidates" query
-takes the latest `run_kind='full'` row, so a persisted full-universe sweep would
-displace a real screen with a hypothetical. A sweep report is a hypothesis, not a
-record of the universe. Overrides are restricted to a **selection-only
-allowlist** — a key that changes what the cached chain must contain, or that the
-replay never reads, is refused with the reason. **Without `--holdout-start` the
-report is labelled IN-SAMPLE ONLY**: a ranking chosen on the window it was
-measured on is a hypothesis, not a result. See `docs/BACKTEST_ENGINE.md`
-§"Scenario sweeps"; FC-060 Layer 3 owns a store for sweep results that cannot
-displace the screen.
+not results.
+
+**It must never write `backtest_runs`.** That table's documented "current
+demotion candidates" query takes the latest `run_kind='full'` row, so a persisted
+full-universe sweep there would displace a real screen with a hypothetical. The
+two sweep tables have no `run_kind` column at all, which makes the mistake
+unrepresentable rather than merely discouraged. A sweep is a hypothesis; a screen
+is a record of the universe.
+
+Overrides are restricted to a **selection-only allowlist** — a key that changes
+what the chain must contain, or that the replay never reads, is refused with the
+reason. The allowlist lives in `src/backtesting/scenarios/overrides.py` and is
+**imported, not restated**, by the dashboard's submit API (the file is copied
+into the dashboard image), so the API refuses exactly what the Job refuses, with
+the same reason strings. **Without `--holdout-start` the report is labelled
+IN-SAMPLE ONLY**: a ranking chosen on the window it was measured on is a
+hypothesis, not a result. See `docs/BACKTEST_ENGINE.md` §"Scenario sweeps".
 
 **`docs/BACKTEST_ENGINE.md` is the single home of every measured backtest
 figure. Read it before quoting any backtest number, and quote numbers from
@@ -794,6 +805,46 @@ never resolved) and most were cold-start duplicates. The dashboard reads the
 feed. Note the separate `options_wheel_logs.wheel_cycles` **view** still has
 NULL `strike_price` / `premium` from every feeder — pre-existing rot, not a
 regression; do not treat those columns as data.
+
+### The sweep API — the one write path this backend has (FC-060 Layer 3)
+
+`/api/v2/sweeps*` is the dashboard's only endpoint family that *causes* anything.
+Four routes, and the asymmetry between them is deliberate:
+
+| route | auth | what it does |
+|---|---|---|
+| `GET /api/v2/sweeps/allowlist` | none | the override keys, the refusals **and their reasons**, presets, caps. Static — no BigQuery |
+| `GET /api/v2/sweeps` | none | recent runs, latest status per `run_id`, `stuck` label |
+| `GET /api/v2/sweeps/{run_id}` | none | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
+| `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → 409 gate → write `submitted` → launch the Job → **202** |
+
+- **The GETs are public because everything on this dashboard is** (it is reachable
+  by `allUsers` — FC-094 owns that decision). Sweep results are hypotheticals over
+  historical data, not the live book. Only the submit is gated, because a submit
+  spends Job time.
+- **The token compare is `hmac.compare_digest`, and it fails closed.** An unset
+  `SWEEP_SUBMIT_TOKEN` returns 503 "sweeps disabled" rather than accepting
+  anything. The secret is wired out-of-band (`--update-secrets`), so "not
+  configured yet" is a real state.
+- **Everything decidable lives in `services/sweeps.py`, not in the router.**
+  FastAPI is absent from the image Cloud Build tests with, so a rule written in
+  `routers/v2.py` is a rule nobody checks — the same reason `services/pause_alert.py`
+  exists. `tests/test_dashboard_sweeps.py` exercises the service module directly.
+- **`shape_results` is asserted EQUAL to `report.py`** on a real sweep, so `/sims`
+  and `sweep.md` cannot disagree about a median, a delta, or which cells count.
+  Three constants that could not be imported (the report prose, `ENGINE_VERSION`,
+  the status ORDER BY) are copied with byte-equality tests; drift fails the build.
+- **The API never deduplicates — only the Job does.** The API cannot compute the
+  Job's effective config, and the round-1 attempt to approximate it was
+  self-referential (after a kill-switch flip, a re-submitted spec matched the
+  pre-flip run's own hash and dedupped to it for ever, while the Job's exact
+  check never ran because nothing was launched). It always launches and returns
+  `prior_done_run_id` as a hint; the Job decides and writes the `deduplicated`
+  row. One container start on a repeat is the price.
+- **Status is BigQuery-based, never execution-polling** (D3). `run.executions.get`
+  is unproven for this service account and grantable only in the console;
+  `execution_name` is stored so an operator can go and look. A `submitted` row with
+  no `running` row after 10 minutes renders as "stuck" — a label, not a cancel.
 
 ### Verification Steps
 
