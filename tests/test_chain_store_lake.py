@@ -25,7 +25,9 @@ L8  counters distinguish miss / rejected / skipped / error
 """
 
 import base64
+import dataclasses
 import hashlib
+import io
 from datetime import date
 from pathlib import Path
 
@@ -674,6 +676,433 @@ class TestCoverageAppliesToLakeFiles:
 
 
 # --------------------------------------------------------------------------- #
+# 4b. FC-091 — merge-on-put
+# --------------------------------------------------------------------------- #
+OLD_W = dict(universe_dte=14, strike_gte=90.0, strike_lte=110.0, model="m1")
+NEW_W = dict(universe_dte=7, strike_gte=100.0, strike_lte=130.0, model="m1")
+# The request the cold run makes: the lake's OLD_W file reaches high enough on
+# the low bound but not on the high one, so `_covers` rejects it and neither
+# window contains the other — the SPY/IWM/PFE production signature.
+NEW_REQUEST = dict(universe_dte=7, strike_gte=100.0, strike_lte=130.0,
+                   underlying_price=100.0, model="m1")
+OLD_REQUEST = dict(universe_dte=14, strike_gte=90.0, strike_lte=110.0,
+                   underlying_price=100.0, model="m1")
+
+
+def _marked(mark, **kwargs):
+    """A snapshot whose quotes carry a distinguishing ``mark``."""
+    snap = _snapshot(**kwargs)
+    puts = [dataclasses.replace(q, mark=mark) for q in snap.puts]
+    return ChainSnapshot(snap.underlying, snap.as_of, snap.underlying_price,
+                         puts, [])
+
+
+def _lake_frame(lake, underlying="XYZ", as_of=AS_OF):
+    """The object as it now stands in the lake, parsed back from its bytes."""
+    payload = lake.bytes_of(underlying, as_of)
+    assert payload is not None
+    return pd.read_parquet(io.BytesIO(payload))
+
+
+def _provenance(df):
+    row = df.iloc[0]
+    return (float(row["universe_dte"]), float(row["strike_gte"]),
+            float(row["strike_lte"]), str(row["model"]))
+
+
+def _thrash(tmp_path, lake, old_window=None, old_snapshot=None, sub="cold"):
+    """Reproduce the thrash: seed the lake, then reject its object on a get.
+
+    Returns the cold store, primed with the rejected frame, ready for the
+    rebuild's ``put``.
+    """
+    _seed_lake(tmp_path, lake, old_window or OLD_W,
+               snapshot=old_snapshot if old_snapshot is not None
+               else _marked(1.0, strikes=(90.0, 95.0, 100.0)))
+    store = ChainStore(str(tmp_path / sub), lake=lake)
+    assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+    assert store.lake_hits == 1 and store.lake_rejected == 1
+    return store
+
+
+class TestMergeOnPut:
+    """FC-091. A window that thrashes must heal, not stay cold forever.
+
+    The coverage-monotone guard (Layer 1) refuses a narrowing, which is right,
+    but a window can move so that the rebuild is wider on one bound and
+    narrower on the other. Then neither file covers the other, every upload is
+    refused, and the symbol is re-fetched cold on every monthly run — observed
+    in production on SPY, IWM and PFE (`rejected=231 skipped=231` apiece). The
+    union is the missing operation.
+    """
+
+    # -- test 1 ------------------------------------------------------------
+    def test_overlapping_windows_merge_into_the_union(self, tmp_path,
+                                                      captured_events):
+        lake = FakeLake()
+        old_gen = lake.generation_of("XYZ", AS_OF)
+        store = _thrash(tmp_path, lake)
+        old_gen = lake.generation_of("XYZ", AS_OF)
+
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+
+        assert store.lake_merged == 1
+        assert store.lake_puts == 1, "the merged file is a superset; it uploads"
+        assert store.lake_skipped == 0 and store.lake_merge_gaps == 0
+        assert lake.generation_of("XYZ", AS_OF) != old_gen
+
+        merged = _lake_frame(lake)
+        assert sorted(merged["strike"]) == [90.0, 95.0, 100.0, 105.0, 130.0]
+        # New build wins the collision at strike 100 — same session, same
+        # model, but produced by this process under this code.
+        by_strike = dict(zip(merged["strike"], merged["mark"]))
+        assert by_strike[100.0] == 2.0
+        assert by_strike[90.0] == 1.0 and by_strike[130.0] == 2.0
+        # dte is a reach, so its union is the longer one, not the new one.
+        assert _provenance(merged) == (14.0, 90.0, 130.0, "m1")
+        assert merged["universe_dte"].nunique() == 1, (
+            "provenance is a property of the file; every row carries the union"
+        )
+
+        event = _events(captured_events, "chain_lake_merged")
+        assert len(event) == 1
+        assert event[0]["merged_window"]["strike_gte"] == 90.0
+        assert event[0]["merged_window"]["strike_lte"] == 130.0
+        assert event[0]["merged_rows"] == 5 and event[0]["new_rows"] == 3
+
+    def test_the_local_file_is_the_merged_file_too(self, tmp_path):
+        """Local and remote must not diverge: the lake mirrors what is on disk."""
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        local = (tmp_path / "cold" / "XYZ" / "2025-01-06.parquet")
+        assert local.read_bytes() == lake.bytes_of("XYZ", AS_OF)
+
+    def test_the_merge_uses_the_generation_captured_on_the_download(self, tmp_path):
+        """No re-stat, no re-download: the read already learned the generation."""
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        before = list(lake.ops())
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        assert [op for op in lake.ops()[len(before):]] == ["upload"], (
+            "a merge must not pay for a second probe of the object it just read"
+        )
+        assert store.lake_puts == 1
+
+    # -- test 2 ------------------------------------------------------------
+    def test_disjoint_windows_refuse_the_merge_and_upload_nothing(
+        self, tmp_path, captured_events
+    ):
+        """A gap is strikes NEITHER file fetched. Never claim them."""
+        lake = FakeLake()
+        gap_old = dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+                       model="m1")
+        _seed_lake(tmp_path, lake, gap_old,
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        old_bytes = lake.bytes_of("XYZ", AS_OF)
+        old_gen = lake.generation_of("XYZ", AS_OF)
+
+        store = ChainStore(str(tmp_path / "gap"), lake=lake)
+        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+                         strike_lte=130.0, underlying_price=100.0,
+                         model="m1") is None
+        assert store.lake_rejected == 1
+
+        before = list(lake.ops())
+        store.put(_marked(2.0, strikes=(120.0, 125.0, 130.0)),
+                  universe_dte=7, strike_gte=120.0, strike_lte=130.0,
+                  model="m1")
+
+        assert store.lake_merge_gaps == 1 and store.lake_merged == 0
+        assert store.lake_puts == 0 and store.lake_skipped == 0
+        assert store.lake_errors == 0, "a refused merge is not an error"
+        assert lake.ops()[len(before):] == [], "nothing was sent to the lake"
+        assert lake.bytes_of("XYZ", AS_OF) == old_bytes
+        assert lake.generation_of("XYZ", AS_OF) == old_gen
+
+        gap = _events(captured_events, "chain_lake_merge_gap")
+        assert len(gap) == 1
+        assert gap[0]["existing_window"]["strike_lte"] == 100.0
+        assert gap[0]["new_window"]["strike_gte"] == 120.0
+        assert gap[0]["symbol"] == "XYZ"
+
+    def test_the_gap_case_still_writes_the_local_file(self, tmp_path):
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+                        model="m1"))
+        store = ChainStore(str(tmp_path / "gap2"), lake=lake)
+        store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+                  strike_lte=130.0, underlying_price=100.0, model="m1")
+        store.put(_snapshot(strikes=(120.0, 130.0)), universe_dte=7,
+                  strike_gte=120.0, strike_lte=130.0, model="m1")
+        got = store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+                        strike_lte=130.0, underlying_price=100.0, model="m1")
+        assert got is not None and [q.strike for q in got.puts] == [120.0, 130.0]
+
+    def test_touching_windows_are_not_a_gap(self, tmp_path):
+        """`old.lte == new.gte` share a strike; that is an overlap, not a gap."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+                        model="m1"),
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        store = ChainStore(str(tmp_path / "touch"), lake=lake)
+        store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+                  strike_lte=130.0, underlying_price=100.0, model="m1")
+        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=7,
+                  strike_gte=100.0, strike_lte=130.0, model="m1")
+        assert store.lake_merged == 1 and store.lake_merge_gaps == 0
+        assert _provenance(_lake_frame(lake)) == (14.0, 90.0, 130.0, "m1")
+
+    # -- test 3 ------------------------------------------------------------
+    def test_a_model_change_is_never_merged(self, tmp_path, captured_events):
+        """Prices and greeks are computed; two models are two answers."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, OLD_W,
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        old_bytes = lake.bytes_of("XYZ", AS_OF)
+        store = ChainStore(str(tmp_path / "m2"), lake=lake)
+        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+                         strike_lte=130.0, underlying_price=100.0,
+                         model="m2") is None
+        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=7,
+                  strike_gte=100.0, strike_lte=130.0, model="m2")
+
+        assert store.lake_merged == 0 and store.lake_merge_gaps == 0
+        assert store.lake_skipped == 1 and store.lake_puts == 0
+        assert lake.bytes_of("XYZ", AS_OF) == old_bytes
+        assert _events(captured_events, "chain_lake_overwrite_skipped")[0][
+            "reason"] == "model_changed"
+
+    def test_unknown_provenance_on_either_side_is_never_merged(self, tmp_path):
+        """A file that cannot say what it covers cannot widen a claim."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, OLD_W)
+        store = ChainStore(str(tmp_path / "u"), lake=lake)
+        store.get("XYZ", AS_OF, **NEW_REQUEST)
+        store.put(_snapshot(strikes=(100.0, 130.0)), model="m1")  # no bounds
+        assert store.lake_merged == 0
+        assert store.lake_skipped == 1 and store.lake_puts == 0
+
+    def test_a_different_session_close_is_never_merged(self, tmp_path):
+        """Every delta in a file is computed against that file's close.
+
+        `get` checks the price only AFTER `_covers`, so a frame can be
+        remembered without its price having been compared at all — the merge
+        has to make that comparison itself or it will union two sessions.
+        """
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, OLD_W,
+                   snapshot=_snapshot(strikes=(90.0, 95.0, 100.0), price=100.0))
+        store = ChainStore(str(tmp_path / "px"), lake=lake)
+        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+                         strike_lte=130.0, underlying_price=101.0,
+                         model="m1") is None
+        store.put(_snapshot(strikes=(100.0, 130.0), price=101.0), **NEW_W)
+        assert store.lake_merged == 0, "two closes cannot be unioned"
+
+    # -- test 4 ------------------------------------------------------------
+    def test_the_merged_file_answers_both_the_old_and_the_new_request(
+        self, tmp_path
+    ):
+        """The whole point: one object, both windows, no further re-fetching."""
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+
+        hits_before = store.lake_hits
+        ops_before = list(lake.ops())
+
+        new_side = store.get("XYZ", AS_OF, **NEW_REQUEST)
+        assert new_side is not None
+        assert [q.strike for q in new_side.puts] == [100.0, 105.0, 130.0]
+
+        old_side = store.get("XYZ", AS_OF, **OLD_REQUEST)
+        assert old_side is not None, (
+            "the merged file must still cover the window the lake object had"
+        )
+        assert [q.strike for q in old_side.puts] == [90.0, 95.0, 100.0, 105.0], (
+            "MUTATION GUARD: keeping only the new rows and dropping the union "
+            "leaves this request covered on paper and empty in fact"
+        )
+
+        assert store.lake_hits == hits_before, "both reads are local"
+        assert lake.ops()[len(ops_before):] == []
+
+    def test_a_reader_cannot_tell_a_merged_file_from_a_plain_one(self, tmp_path):
+        """Row conversion is unchanged: merging moves rows, it never re-prices.
+
+        A request the unmerged build could satisfy gets byte-identical quotes
+        out of the merged file, because every row the union added lies outside
+        that build's window and the narrowing mask drops it.
+        """
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        rebuild = _marked(2.0, strikes=(100.0, 105.0, 130.0))
+        store.put(rebuild, **NEW_W)
+        merged = store.get("XYZ", AS_OF, **NEW_REQUEST)
+
+        plain_store = ChainStore(str(tmp_path / "plain"))
+        plain_store.put(rebuild, **NEW_W)
+        plain = plain_store.get("XYZ", AS_OF, **NEW_REQUEST)
+
+        assert merged is not None and plain is not None
+        assert merged.puts == plain.puts and merged.calls == plain.calls
+        assert merged.underlying_price == plain.underlying_price
+
+    def test_the_rejected_frame_is_consumed_by_the_put_that_uses_it(self, tmp_path):
+        """A second put must not resurrect rows the first one already merged."""
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        store.put(_marked(3.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        assert store.lake_merged == 1, "the frame is used once, then dropped"
+        assert store._lake_rejected_frames == {}
+
+    # -- test 5 ------------------------------------------------------------
+    def test_an_empty_old_chain_contributes_no_sentinel_row(self, tmp_path):
+        """A sentinel asserts a window, not a contract. The union replaces it."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=14, strike_gte=80.0, strike_lte=110.0,
+                        model="m1"),
+                   snapshot=_snapshot(strikes=()))
+        store = ChainStore(str(tmp_path / "e1"), lake=lake)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+
+        assert store.lake_merged == 1
+        merged = _lake_frame(lake)
+        assert list(merged["symbol"]).count("") == 0
+        assert sorted(merged["strike"]) == [100.0, 105.0, 130.0]
+        assert _provenance(merged) == (14.0, 80.0, 130.0, "m1")
+
+    def test_an_empty_new_chain_keeps_the_old_contracts(self, tmp_path):
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        store.put(_snapshot(strikes=()), **NEW_W)
+
+        assert store.lake_merged == 1
+        merged = _lake_frame(lake)
+        assert list(merged["symbol"]).count("") == 0
+        assert sorted(merged["strike"]) == [90.0, 95.0, 100.0]
+
+    def test_two_empty_chains_stay_one_sentinel(self, tmp_path):
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=14, strike_gte=80.0, strike_lte=110.0,
+                        model="m1"),
+                   snapshot=_snapshot(strikes=()))
+        store = ChainStore(str(tmp_path / "e3"), lake=lake)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        store.put(_snapshot(strikes=()), **NEW_W)
+
+        merged = _lake_frame(lake)
+        assert len(merged) == 1 and merged["symbol"].iloc[0] == ""
+        assert _provenance(merged) == (14.0, 80.0, 130.0, "m1")
+
+    # -- test 6 ------------------------------------------------------------
+    def test_the_seed_tool_never_merges(self, tmp_path, captured_events):
+        """`seed` uploads files; it has no ChainStore and no rejected frames."""
+        from tools.diagnostics.chain_lake_seed import seed
+
+        root = tmp_path / "cache"
+        ChainStore(str(root)).put(_snapshot(), **NARROW)
+        lake = FakeLake()
+        lake.put_object("XYZ", AS_OF, b"a different, possibly wider file")
+
+        counts = seed(root, lake)
+        assert (counts.uploaded, counts.skipped_differs) == (0, 1)
+        assert lake.bytes_of("XYZ", AS_OF) == b"a different, possibly wider file"
+        assert not _events(captured_events, "chain_lake_merged")
+        assert not _events(captured_events, "chain_lake_merge_gap")
+
+    # -- no lake, no merge -------------------------------------------------
+    def test_a_store_without_a_lake_never_remembers_a_frame(self, tmp_path):
+        """The merge path exists only where a download happened."""
+        store = ChainStore(str(tmp_path))
+        store.put(_snapshot(), **OLD_W)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        assert store._lake_rejected_frames == {}
+        store.put(_snapshot(strikes=(100.0, 130.0)), **NEW_W)
+        assert store.lake_merged == 0 and store.lake_merge_gaps == 0
+        got = store.get("XYZ", AS_OF, **NEW_REQUEST)
+        assert [q.strike for q in got.puts] == [100.0, 130.0], (
+            "a local rebuild replaces its own file, exactly as before FC-091"
+        )
+
+    def test_a_locally_rejected_file_is_not_a_merge_candidate(self, tmp_path):
+        """Only a file the LAKE served can be merged.
+
+        A local file is this machine's own, and `put` has always replaced it.
+        Merging one would change local-cache semantics for runs with no lake
+        at all.
+        """
+        lake = FakeLake()
+        store = ChainStore(str(tmp_path / "loc"), lake=lake)
+        store.put(_snapshot(strikes=(90.0, 95.0, 100.0)), **OLD_W)
+        store.lake_puts = 0
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        assert store._lake_rejected_frames == {}
+
+
+class TestMergeWindows:
+    """The union rule, directly."""
+
+    def _w(self, dte=7.0, gte=90.0, lte=110.0, model="m1"):
+        return chain_store_module._Window(dte, gte, lte, model)
+
+    def test_the_union_takes_the_widest_of_each_bound(self):
+        window, reason = chain_store_module._merge_windows(
+            self._w(dte=7.0, gte=100.0, lte=130.0),
+            self._w(dte=14.0, gte=90.0, lte=110.0),
+        )
+        assert reason is None
+        assert (window.universe_dte, window.strike_gte, window.strike_lte) == (
+            14.0, 90.0, 130.0)
+        assert window.model == "m1"
+
+    def test_a_contained_window_unions_to_the_container(self):
+        window, reason = chain_store_module._merge_windows(
+            self._w(dte=7.0, gte=95.0, lte=105.0),
+            self._w(dte=14.0, gte=90.0, lte=110.0),
+        )
+        assert reason is None
+        assert (window.universe_dte, window.strike_gte, window.strike_lte) == (
+            14.0, 90.0, 110.0)
+
+    def test_a_model_change_refuses(self):
+        assert chain_store_module._merge_windows(
+            self._w(model="m2"), self._w(model="m1"))[1] == "model_changed"
+
+    def test_unknown_on_either_side_refuses(self):
+        nan = float("nan")
+        assert chain_store_module._merge_windows(
+            self._w(gte=nan), self._w())[1] == "unknown_provenance"
+        assert chain_store_module._merge_windows(
+            self._w(), self._w(dte=nan))[1] == "unknown_provenance"
+
+    def test_disjoint_in_either_direction_is_a_gap(self):
+        assert chain_store_module._merge_windows(
+            self._w(gte=120.0, lte=130.0), self._w(gte=90.0, lte=100.0),
+        )[1] == "strike_gap"
+        assert chain_store_module._merge_windows(
+            self._w(gte=90.0, lte=100.0), self._w(gte=120.0, lte=130.0),
+        )[1] == "strike_gap"
+
+    def test_windows_that_share_one_bound_are_not_a_gap(self):
+        window, reason = chain_store_module._merge_windows(
+            self._w(gte=100.0, lte=130.0), self._w(gte=90.0, lte=100.0),
+        )
+        assert reason is None and window.strike_gte == 90.0
+
+    def test_union_rows_refuses_a_frame_with_a_missing_column(self):
+        frame = pd.DataFrame([{"symbol": "A", "strike": 1.0}])
+        assert chain_store_module._union_rows([{"symbol": "B"}], frame) is None
+
+
+# --------------------------------------------------------------------------- #
 # 5. Failure is never fatal
 # --------------------------------------------------------------------------- #
 class TestLakeFailuresDegrade:
@@ -1258,6 +1687,7 @@ class TestWiring:
             "lake_enabled", "lake_bucket", "lake_prefix",
             "lake_hits", "lake_misses", "lake_rejected",
             "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
+            "lake_merged", "lake_merge_gaps",
             "lake_errors", "lake_disabled", "lake_disabled_reason",
         }
         assert "symbol" not in summary, "must not collide with the log's symbol key"

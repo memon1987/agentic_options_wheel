@@ -221,6 +221,7 @@ def run_screen(
 _LAKE_COUNTERS = (
     "lake_hits", "lake_misses", "lake_rejected",
     "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
+    "lake_merged", "lake_merge_gaps",
     "lake_errors",
 )
 

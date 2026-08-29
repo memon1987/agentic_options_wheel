@@ -275,16 +275,31 @@ cache, and `ChainStore` uses it write-through:
 - **The coverage check is unchanged and still governs.** A lake-sourced file goes through
   `_covers` and the narrowing read path exactly as a local file does, so a warm run and a
   cold run return the identical chain. The lake moves files; it never answers questions.
-- **Objects are coverage-monotone, not immutable.** The *chain* for a settled session never
-  changes, but the *file* records the window it was built under, and that window is
+- **Objects are coverage-monotone via merge (FC-091).** The *chain* for a settled session
+  never changes, but the *file* records the window it was built under, and that window is
   path-dependent — the bid pass of `evaluate_symbol` rebuilds the same session under a
   different `cost_basis`/`low_anchor` than the mid pass, and another machine gets a third.
   An object is therefore replaced only by a file whose request is a **superset** (same
   model, ≥ DTE reach, ⊇ strike window). A narrowing is refused and logged as
   `chain_lake_overwrite_skipped`; every upload carries an `if_generation_match`
-  precondition so concurrent writers cannot clobber each other. Merging two partial windows
-  into their union on write is **still outstanding** — Layer 2 shipped without it (it went
-  to the scenario runner instead), so it belongs to Layer 3 or its own FC.
+  precondition so concurrent writers cannot clobber each other.
+  Refusing the narrowing is not enough on its own: a window can move so that the rebuild is
+  wider on one bound and narrower on the other, in which case *neither* file covers the
+  other, every upload is refused and the symbol is re-fetched cold on **every** monthly run
+  — which is exactly what the lake's first production run did to SPY, IWM and PFE
+  (`rejected=231 skipped=231` apiece). So when a downloaded object fails `_covers`, the
+  rebuild's `put` **merges** rather than replaces: the union of contracts keyed by OCC
+  symbol (the new build wins on duplicates), stamped with the union of the two windows
+  (`max` DTE reach, `min` strike floor, `max` strike ceiling). The merged file is a
+  superset, so the monotone rule accepts it and the day is warm from then on
+  (`chain_lake_merged`). Merging is refused when the models differ, when either side's
+  provenance is unknown, when the two files were built against different closes for the
+  session, and — the one case that also uploads **nothing** — when the two strike windows
+  do not overlap, since the union would claim strikes neither file ever fetched
+  (`chain_lake_merge_gap`). Row conversion is untouched: a merged file is read back through
+  the same `_covers` + narrowing path as any other, and every row the union adds lies
+  outside the new build's own window, so a request the unmerged file could answer gets the
+  identical quotes in the identical order.
 - **A model change needs a prefix bump.** The `model` fingerprint is part of the format
   contract, and a different model is never a *wider* answer — such an upload is skipped, so
   without bumping `CHAIN_LAKE_PREFIX` a model change silently stops populating the lake.
@@ -312,10 +327,12 @@ cache, and `ChainStore` uses it write-through:
 |---|---|
 | `lake_hits` | object downloaded and used |
 | `lake_misses` | object absent |
-| `lake_rejected` | downloaded, then failed the coverage check (should be rare; persistent non-zero means the window is thrashing) |
+| `lake_rejected` | downloaded, then failed the coverage check — the window is thrashing. Not itself a problem now that a rejection heals: expect `lake_merged` to track it and both to fall to ~0 on the next run |
 | `lake_puts` | object written |
 | `lake_skipped` | upload declined, all reasons — would have narrowed coverage, changed model, or lost a generation race |
 | `lake_skipped_unreadable_remote` | **subset of `lake_skipped`**: the existing object's provenance could not be read, so coverage could not be compared. The other skips are the guard working; this one is a poisoned object that only `chain_lake_seed.py --force` will clear |
+| `lake_merged` | a rejected object was unioned with the rebuild, so the file that replaces it is a superset (FC-091) — whether the upload then landed is `lake_puts`/`lake_errors`. This is the heal: a symbol that thrashed should show `lake_merged ≈ lake_rejected` once, then neither again |
+| `lake_merge_gaps` | the two strike windows did not overlap, so the merge was refused and **nothing** was uploaded — the union would have claimed strikes neither file fetched. Persistent non-zero on a symbol means the run's strike window is moving further than one window's width, and that day stays cold until the windows are reconciled |
 | `lake_errors` | operation failed; the run continued local-only |
 
 - **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.

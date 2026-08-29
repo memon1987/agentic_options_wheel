@@ -42,10 +42,24 @@ object may only ever be replaced by a file whose request is a **superset** —
 same model, at least the DTE reach, at least the strike window. A narrowing is
 refused and logged (``chain_lake_overwrite_skipped``) because the wider file is
 shared: losing it turns hits into misses for every machine, and the coverage it
-proved is not recoverable without re-fetching from the vendor. Merging two
-partial windows into their union on write is the Layer-2 follow-up; Layer 1
-deliberately only ever widens. Uploads carry an ``if_generation_match``
-precondition so two writers cannot resolve that race by luck.
+proved is not recoverable without re-fetching from the vendor. Uploads carry an
+``if_generation_match`` precondition so two writers cannot resolve that race by
+luck.
+
+**Coverage-monotone via merge (FC-091).** Refusing the narrowing is correct but
+not sufficient: a window can move so that a rebuild is wider on one bound and
+narrower on the other, in which case *neither* file covers the other and the
+lake never heals — the first production run of the lake left SPY, IWM and PFE
+in exactly that state (``rejected=231 skipped=231`` each, cold on every monthly
+run, forever). So when a downloaded object is rejected by ``_covers`` this run,
+``get`` remembers the frame and the rebuild's ``put`` merges the two: the union
+of contracts keyed by OCC symbol (the new build wins on duplicates), under the
+union of the two windows. The merged file is a superset of the object it
+replaces, so the monotone rule accepts it and the day is warm from then on.
+The one case a merge must refuse is a **gap** — two strike windows that do not
+overlap — because the union window would then claim strikes that neither file
+ever fetched. That is logged as ``chain_lake_merge_gap`` and uploads nothing:
+never claim coverage the file does not contain.
 
 **Nothing here ever deletes.** See ``ChainLake``'s docstring: an unreadable
 local file is a reader-side event as often as it is corruption, and the lake
@@ -94,6 +108,13 @@ _COLUMNS = [
     # a different question — see ChainBuilder._model_fingerprint.
     "model",
 ]
+
+# The provenance columns are constant within a file and are rewritten wholesale
+# when two files are merged; everything else belongs to one quote and travels
+# with it. Split out so the merge can copy quote rows between files without
+# carrying the source file's window claim along with them.
+_PROVENANCE_COLUMNS = ("universe_dte", "strike_gte", "strike_lte", "model")
+_QUOTE_COLUMNS = [c for c in _COLUMNS if c not in _PROVENANCE_COLUMNS]
 
 # Written into the provenance columns when a caller persists a snapshot without
 # declaring what window it was built under. Such a file can still be read back
@@ -562,6 +583,89 @@ def _unknown_pair(new: float, old: float) -> bool:
     return bool(pd.isna(new)) != bool(pd.isna(old))
 
 
+def _merge_windows(new: _Window, old: _Window):
+    """The union of two build windows, or ``(None, reason)`` if they must not merge.
+
+    Returns ``(window, None)`` on success and ``(None, reason)`` otherwise. The
+    union is ``max(universe_dte)``, ``min(strike_gte)``, ``max(strike_lte)`` —
+    the widest claim the two files jointly support.
+
+    Three refusals, and they mean different things:
+
+    * ``model_changed`` — the two files answer different questions. Prices and
+      greeks in these rows are *computed*, not fetched, so unioning rows priced
+      under two models yields a file coherent under neither.
+    * ``unknown_provenance`` — a file that cannot say what it covers cannot
+      contribute to a coverage claim. Fails closed, as ``_window_regression``
+      does.
+    * ``strike_gap`` — the windows do not overlap, so their union spans strikes
+      *neither* file fetched. A merged file claiming that range would look
+      exactly like a session on which those strikes did not trade. This is the
+      one refusal that also suppresses the upload entirely (see
+      ``ChainStore._merge_rejected_lake_frame``).
+
+    There is deliberately no gap concept on the DTE axis: ``universe_dte`` is a
+    reach from zero, so two reaches always overlap and their union is the longer.
+    """
+    if new.model != old.model:
+        return None, "model_changed"
+    bounds = (
+        new.universe_dte, new.strike_gte, new.strike_lte,
+        old.universe_dte, old.strike_gte, old.strike_lte,
+    )
+    if any(pd.isna(v) for v in bounds):
+        return None, "unknown_provenance"
+    if (
+        float(new.strike_gte) > float(old.strike_lte) + _BOUND_TOL
+        or float(old.strike_gte) > float(new.strike_lte) + _BOUND_TOL
+    ):
+        return None, "strike_gap"
+    return _Window(
+        max(float(new.universe_dte), float(old.universe_dte)),
+        min(float(new.strike_gte), float(old.strike_gte)),
+        max(float(new.strike_lte), float(old.strike_lte)),
+        new.model,
+    ), None
+
+
+def _union_rows(new_rows, old_df):
+    """Union a fresh build's rows with an older file's, keyed by contract symbol.
+
+    ``None`` when the old frame is not schema-compatible — fail closed rather
+    than write a file with holes in it.
+
+    The new build wins every collision: it was produced by this process, under
+    this code, from the same immutable session, so where the two disagree the
+    older file is the one to distrust.
+
+    **Sentinel rows** (empty ``symbol``, written for a genuine "no contracts
+    traded" day) are dropped from the union whenever the other side has real
+    rows — a sentinel is an assertion about a window, not a contract, and the
+    merged file's window claim replaces it. They survive only when both sides
+    are sentinels, i.e. the merged day really is empty.
+
+    **Row order is new-first**, which is load-bearing rather than incidental:
+    every old row that survives the union lies outside the new build's window
+    (anything inside it is either a duplicate the new build wins or a contract
+    the new build would itself have fetched), so narrowing the merged file back
+    to any request the *unmerged* new file could satisfy drops all of them and
+    returns the identical rows in the identical order. Merging cannot change an
+    answer the new file already had.
+    """
+    missing = [c for c in _QUOTE_COLUMNS if c not in old_df.columns]
+    if missing:
+        return None
+    old_rows = old_df[_QUOTE_COLUMNS].to_dict("records")
+    old_real = [r for r in old_rows if r.get("symbol")]
+    new_real = [r for r in new_rows if r.get("symbol")]
+    if not new_real:
+        # This build found nothing: keep the older file's contracts if it has
+        # any, else keep the new sentinel (both sides genuinely empty).
+        return old_real if old_real else list(new_rows)
+    new_symbols = {r["symbol"] for r in new_real}
+    return new_real + [r for r in old_real if r["symbol"] not in new_symbols]
+
+
 @dataclass
 class _RemoteState:
     """What this store last learned about one object in the lake.
@@ -603,9 +707,19 @@ class ChainStore:
         # object that only `chain_lake_seed.py --force` can clear.
         self.lake_skipped_unreadable_remote = 0
         self.lake_errors = 0      # operation failed; run continued local-only
+        # FC-091. A rebuild whose window neither covers nor is covered by the
+        # object it replaces is unioned with it instead of being skipped.
+        self.lake_merged = 0      # rebuild unioned with the rejected object
+        self.lake_merge_gaps = 0  # windows disjoint: merge refused, nothing sent
         # Remembers what the lake held for a key, so ``put`` can check coverage
         # against the object it is about to replace without re-downloading it.
         self._lake_seen: Dict[tuple, _RemoteState] = {}
+        # FC-091. Frames this run downloaded from the lake and then rejected in
+        # ``get`` for not covering the request, kept so the rebuild that follows
+        # can merge rather than replace. Popped by the matching ``put``; the
+        # only entry that outlives one is a rejected day nothing rebuilds, so
+        # the dict is bounded by this run's own symbol-days.
+        self._lake_rejected_frames: Dict[tuple, Any] = {}
 
     @classmethod
     def lake_from_env(cls) -> Optional[ChainLake]:
@@ -643,6 +757,8 @@ class ChainStore:
             "lake_puts": self.lake_puts,
             "lake_skipped": self.lake_skipped,
             "lake_skipped_unreadable_remote": self.lake_skipped_unreadable_remote,
+            "lake_merged": self.lake_merged,
+            "lake_merge_gaps": self.lake_merge_gaps,
             "lake_errors": self.lake_errors,
             "lake_disabled": bool(getattr(self.lake, "disabled", False)),
             "lake_disabled_reason": getattr(self.lake, "disabled_reason", None),
@@ -903,22 +1019,37 @@ class ChainStore:
         runs B1 and B2 concurrently) make that a routine event, not an exotic one.
 
         When a lake is configured the completed file is then mirrored to it —
-        after ``os.replace``, so a torn write is never uploaded.
+        after ``os.replace``, so a torn write is never uploaded. If this run
+        downloaded an object for this key and rejected it for not covering the
+        request (FC-091), the two are unioned first and what lands on disk *and*
+        in the lake is the merged superset; see ``_merge_rejected_lake_frame``.
         """
         path = self._path(snapshot.underlying, snapshot.as_of)
         path.parent.mkdir(parents=True, exist_ok=True)
-        provenance = {
-            "universe_dte": _UNKNOWN if universe_dte is None else float(universe_dte),
-            "strike_gte": _UNKNOWN if strike_gte is None else float(strike_gte),
-            "strike_lte": _UNKNOWN if strike_lte is None else float(strike_lte),
-            "model": model,
-        }
-        rows = [{**self._quote_to_row(q), **provenance} for q in snapshot.all_quotes()]
+        window = _Window(
+            _UNKNOWN if universe_dte is None else float(universe_dte),
+            _UNKNOWN if strike_gte is None else float(strike_gte),
+            _UNKNOWN if strike_lte is None else float(strike_lte),
+            model,
+        )
+        rows = [self._quote_to_row(q) for q in snapshot.all_quotes()]
         if not rows:
             # A real "no contracts traded" day: write one sentinel row (empty
             # symbol) carrying the underlying price so a later read distinguishes
             # an empty chain from a cache miss.
-            rows = [{**self._empty_row(snapshot), **provenance}]
+            rows = [self._empty_row(snapshot)]
+        rows, window, mirror = self._merge_rejected_lake_frame(snapshot, rows, window)
+        # Provenance is a property of the FILE, not of any row, and is stamped
+        # on every row so ``_window_of``/``_covers`` can read it from row 0. A
+        # merged file therefore carries the union window on rows from both
+        # sources — which is the whole point of the merge.
+        provenance = {
+            "universe_dte": window.universe_dte,
+            "strike_gte": window.strike_gte,
+            "strike_lte": window.strike_lte,
+            "model": window.model,
+        }
+        rows = [{**row, **provenance} for row in rows]
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             pd.DataFrame(rows, columns=_COLUMNS).to_parquet(tmp, index=False)
@@ -932,17 +1063,90 @@ class ChainStore:
         # coverage-guarded — see ``_mirror_to_lake`` — because the local
         # overwrite above is always safe (this machine rebuilt it) while the
         # remote one is not (other machines read it).
-        self._mirror_to_lake(
-            path,
-            snapshot.underlying,
-            snapshot.as_of,
-            _Window(
-                provenance["universe_dte"],
-                provenance["strike_gte"],
-                provenance["strike_lte"],
-                provenance["model"],
-            ),
+        if mirror:
+            self._mirror_to_lake(path, snapshot.underlying, snapshot.as_of, window)
+
+    def _merge_rejected_lake_frame(self, snapshot: ChainSnapshot, rows, window):
+        """Union this build with a lake file this run downloaded and rejected.
+
+        Returns ``(rows, window, mirror)``. ``mirror`` is False only for the
+        gap case, which must publish nothing at all.
+
+        This is the FC-091 heal. Without it, a symbol whose strike window moved
+        so that the rebuild is wider on one bound and narrower on the other can
+        never update the lake — every upload is a narrowing somewhere, so the
+        guard refuses it forever and the symbol is re-fetched cold on every
+        monthly run (observed: SPY, IWM, PFE, ``rejected=231 skipped=231``).
+
+        A merge is refused, and the ordinary monotone path left to decide, when
+        the models differ, when either side's provenance is unknown, when the
+        old frame's schema is not this one, or when the two files were built
+        against different closes for the session — every delta in a file is
+        computed against that close, so unioning across two of them produces a
+        file whose rows disagree about what the underlying did. That last check
+        is not redundant with ``get``'s: ``_covers`` runs *before* the price
+        comparison there, so a frame can be remembered without its price ever
+        having been looked at.
+        """
+        key = self._key(snapshot.underlying, snapshot.as_of)
+        old_df = self._lake_rejected_frames.pop(key, None)
+        if old_df is None:
+            return rows, window, True
+
+        old_window = _window_of(old_df)
+        merged_window, reason = _merge_windows(window, old_window)
+        if reason == "strike_gap":
+            self.lake_merge_gaps += 1
+            logger.warning(
+                "Chain lake merge refused: the two strike windows do not overlap",
+                event_category="backtest_data",
+                event_type="chain_lake_merge_gap",
+                remedy=(
+                    "neither file covers the strikes between the two windows; "
+                    "widening the run's strike window, or a deliberate "
+                    "`tools/diagnostics/chain_lake_seed.py --force`, is the "
+                    "only way to reconcile them"
+                ),
+                symbol=snapshot.underlying,
+                as_of=snapshot.as_of.isoformat(),
+                bucket=getattr(self.lake, "bucket_name", None),
+                new_window=window.as_log(),
+                existing_window=old_window.as_log(),
+            )
+            # Upload nothing: with a gap there is no file this run can build
+            # that safely replaces the object.
+            return rows, window, False
+        if reason is not None:
+            # model_changed / unknown_provenance: not mergeable, but the
+            # existing coverage-monotone path is still entitled to its say.
+            return rows, window, True
+
+        try:
+            old_price = float(old_df["underlying_price"].iloc[0])
+        except Exception:
+            return rows, window, True
+        if not _close(old_price, float(snapshot.underlying_price)):
+            return rows, window, True
+
+        merged_rows = _union_rows(rows, old_df)
+        if merged_rows is None:
+            return rows, window, True
+
+        self.lake_merged += 1
+        logger.info(
+            "Chain lake merge: rebuilt chain unioned with the object it replaces",
+            event_category="backtest_data",
+            event_type="chain_lake_merged",
+            symbol=snapshot.underlying,
+            as_of=snapshot.as_of.isoformat(),
+            bucket=getattr(self.lake, "bucket_name", None),
+            new_window=window.as_log(),
+            existing_window=old_window.as_log(),
+            merged_window=merged_window.as_log(),
+            new_rows=len(rows),
+            merged_rows=len(merged_rows),
         )
+        return merged_rows, merged_window, True
 
     def get(
         self,
@@ -1020,6 +1224,14 @@ class ChainStore:
         if not self._covers(df, universe_dte, strike_gte, strike_lte, model):
             if from_lake:
                 self.lake_rejected += 1
+                # FC-091. The caller will now rebuild this day and ``put`` it.
+                # Hold the rejected frame so that write can be the UNION of the
+                # two windows rather than a replacement the monotone guard has
+                # to refuse. Remembered only on the coverage rejection: the
+                # ``df.empty`` case has nothing to contribute, and the
+                # underlying-price rejection below is a disagreement about the
+                # session itself, which no union can reconcile.
+                self._lake_rejected_frames[self._key(underlying, as_of)] = df
             return None
 
         cached_price = float(df["underlying_price"].iloc[0])
