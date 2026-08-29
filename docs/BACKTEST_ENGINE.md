@@ -277,8 +277,11 @@ cache, and `ChainStore` uses it write-through:
   cold run return the identical chain. The lake moves files; it never answers questions.
 - **Objects are coverage-monotone via merge (FC-091).** The *chain* for a settled session
   never changes, but the *file* records the window it was built under, and that window is
-  path-dependent — the bid pass of `evaluate_symbol` rebuilds the same session under a
-  different `cost_basis`/`low_anchor` than the mid pass, and another machine gets a third.
+  path-dependent — it moves with `cost_basis`/`low_anchor`, so a machine holding a position
+  builds the same session under a different window than one that does not, and so does the
+  same machine on a later run once its price range has moved. (It does *not* move between
+  the mid and bid passes of `evaluate_symbol`: since Layer 2 the data is materialised once
+  and replayed, so both passes read the same chains.)
   An object is therefore replaced only by a file whose request is a **superset** (same
   model, ≥ DTE reach, ⊇ strike window). A narrowing is refused and logged as
   `chain_lake_overwrite_skipped`; every upload carries an `if_generation_match`
@@ -289,17 +292,49 @@ cache, and `ChainStore` uses it write-through:
   — which is exactly what the lake's first production run did to SPY, IWM and PFE
   (`rejected=231 skipped=231` apiece). So when a downloaded object fails `_covers`, the
   rebuild's `put` **merges** rather than replaces: the union of contracts keyed by OCC
-  symbol (the new build wins on duplicates), stamped with the union of the two windows
-  (`max` DTE reach, `min` strike floor, `max` strike ceiling). The merged file is a
-  superset, so the monotone rule accepts it and the day is warm from then on
-  (`chain_lake_merged`). Merging is refused when the models differ, when either side's
-  provenance is unknown, when the two files were built against different closes for the
-  session, and — the one case that also uploads **nothing** — when the two strike windows
-  do not overlap, since the union would claim strikes neither file ever fetched
-  (`chain_lake_merge_gap`). Row conversion is untouched: a merged file is read back through
-  the same `_covers` + narrowing path as any other, and every row the union adds lies
-  outside the new build's own window, so a request the unmerged file could answer gets the
-  identical quotes in the identical order.
+  symbol (the new build wins on duplicates), stamped with the union of the two **strike**
+  windows (`min` strike floor, `max` strike ceiling) at their **shared** DTE reach. The
+  merged file is a superset, so the monotone rule accepts it and the day is warm from then
+  on (`chain_lake_merged`).
+- **Only one axis may widen, and that is what keeps the merge honest.** A build window is a
+  rectangle in (DTE reach × strike range), and the union of two rectangles is an **L** — but
+  the provenance columns can only describe a rectangle. Taking `max(universe_dte)` as well
+  would stamp the merged file with the *bounding box*, claiming a corner that neither fetch
+  ever asked for: e.g. old = reach 14 over [90, 110] merged with new = reach 7 over
+  [100, 130] would claim "14 days out, strikes 90–130" while holding no 8–14 day contract
+  above 110. A later request at reach 14 across the new strikes would then be a cache **hit
+  that is silently missing rows** — a wrong backtest, not a slow one. So the reaches must be
+  **equal** or the merge is refused (`chain_lake_merge_refused`, reason `dte_mismatch`) and
+  the day falls back to the monotone path. This costs nothing on the case the feature exists
+  for: `universe_dte` is `max_dte + UNIVERSE_DTE_BUFFER`, neither term path-dependent, so
+  the observed SPY/IWM/PFE thrash is a pure strike move at a constant reach (8 on both
+  sides). Two other refusals follow the same principle — **never claim coverage the file
+  does not contain**:
+  - **Gap** (`chain_lake_merge_gap`): the two strike windows do not overlap, so the union
+    would span strikes neither file fetched. This is the one case that also uploads
+    **nothing** at all.
+  - **Overlap conflict** (`chain_lake_merge_refused`, reason `overlap_conflict`): where the
+    two windows *do* overlap, both files asked the same question of the same settled
+    session and must have found the same contracts. Compared by contract symbol, not by
+    count. A disagreement means one fetch was truncated, rate-limited or restated by the
+    vendor, and merging would absorb that into a file that is self-consistent, passes every
+    coverage check, and is quietly missing rows.
+
+  Merging is also refused, silently, when the models differ, when either side's provenance
+  is unknown, or when the two files were built against different closes for the session.
+  Row conversion is untouched: a merged file is read back through the same `_covers` +
+  narrowing path as any other, and every row the union adds lies outside the new build's own
+  window, so a request the unmerged file could answer gets the identical quotes in the
+  identical order — **provided the two fetches agree on the overlap, which the merge
+  verifies**.
+- **Only the downloaded path heals.** A rejected frame is remembered only when it came off
+  the *lake*, so healing is a property of the Job, whose filesystem is ephemeral and whose
+  every chain-day therefore arrives from GCS. A developer machine with a persistent local
+  cache never merges: a locally-rejected file is this machine's own, `put` overwrites it as
+  it always has, and the pre-FC-091 semantics are unchanged. The same is true inside the
+  scenario runner — its multi-window loops read materialised chains, and any file they
+  reject locally is rebuilt, not unioned. If a dev machine's cache and the lake have
+  diverged, the lever is `chain_lake_seed.py --force`, by hand.
 - **A model change needs a prefix bump.** The `model` fingerprint is part of the format
   contract, and a different model is never a *wider* answer — such an upload is skipped, so
   without bumping `CHAIN_LAKE_PREFIX` a model change silently stops populating the lake.
@@ -320,7 +355,10 @@ cache, and `ChainStore` uses it write-through:
   objects is a healthy *empty* lake, which is the day-one state before the seed runs.
 - **Measure it from the logs.** Each symbol emits one `chain_lake_summary`; the run emits
   one `chain_lake_run_summary` with the totals, plus a `chain_lake_degraded` **warning** if
-  anything errored or the lake was disabled. The failure mode of this feature is silence —
+  anything errored, the lake was disabled, or a merge was refused (`lake_merge_gaps` /
+  `lake_merge_refused` — a thrashing symbol that failed to heal will be cold again next
+  month, which is exactly the kind of thing that goes unnoticed). The failure mode of this
+  feature is silence —
   a lake erroring on every call still produces a green run that took the full cold 1h47m.
 
 | counter | meaning |
@@ -332,7 +370,8 @@ cache, and `ChainStore` uses it write-through:
 | `lake_skipped` | upload declined, all reasons — would have narrowed coverage, changed model, or lost a generation race |
 | `lake_skipped_unreadable_remote` | **subset of `lake_skipped`**: the existing object's provenance could not be read, so coverage could not be compared. The other skips are the guard working; this one is a poisoned object that only `chain_lake_seed.py --force` will clear |
 | `lake_merged` | a rejected object was unioned with the rebuild, so the file that replaces it is a superset (FC-091) — whether the upload then landed is `lake_puts`/`lake_errors`. This is the heal: a symbol that thrashed should show `lake_merged ≈ lake_rejected` once, then neither again |
-| `lake_merge_gaps` | the two strike windows did not overlap, so the merge was refused and **nothing** was uploaded — the union would have claimed strikes neither file fetched. Persistent non-zero on a symbol means the run's strike window is moving further than one window's width, and that day stays cold until the windows are reconciled |
+| `lake_merge_gaps` | the two strike windows did not overlap, so the merge was refused and **nothing** was uploaded — the union would have claimed strikes neither file fetched. Persistent non-zero on a symbol means the price range is moving further than one window's width between runs. There is no knob to widen the window (it is derived from the session's bars and the run's positions in `Simulator._strike_anchors`, not from `settings.yaml`); the only lever is a deliberate `chain_lake_seed.py --force` from a local build spanning both windows |
+| `lake_merge_refused` | a merge the windows allowed but a correctness check refused: `dte_mismatch` (the two DTE reaches differ, so the union is not a rectangle) or `overlap_conflict` (the two fetches disagree about the strikes they both cover). Unlike a gap these fall through to the coverage-monotone path, and each carries its own WARNING naming the reason. Non-zero means a day did **not** heal and will be re-fetched cold next run |
 | `lake_errors` | operation failed; the run continued local-only |
 
 - **Cost is negligible**: ~5,400 files / 137 MB for ~2 years × 14 symbols ≈ $0.003/month.

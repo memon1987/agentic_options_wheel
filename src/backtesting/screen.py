@@ -221,7 +221,7 @@ def run_screen(
 _LAKE_COUNTERS = (
     "lake_hits", "lake_misses", "lake_rejected",
     "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
-    "lake_merged", "lake_merge_gaps",
+    "lake_merged", "lake_merge_gaps", "lake_merge_refused",
     "lake_errors",
 )
 
@@ -239,6 +239,12 @@ def _log_lake_run_summary(lake, totals: Dict[str, int], run_id: str) -> None:
     because the failure mode of this feature is *silence*: a lake that errored
     on every call still produces a green run that took the full cold 1h47m, and
     without a warning nobody would look.
+
+    A refused merge (FC-091) degrades the run for the same reason an error
+    does: the day did not heal, so it will be re-fetched cold next month and
+    every month after. `lake_merge_gaps` and `lake_merge_refused` therefore
+    trip the warning too — a screen whose thrashing symbols are silently
+    failing to heal must not read as clean.
     """
     if lake is None:
         return
@@ -253,10 +259,16 @@ def _log_lake_run_summary(lake, totals: Dict[str, int], run_id: str) -> None:
                 event_category="backtest_data",
                 event_type="chain_lake_run_summary",
                 run_id=run_id, **payload)
-    if lake.disabled or totals.get("lake_errors", 0) > 0:
+    if (
+        lake.disabled
+        or totals.get("lake_errors", 0) > 0
+        or totals.get("lake_merge_gaps", 0) > 0
+        or totals.get("lake_merge_refused", 0) > 0
+    ):
         logger.warning(
             "Chain lake degraded during this run — the screen ran at least "
-            "partly cold and the lake may not have been updated",
+            "partly cold, or a thrashing symbol failed to heal, and the lake "
+            "may not have been updated",
             event_category="backtest_data",
             event_type="chain_lake_degraded",
             run_id=run_id, **payload,

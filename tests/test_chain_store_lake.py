@@ -678,14 +678,22 @@ class TestCoverageAppliesToLakeFiles:
 # --------------------------------------------------------------------------- #
 # 4b. FC-091 — merge-on-put
 # --------------------------------------------------------------------------- #
-OLD_W = dict(universe_dte=14, strike_gte=90.0, strike_lte=110.0, model="m1")
-NEW_W = dict(universe_dte=7, strike_gte=100.0, strike_lte=130.0, model="m1")
-# The request the cold run makes: the lake's OLD_W file reaches high enough on
-# the low bound but not on the high one, so `_covers` rejects it and neither
-# window contains the other — the SPY/IWM/PFE production signature.
-NEW_REQUEST = dict(universe_dte=7, strike_gte=100.0, strike_lte=130.0,
+# The SPY/IWM/PFE production signature, faithfully: a pure STRIKE-window move
+# at a constant DTE reach. `universe_dte` is `max_dte + UNIVERSE_DTE_BUFFER`
+# and neither term is path-dependent, while the strike anchors follow the
+# session's price — which is why the observed thrash had dte 8 on both sides.
+# A merge across two DIFFERENT reaches is refused (see the dte_mismatch tests):
+# the union of two rectangles is an L, and provenance can only describe a
+# rectangle.
+_DTE = 14
+OLD_W = dict(universe_dte=_DTE, strike_gte=90.0, strike_lte=110.0, model="m1")
+NEW_W = dict(universe_dte=_DTE, strike_gte=100.0, strike_lte=130.0, model="m1")
+# The request the cold run makes: the lake's OLD_W file reaches low enough on
+# the bottom bound but not high enough on the top one, so `_covers` rejects it
+# and neither window contains the other.
+NEW_REQUEST = dict(universe_dte=_DTE, strike_gte=100.0, strike_lte=130.0,
                    underlying_price=100.0, model="m1")
-OLD_REQUEST = dict(universe_dte=14, strike_gte=90.0, strike_lte=110.0,
+OLD_REQUEST = dict(universe_dte=_DTE, strike_gte=90.0, strike_lte=110.0,
                    underlying_price=100.0, model="m1")
 
 
@@ -718,7 +726,7 @@ def _thrash(tmp_path, lake, old_window=None, old_snapshot=None, sub="cold"):
     """
     _seed_lake(tmp_path, lake, old_window or OLD_W,
                snapshot=old_snapshot if old_snapshot is not None
-               else _marked(1.0, strikes=(90.0, 95.0, 100.0)))
+               else _marked(1.0, strikes=(90.0, 95.0, 100.0, 105.0)))
     store = ChainStore(str(tmp_path / sub), lake=lake)
     assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
     assert store.lake_hits == 1 and store.lake_rejected == 1
@@ -758,7 +766,8 @@ class TestMergeOnPut:
         by_strike = dict(zip(merged["strike"], merged["mark"]))
         assert by_strike[100.0] == 2.0
         assert by_strike[90.0] == 1.0 and by_strike[130.0] == 2.0
-        # dte is a reach, so its union is the longer one, not the new one.
+        # ONLY the strike axis widens. The DTE reach is carried through
+        # unchanged because the merge refuses to run unless the two agree.
         assert _provenance(merged) == (14.0, 90.0, 130.0, "m1")
         assert merged["universe_dte"].nunique() == 1, (
             "provenance is a property of the file; every row carries the union"
@@ -795,7 +804,7 @@ class TestMergeOnPut:
     ):
         """A gap is strikes NEITHER file fetched. Never claim them."""
         lake = FakeLake()
-        gap_old = dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+        gap_old = dict(universe_dte=_DTE, strike_gte=90.0, strike_lte=100.0,
                        model="m1")
         _seed_lake(tmp_path, lake, gap_old,
                    snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
@@ -803,17 +812,18 @@ class TestMergeOnPut:
         old_gen = lake.generation_of("XYZ", AS_OF)
 
         store = ChainStore(str(tmp_path / "gap"), lake=lake)
-        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+        assert store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=120.0,
                          strike_lte=130.0, underlying_price=100.0,
                          model="m1") is None
         assert store.lake_rejected == 1
 
         before = list(lake.ops())
         store.put(_marked(2.0, strikes=(120.0, 125.0, 130.0)),
-                  universe_dte=7, strike_gte=120.0, strike_lte=130.0,
+                  universe_dte=_DTE, strike_gte=120.0, strike_lte=130.0,
                   model="m1")
 
         assert store.lake_merge_gaps == 1 and store.lake_merged == 0
+        assert store.lake_merge_refused == 0, "a gap is not a refusal"
         assert store.lake_puts == 0 and store.lake_skipped == 0
         assert store.lake_errors == 0, "a refused merge is not an error"
         assert lake.ops()[len(before):] == [], "nothing was sent to the lake"
@@ -829,14 +839,14 @@ class TestMergeOnPut:
     def test_the_gap_case_still_writes_the_local_file(self, tmp_path):
         lake = FakeLake()
         _seed_lake(tmp_path, lake,
-                   dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+                   dict(universe_dte=_DTE, strike_gte=90.0, strike_lte=100.0,
                         model="m1"))
         store = ChainStore(str(tmp_path / "gap2"), lake=lake)
-        store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+        store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=120.0,
                   strike_lte=130.0, underlying_price=100.0, model="m1")
-        store.put(_snapshot(strikes=(120.0, 130.0)), universe_dte=7,
+        store.put(_snapshot(strikes=(120.0, 130.0)), universe_dte=_DTE,
                   strike_gte=120.0, strike_lte=130.0, model="m1")
-        got = store.get("XYZ", AS_OF, universe_dte=7, strike_gte=120.0,
+        got = store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=120.0,
                         strike_lte=130.0, underlying_price=100.0, model="m1")
         assert got is not None and [q.strike for q in got.puts] == [120.0, 130.0]
 
@@ -844,13 +854,13 @@ class TestMergeOnPut:
         """`old.lte == new.gte` share a strike; that is an overlap, not a gap."""
         lake = FakeLake()
         _seed_lake(tmp_path, lake,
-                   dict(universe_dte=14, strike_gte=90.0, strike_lte=100.0,
+                   dict(universe_dte=_DTE, strike_gte=90.0, strike_lte=100.0,
                         model="m1"),
                    snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
         store = ChainStore(str(tmp_path / "touch"), lake=lake)
-        store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+        store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=100.0,
                   strike_lte=130.0, underlying_price=100.0, model="m1")
-        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=7,
+        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=_DTE,
                   strike_gte=100.0, strike_lte=130.0, model="m1")
         assert store.lake_merged == 1 and store.lake_merge_gaps == 0
         assert _provenance(_lake_frame(lake)) == (14.0, 90.0, 130.0, "m1")
@@ -863,10 +873,10 @@ class TestMergeOnPut:
                    snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
         old_bytes = lake.bytes_of("XYZ", AS_OF)
         store = ChainStore(str(tmp_path / "m2"), lake=lake)
-        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+        assert store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=100.0,
                          strike_lte=130.0, underlying_price=100.0,
                          model="m2") is None
-        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=7,
+        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=_DTE,
                   strike_gte=100.0, strike_lte=130.0, model="m2")
 
         assert store.lake_merged == 0 and store.lake_merge_gaps == 0
@@ -896,11 +906,110 @@ class TestMergeOnPut:
         _seed_lake(tmp_path, lake, OLD_W,
                    snapshot=_snapshot(strikes=(90.0, 95.0, 100.0), price=100.0))
         store = ChainStore(str(tmp_path / "px"), lake=lake)
-        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+        assert store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=100.0,
                          strike_lte=130.0, underlying_price=101.0,
                          model="m1") is None
         store.put(_snapshot(strikes=(100.0, 130.0), price=101.0), **NEW_W)
         assert store.lake_merged == 0, "two closes cannot be unioned"
+
+    # -- T1: only the strike axis may widen --------------------------------
+    def test_a_different_dte_reach_is_refused_and_never_falsely_covers(
+        self, tmp_path, captured_events
+    ):
+        """THE REGRESSION. A union of two rectangles is not a rectangle.
+
+        Old: reach 14 over strikes [90, 110]. New: reach 7 over [100, 130].
+        Taking `max(universe_dte)` would stamp the merged file (14, 90, 130) —
+        a claim that includes the corner "14-day contracts between 110 and
+        130", which NEITHER fetch ever asked for. A later request at reach 14
+        across the new strikes would then be a cache HIT silently missing every
+        8-to-14-day contract up there: a wrong backtest, not a slow one.
+
+        Both adversarial reviewers of PR #101 reproduced exactly this.
+        """
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=14, strike_gte=90.0, strike_lte=110.0,
+                        model="m1"),
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        store = ChainStore(str(tmp_path / "dte"), lake=lake)
+        assert store.get("XYZ", AS_OF, universe_dte=7, strike_gte=100.0,
+                         strike_lte=130.0, underlying_price=100.0,
+                         model="m1") is None
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)),
+                  universe_dte=7, strike_gte=100.0, strike_lte=130.0,
+                  model="m1")
+
+        assert store.lake_merged == 0, "the reaches differ; there is no union"
+        assert store.lake_merge_refused == 1
+        assert store.lake_merge_gaps == 0
+        assert store.lake_skipped == 1, "it falls to the monotone path"
+        refused = _events(captured_events, "chain_lake_merge_refused")
+        assert len(refused) == 1 and refused[0]["reason"] == "dte_mismatch"
+        assert refused[0]["existing_universe_dte"] == 14
+        assert refused[0]["new_universe_dte"] == 7
+
+        # The point of the whole fix: the long-reach request over the NEW
+        # strikes must be a MISS, not a hit that is missing contracts.
+        assert store.get("XYZ", AS_OF, universe_dte=14, strike_gte=100.0,
+                         strike_lte=130.0, underlying_price=100.0,
+                         model="m1") is None, (
+            "MUTATION GUARD: restoring max(universe_dte) makes this a HIT "
+            "whose 8-14 DTE contracts above strike 110 were never fetched"
+        )
+
+    def test_a_shorter_dte_reach_is_refused_in_the_other_direction_too(
+        self, tmp_path
+    ):
+        """Equality, not monotonicity: neither reach may absorb the other."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=7, strike_gte=90.0, strike_lte=110.0,
+                        model="m1"),
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        store = ChainStore(str(tmp_path / "dte2"), lake=lake)
+        store.get("XYZ", AS_OF, universe_dte=14, strike_gte=100.0,
+                  strike_lte=130.0, underlying_price=100.0, model="m1")
+        store.put(_marked(2.0, strikes=(100.0, 130.0)), universe_dte=14,
+                  strike_gte=100.0, strike_lte=130.0, model="m1")
+        assert store.lake_merged == 0 and store.lake_merge_refused == 1
+
+    # -- T2: the two fetches must agree where they overlap -----------------
+    def test_a_disagreement_about_the_shared_strikes_is_refused(
+        self, tmp_path, captured_events
+    ):
+        """Same count, different contracts — so this cannot be a count check.
+
+        The old file holds strike 100 in the overlap [100, 110]; the new build
+        holds strike 105 there and not 100. One fetch is incomplete. A union
+        would produce a file holding both, self-consistent and wrong.
+        """
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, OLD_W,
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0, 100.0)))
+        old_bytes = lake.bytes_of("XYZ", AS_OF)
+        store = ChainStore(str(tmp_path / "conflict"), lake=lake)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        store.put(_marked(2.0, strikes=(105.0, 130.0)), **NEW_W)
+
+        assert store.lake_merged == 0 and store.lake_merge_refused == 1
+        assert store.lake_skipped == 1 and store.lake_puts == 0
+        assert lake.bytes_of("XYZ", AS_OF) == old_bytes
+        refused = _events(captured_events, "chain_lake_merge_refused")
+        assert refused[0]["reason"] == "overlap_conflict"
+        assert refused[0]["existing_contracts_in_overlap"] == 1
+        assert refused[0]["new_contracts_in_overlap"] == 1, (
+            "MUTATION GUARD: equal counts, different symbols — a count "
+            "comparison would pass this and merge the conflict away"
+        )
+
+    def test_agreement_on_the_overlap_still_merges(self, tmp_path):
+        """The check must not refuse the healthy case it is guarding."""
+        lake = FakeLake()
+        store = _thrash(tmp_path, lake)
+        # Old holds 100 in [100,110]; the rebuild holds 100 and 105.
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        assert store.lake_merged == 1 and store.lake_merge_refused == 0
 
     # -- test 4 ------------------------------------------------------------
     def test_the_merged_file_answers_both_the_old_and_the_new_request(
@@ -935,7 +1044,11 @@ class TestMergeOnPut:
 
         A request the unmerged build could satisfy gets byte-identical quotes
         out of the merged file, because every row the union added lies outside
-        that build's window and the narrowing mask drops it.
+        that build's window and the narrowing mask drops it — provided the two
+        fetches agree on the overlap, which the merge verifies before it runs
+        (`_overlap_conflict`). Without that check this property would be a
+        hope rather than a guarantee: an old row the new build did not find
+        would land inside the new window and change the answer.
         """
         lake = FakeLake()
         store = _thrash(tmp_path, lake)
@@ -962,42 +1075,105 @@ class TestMergeOnPut:
 
     # -- test 5 ------------------------------------------------------------
     def test_an_empty_old_chain_contributes_no_sentinel_row(self, tmp_path):
-        """A sentinel asserts a window, not a contract. The union replaces it."""
+        """A sentinel asserts a window, not a contract. The union replaces it.
+
+        The two windows meet at 102 and neither side found a contract there,
+        so the overlap check passes and the sentinel-drop rule applies. When
+        the old sentinel *does* contradict the new rows, the test below shows
+        it is a conflict instead.
+        """
         lake = FakeLake()
-        _seed_lake(tmp_path, lake,
-                   dict(universe_dte=14, strike_gte=80.0, strike_lte=110.0,
-                        model="m1"),
-                   snapshot=_snapshot(strikes=()))
+        empty_old = dict(universe_dte=_DTE, strike_gte=80.0, strike_lte=102.0,
+                         model="m1")
+        _seed_lake(tmp_path, lake, empty_old, snapshot=_snapshot(strikes=()))
         store = ChainStore(str(tmp_path / "e1"), lake=lake)
-        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
-        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+        assert store.get("XYZ", AS_OF, universe_dte=_DTE, strike_gte=102.0,
+                         strike_lte=130.0, underlying_price=100.0,
+                         model="m1") is None
+        store.put(_marked(2.0, strikes=(105.0, 110.0, 130.0)),
+                  universe_dte=_DTE, strike_gte=102.0, strike_lte=130.0,
+                  model="m1")
 
         assert store.lake_merged == 1
         merged = _lake_frame(lake)
         assert list(merged["symbol"]).count("") == 0
-        assert sorted(merged["strike"]) == [100.0, 105.0, 130.0]
+        assert sorted(merged["strike"]) == [105.0, 110.0, 130.0]
         assert _provenance(merged) == (14.0, 80.0, 130.0, "m1")
 
-    def test_an_empty_new_chain_keeps_the_old_contracts(self, tmp_path):
+    def test_an_empty_old_chain_that_contradicts_the_new_rows_is_a_conflict(
+        self, tmp_path, captured_events
+    ):
+        """The old file said "nothing here"; the new build found contracts there.
+
+        One of the two fetches is wrong. Absorbing that into a union writes a
+        file that is self-consistent, passes every coverage check, and quietly
+        inherits whichever fetch was incomplete.
+        """
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake,
+                   dict(universe_dte=_DTE, strike_gte=80.0, strike_lte=110.0,
+                        model="m1"),
+                   snapshot=_snapshot(strikes=()))
+        store = ChainStore(str(tmp_path / "e1b"), lake=lake)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
+        store.put(_marked(2.0, strikes=(100.0, 105.0, 130.0)), **NEW_W)
+
+        assert store.lake_merged == 0 and store.lake_merge_refused == 1
+        refused = _events(captured_events, "chain_lake_merge_refused")
+        assert refused[0]["reason"] == "overlap_conflict"
+        assert refused[0]["existing_contracts_in_overlap"] == 0
+        assert refused[0]["new_contracts_in_overlap"] == 2
+
+    def test_an_empty_new_build_over_existing_contracts_is_a_conflict(
+        self, tmp_path, captured_events
+    ):
+        """The mirror image, and the more dangerous direction.
+
+        Merging here would have kept the old contracts under a window claiming
+        the new build's reach — i.e. published a chain the new fetch says does
+        not exist. If the new fetch is the broken one, that is the row set we
+        want; if the OLD one is, we have just re-published stale data. Neither
+        is a call this code may make silently.
+        """
         lake = FakeLake()
         store = _thrash(tmp_path, lake)
+        store.put(_snapshot(strikes=()), **NEW_W)
+
+        assert store.lake_merged == 0 and store.lake_merge_refused == 1
+        assert store.lake_skipped == 1, "it falls to the monotone path"
+        refused = _events(captured_events, "chain_lake_merge_refused")
+        assert refused[0]["reason"] == "overlap_conflict"
+        assert refused[0]["existing_contracts_in_overlap"] == 2  # 100 and 105
+        assert refused[0]["new_contracts_in_overlap"] == 0
+
+    def test_an_empty_new_build_keeps_old_contracts_outside_the_overlap(
+        self, tmp_path
+    ):
+        """An empty new build is only a conflict where the two windows meet."""
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, OLD_W,
+                   snapshot=_marked(1.0, strikes=(90.0, 95.0)))
+        store = ChainStore(str(tmp_path / "e2b"), lake=lake)
+        assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
         store.put(_snapshot(strikes=()), **NEW_W)
 
         assert store.lake_merged == 1
         merged = _lake_frame(lake)
         assert list(merged["symbol"]).count("") == 0
-        assert sorted(merged["strike"]) == [90.0, 95.0, 100.0]
+        assert sorted(merged["strike"]) == [90.0, 95.0]
+        assert _provenance(merged) == (14.0, 90.0, 130.0, "m1")
 
     def test_two_empty_chains_stay_one_sentinel(self, tmp_path):
         lake = FakeLake()
         _seed_lake(tmp_path, lake,
-                   dict(universe_dte=14, strike_gte=80.0, strike_lte=110.0,
+                   dict(universe_dte=_DTE, strike_gte=80.0, strike_lte=110.0,
                         model="m1"),
                    snapshot=_snapshot(strikes=()))
         store = ChainStore(str(tmp_path / "e3"), lake=lake)
         assert store.get("XYZ", AS_OF, **NEW_REQUEST) is None
         store.put(_snapshot(strikes=()), **NEW_W)
 
+        assert store.lake_merged == 1, "nothing to disagree about"
         merged = _lake_frame(lake)
         assert len(merged) == 1 and merged["symbol"].iloc[0] == ""
         assert _provenance(merged) == (14.0, 80.0, 130.0, "m1")
@@ -1053,9 +1229,10 @@ class TestMergeWindows:
     def _w(self, dte=7.0, gte=90.0, lte=110.0, model="m1"):
         return chain_store_module._Window(dte, gte, lte, model)
 
-    def test_the_union_takes_the_widest_of_each_bound(self):
+    def test_only_the_strike_axis_widens(self):
+        """The DTE reach is carried through, never maximised."""
         window, reason = chain_store_module._merge_windows(
-            self._w(dte=7.0, gte=100.0, lte=130.0),
+            self._w(dte=14.0, gte=100.0, lte=130.0),
             self._w(dte=14.0, gte=90.0, lte=110.0),
         )
         assert reason is None
@@ -1065,12 +1242,36 @@ class TestMergeWindows:
 
     def test_a_contained_window_unions_to_the_container(self):
         window, reason = chain_store_module._merge_windows(
-            self._w(dte=7.0, gte=95.0, lte=105.0),
+            self._w(dte=14.0, gte=95.0, lte=105.0),
             self._w(dte=14.0, gte=90.0, lte=110.0),
         )
         assert reason is None
         assert (window.universe_dte, window.strike_gte, window.strike_lte) == (
             14.0, 90.0, 110.0)
+
+    def test_a_different_dte_reach_refuses_in_either_direction(self):
+        """Equality, not monotonicity — the union would claim a corner.
+
+        The provenance columns describe a rectangle. Two rectangles of
+        different heights union to an L, and the only rectangle that contains
+        an L is its bounding box, which includes a corner neither file holds.
+        """
+        assert chain_store_module._merge_windows(
+            self._w(dte=7.0), self._w(dte=14.0))[1] == "dte_mismatch"
+        assert chain_store_module._merge_windows(
+            self._w(dte=14.0), self._w(dte=7.0))[1] == "dte_mismatch"
+
+    def test_dte_is_compared_as_an_integer(self):
+        window, reason = chain_store_module._merge_windows(
+            self._w(dte=14.0, gte=100.0), self._w(dte=14.0, gte=90.0))
+        assert reason is None and window.universe_dte == 14.0
+
+    def test_dte_is_checked_before_the_strike_gap(self):
+        """A pair failing both is reported as the DTE mismatch."""
+        assert chain_store_module._merge_windows(
+            self._w(dte=7.0, gte=120.0, lte=130.0),
+            self._w(dte=14.0, gte=90.0, lte=100.0),
+        )[1] == "dte_mismatch"
 
     def test_a_model_change_refuses(self):
         assert chain_store_module._merge_windows(
@@ -1100,6 +1301,30 @@ class TestMergeWindows:
     def test_union_rows_refuses_a_frame_with_a_missing_column(self):
         frame = pd.DataFrame([{"symbol": "A", "strike": 1.0}])
         assert chain_store_module._union_rows([{"symbol": "B"}], frame) is None
+
+    def test_overlap_conflict_ignores_rows_outside_the_other_window(self):
+        """Only the shared strikes are compared; the rest is what merging is for."""
+        old = pd.DataFrame([{"symbol": "A", "strike": 90.0},
+                            {"symbol": "B", "strike": 105.0}])
+        new_rows = [{"symbol": "B", "strike": 105.0},
+                    {"symbol": "C", "strike": 130.0}]
+        assert chain_store_module._overlap_conflict(
+            new_rows, old, self._w(gte=100.0, lte=130.0),
+            self._w(gte=90.0, lte=110.0)) is None
+
+    def test_overlap_conflict_reports_both_counts(self):
+        old = pd.DataFrame([{"symbol": "A", "strike": 100.0}])
+        new_rows = [{"symbol": "Z", "strike": 105.0}]
+        assert chain_store_module._overlap_conflict(
+            new_rows, old, self._w(gte=100.0, lte=130.0),
+            self._w(gte=90.0, lte=110.0)) == (1, 1)
+
+    def test_overlap_conflict_skips_sentinel_and_nan_strikes(self):
+        old = pd.DataFrame([{"symbol": "", "strike": 0.0},
+                            {"symbol": "A", "strike": float("nan")}])
+        assert chain_store_module._overlap_conflict(
+            [], old, self._w(gte=100.0, lte=130.0),
+            self._w(gte=90.0, lte=110.0)) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -1673,6 +1898,41 @@ class TestWiring:
             "a run that errored must not look clean in the logs"
         )
 
+    def test_a_run_with_refused_merges_is_degraded_even_with_no_errors(
+        self, captured_events
+    ):
+        """A thrashing symbol that failed to heal did not have a clean run.
+
+        `lake_errors == 0` and a green exit is exactly how SPY stayed cold for
+        a month without anyone noticing. A refused merge means the day will be
+        re-fetched cold next month, and every month after, so it belongs in
+        the same warning as an outage.
+        """
+        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
+
+        lake = FakeLake()
+        store = ChainStore("z", lake=lake)
+        store.lake_merge_gaps, store.lake_merge_refused = 1, 2
+        totals = {}
+        _accumulate_lake(totals, store.summary())
+        _log_lake_run_summary(lake, totals, "run-3")
+
+        degraded = _events(captured_events, "chain_lake_degraded")
+        assert degraded, "a run whose merges were refused must not look clean"
+        assert degraded[0]["lake_merge_gaps"] == 1
+        assert degraded[0]["lake_merge_refused"] == 2
+        assert degraded[0]["lake_errors"] == 0
+
+    def test_a_clean_run_is_still_clean(self, captured_events):
+        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
+
+        lake = FakeLake()
+        totals = {}
+        _accumulate_lake(totals, ChainStore("w", lake=lake).summary())
+        _log_lake_run_summary(lake, totals, "run-4")
+        assert _events(captured_events, "chain_lake_run_summary")
+        assert not _events(captured_events, "chain_lake_degraded")
+
     def test_no_run_summary_without_a_lake(self, captured_events):
         from src.backtesting.screen import _log_lake_run_summary
 
@@ -1687,7 +1947,7 @@ class TestWiring:
             "lake_enabled", "lake_bucket", "lake_prefix",
             "lake_hits", "lake_misses", "lake_rejected",
             "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
-            "lake_merged", "lake_merge_gaps",
+            "lake_merged", "lake_merge_gaps", "lake_merge_refused",
             "lake_errors", "lake_disabled", "lake_disabled_reason",
         }
         assert "symbol" not in summary, "must not collide with the log's symbol key"
