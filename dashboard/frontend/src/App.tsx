@@ -4,6 +4,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import OverviewV2 from './pages/v2/Overview';
 import SymbolDeepDiveV2 from './pages/v2/SymbolDeepDive';
 import BotHealthV2 from './pages/v2/BotHealth';
+import SimulationsV2 from './pages/v2/Simulations';
 
 export default function App() {
   return (
@@ -17,6 +18,8 @@ export default function App() {
             <Route path="/symbol"              element={<SymbolDeepDiveV2 />} />
             <Route path="/symbol/:underlying"  element={<SymbolDeepDiveV2 />} />
             <Route path="/bot-health"          element={<BotHealthV2 />} />
+            {/* FC-060 Layer 4: scenario sweeps. Simulations, not the live book. */}
+            <Route path="/sims"                element={<SimulationsV2 />} />
           </Route>
 
           {/* Bookmark redirects: every old path lands on the new equivalent. */}

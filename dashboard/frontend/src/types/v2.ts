@@ -351,3 +351,303 @@ export interface DailySummary {
   avg_scan_duration_sec: number;
   total_trades_failed: number;
 }
+
+// ---------------------------------------------------------------------------
+// FC-060 Layer 4 — scenario sweeps ("Simulations", /sims).
+//
+// Three shapes, three owners:
+//   SweepRow    — one `options_wheel.scenario_sweeps` row (plan D1). Written by
+//                 the Job, read by `GET /api/v2/sweeps` and `.../{run_id}`.
+//   SweepReport — the Layer 2 JSON report (`src/backtesting/scenarios/report.py`
+//                 `render_json`), passed through by the API (plan D11).
+//                 THIS BLOCK MIRRORS THAT PAYLOAD KEY-FOR-KEY. The UI renders
+//                 what the runner computed; it never recomputes a verdict.
+//   SweepSpec   — the D2 submit body.
+// ---------------------------------------------------------------------------
+
+/** `submitted` and `running` are live; the other three are terminal. */
+export type SweepStatus = 'submitted' | 'running' | 'done' | 'failed' | 'deduplicated';
+
+export const TERMINAL_SWEEP_STATUSES: readonly SweepStatus[] = ['done', 'failed', 'deduplicated'];
+
+/**
+ * Terminal = nothing will change, so polling must stop.
+ *
+ * An UNRECOGNISED status counts as NON-terminal on purpose: a status this build
+ * has never heard of is a reason to keep looking, not a reason to declare the
+ * run finished and freeze a half-rendered page.
+ */
+export const isTerminalSweepStatus = (s: string | null | undefined): boolean =>
+  TERMINAL_SWEEP_STATUSES.includes(s as SweepStatus);
+
+/** One `scenario_sweeps` row (plan D1). Every column is nullable but `run_id`. */
+export interface SweepRow {
+  run_id: string;
+  sweep_key: string | null;
+  status: SweepStatus;
+  deduplicated_to: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  submitted_via: string | null;
+  execution_name: string | null;
+  git_commit: string | null;
+  engine_version: string | null;
+  base_config_hash: string | null;
+  base_config_json: string | null;
+  spec_json: string | null;
+  symbols: string[] | null;
+  window_start: string | null;
+  window_end: string | null;
+  holdout_start: string | null;
+  in_sample_only: boolean | null;
+  scenario_count: number | null;
+  cell_count: number | null;
+  wall_seconds: number | null;
+  materialise_seconds: number | null;
+  replay_seconds: number | null;
+  provider_fetches: number | null;
+  bar_cache_hits: number | null;
+  lake_summary_json: string | null;
+  error: string | null;
+  /**
+   * Server-computed: still `submitted` past the container-start window (D3).
+   *
+   * A LABEL and nothing more — this backend cannot cancel an execution. It is
+   * read rather than re-derived so the dashboard and the API can never disagree
+   * about whether a run is stuck, which is exactly the kind of split-brain a
+   * second clock buys you.
+   */
+  stuck?: boolean;
+}
+
+/**
+ * One (scenario, symbol, window) cell — `ScenarioResult.as_dict()`.
+ *
+ * `measured` / `insufficient` / `low_activity` / errored PARTITION every cell:
+ * exactly one is true (pinned by `tests/test_scenarios.py`). The UI renders each
+ * of the four distinctly and NEVER renders an unmeasured cell as a return — an
+ * `insufficient` cell is a statement about the WINDOW, not a measurement of the
+ * arm, and showing it as a small number is how a sweep manufactures a ranking.
+ */
+export interface SweepResultRow {
+  scenario: string;
+  symbol: string;
+  start: string;
+  end: string;
+  split: string;                 // 'fit' | 'holdout' | 'all'
+  config_hash: string;
+  scenario_hash: string;
+  verdict: string | null;        // 'fit' | 'marginal' | 'unfit' | 'insufficient'
+  demote: boolean | null;
+  total_return: number | null;
+  annualized_return: number | null;
+  annualized_return_on_collateral: number | null;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  option_pnl: number | null;
+  stock_pnl_realized: number | null;
+  stock_pnl_unrealized: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
+  assignment_rate: number | null;
+  puts_sold: number | null;
+  calls_sold: number | null;
+  cycles_completed: number | null;
+  cycles_open: number | null;
+  decision_days: number | null;
+  days_in_position_fraction: number | null;
+  bid_fill_return: number | null;
+  verdict_flips_on_fill: boolean | null;
+  replay_seconds: number | null;
+  error: string | null;
+  insufficient: boolean;
+  low_activity: boolean;
+  measured: boolean;
+}
+
+export interface SweepWindow {
+  split: string;
+  start: string;
+  end: string;
+}
+
+/** `windows` on the wire: `{split: {start, end}}`, from the stored columns. */
+export type SweepWindowMap = Record<string, { start: string; end: string }>;
+
+/**
+ * One row of the server's per-(scenario, split) summary.
+ *
+ * READ, never recomputed. Every median, min, max and count on the page comes
+ * from here — three implementations of "which cells count" would be three
+ * chances to average an `insuf` cell into a ranking.
+ */
+export interface SweepSummaryRow {
+  scenario: string;
+  split: string;
+  median: number | null;
+  min: number | null;
+  max: number | null;
+  measured: number;
+  insufficient: number;
+  low_activity: number;
+  errors: number;
+  demote_flags: number;
+  delta_vs_base: number | null;
+  delta_symbols: number;
+}
+
+export interface SweepDeltaCell {
+  /** Median of the per-symbol deltas over the COMMON measured subset. */
+  median: number | null;
+  /** How many symbols that median is over — the `n=k` the UI must show. */
+  symbols: number;
+}
+
+export interface SweepSignAgreement {
+  agreeing: number;
+  comparable: number;
+}
+
+export interface SweepBias {
+  title: string;
+  detail: string;
+}
+
+/** `render_json`'s payload (report.py:504-560), passed through by the API. */
+export interface SweepReport {
+  scenarios: string[];
+  symbols: string[];
+  windows: SweepWindow[];
+  starting_cash?: number | null;
+  run_sensitivity?: boolean | null;
+  base_config_hash?: string | null;
+  scenario_config_hashes?: Record<string, string>;
+  scenario_hashes?: Record<string, string>;
+  scenario_overrides?: Record<string, Record<string, unknown>>;
+  scenario_fill_haircuts?: Record<string, number | null>;
+  in_sample_only: boolean;
+  min_days_in_position: number;
+  timing?: {
+    materialise_seconds?: Record<string, number>;
+    replay_seconds?: Record<string, number>;
+    wall_seconds?: number;
+  };
+  provider_calls?: {
+    fetches?: number;
+    bar_cache_hits?: number;
+    during_replays?: number;
+  };
+  rows: SweepResultRow[];
+  /** The server's aggregates. The page renders these; it never derives them. */
+  summary: SweepSummaryRow[];
+  /** null when the run had no holdout — there is nothing to agree about. */
+  sign_agreement: Record<string, SweepSignAgreement> | null;
+  /** split -> scenario -> delta. */
+  delta_vs_base: Record<string, Record<string, SweepDeltaCell>>;
+  known_biases: SweepBias[];
+  cross_scenario_caveat: string;
+  rejection_tally_caveat: string;
+  /** Non-null IFF `in_sample_only`. Rendered verbatim, never paraphrased. */
+  in_sample_banner: string | null;
+  holdout_semantics: string | null;
+  persisted?: boolean;
+}
+
+/**
+ * `GET /api/v2/sweeps/{run_id}`.
+ *
+ * `results` is non-null ONLY for a `done` run. A `submitted`/`running` sweep
+ * comes back with `grid: {}` and `splits: []`, which would otherwise render as
+ * a finished report that measured nothing — the opposite of the truth.
+ */
+export interface SweepDetail {
+  sweep: SweepRow;
+  results: SweepReport | null;
+  /**
+   * The response exactly as served. "Download JSON" exports THIS, not the
+   * normalised reconstruction: an export that quietly differed from what the
+   * API returned would be useless for reproducing or filing a bug.
+   */
+  raw: unknown;
+}
+
+export interface SweepCaps {
+  max_symbols: number;
+  max_scenarios: number;
+  max_cells: number;
+  max_window_days: number;
+  min_holdout_days: number;
+  /** Present on the live allowlist; the form prefers these over its fallbacks. */
+  min_starting_cash?: number;
+  max_starting_cash?: number;
+  max_spec_bytes?: number;
+  running_lock_hours?: number;
+}
+
+export interface SweepPreset {
+  /** The arm name written into the spec. */
+  name: string;
+  /** Human label for the chip, when the API supplies one. */
+  label?: string;
+  overrides: Record<string, unknown>;
+  /** A preset may vary the fill assumption instead of a config key. */
+  fill_haircut?: number;
+}
+
+/** `GET /api/v2/sweeps/allowlist` — the same allowlist the runner enforces. */
+export interface SweepAllowlist {
+  allowed: Array<{ key: string; description: string }>;
+  rejected: Array<{ key: string; reason: string }>;
+  presets: SweepPreset[];
+  caps: SweepCaps;
+}
+
+/** One arm. `base` is IMPLICIT and reserved — never declared here. */
+export interface SweepScenarioSpec {
+  name: string;
+  overrides: Record<string, unknown>;
+  fill_haircut?: number;
+}
+
+/** The `POST /api/v2/sweeps` body (plan D2). */
+export interface SweepSpec {
+  symbols: string[];
+  start: string;
+  end: string;
+  holdout_start?: string;
+  starting_cash?: number;
+  run_sensitivity?: boolean;
+  scenarios: SweepScenarioSpec[];
+}
+
+/**
+ * The 202 body from a successful submit.
+ *
+ * `deduplicated_to` is ALWAYS null here: the API no longer decides dedup. It
+ * cannot see the Job's effective configuration, so a spec whose `sweep_key`
+ * matched an earlier run could dedup to a run made under different env-shadowed
+ * settings. The Job decides, against the config it is actually holding, and
+ * writes the `deduplicated` row itself — which the poll then shows.
+ */
+export interface SweepSubmitAccepted {
+  run_id: string;
+  status: SweepStatus;
+  /** Always null from submit; the Job's own row carries it if it dedups. */
+  deduplicated_to?: string | null;
+  /**
+   * HINT ONLY: an earlier run that already completed under this `sweep_key`.
+   *
+   * The launch STILL HAPPENS. This says "you may already have this answer",
+   * never "nothing was run".
+   */
+  prior_done_run_id?: string | null;
+}
+
+/** The bot's sanitized `/config`, proxied by `/api/live/config`. */
+export interface LiveStrategyConfig {
+  paper_trading?: boolean;
+  stock_symbols?: string[];
+  put_delta_range?: number[];
+  call_delta_range?: number[];
+}
