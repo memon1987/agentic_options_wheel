@@ -35,12 +35,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 # The comparator arm. Duplicated from ``runner.BASE_SCENARIO_NAME`` rather than
 # imported: importing ``runner`` would drag the whole engine in, and this module
 # exists precisely to be importable without it. Pinned equal by a test.
 BASE_SCENARIO_NAME = "base"
+
+# What a scenario NAME may be. Here rather than in either caller because both
+# have to agree: the API refuses a name at the boundary, and the CLI/YAML path
+# must refuse the same one — a `--persist` sweep that landed a 200-character name
+# would put a column header three screens wide in the grid the API then serves,
+# and the API would have refused to create it. One rule, imported by both.
+#
+# 40 characters is generous for a label and short enough that a pasted blob is
+# refused rather than rendered. The pattern keeps names to things that are safe
+# as a grid key, a report cell and an env-var payload.
+MAX_SCENARIO_NAME_CHARS = 40
+SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+
+
+def validate_scenario_name(name: str, where: str) -> None:
+    """Raise ``ValueError`` unless ``name`` is a legal scenario name.
+
+    ``where`` names the source in the message — a YAML path for the CLI, the
+    literal ``'sweep spec'`` for the Job, the arm's position for the API.
+    """
+    if len(name) > MAX_SCENARIO_NAME_CHARS:
+        raise ValueError(
+            f"{where}: scenario name {name[:20]!r}... is {len(name)} characters; "
+            f"the cap is {MAX_SCENARIO_NAME_CHARS}. Names key the grid and its "
+            f"column headers, and they travel in the spec env var")
+    if not SCENARIO_NAME_RE.match(name):
+        raise ValueError(
+            f"{where}: scenario name {name!r} must start alphanumeric and "
+            f"contain only letters, digits, '_', '.' or '-' "
+            f"(pattern {SCENARIO_NAME_RE.pattern})")
+
 
 # The per-symbol notional a spec that does not say otherwise is run at. Same
 # default as ``run_sweep`` and ``main.py --starting-cash``; pinned by a test,

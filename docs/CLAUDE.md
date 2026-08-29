@@ -816,7 +816,7 @@ Four routes, and the asymmetry between them is deliberate:
 | `GET /api/v2/sweeps/allowlist` | none | the override keys, the refusals **and their reasons**, presets, caps. Static — no BigQuery |
 | `GET /api/v2/sweeps` | none | recent runs, latest status per `run_id`, `stuck` label |
 | `GET /api/v2/sweeps/{run_id}` | none | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
-| `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → dedup → 409 gate → write `submitted` → launch the Job |
+| `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → 409 gate → write `submitted` → launch the Job → **202** |
 
 - **The GETs are public because everything on this dashboard is** (it is reachable
   by `allUsers` — FC-094 owns that decision). Sweep results are hypotheticals over
@@ -834,6 +834,13 @@ Four routes, and the asymmetry between them is deliberate:
   and `sweep.md` cannot disagree about a median, a delta, or which cells count.
   Three constants that could not be imported (the report prose, `ENGINE_VERSION`,
   the status ORDER BY) are copied with byte-equality tests; drift fails the build.
+- **The API never deduplicates — only the Job does.** The API cannot compute the
+  Job's effective config, and the round-1 attempt to approximate it was
+  self-referential (after a kill-switch flip, a re-submitted spec matched the
+  pre-flip run's own hash and dedupped to it for ever, while the Job's exact
+  check never ran because nothing was launched). It always launches and returns
+  `prior_done_run_id` as a hint; the Job decides and writes the `deduplicated`
+  row. One container start on a repeat is the price.
 - **Status is BigQuery-based, never execution-polling** (D3). `run.executions.get`
   is unproven for this service account and grantable only in the console;
   `execution_name` is stored so an operator can go and look. A `submitted` row with

@@ -54,14 +54,19 @@ from services.sweep_report_text import (
 # COPY destinations against the fallback names below, so a rename cannot leave
 # this silently importing something else.
 try:  # repo / test environment
-    from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH, sweep_key
+    from src.backtesting.scenarios.identity import (
+        DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
+        sweep_key, validate_scenario_name,
+    )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, REJECTED_OVERRIDES, OverrideError, describe_allowlist,
         validate_override_key,
     )
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
-        DEFAULT_STARTING_CASH, sweep_key)
+        DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
+        sweep_key, validate_scenario_name,
+    )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, REJECTED_OVERRIDES, OverrideError, describe_allowlist,
         validate_override_key,
@@ -150,11 +155,10 @@ SPEC_FIELDS = frozenset({
 })
 SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut"})
 
-# Scenario names key the grid, appear in the report and travel in the spec env
-# var. 40 characters is generous for a label and short enough that a pasted blob
-# is refused rather than rendered as a column header three screens wide.
-MAX_SCENARIO_NAME_CHARS = 40
-SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+# `MAX_SCENARIO_NAME_CHARS` / `SCENARIO_NAME_RE` / `validate_scenario_name` are
+# IMPORTED from `identity.py` above, not defined here: `main._scenarios_from_entries`
+# applies the same rule to the CLI/YAML path, and a second copy would let a
+# `--persist` sweep land a name this API would have refused.
 
 # What each allowlisted key's value must LOOK like. The allowlist says which
 # knobs may be turned; this says what a legal setting of one is.
@@ -387,16 +391,10 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
         name = str(entry.get("name") or "").strip()
         if not name:
             raise SweepValidationError(f"scenario #{i + 1} has no 'name'")
-        if len(name) > MAX_SCENARIO_NAME_CHARS:
-            raise SweepValidationError(
-                f"scenario name {name[:20]!r}... is {len(name)} characters; the "
-                f"cap is {MAX_SCENARIO_NAME_CHARS}. Names key the grid and its "
-                f"column headers, and they travel in the spec env var")
-        if not SCENARIO_NAME_RE.match(name):
-            raise SweepValidationError(
-                f"scenario name {name!r} must start alphanumeric and contain "
-                f"only letters, digits, '_', '.' or '-' "
-                f"(pattern {SCENARIO_NAME_RE.pattern})")
+        try:
+            validate_scenario_name(name, f"scenario #{i + 1}")
+        except ValueError as exc:
+            raise SweepValidationError(str(exc))
         if name == BASE_SCENARIO_NAME:
             raise SweepValidationError(
                 f"'{BASE_SCENARIO_NAME}' is reserved: it is the comparator every "
@@ -696,18 +694,39 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
     executions would contend on the same chain cache while each reporting the
     other's fetches as its own.
 
-    A lock expires once the row is older than the Job could possibly still be
-    running (``stale_cutoff``). That is deliberate: a Job killed before its
-    ``finally`` (OOM, eviction, a cancelled execution) leaves a ``running`` row
-    nothing will ever terminalise, and a permanent lock on a dead run takes the
-    feature offline with no way back except a manual BigQuery insert.
+    **Two expiries, because the two states mean different things.**
+
+    * A ``running`` row holds the lock until ``stale_cutoff`` — the Job's task
+      timeout plus a grace — because until then a legitimate cold sweep may well
+      still be replaying, and releasing early lets a second execution contend
+      with it for the same chain cache.
+    * A ``submitted`` row holds it only until ``STUCK_AFTER_MINUTES``. It has
+      already been declared *stuck* at that point (``is_stuck``), and a
+      submission that produced no ``running`` row within ten minutes — three to
+      four times container start — is not running. Holding the lock for the full
+      three hours on a launch that never happened was the round-1 regression: the
+      row rendered "stuck — check the execution" while the endpoint went on
+      refusing every submit for another three hours.
+
+    A lock expiring at all is deliberate: a Job killed before its ``finally``
+    (OOM, eviction, a cancelled execution) leaves a row nothing will ever
+    terminalise, and a permanent lock on a dead run takes the feature offline
+    with no way back except a manual BigQuery insert.
     """
+    now = now or datetime.now(timezone.utc)
     cutoff = stale_cutoff(now)
+    submitted_cutoff = now - timedelta(minutes=STUCK_AFTER_MINUTES)
     for row in rows:
-        if row.get("status") in TERMINAL_STATUSES:
+        status = row.get("status")
+        if status in TERMINAL_STATUSES:
             continue
         stamp = _last_seen(row)
-        if stamp is not None and stamp < cutoff:
+        if stamp is None:
+            return row
+        if status == STATUS_SUBMITTED:
+            if stamp < submitted_cutoff:
+                continue
+        elif stamp < cutoff:
             continue
         return row
     return None
@@ -804,7 +823,17 @@ def one_sweep_sql(dataset: str) -> str:
 
 
 def done_by_key_sql(dataset: str) -> str:
-    """The most recent COMPLETED run under a ``sweep_key`` — the dedup lookup.
+    """The most recent COMPLETED run under a ``sweep_key``.
+
+    **The JOB uses this to dedup. The API uses it only as a HINT** (round-2 fix
+    1). The API cannot compute the Job's effective configuration — it has no
+    ``Config`` — and the round-1 attempt to approximate it (bind
+    ``@base_config_hash`` to whatever a prior run had recorded on the same
+    commit) was self-referential: after an operator flipped ``ROLLER_ENABLED`` on
+    the Job, a re-submitted spec matched the *pre-flip* run's own hash and
+    deduplicated to it for ever, and the Job's exact check — the one that would
+    have caught the flip — never ran, because nothing was ever launched. So the
+    API always launches, and the Job decides.
 
     "Completed" is four conditions, not one status string, and each one exists
     because ``status = 'done'`` alone would return something that is not an
@@ -817,10 +846,13 @@ def done_by_key_sql(dataset: str) -> str:
     * ``base_config_hash`` equality — ``sweep_key`` covers the spec, the engine
       version and the commit, and cannot see an operator flipping
       ``EARNINGS_ENABLED`` on the Job between two otherwise identical
-      submissions. That value is not in the yaml the key hashes.
+      submissions. That value is not in the yaml the key hashes. **Only the Job
+      binds this parameter**; the API passes NULL, which is why its answer is a
+      hint and not a decision.
 
     A duplicate replay costs eight minutes. A wrong dedup hit serves one
-    experiment's numbers as another's, silently.
+    experiment's numbers as another's, silently — so the side that cannot check
+    exactly does not get to decide.
     """
     return latest_status_per_run_sql(dataset, "sweep_key = @sweep_key") + (
         f" AND status = '{STATUS_DONE}'"
@@ -830,29 +862,6 @@ def done_by_key_sql(dataset: str) -> str:
         " AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)"
         " ORDER BY submitted_at DESC LIMIT 1"
     )
-
-
-def latest_base_config_hash_sql(dataset: str) -> str:
-    """The most recent effective-config hash observed for one ``git_commit``.
-
-    The API has no ``Config`` — it cannot compute the Job's effective
-    configuration, only read what past runs recorded. So its dedup asks a
-    weaker but still useful question: *has the effective config changed since
-    that run, as far as this store can tell?* If it has, no dedup hit.
-
-    When no run on this commit has been recorded yet the answer is NULL and the
-    predicate is a no-op; the **Job's** own `find_done_sweep`, which knows the
-    real hash, is the backstop that catches a mismatch before it replays. Two
-    checks, and only the second one can be exact — which is why the second one
-    exists rather than trusting this one.
-    """
-    return f"""
-    SELECT base_config_hash
-    FROM `{dataset}.{SWEEPS_TABLE}`
-    WHERE git_commit = @git_commit AND base_config_hash IS NOT NULL
-    ORDER BY written_at DESC
-    LIMIT 1
-    """
 
 
 def sweep_rows_sql(dataset: str) -> str:
@@ -1196,6 +1205,8 @@ def allowlist_payload() -> Dict[str, Any]:
             "max_starting_cash": MAX_STARTING_CASH,
             "max_spec_bytes": MAX_SPEC_BYTES,
             "max_scenario_name_chars": MAX_SCENARIO_NAME_CHARS,
+            "scenario_name_pattern": SCENARIO_NAME_RE.pattern,
+            "symbol_pattern": SYMBOL_RE.pattern,
             "job_task_timeout_seconds": JOB_TASK_TIMEOUT_SECONDS,
             "stale_grace_minutes": STALE_GRACE_MINUTES,
         },

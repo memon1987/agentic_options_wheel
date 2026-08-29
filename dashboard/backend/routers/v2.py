@@ -602,23 +602,41 @@ async def get_sweep(run_id: str) -> Dict[str, Any]:
     return shaped
 
 
-@router.post("/sweeps")
+@router.post("/sweeps", status_code=202)
 async def submit_sweep(
     spec: Dict[str, Any] = Body(...),
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    """Validate, dedup, launch, record. In that order, and the order matters.
+    """Validate, gate, launch, record. In that order, and the order matters.
 
     * **503** when `SWEEP_SUBMIT_TOKEN` is unset — sweeps disabled, fail closed.
     * **401** when the bearer does not match (constant-time compare).
     * **422** with the runner's own reason for any spec the Job would refuse.
-    * **200 + `deduplicated_to`** when this exact spec already completed on this
-      engine and commit: nothing is launched (D4, goal 5 — revisit, not
-      recompute).
-    * **409** while another sweep is `submitted`/`running` and younger than an
-      hour. One 1-vCPU Job; two executions would contend on one chain cache.
+    * **409** while another sweep is live. One 1-vCPU Job; two executions would
+      contend on one chain cache.
     * **502** when Cloud Run refuses the launch, carrying the grant command for
       the one cause that has a specific fix.
+    * **202** on success — *accepted*, not completed: the sweep runs for minutes
+      in a Job, and the caller polls `GET /api/v2/sweeps/{run_id}`.
+
+    **THIS ENDPOINT NEVER DEDUPLICATES** (round-2 fix 1). It always launches.
+
+    It used to short-circuit to a `deduplicated` row when `find_done_sweep`
+    matched, binding the config predicate to the last `base_config_hash` any run
+    on this commit had recorded. That was self-referential: after an operator
+    flipped `ROLLER_ENABLED` on the Job, a re-submitted spec matched the
+    *pre-flip* run's own hash, deduplicated to it, and — because nothing was
+    launched — the Job's exact check, the one that would have caught the flip,
+    never ran. The dedup became permanent and wrong, silently.
+
+    The API cannot compute the Job's effective configuration, so it does not get
+    to make that call. `find_done_sweep` is still consulted, purely as a HINT:
+    the earlier run id is returned as `prior_done_run_id` so an operator can open
+    it while the new execution starts. The **Job** deduplicates, against the
+    config it is actually holding, and writes the `deduplicated` row itself. The
+    cost of the change is one container start (~3-4 min) on a repeat submission,
+    which is the right price for never serving one experiment's numbers as
+    another's.
 
     The `submitted` row is written BEFORE the launch. If the launch then fails,
     the row is terminalised as `failed` with the reason — a visible failed sweep,
@@ -653,30 +671,15 @@ async def submit_sweep(
     force = bool(normalised.get("force"))
 
     try:
-        # The best the API can do about effective config: the last hash any run
-        # on this commit recorded. The Job re-checks against the config it
-        # actually has, which is the only exact check available.
-        config_hash = bq.latest_base_config_hash(git_commit)
-        prior = (None if force
-                 else bq.find_done_sweep(key, base_config_hash=config_hash))
+        # A HINT, never a decision — no `base_config_hash` is bound, so this
+        # cannot see a kill switch flipped on the Job. `force` suppresses even
+        # the hint, since the operator has already said they do not want one.
+        prior = None if force else bq.find_done_sweep(key)
         history = bq.get_recent_sweeps(limit=25)
     except Exception as exc:  # noqa: BLE001
         if _sweep_store_missing(exc):
             raise _tables_missing()
         raise
-
-    if prior is not None:
-        run_id = sweeps.new_run_id()
-        bq.insert_sweep_status(sweeps.submitted_row(
-            run_id=run_id, spec=normalised, sweep_key_value=key,
-            submitted_at=submitted_at, git_commit=git_commit,
-            status=sweeps.STATUS_DEDUPLICATED,
-            deduplicated_to=prior["run_id"]))
-        return {"run_id": run_id, "status": sweeps.STATUS_DEDUPLICATED,
-                "deduplicated_to": prior["run_id"], "sweep_key": key,
-                "launched": False,
-                "detail": ("this exact spec already completed on this engine and "
-                           "commit; nothing was replayed")}
 
     blocking = sweeps.blocking_sweep(history)
     if blocking is not None:
@@ -737,4 +740,11 @@ async def submit_sweep(
             "execution_name": execution_name,
             "cell_count": sweeps.cell_count(normalised),
             "forced": force,
+            # A HINT for the UI: an earlier run that completed under this
+            # `sweep_key`. The Job may or may not deduplicate to it — that
+            # depends on the effective config, which only the Job can see — so
+            # this is offered as "you may already have this answer", never as
+            # "nothing was run". `deduplicated_to` stays None here on purpose:
+            # if the Job dedups, ITS row carries it and the poll will show it.
+            "prior_done_run_id": (prior or {}).get("run_id"),
             "deduplicated_to": None}

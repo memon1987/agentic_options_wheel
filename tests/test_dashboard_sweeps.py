@@ -368,6 +368,31 @@ class TestOverrideValueValidation:
 
 
 class TestScenarioNames:
+    def test_the_rule_is_the_engines_not_a_copy(self):
+        """`main._scenarios_from_entries` applies the same rule to the CLI/YAML
+        path. A second copy would let a `--persist` sweep land a name this API
+        would have refused, and the results view would then have to render a
+        column header it was designed never to receive."""
+        from src.backtesting.scenarios import identity
+
+        assert S.MAX_SCENARIO_NAME_CHARS is identity.MAX_SCENARIO_NAME_CHARS
+        assert S.SCENARIO_NAME_RE is identity.SCENARIO_NAME_RE
+
+    def test_the_cli_refuses_what_the_api_refuses(self):
+        import main as main_mod
+
+        for bad in ("has space", "-leading", "a" * 41, "semi;colon"):
+            with pytest.raises(SystemExit):
+                main_mod._scenarios_from_entries([{"name": bad}], "sweep spec")
+        # ...and accepts what the API accepts.
+        assert len(main_mod._scenarios_from_entries(
+            [{"name": "tighter_puts"}, {"name": "v1.2"}], "spec")) == 2
+
+    def test_the_pattern_is_served_to_the_form(self):
+        payload = S.allowlist_payload()["caps"]
+        assert payload["scenario_name_pattern"] == S.SCENARIO_NAME_RE.pattern
+        assert payload["max_scenario_name_chars"] == S.MAX_SCENARIO_NAME_CHARS
+
     def test_an_over_long_name_is_422(self):
         long = "a" * (S.MAX_SCENARIO_NAME_CHARS + 1)
         with pytest.raises(S.SweepValidationError, match="the cap is"):
@@ -527,6 +552,40 @@ class TestTheOneAtATimeGate:
         row = {"run_id": "r", "status": "running",
                "submitted_at": old_submit, "written_at": recent_write}
         assert S.blocking_sweep([row], now=self.now()) is not None
+
+    def test_a_submitted_row_releases_the_lock_when_it_is_declared_stuck(self):
+        """A launch that produced no `running` row within ten minutes is not
+        running, and holding the lock for another three hours on it was the
+        round-1 regression: the row rendered "stuck — check the execution" while
+        the endpoint went on refusing every submit."""
+        stuck = self.row("submitted", minutes_ago=S.STUCK_AFTER_MINUTES + 1)
+        assert S.is_stuck(stuck, now=self.now()) is True
+        assert S.blocking_sweep([stuck], now=self.now()) is None
+
+    def test_a_submitted_row_inside_the_container_start_window_still_blocks(self):
+        """Container start is 3-4 minutes; releasing during it would let a
+        second execution start alongside the one that is booting."""
+        booting = self.row("submitted", minutes_ago=S.STUCK_AFTER_MINUTES - 1)
+        assert S.is_stuck(booting, now=self.now()) is False
+        assert S.blocking_sweep([booting], now=self.now()) is not None
+
+    def test_a_running_row_keeps_the_longer_rule(self):
+        """The two states expire differently on purpose: a `running` sweep may
+        legitimately be replaying a cold window for hours."""
+        long_run = self.row("running", minutes_ago=S.STUCK_AFTER_MINUTES + 30)
+        assert S.blocking_sweep([long_run], now=self.now()) is not None
+
+    def test_the_lock_and_the_stuck_label_agree_for_every_state(self):
+        """A row that renders `stuck` must not still be holding the lock — the
+        two are read side by side in the UI, and disagreeing is what made the
+        round-1 behaviour unexplainable."""
+        for status, minutes in (("submitted", S.STUCK_AFTER_MINUTES + 1),
+                                ("running", (S.JOB_TASK_TIMEOUT_SECONDS
+                                             + S.STALE_GRACE_MINUTES * 60) / 60
+                                 + 1)):
+            row = self.row(status, minutes_ago=minutes)
+            assert S.is_stuck(row, now=self.now()) is True, status
+            assert S.blocking_sweep([row], now=self.now()) is None, status
 
     def test_empty_history_does_not_block(self):
         assert S.blocking_sweep([], now=self.now()) is None
@@ -1312,22 +1371,98 @@ class TestTheSubmitEndpoint:
         assert "other" in str(exc.value.detail)
         assert live.rows == []
 
-    def test_a_prior_done_run_returns_200_and_launches_nothing(
+    def test_a_prior_done_run_still_launches_and_is_only_a_hint(
             self, wired, monkeypatch):
+        """THE API NEVER DEDUPLICATES (round-2 fix 1).
+
+        It used to short-circuit here, binding the config predicate to the last
+        `base_config_hash` any run on this commit had recorded. That is
+        self-referential: after an operator flips `ROLLER_ENABLED` on the Job, a
+        re-submitted spec matches the *pre-flip* run's own hash and dedups to it
+        for ever — and because nothing is launched, the Job's exact check, the
+        one that would have caught the flip, never runs.
+
+        So it launches, every time, and returns the prior run as a HINT.
+        """
+        import httpx
+
         v2, _bq = wired
         cached = FakeBQ(prior={"run_id": "earlierrun000001"})
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: cached)
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
         launched = []
-        monkeypatch.setattr(v2, "_launch_job",
-                            lambda body: launched.append(body))
+
+        async def ok(self, url, **kwargs):
+            launched.append(kwargs.get("json"))
+            return httpx.Response(200, json={"metadata": {"name": "exec-1"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
 
         out = self.submit(v2)
-        assert out["status"] == "deduplicated"
-        assert out["deduplicated_to"] == "earlierrun000001"
-        assert out["launched"] is False
-        assert launched == []
+        assert out["status"] == "submitted"
+        assert out["launched"] is True
+        assert len(launched) == 1
+        # The hint, and nothing that reads as a decision.
+        assert out["prior_done_run_id"] == "earlierrun000001"
+        assert out["deduplicated_to"] is None
+        assert [r["status"] for r in cached.rows] == ["submitted", "submitted"]
 
-    def test_force_skips_the_dedup_lookup(self, wired, monkeypatch):
+    def test_the_api_never_writes_a_deduplicated_row(self, wired, monkeypatch):
+        """Only the Job may write that status — it is the only side that can
+        check the effective config."""
+        import httpx
+
+        v2, _bq = wired
+        cached = FakeBQ(prior={"run_id": "earlierrun000001"})
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: cached)
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def ok(*_a, **_k):
+            return httpx.Response(200, json={"metadata": {"name": "exec-1"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+        self.submit(v2)
+        assert all(r["status"] != "deduplicated" for r in cached.rows)
+
+    def test_the_hint_is_not_bound_to_a_config_hash(self, wired, monkeypatch):
+        """The self-referential bind is gone: the API passes no
+        `base_config_hash`, so its answer cannot masquerade as a decision.
+
+        Checked on the CALL, not on the source — the docstring necessarily
+        mentions the parameter it no longer sends.
+        """
+        import httpx
+
+        v2, _bq = wired
+        recorded = []
+
+        class Recording(FakeBQ):
+            def find_done_sweep(self, key, base_config_hash=None):
+                recorded.append({"key": key, "hash": base_config_hash})
+                return None
+
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: Recording())
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def ok(*_a, **_k):
+            return httpx.Response(200, json={"metadata": {"name": "e"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+        self.submit(v2)
+
+        assert len(recorded) == 1
+        assert recorded[0]["hash"] is None
+
+    def test_the_self_referential_lookup_is_gone_entirely(self):
+        """Dead code that encodes a rejected design is worse than none: the next
+        reader would take it for the intended one."""
+        from services import bigquery as bq_mod
+        from services import sweeps as sweeps_mod
+
+        assert not hasattr(bq_mod.BigQueryService, "latest_base_config_hash")
+        assert not hasattr(sweeps_mod, "latest_base_config_hash_sql")
+
+    def test_force_suppresses_even_the_hint(self, wired, monkeypatch):
         import httpx
 
         v2, _bq = wired
@@ -1344,6 +1479,7 @@ class TestTheSubmitEndpoint:
         assert out["launched"] is True
         assert out["forced"] is True
         assert out["deduplicated_to"] is None
+        assert out["prior_done_run_id"] is None
 
     def test_a_422_writes_nothing(self, wired):
         from fastapi import HTTPException

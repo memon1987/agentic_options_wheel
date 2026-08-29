@@ -681,6 +681,95 @@ class TestTerminationIsRecorded:
         assert [r["status"] for r in writer.statuses] == ["running", "failed"]
         assert "SIGKILL" in writer.statuses[-1]["error"]
 
+    def test_a_cancel_during_the_dedup_lookup_still_terminalises(
+            self, monkeypatch, wired, cli_args, job_env):
+        """SIGTERM in the first seconds, before a single day is replayed.
+
+        The `running` insert, the dedup query (up to 60 s) and
+        `ChainStore.from_env()`'s bucket probe all happen before the replay
+        starts, and until round-2 fix 2 the handler was not installed until
+        after them. A cancel in that window — the minutes when a cancel is most
+        likely — killed the process outright and left exactly the orphaned
+        `running` row the mechanism exists to prevent.
+        """
+        import os
+        import signal
+
+        main_mod, writer = wired
+
+        def cancelled_during_lookup(key, base_config_hash=None):
+            # A real signal, delivered to this process, not a hand-called
+            # handler: that is what proves the handler is INSTALLED by now.
+            os.kill(os.getpid(), signal.SIGTERM)
+            return None
+
+        writer.find_done_sweep = cancelled_during_lookup
+
+        with pytest.raises(main_mod.SweepTerminated):
+            main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+
+        assert [r["status"] for r in writer.statuses] == ["running", "failed"]
+        assert "SIGKILL" in writer.statuses[-1]["error"]
+
+    def test_a_cancel_before_the_running_row_still_terminalises(
+            self, monkeypatch, wired, cli_args, job_env):
+        """Earlier still: the signal arrives as the `running` row is written."""
+        import os
+        import signal
+
+        main_mod, writer = wired
+        real_write = writer.write_status
+
+        def cancel_on_first_write(row):
+            real_write(row)
+            if row["status"] == "running":
+                os.kill(os.getpid(), signal.SIGTERM)
+            return True
+
+        writer.write_status = cancel_on_first_write
+
+        with pytest.raises(main_mod.SweepTerminated):
+            main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert [r["status"] for r in writer.statuses] == ["running", "failed"]
+
+    def test_sigterm_during_the_finalise_does_not_kill_the_writes(
+            self, monkeypatch, wired, cli_args, job_env):
+        """`terminate_on_sigterm` restores the previous handler exactly when the
+        finalise begins, so a signal landing there used to hit SIG_DFL and kill
+        the process mid-insert — with no terminal row. Round-2 fix 3 ignores
+        SIGTERM for the duration of the two writes, which finish well inside
+        Cloud Run's 10-second grace.
+        """
+        import os
+        import signal
+
+        main_mod, writer = wired
+        fired = {"n": 0}
+        real_write_runs = writer.write_runs
+
+        def cancel_mid_finalise(rows):
+            out = real_write_runs(rows)
+            fired["n"] += 1
+            os.kill(os.getpid(), signal.SIGTERM)   # would be fatal under SIG_DFL
+            return out
+
+        writer.write_runs = cancel_mid_finalise
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+
+        assert fired["n"] == 1
+        # The process survived the signal AND the terminal row landed.
+        assert [r["status"] for r in writer.statuses] == ["running", "done"]
+        assert len(writer.runs) == 6
+
+    def test_the_finalise_restores_the_handler_afterwards(self):
+        import signal
+
+        import main as main_mod
+        before = signal.getsignal(signal.SIGTERM)
+        with main_mod.ignore_sigterm_while_finalising(_Logger()):
+            assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) is before
+
     def test_a_sweep_terminated_is_not_an_ordinary_exception(self):
         """`run_sweep` catches `Exception` per scenario so one bad arm does not
         cost the others their results. A termination caught THERE would be

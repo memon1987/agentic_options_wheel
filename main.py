@@ -444,6 +444,7 @@ def _scenarios_from_entries(raw, where: str):
     into a container start.
     """
     from src.backtesting.scenarios import Scenario
+    from src.backtesting.scenarios.identity import validate_scenario_name
 
     if not isinstance(raw, list):
         raise SystemExit(f"{where}: 'scenarios' must be a list, got {type(raw).__name__}")
@@ -455,6 +456,14 @@ def _scenarios_from_entries(raw, where: str):
         name = entry.get('name')
         if not name:
             raise SystemExit(f"{where}: scenario #{i + 1} has no 'name'")
+        # The SAME rule the API applies (identity.validate_scenario_name).
+        # Without it a `--persist` CLI sweep could land a name the API would have
+        # refused, and the results view would then have to render a column header
+        # it was designed never to receive.
+        try:
+            validate_scenario_name(str(name), where)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
         overrides = entry.get('overrides') or {}
         if not isinstance(overrides, dict):
             raise SystemExit(
@@ -589,8 +598,18 @@ def terminate_on_sigterm(logger):
     forever, block the next submission until the lock expires, and tell an
     operator nothing about why.
 
-    Ten seconds is comfortably enough for two streaming inserts, which is the
-    whole reason this is worth doing rather than accepting the loss.
+    **The ten seconds is the budget for the `finally`, not for this block.** A
+    signal arriving here raises immediately and unwinds; what has to fit inside
+    the grace period is `_finalise_sweep_status` — two streaming inserts, which
+    fit comfortably. That is the whole reason converting the signal is worth
+    doing rather than accepting the loss.
+
+    **Entered before the `running` row is written**, not just around the replay
+    (round-2 fix 2). The `running` insert, the dedup query (up to 60 s) and
+    `ChainStore.from_env()`'s bucket probe all happen before a single day is
+    replayed, and a cancel landing in that window used to kill the process
+    outright — leaving exactly the orphaned `running` row this mechanism exists
+    to prevent, in the minutes when a cancel is most likely.
 
     Restores the previous handler on the way out, and no-ops off the main thread
     (`signal.signal` raises there) so tests and library callers are unaffected.
@@ -618,6 +637,40 @@ def terminate_on_sigterm(logger):
         yield _raise
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
+def ignore_sigterm_while_finalising(logger):
+    """Hold SIGTERM off for the duration of the terminal writes.
+
+    `terminate_on_sigterm` restores the previous handler when its block exits —
+    which is exactly when `_finalise_sweep_status` begins. A SIGTERM landing in
+    that window hits the default handler and kills the process mid-insert, with
+    no terminal row: the precise outcome the whole mechanism exists to prevent,
+    displaced by a few milliseconds into the one stretch of code that must not
+    be interrupted (round-2 fix 3).
+
+    SIG_IGN rather than another raising handler: there is nothing useful left to
+    do about a second signal, and the writes finish well inside Cloud Run's
+    10-second grace. If SIGKILL arrives anyway the row is lost either way, and
+    ignoring costs nothing.
+    """
+    import signal
+
+    try:
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (ValueError, OSError, AttributeError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError):  # pragma: no cover - defensive
+            logger.warning("could not restore the SIGTERM handler",
+                           event_category="backtest",
+                           event_type="sweep_sigterm_restore_failed")
 
 
 class SweepPersistence:
@@ -819,49 +872,54 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
             return 2
 
     started_at = datetime.now(timezone.utc).isoformat()
-    if writer is not None:
-        # `running` FIRST, before the dedup query (D3). A `submitted` row with no
-        # `running` row after 10 minutes is the dashboard's "stuck — check the
-        # execution" signal, and a dedup lookup that hung would otherwise sit
-        # inside exactly that window and read as a dead container.
-        writer.write_status(sweep_store.status_row(
-            status=sweep_store.STATUS_RUNNING, started_at=started_at, **provenance))
-
-        prior = (None if force else
-                 writer.find_done_sweep(key, base_config_hash=effective_hash))
-        if prior is not None and prior.get('run_id') != run_id:
-            writer.write_status(sweep_store.status_row(
-                status=sweep_store.STATUS_DEDUPLICATED,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                deduplicated_to=prior['run_id'], **provenance))
-            print(f"\nDEDUPLICATED: sweep_key {key} already completed as run "
-                  f"{prior['run_id']}. Nothing was replayed; read that run's "
-                  f"rows instead.")
-            logger.info("Sweep deduplicated against a completed run",
-                        event_category="backtest", event_type="sweep_deduplicated",
-                        run_id=run_id, sweep_key=key,
-                        deduplicated_to=prior['run_id'])
-            return 0
-
     result = None
     failure = None
     chain_store = None
     rows_persisted = None
+    deduplicated_to = None
     try:
-        # INSIDE the try: `ChainStore.from_env()` builds a GCS client and probes
-        # the bucket, so it can raise — and a raise out here would skip the
-        # `finally` and leave the sweep `running` for ever, which is the exact
-        # failure the `finally` exists to prevent.
-        chain_store = ChainStore.from_env()
+        # THE SIGNAL HANDLER GOES ON FIRST, before anything is written (round-2
+        # fix 2). The `running` insert, the dedup query (up to 60 s) and
+        # `ChainStore.from_env()`'s bucket probe all run before a single day is
+        # replayed, and a cancel landing in that window used to kill the process
+        # outright — leaving the orphaned `running` row this whole mechanism
+        # exists to prevent, in the minutes when a cancel is most likely.
+        #
+        # Everything from here is inside the try, so any raise reaches the
+        # `finally` and produces a terminal row.
         with terminate_on_sigterm(logger):
-            result = run_sweep(
-                config, scenarios, symbols, start, end,
-                holdout_start=holdout_start,
-                starting_cash=starting_cash,
-                run_sensitivity=run_sensitivity,
-                chain_store=chain_store,
-            )
+            if writer is not None:
+                # `running` FIRST, before the dedup query (D3). A `submitted` row
+                # with no `running` row after 10 minutes is the dashboard's
+                # "stuck — check the execution" signal, and a dedup lookup that
+                # hung would otherwise sit inside exactly that window and read as
+                # a dead container.
+                writer.write_status(sweep_store.status_row(
+                    status=sweep_store.STATUS_RUNNING, started_at=started_at,
+                    **provenance))
+
+                # THE dedup. The API deliberately does not do this (it cannot
+                # compute the effective config); it launches, and this is where
+                # the decision is actually made, against the config this process
+                # is holding.
+                prior = (None if force else
+                         writer.find_done_sweep(key,
+                                                base_config_hash=effective_hash))
+                if prior is not None and prior.get('run_id') != run_id:
+                    deduplicated_to = prior['run_id']
+
+            if deduplicated_to is None:
+                # `ChainStore.from_env()` builds a GCS client and probes the
+                # bucket, so it can raise; inside the try, that becomes a
+                # `failed` row rather than a silent orphan.
+                chain_store = ChainStore.from_env()
+                result = run_sweep(
+                    config, scenarios, symbols, start, end,
+                    holdout_start=holdout_start,
+                    starting_cash=starting_cash,
+                    run_sensitivity=run_sensitivity,
+                    chain_store=chain_store,
+                )
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
         failure = f"{type(exc).__name__}: {exc}"
         raise
@@ -872,8 +930,18 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                 chain_store=chain_store, started_at=started_at,
                 run_id=run_id, submitted_at=submitted_at,
                 engine_version=ENGINE_VERSION, git_commit=git_commit,
-                provenance=provenance,
+                provenance=provenance, deduplicated_to=deduplicated_to,
             )
+
+    if deduplicated_to is not None:
+        print(f"\nDEDUPLICATED: sweep_key {key} already completed as run "
+              f"{deduplicated_to}. Nothing was replayed; read that run's rows "
+              f"instead.")
+        logger.info("Sweep deduplicated against a completed run",
+                    event_category="backtest", event_type="sweep_deduplicated",
+                    run_id=run_id, sweep_key=key,
+                    deduplicated_to=deduplicated_to)
+        return 0
 
     persistence = SweepPersistence(
         persisted=bool(writer is not None and rows_persisted is not None),
@@ -914,7 +982,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
 
 def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
                            started_at, run_id, submitted_at, engine_version,
-                           git_commit, provenance):
+                           git_commit, provenance, deduplicated_to=None):
     """Write the cells and the terminal status row. Returns rows persisted, or None.
 
     Extracted from the `finally` because **every step in here can itself raise**,
@@ -939,6 +1007,24 @@ def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
     from src.backtesting.scenarios import persist as sweep_store
     from src.backtesting.screen import accumulate_lake_summary
 
+    with ignore_sigterm_while_finalising(logger):
+        return _finalise_sweep_status_inner(
+            writer=writer, logger=logger, result=result, failure=failure,
+            chain_store=chain_store, started_at=started_at, run_id=run_id,
+            submitted_at=submitted_at, engine_version=engine_version,
+            git_commit=git_commit, provenance=provenance,
+            deduplicated_to=deduplicated_to,
+            sweep_store=sweep_store,
+            accumulate_lake_summary=accumulate_lake_summary,
+            datetime=datetime, timezone=timezone)
+
+
+def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store,
+                                 started_at, run_id, submitted_at,
+                                 engine_version, git_commit, provenance,
+                                 deduplicated_to, sweep_store,
+                                 accumulate_lake_summary, datetime, timezone):
+    """The body of `_finalise_sweep_status`, run with SIGTERM ignored."""
     lake_summary = None
     try:
         if chain_store is not None:
@@ -976,15 +1062,24 @@ def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
                    "scenario_runs insert did not land, so there are no results "
                    "to read")
 
-    status = (sweep_store.STATUS_DONE
-              if failure is None and result is not None and rows_ok
-              else sweep_store.STATUS_FAILED)
+    if deduplicated_to is not None and failure is None:
+        # The Job found a completed run under this key and did not replay. It is
+        # still a terminal row, and it still goes through this one path so a
+        # cancel arriving during the dedup lookup cannot leave the run orphaned.
+        status = sweep_store.STATUS_DEDUPLICATED
+    elif failure is None and result is not None and rows_ok:
+        status = sweep_store.STATUS_DONE
+    else:
+        status = sweep_store.STATUS_FAILED
     try:
         writer.write_status(sweep_store.status_row(
             status=status, started_at=started_at,
             finished_at=datetime.now(timezone.utc).isoformat(),
             result=result, error=failure, lake_summary=lake_summary,
             rows_persisted=(rows_written if rows_ok else None),
+            deduplicated_to=(deduplicated_to
+                             if status == sweep_store.STATUS_DEDUPLICATED
+                             else None),
             **provenance))
     except Exception:  # noqa: BLE001 - nothing left to fall back to
         logger.error("Terminal sweep status row could not be written — this run "

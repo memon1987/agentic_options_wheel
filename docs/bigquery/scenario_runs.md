@@ -25,7 +25,7 @@ A submission produces a *sequence* of rows, not one row edited in place:
 | the dashboard (`POST /api/v2/sweeps`) | `submitted` | before the Job is launched |
 | the dashboard, again | `submitted` | immediately after launch, now carrying `execution_name` |
 | the Job | `running` | right after `Config()` — before the dedup lookup |
-| the Job | `deduplicated` | an identical `sweep_key` already reached `done`; nothing was replayed |
+| **the Job only** | `deduplicated` | an identical `sweep_key` already reached `done` under the same effective config; nothing was replayed |
 | the Job | `done` / `failed` | in a `finally`, after the cell rows are written |
 | the dashboard | `failed` | the launch itself was refused (403/404/5xx from `jobs.run`) |
 
@@ -34,7 +34,11 @@ A submission produces a *sequence* of rows, not one row edited in place:
 (it is the partition key and the submission's identity), so ordering by it is a
 three-way tie and "latest status wins" resolves arbitrarily. The canonical
 ordering lives in `persist.LATEST_STATUS_ORDER_BY`, mirrored in
-`dashboard/backend/services/sweeps.py` and pinned equal by a test:
+`dashboard/backend/services/sweeps.py` and pinned equal by a test. **`done`
+outranks `failed`** in the tiebreak: the one realistic collision is the launch
+path — the API writes `failed` when `jobs.run` errors while an execution that in
+fact started writes `done` — and a sweep whose cells are in the table is done,
+whatever a launch-side timeout thought.
 
 ```sql
 -- latest status per run
@@ -42,7 +46,7 @@ SELECT * EXCEPT(rn) FROM (
   SELECT *, ROW_NUMBER() OVER (
     PARTITION BY run_id
     ORDER BY written_at DESC,
-             CASE status WHEN 'deduplicated' THEN 2 WHEN 'done' THEN 3
+             CASE status WHEN 'deduplicated' THEN 2 WHEN 'done' THEN 4
                          WHEN 'failed' THEN 3 WHEN 'running' THEN 1
                          WHEN 'submitted' THEN 0 ELSE -1 END DESC) AS rn
   FROM `options_wheel.scenario_sweeps`
@@ -137,10 +141,25 @@ engine version and the commit — it cannot see a kill switch flipped on the Job
 A duplicate replay costs eight minutes. A wrong dedup hit serves one
 experiment's numbers as another's, silently.
 
-The API cannot compute the Job's effective config — it has no `Config` — so it
-passes the last `base_config_hash` any run on the same `git_commit` recorded,
-and NULL when there is none. The Job's own lookup, which knows the real hash, is
-the exact backstop.
+**Only the Job deduplicates.** The API never skips a launch on the strength of
+this query, and it binds no `base_config_hash`.
+
+It used to: it passed the last `base_config_hash` any run on the same
+`git_commit` had recorded. That was self-referential. After an operator flipped
+`ROLLER_ENABLED` on the Job, a re-submitted spec matched the *pre-flip* run's own
+hash, deduplicated to it, and — because nothing was launched — the Job's exact
+check, the one that would have caught the flip, never ran. The dedup became
+permanent and wrong, and nothing said so.
+
+So `POST /api/v2/sweeps` always launches. `find_done_sweep` is still consulted
+there, purely as a **hint**: the earlier run id comes back as
+`prior_done_run_id` so an operator can open it while the new execution starts.
+The Job then decides, against the config it is actually holding, and writes the
+`deduplicated` row itself. The cost is one container start (~3-4 min) on a repeat
+submission — the right price for never serving one experiment's numbers as
+another's.
+
+`force: true` suppresses even the hint, and the Job's lookup with it.
 
 ### `force`
 
@@ -275,6 +294,12 @@ A run with no cells yet (`submitted`, `running`) returns `grid: {}`,
 state, not 500. `GET /api/v2/sweeps` stays a bare JSON array of rows, each with
 an added `stuck` boolean.
 
+`POST /api/v2/sweeps` answers **202 Accepted** — the sweep runs for minutes in a
+Job and the caller polls the detail route. Its body carries `run_id`,
+`sweep_key`, `execution_name`, `cell_count`, `forced`, `deduplicated_to` (always
+`null` from this endpoint) and `prior_done_run_id` (the hint described above,
+`null` when there is none or when `force` was set).
+
 ## Operational notes
 
 - **The tables are created by the Job's writer**, not by the dashboard. The
@@ -305,7 +330,16 @@ an added `stuck` boolean.
   insert fail on that field, so the sweep writes zero rows while reporting a
   clean run. `_ensure_table` refuses to start in that state and names the
   offending columns — retyping is an operator migration.
-- **Termination is recorded.** Cloud Run sends SIGTERM and SIGKILL 10 s later;
-  `main.py` installs a handler that raises, so the `finally` still writes a
-  terminal `failed` row. Without it a killed task sits as `running` for ever and
-  holds the lock until the stale cutoff.
+- **Termination is recorded, from the first write onward.** Cloud Run sends
+  SIGTERM and SIGKILL 10 s later; `main.py` installs a handler that raises, so
+  the `finally` still writes a terminal row. The handler goes on **before** the
+  `running` insert — the insert, the dedup query (up to 60 s) and the chain
+  lake's bucket probe all precede the replay, and a cancel there is exactly the
+  case that used to orphan a `running` row. During the terminal writes SIGTERM
+  is set to `SIG_IGN` instead, because that stretch is the one that must not be
+  interrupted; the ten-second grace is the budget for those two inserts.
+- **The 409 lock and the `stuck` label agree.** A `submitted` row releases the
+  lock at the same 10-minute threshold at which it is labelled stuck (a launch
+  that produced no `running` row by then is not running). A `running` row keeps
+  the task-timeout + grace rule, because a cold sweep may legitimately still be
+  replaying.

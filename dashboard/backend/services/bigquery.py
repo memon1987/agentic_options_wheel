@@ -1772,39 +1772,22 @@ class BigQueryService:
             [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
         )
 
-    def latest_base_config_hash(self, git_commit: Optional[str]
-                                ) -> Optional[str]:
-        """The last effective-config hash any run on ``git_commit`` recorded.
-
-        The API cannot compute the Job's effective configuration — it has no
-        ``Config`` and no yaml — so its dedup asks the weaker question the store
-        can answer: has the effective config changed since the run we are about
-        to reuse? The Job's own lookup, which knows the real hash, is the exact
-        backstop.
-        """
-        from services.sweeps import latest_base_config_hash_sql
-
-        if not git_commit:
-            return None
-        rows = self._sweep_query(
-            latest_base_config_hash_sql(self.dataset),
-            [bigquery.ScalarQueryParameter("git_commit", "STRING", git_commit)],
-        )
-        return rows[0].get("base_config_hash") if rows else None
-
     def find_done_sweep(self, sweep_key: str,
                         base_config_hash: Optional[str] = None
                         ) -> Optional[Dict[str, Any]]:
-        """The most recent COMPLETED run under ``sweep_key``, or None (D4).
+        """The most recent COMPLETED run under ``sweep_key``, or None.
 
-        Goal 5 — "revisit, not recompute" — at the API layer: an identical spec
-        on the same engine and commit returns the prior run instead of burning
-        another eight minutes of Job time to reproduce it.
+        **A HINT for this backend, not a decision** (round-2 fix 1). The API
+        never skips a launch on the strength of it: it cannot compute the Job's
+        effective configuration, so it passes no ``base_config_hash`` and its
+        answer cannot see a kill switch flipped on the Job. The run id goes into
+        the submit response as ``prior_done_run_id`` so an operator can open the
+        earlier run while the new one starts; the **Job** does the actual dedup,
+        against the config it is holding.
 
-        "Completed" excludes a run whose cells never landed, a run every arm of
-        which errored, and a run under a different effective base config. See
-        `services.sweeps.done_by_key_sql` for why each one would otherwise serve
-        an absence, or somebody else's experiment, as a result.
+        "Completed" still excludes a run whose cells never landed and a run every
+        arm of which errored — those are exact, and a hint that pointed at an
+        empty grid would be worse than none.
         """
         from services.sweeps import done_by_key_sql
 
