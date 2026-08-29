@@ -683,16 +683,28 @@ async def submit_sweep(
 
     blocking = sweeps.blocking_sweep(history)
     if blocking is not None:
+        # STATE-AWARE, because the two states expire on different clocks. One
+        # message quoting the task timeout told an operator blocked by a
+        # `submitted` row to wait three hours for a lock that frees in ten
+        # minutes — and "wait three hours" is exactly the advice that gets a
+        # feature abandoned.
+        status = blocking.get("status")
+        if status == sweeps.STATUS_SUBMITTED:
+            release = (f"it releases at most {sweeps.STUCK_AFTER_MINUTES} minutes "
+                       f"after that run's last update — a launch that has "
+                       f"produced no `running` row by then is not running")
+        else:
+            release = (f"it releases once that run is older than the Job's task "
+                       f"timeout ({sweeps.JOB_TASK_TIMEOUT_SECONDS // 3600}h + "
+                       f"{sweeps.STALE_GRACE_MINUTES}m), because Cloud Run has "
+                       f"killed the task by then; a cold sweep can legitimately "
+                       f"replay for that long")
         raise HTTPException(
             status_code=409,
-            detail=(f"sweep {blocking.get('run_id')} is {blocking.get('status')}; "
+            detail=(f"sweep {blocking.get('run_id')} is {status}; "
                     f"one sweep runs at a time (the Job is a single vCPU and two "
                     f"executions would contend on one chain cache). Wait for it "
-                    f"— the lock releases on its own once the run is older than "
-                    f"the Job's task timeout "
-                    f"({sweeps.JOB_TASK_TIMEOUT_SECONDS // 3600}h + "
-                    f"{sweeps.STALE_GRACE_MINUTES}m), because Cloud Run has "
-                    f"killed the task by then."))
+                    f"— {release}."))
 
     run_id = sweeps.new_run_id()
     row = sweeps.submitted_row(

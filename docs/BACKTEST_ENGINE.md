@@ -493,9 +493,10 @@ report names the dataset, the `run_id` and the `sweep_key`, and the JSON carries
 only when the cell rows actually landed; a sweep whose insert failed is `failed`, and
 the CLI exits non-zero rather than printing a "Stored as" line that points at nothing.
 
-**`force: true`** in a spec skips the dedup lookup on both sides, for re-running a
-question whose answer you no longer trust. It is excluded from `sweep_key`, so a forced
-run stays comparable with the run it reproduces.
+**`force: true`** in a spec skips the Job's dedup lookup — the only one that decides
+anything — for re-running a question whose answer you no longer trust; it suppresses the
+API's informational hint with it. It is excluded from `sweep_key`, so a forced run stays
+comparable with the run it reproduces.
 
 **The Job's `--task-timeout` is 10800s (3h)**, matching `backtest-screen`'s rationale:
 a cold window materialises at ~5.5 min/symbol. A task killed at the timeout receives

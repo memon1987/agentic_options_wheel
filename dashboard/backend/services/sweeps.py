@@ -743,6 +743,14 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     * ``running`` past ``stale_cutoff`` — Cloud Run has killed the task by now
       (``--task-timeout``), so nothing will ever write its terminal row.
 
+    **Both clocks are ``_last_seen`` (``written_at``), the same one
+    ``blocking_sweep`` uses.** They must agree, and reading ``submitted_at`` here
+    made them disagree for up to ~30 s: the API writes a second ``submitted``
+    row after the launch to record ``execution_name``, so the row's
+    ``written_at`` moves while ``submitted_at`` does not. A row could therefore
+    be labelled stuck while still holding the lock, or the reverse — and the two
+    are read side by side in the UI.
+
     A LABEL, not a cancel. D3 is explicit that nothing here polls or cancels an
     execution: ``run.executions.get`` is unproven for this service account and
     grantable only in the console, so the honest thing is to say the Job stopped
@@ -752,13 +760,12 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if status in TERMINAL_STATUSES:
         return False
     now = now or datetime.now(timezone.utc)
-    if status == STATUS_RUNNING:
-        stamp = _last_seen(row)
-        return stamp is not None and stamp < stale_cutoff(now)
-    if status != STATUS_SUBMITTED:
-        return False
-    stamp = _as_datetime(row.get("submitted_at"))
+    stamp = _last_seen(row)
     if stamp is None:
+        return False
+    if status == STATUS_RUNNING:
+        return stamp < stale_cutoff(now)
+    if status != STATUS_SUBMITTED:
         return False
     return now - stamp > timedelta(minutes=STUCK_AFTER_MINUTES)
 

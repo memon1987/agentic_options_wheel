@@ -575,17 +575,59 @@ class TestTheOneAtATimeGate:
         long_run = self.row("running", minutes_ago=S.STUCK_AFTER_MINUTES + 30)
         assert S.blocking_sweep([long_run], now=self.now()) is not None
 
+    def stamped(self, status, *, submitted_minutes_ago, written_minutes_ago):
+        """A row whose two clocks DIFFER — the real shape after a launch.
+
+        The API writes a second `submitted` row once `jobs.run` returns, to
+        record `execution_name`, so `written_at` moves while `submitted_at`
+        (the partition key and the submission's identity) does not. Every test
+        that uses one timestamp for both cannot see the two readers disagreeing.
+        """
+        return {
+            "run_id": "r1", "status": status,
+            "submitted_at": (self.now() - timedelta(
+                minutes=submitted_minutes_ago)).isoformat(),
+            "written_at": (self.now() - timedelta(
+                minutes=written_minutes_ago)).isoformat(),
+        }
+
     def test_the_lock_and_the_stuck_label_agree_for_every_state(self):
-        """A row that renders `stuck` must not still be holding the lock — the
-        two are read side by side in the UI, and disagreeing is what made the
-        round-1 behaviour unexplainable."""
-        for status, minutes in (("submitted", S.STUCK_AFTER_MINUTES + 1),
-                                ("running", (S.JOB_TASK_TIMEOUT_SECONDS
-                                             + S.STALE_GRACE_MINUTES * 60) / 60
-                                 + 1)):
-            row = self.row(status, minutes_ago=minutes)
-            assert S.is_stuck(row, now=self.now()) is True, status
-            assert S.blocking_sweep([row], now=self.now()) is None, status
+        """A row that renders `stuck` must not still be holding the lock.
+
+        The two are read side by side in the UI, and they used to disagree for
+        up to the launch latency: `is_stuck` read `submitted_at` while
+        `blocking_sweep` read `written_at`. Both now read `_last_seen`, so this
+        holds even when the two timestamps differ — which is the normal case,
+        not the exotic one.
+        """
+        cases = [
+            # (status, submitted_minutes_ago, written_minutes_ago)
+            ("submitted", S.STUCK_AFTER_MINUTES + 1, S.STUCK_AFTER_MINUTES + 1),
+            # Submitted long ago, but the launch row landed seconds later: NOT
+            # stuck and still holding the lock. Reading `submitted_at` here
+            # would have called it stuck while the lock stayed on.
+            ("submitted", S.STUCK_AFTER_MINUTES + 5, 1),
+            ("running", 400, (S.JOB_TASK_TIMEOUT_SECONDS
+                              + S.STALE_GRACE_MINUTES * 60) / 60 + 1),
+            ("running", 400, 5),
+        ]
+        for status, submitted_ago, written_ago in cases:
+            row = self.stamped(status, submitted_minutes_ago=submitted_ago,
+                               written_minutes_ago=written_ago)
+            stuck = S.is_stuck(row, now=self.now())
+            blocked = S.blocking_sweep([row], now=self.now()) is not None
+            assert stuck is not blocked, (status, submitted_ago, written_ago)
+
+    def test_both_readers_use_the_same_clock(self):
+        """The launch-latency window, pinned directly: a `submitted` row that is
+        old by `submitted_at` but fresh by `written_at` is neither stuck nor
+        released."""
+        fresh_launch = self.stamped(
+            "submitted",
+            submitted_minutes_ago=S.STUCK_AFTER_MINUTES + 5,
+            written_minutes_ago=1)
+        assert S.is_stuck(fresh_launch, now=self.now()) is False
+        assert S.blocking_sweep([fresh_launch], now=self.now()) is not None
 
     def test_empty_history_does_not_block(self):
         assert S.blocking_sweep([], now=self.now()) is None
@@ -1106,21 +1148,15 @@ _HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 class FakeBQ:
     """A BigQueryService stand-in that records writes and can be made to fail."""
 
-    def __init__(self, *, prior=None, history=None, raises=None,
-                 config_hash="cfg0123456789ab"):
+    def __init__(self, *, prior=None, history=None, raises=None):
         self.rows = []
         self.prior = prior
         self.history = history or []
         self.raises = raises
-        self.config_hash = config_hash
 
     def _maybe_raise(self):
         if self.raises is not None:
             raise self.raises
-
-    def latest_base_config_hash(self, git_commit):
-        self._maybe_raise()
-        return self.config_hash
 
     def find_done_sweep(self, key, base_config_hash=None):
         self._maybe_raise()
@@ -1356,6 +1392,36 @@ class TestTheSubmitEndpoint:
             self._run(v2.list_sweeps(limit=10))
 
     # -- gates -------------------------------------------------------------
+    def _blocked_detail(self, v2, monkeypatch, status):
+        from fastapi import HTTPException
+
+        stamp = datetime.now(timezone.utc).isoformat()
+        live = FakeBQ(history=[{"run_id": "other", "status": status,
+                                "written_at": stamp, "submitted_at": stamp}])
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: live)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 409
+        return str(exc.value.detail)
+
+    def test_the_409_names_the_right_clock_for_a_submitted_blocker(
+            self, wired, monkeypatch):
+        """The two states expire on different clocks, and a message quoting the
+        wrong one told an operator to wait three hours for a lock that frees in
+        ten minutes. "Wait three hours" is how a feature gets abandoned."""
+        v2, _bq = wired
+        detail = self._blocked_detail(v2, monkeypatch, "submitted")
+        assert f"{S.STUCK_AFTER_MINUTES} minutes" in detail
+        assert "task timeout" not in detail
+
+    def test_the_409_names_the_right_clock_for_a_running_blocker(
+            self, wired, monkeypatch):
+        v2, _bq = wired
+        detail = self._blocked_detail(v2, monkeypatch, "running")
+        assert "task timeout" in detail
+        assert f"{S.JOB_TASK_TIMEOUT_SECONDS // 3600}h" in detail
+        assert f"{S.STUCK_AFTER_MINUTES} minutes" not in detail
+
     def test_a_running_sweep_is_409(self, wired, monkeypatch):
         from fastapi import HTTPException
 

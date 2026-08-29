@@ -159,12 +159,14 @@ The Job then decides, against the config it is actually holding, and writes the
 submission — the right price for never serving one experiment's numbers as
 another's.
 
-`force: true` suppresses even the hint, and the Job's lookup with it.
+`force: true` suppresses the Job's dedup lookup — the one that actually decides
+— and the API's hint lookup with it.
 
 ### `force`
 
-The spec accepts an optional `force: true`, which **skips the dedup lookup on
-both sides**. It is validated as a bool, travels in `SWEEP_SPEC_JSON`, and is
+The spec accepts an optional `force: true`. It **skips the Job's dedup lookup**
+— the only one that decides anything — and suppresses the API's hint lookup with
+it, so a forced submission neither dedups nor advertises a prior run. It is validated as a bool, travels in `SWEEP_SPEC_JSON`, and is
 deliberately **excluded from `sweep_key`** (`identity.NON_IDENTITY_FIELDS`): a
 forced re-run must key identically to the run it is reproducing, or the two are
 never comparable and a second force would not dedup either.
