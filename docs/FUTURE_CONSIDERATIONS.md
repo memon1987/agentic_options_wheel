@@ -1020,6 +1020,20 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-093: backtest bars cache — provenance, refresh path, and the next `ChainStore.get` levers
+
+**Scope:** shared (backtest engine)
+**Status:** Filed 2026-08-28 (FC-060 Layer 2 reviews, PR #100 — deferred items)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Layer 2 added a local bars cache (`BarStore`) whose coverage is "proven from the provider's answer". Three things were deferred from its review: (1) **no provenance** — the file does not record the feed/adjustment the bars came from (the provider requests `raw`), so a vendor restatement or a future adjustment change is frozen on dev while the ephemeral Job refetches — dev sweeps and the Job can silently diverge; the chain cache hedges the same vendor promise with a close-price check, the bars cache hedges nothing; (2) **no in-band refresh** — recovery is `rm cache/backtest/bars/<SYM>.parquet`; add `--refresh-bars` (and `--refresh-chains`?) to `backtest`/`sweep`; (3) **stale `.tmp` cleanup** after a SIGKILLed writer (pid-suffixed, harmless, but accumulates). Separately, the profile after the D5 rewrite: `ChainStore.get` is still ~all of a warm materialisation (AAPL 1.22 of 1.23 s) — next levers in order: vectorised NaN→None + `zip` over `.to_numpy()` columns (kills the per-file namedtuple class and 580k `pd.isna` calls on SPY), `.iat` instead of the ~25 `.iloc[0]` provenance/price lookups per file (19% on AAPL), `pyarrow.parquet.read_table(columns=…)`. Worth doing only if sweep sizes grow past a few hundred cells.
+
+**Links:** PR #100 reviews (data/perf persona), `src/backtesting/data/bar_store.py`, `src/backtesting/data/chain_store.py`, FC-091 (merge-on-put, same file), `docs/plans/fc-060-scenario-runner.md`.
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
