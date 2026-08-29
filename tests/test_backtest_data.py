@@ -11,11 +11,14 @@ import math
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List
 
+import pandas as pd
 import pytest
 
 from src.backtesting.data import greeks
 from src.backtesting.data.chain_builder import (
     ChainBuilder,
+    ChainQuote,
+    ChainSnapshot,
     STRIKE_WINDOW_PCT,
     strike_window,
 )
@@ -1112,3 +1115,196 @@ class TestCacheDurability:
         assert [q.strike for q in only_lower.puts] == [95.0, 100.0]
         only_upper = f.store.get("XYZ", f.as_of, strike_lte=90.0, model="m")
         assert [q.strike for q in only_upper.puts] == [85.0]
+
+
+# --------------------------------------------------------------------------- #
+# FC-060 Layer 2 (D5) — the row-conversion hot path
+# --------------------------------------------------------------------------- #
+def _row_to_quote_legacy(r) -> ChainQuote:
+    """The pre-FC-060 per-row converter, verbatim from ``chain_store.py``.
+
+    It lives HERE and only here. Keeping it in ``src`` would make it dead code
+    that drifts from the thing it exists to pin; keeping it in the test module
+    makes it an oracle compiled against the same parquet the real reader sees.
+    If ``ChainQuote`` gains a field this stops matching, and the mismatch is the
+    point — the new field has to be handled deliberately on both sides.
+
+    Row conversion was ~80% of a warm replay's runtime (~250 files per
+    symbol-year, a few hundred rows each; ``iterrows`` builds a fresh Series per
+    row and pays a label lookup per cell). ``_rows_to_quotes`` walks C-level
+    tuples instead. The speed is worthless if the output moved by a bit, so what
+    is asserted here is identity, not equivalence.
+    """
+    return ChainQuote(
+        symbol=r["symbol"],
+        underlying=r["underlying"],
+        as_of=date.fromisoformat(r["as_of"]),
+        expiration=date.fromisoformat(r["expiration"]),
+        strike=float(r["strike"]),
+        option_type=r["option_type"],
+        dte=int(r["dte"]),
+        underlying_price=float(r["underlying_price"]),
+        mark=float(r["mark"]),
+        bid=float(r["bid"]),
+        ask=float(r["ask"]),
+        implied_volatility=(
+            None if pd.isna(r["implied_volatility"]) else float(r["implied_volatility"])
+        ),
+        delta=(None if pd.isna(r["delta"]) else float(r["delta"])),
+        volume=int(r["volume"]),
+        modeled_spread=bool(r["modeled_spread"]),
+        modeled_greeks=bool(r["modeled_greeks"]),
+    )
+
+
+def _legacy_narrow_and_convert(df, universe_dte=None, strike_gte=None, strike_lte=None):
+    """The pre-FC-060 narrow-and-convert loop out of ``ChainStore.get``, verbatim."""
+    puts, calls = [], []
+    for _, r in df.iterrows():
+        if not r["symbol"]:  # sentinel row for an empty chain
+            continue
+        strike = float(r["strike"])
+        if strike_gte is not None and strike < strike_gte:
+            continue
+        if strike_lte is not None and strike > strike_lte:
+            continue
+        if universe_dte is not None and int(r["dte"]) > universe_dte:
+            continue
+        q = _row_to_quote_legacy(r)
+        (puts if q.option_type == "put" else calls).append(q)
+    puts.sort(key=lambda x: x.strike)
+    calls.sort(key=lambda x: x.strike)
+    return puts, calls
+
+
+class TestRowConversionIsIdenticalToTheLegacyLoop:
+    """D5: the rewrite must move the clock and nothing else."""
+
+    def _file(self, tmp_path, quotes, *, as_of=date(2025, 1, 6), spot=100.0):
+        """Write a real cache file through the real writer, then read it back raw."""
+        store = ChainStore(str(tmp_path))
+        snap = ChainSnapshot("XYZ", as_of, spot,
+                             [q for q in quotes if q.option_type == "put"],
+                             [q for q in quotes if q.option_type == "call"])
+        store.put(snap, universe_dte=8, strike_gte=50.0, strike_lte=200.0, model="m")
+        return store, pd.read_parquet(store._path("XYZ", as_of))
+
+    def _quote(self, strike, option_type, **kw):
+        as_of = kw.pop("as_of", date(2025, 1, 6))
+        exp = kw.pop("expiration", date(2025, 1, 10))
+        cp = "P" if option_type == "put" else "C"
+        defaults = dict(
+            symbol=f"XYZ{exp:%y%m%d}{cp}{int(strike * 1000):08d}",
+            underlying="XYZ", as_of=as_of, expiration=exp, strike=strike,
+            option_type=option_type, dte=(exp - as_of).days,
+            underlying_price=100.0, mark=1.2345, bid=1.20, ask=1.27,
+            implied_volatility=0.3141592653589793, delta=-0.1234567,
+            volume=137, modeled_spread=True, modeled_greeks=True,
+        )
+        defaults.update(kw)
+        return ChainQuote(**defaults)
+
+    def _full_ladder(self):
+        """Puts and calls, two expiries, plus the NaN-sentinel cases."""
+        quotes = []
+        for strike in (85.0, 90.0, 95.0, 100.0, 105.0, 110.0):
+            for opt in ("put", "call"):
+                quotes.append(self._quote(strike, opt))
+                # 11 DTE, so the universe_dte narrowing has something to drop.
+                quotes.append(self._quote(
+                    strike, opt, expiration=date(2025, 1, 17),
+                    volume=0, mark=0.05, bid=0.0, ask=0.10,
+                ))
+        # A contract whose IV never solved: both greek columns come back NaN.
+        quotes.append(self._quote(80.0, "put", implied_volatility=None, delta=None))
+        # ...and one where only delta is missing, a different row shape.
+        quotes.append(self._quote(115.0, "call", delta=None))
+        return quotes
+
+    def _assert_same(self, df, **bounds):
+        new_puts, new_calls = ChainStore._rows_to_quotes(
+            df, bounds.get("universe_dte"), bounds.get("strike_gte"),
+            bounds.get("strike_lte"),
+        )
+        new_puts = sorted(new_puts, key=lambda x: x.strike)
+        new_calls = sorted(new_calls, key=lambda x: x.strike)
+        old_puts, old_calls = _legacy_narrow_and_convert(df, **bounds)
+        assert new_puts == old_puts, f"puts diverged under {bounds}"
+        assert new_calls == old_calls, f"calls diverged under {bounds}"
+        # Field by field as well, so a dataclass that ever loses __eq__ cannot
+        # make this vacuous — and so a failure names the field and the type.
+        for a, b in zip(old_puts + old_calls, new_puts + new_calls):
+            assert a.__dict__ == b.__dict__
+            for name, value in a.__dict__.items():
+                assert type(value) is type(getattr(b, name)), (
+                    f"{name} changed type: {type(value)} -> {type(getattr(b, name))}"
+                )
+        return new_puts, new_calls
+
+    def test_identical_on_a_full_ladder_unbounded(self, tmp_path):
+        _store, df = self._file(tmp_path, self._full_ladder())
+        puts, calls = self._assert_same(df)
+        assert puts and calls, "fixture produced no quotes; the test is vacuous"
+
+    def test_identical_under_every_narrowing(self, tmp_path):
+        _store, df = self._file(tmp_path, self._full_ladder())
+        for bounds in (
+            {"universe_dte": 7},
+            {"universe_dte": 4},
+            {"strike_gte": 90.0},
+            {"strike_lte": 100.0},
+            {"strike_gte": 90.0, "strike_lte": 105.0},
+            {"universe_dte": 7, "strike_gte": 90.0, "strike_lte": 105.0},
+            # Bounds that exclude everything: the empty case must match too.
+            {"strike_gte": 1000.0},
+        ):
+            self._assert_same(df, **bounds)
+
+    def test_the_nan_sentinels_still_become_none(self, tmp_path):
+        _store, df = self._file(tmp_path, self._full_ladder())
+        puts, calls = self._assert_same(df)
+        unsolved = [q for q in puts if q.strike == 80.0]
+        assert unsolved and unsolved[0].implied_volatility is None
+        assert unsolved[0].delta is None
+        partial = [q for q in calls if q.strike == 115.0]
+        assert partial and partial[0].delta is None
+        assert partial[0].implied_volatility is not None
+
+    def test_the_empty_chain_sentinel_row_is_skipped_by_both(self, tmp_path):
+        """A no-contracts day writes one row with an empty symbol.
+
+        Neither reader may turn it into a quote — a phantom strike-0 put would
+        be indistinguishable from a real one in the strategy's chain.
+        """
+        store = ChainStore(str(tmp_path))
+        as_of = date(2025, 1, 6)
+        store.put(ChainSnapshot("XYZ", as_of, 100.0, [], []),
+                  universe_dte=8, strike_gte=50.0, strike_lte=200.0, model="m")
+        df = pd.read_parquet(store._path("XYZ", as_of))
+        assert len(df) == 1 and df["symbol"].iloc[0] == ""
+        assert self._assert_same(df) == ([], [])
+        assert self._assert_same(df, universe_dte=7, strike_gte=90.0,
+                                 strike_lte=110.0) == ([], [])
+
+    def test_get_returns_exactly_what_the_legacy_loop_would_have(self, tmp_path):
+        """End to end through the public API, not only the private converter."""
+        store, df = self._file(tmp_path, self._full_ladder())
+        snap = store.get("XYZ", date(2025, 1, 6), universe_dte=7,
+                         strike_gte=90.0, strike_lte=105.0, model="m")
+        old_puts, old_calls = _legacy_narrow_and_convert(
+            df, universe_dte=7, strike_gte=90.0, strike_lte=105.0)
+        assert snap.puts == old_puts
+        assert snap.calls == old_calls
+
+    # The same assertion against REAL vendor files lives in
+    # tools/diagnostics/chain_store_identity_check.py, not here. It needs
+    # `cache/backtest/chains`, which is gitignored and absent in CI, so as a test
+    # it was either skipped (proving nothing where it matters) or quietly
+    # dependent on one developer's disk — the ambient-state defect this suite has
+    # already fixed four times. Run it on demand:
+    #
+    #     python tools/diagnostics/chain_store_identity_check.py
+    #
+    # It walks every cached session under six narrowings and compares field by
+    # field INCLUDING Python type, which is the part fixtures cannot cover: a
+    # writer-produced file can only contain shapes the writer emits.

@@ -18,6 +18,7 @@ import structlog
 
 from ..utils.config import Config
 from .data.alpaca_provider import AlpacaDataProvider
+from .data.bar_store import BarStore, CachedBarProvider
 from .data.chain_builder import ChainBuilder
 from .data.chain_store import ChainStore
 from .data.dividends import (
@@ -25,7 +26,8 @@ from .data.dividends import (
     describe_coverage,
     load_default_schedule,
 )
-from .engine.simulator import SimulationResult, Simulator
+from .data.provider import StockBar
+from .engine.simulator import Materialised, SimulationResult, Simulator
 from .metrics.cycles import build_cycles, count_rolls
 from .metrics.fitness import FitnessReport, compute_fitness
 
@@ -50,6 +52,7 @@ def evaluate_symbol(
     fill_haircut: float = DEFAULT_FILL_HAIRCUT,
     run_sensitivity: bool = True,
     chain_store: Optional[ChainStore] = None,
+    bar_provider: Optional[object] = None,
     use_cache: bool = True,
 ) -> tuple:
     """Replay ``symbol`` and score it.
@@ -57,13 +60,19 @@ def evaluate_symbol(
     Args:
         chain_store: parquet chain cache to use; defaults to one rooted at
             ``cache/backtest/`` (gitignored).
-        use_cache: set False to force every chain to be rebuilt from the API.
+        bar_provider: the data provider to read from. Defaults to an
+            ``AlpacaDataProvider`` wrapped in a ``CachedBarProvider`` when
+            ``use_cache``. Injected by the scenario runner so one provider (and
+            one bar cache) is shared across a whole sweep and its calls can be
+            counted.
+        use_cache: set False to force every chain to be rebuilt from the API and
+            every bar to be re-fetched.
 
     Returns:
         ``(FitnessReport, sensitivity_dict_or_None)``.
     """
     config = config or Config()
-    provider = AlpacaDataProvider.from_config(config)
+    provider = bar_provider if bar_provider is not None else AlpacaDataProvider.from_config(config)
     # Cache on by default. Chains for settled sessions are immutable, and the
     # sensitivity pass below replays the identical window a second time under a
     # different fill assumption — without a cache that pays the full API bill
@@ -73,6 +82,13 @@ def evaluate_symbol(
         # lake when CHAIN_LAKE_BUCKET is set (FC-060 Layer 1). Unset — every
         # local run without the env var — it is exactly ChainStore().
         chain_store = ChainStore.from_env()
+    # Bars get the same treatment as chains (FC-060 Layer 2, D4). Without it a
+    # "warm" run still made four network calls per symbol, so it was never
+    # actually offline and a socket-blocked replay died on the first one.
+    # Wrapped, never a change to AlpacaDataProvider: the cache belongs to the
+    # run, not to the vendor client.
+    if use_cache and bar_provider is None:
+        provider = CachedBarProvider(provider, BarStore())
     builder = ChainBuilder(provider, store=chain_store if use_cache else None)
     max_dte = getattr(config, "put_target_dte", 7)
     # ONE schedule for both legs. The wheel's dividends come from this table via
@@ -81,21 +97,32 @@ def evaluate_symbol(
     # reintroduce, silently, exactly the directional bias this removes.
     dividends = load_default_schedule()
 
-    result = _run(
+    # Materialise ONCE, replay twice (FC-060 Layer 2, D6). The sensitivity pass
+    # replays the identical window under a different FILL assumption; the bars,
+    # trading days, strike anchors and chains cannot differ between the two, and
+    # rebuilding them was the single largest cost in a warm run.
+    materialised = _materialise(
         symbol, start, end, config, provider, builder,
         starting_cash=starting_cash, fill_haircut=fill_haircut, max_dte=max_dte,
         dividends=dividends,
     )
-    report = _score(symbol, result, provider, starting_cash, dividends)
+    result = _run(
+        symbol, start, end, config, provider, builder,
+        starting_cash=starting_cash, fill_haircut=fill_haircut, max_dte=max_dte,
+        dividends=dividends, materialised=materialised,
+    )
+    report = _score(symbol, result, materialised.stock_bars.get(symbol, []),
+                    starting_cash, dividends)
 
     sensitivity = None
     if run_sensitivity:
         bid_result = _run(
             symbol, start, end, config, provider, builder,
             starting_cash=starting_cash, fill_haircut=BID_FILL_HAIRCUT, max_dte=max_dte,
-            dividends=dividends,
+            dividends=dividends, materialised=materialised,
         )
-        bid_report = _score(symbol, bid_result, provider, starting_cash, dividends)
+        bid_report = _score(symbol, bid_result, materialised.stock_bars.get(symbol, []),
+                            starting_cash, dividends)
         sensitivity = {
             "mid_haircut": fill_haircut,
             "mid_return": report.total_return,
@@ -125,28 +152,76 @@ def evaluate_symbol(
     return report, sensitivity
 
 
-def _run(
+def _simulator(
     symbol: str, start: date, end: date, config, provider, builder, *,
     starting_cash: float, fill_haircut: float, max_dte: int,
     dividends: Optional[DividendSchedule] = None,
-) -> SimulationResult:
-    simulator = Simulator(
+) -> Simulator:
+    return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte, fill_haircut=fill_haircut,
         dividend_schedule=dividends,
     )
-    return simulator.run()
+
+
+def _materialise(
+    symbol: str, start: date, end: date, config, provider, builder, *,
+    starting_cash: float, fill_haircut: float, max_dte: int,
+    dividends: Optional[DividendSchedule] = None,
+) -> Materialised:
+    return _simulator(
+        symbol, start, end, config, provider, builder,
+        starting_cash=starting_cash, fill_haircut=fill_haircut, max_dte=max_dte,
+        dividends=dividends,
+    ).materialise()
+
+
+def _run(
+    symbol: str, start: date, end: date, config, provider, builder, *,
+    starting_cash: float, fill_haircut: float, max_dte: int,
+    dividends: Optional[DividendSchedule] = None,
+    materialised: Optional[Materialised] = None,
+) -> SimulationResult:
+    """One replay. A FRESH ``Simulator`` per haircut, sharing ``materialised``.
+
+    Reusing one simulator object for both passes would also work and is what the
+    plan's D6 sketches, but it shares one ``HistoricalEarningsCalendar`` between
+    them — and that object accumulates ``symbols_without_data`` /
+    ``symbols_past_horizon`` across calls, which land in the report's
+    data-quality block. A fresh simulator keeps the bid pass reporting exactly
+    what a standalone bid run would report, which is what makes the split
+    byte-identical rather than merely equivalent. The construction cost is a
+    config deep-copy and a 3 KB JSON read; the materialisation, which is the
+    expensive half, is done once and passed in.
+    """
+    simulator = _simulator(
+        symbol, start, end, config, provider, builder,
+        starting_cash=starting_cash, fill_haircut=fill_haircut, max_dte=max_dte,
+        dividends=dividends,
+    )
+    if materialised is None:
+        return simulator.run()
+    return simulator.replay(materialised)
 
 
 def _score(
     symbol: str,
     result: SimulationResult,
-    provider,
+    bars: Sequence[StockBar],
     starting_cash: float,
     dividends: Optional[DividendSchedule] = None,
 ) -> FitnessReport:
+    """Score a replay. ``bars`` are the materialised bars — never re-fetched.
+
+    They cover the warm-up buffer as well as the decision window, so they are
+    clipped to ``[result.start, result.end]`` here. That is exactly the set
+    ``provider.get_stock_bars(symbol, result.start, result.end)`` returned
+    before FC-060 Layer 2: the materialisation fetched with the same ``end``, so
+    the same settlement clamp applies, and the warm-up bars sit below
+    ``result.start``.
+    """
     cycles = build_cycles(result.broker.ledger)
-    prices = _closes(provider, symbol, result.start, result.end)
+    prices = _closes(bars, result.start, result.end)
     quality = _data_quality(result, cycles)
     # Buy-and-hold enters at the close of result.start, so a dividend going ex
     # ON that day belongs to the seller, not this holder — total_between's
@@ -163,8 +238,8 @@ def _score(
     )
 
 
-def _closes(provider, symbol: str, start: date, end: date) -> Dict[date, float]:
-    return {b.bar_date: b.close for b in provider.get_stock_bars(symbol, start, end)}
+def _closes(bars: Sequence[StockBar], start: date, end: date) -> Dict[date, float]:
+    return {b.bar_date: b.close for b in bars if start <= b.bar_date <= end}
 
 
 def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:

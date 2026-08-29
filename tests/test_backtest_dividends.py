@@ -571,13 +571,23 @@ class TestEvaluateWiring:
                 for d, p in self._prices.items()
             ]
 
+        def bars(self, symbol="VZ"):
+            """The bars `_score` now takes directly (FC-060 Layer 2, D6).
+
+            `_score` used to fetch them from a provider; it is handed the
+            already-materialised bars instead, so the scoring pass makes no
+            network call of its own. These tests pin dividend *wiring*, which
+            is unchanged — only where the price series comes from moved.
+            """
+            return self.get_stock_bars(symbol, date.min, date.max)
+
     def test_benchmark_dividends_are_actually_wired_from_the_table(self):
         """The number must come from the schedule, not from a default of zero."""
         from src.backtesting.evaluate import _score
 
         result = self._result()
         provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
-        report = _score("VZ", result, provider, 100_000.0,
+        report = _score("VZ", result, provider.bars(), 100_000.0,
                         DividendSchedule.from_table())
 
         assert report.benchmark is not None
@@ -601,7 +611,7 @@ class TestEvaluateWiring:
         result = self._result(start=start, end=end)
         provider = self._Provider({start: 40.0, end: 43.0})
         schedule = DividendSchedule.from_table()
-        report = _score("VZ", result, provider, 100_000.0, schedule)
+        report = _score("VZ", result, provider.bars(), 100_000.0, schedule)
 
         assert report.benchmark.dividends_per_share == pytest.approx(
             schedule.total_between("VZ", result.daily[0].day, result.daily[-1].day)
@@ -613,7 +623,7 @@ class TestEvaluateWiring:
 
         result = self._result(symbol="ZZZZ")
         provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
-        report = _score("ZZZZ", result, provider, 100_000.0,
+        report = _score("ZZZZ", result, provider.bars(), 100_000.0,
                         DividendSchedule.from_table())
 
         coverage = report.data_quality["dividend_coverage"]
@@ -625,7 +635,7 @@ class TestEvaluateWiring:
 
         result = self._result()
         provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
-        report = _score("VZ", result, provider, 100_000.0, DividendSchedule.empty())
+        report = _score("VZ", result, provider.bars(), 100_000.0, DividendSchedule.empty())
 
         coverage = report.data_quality["dividend_coverage"]
         assert coverage["table_loaded"] is False
@@ -637,7 +647,7 @@ class TestEvaluateWiring:
         start, end = date(2025, 1, 2), date(2099, 1, 1)
         result = self._result(start=start, end=end)
         provider = self._Provider({start: 40.0, end: 43.0})
-        report = _score("VZ", result, provider, 100_000.0,
+        report = _score("VZ", result, provider.bars(), 100_000.0,
                         DividendSchedule.from_table())
 
         coverage = report.data_quality["dividend_coverage"]
@@ -651,7 +661,7 @@ class TestEvaluateWiring:
 
         result = self._result(symbol="ZZZZ")
         provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
-        report = _score("ZZZZ", result, provider, 100_000.0,
+        report = _score("ZZZZ", result, provider.bars(), 100_000.0,
                         DividendSchedule.from_table())
         md = render_markdown(report)
         assert "Dividend data is incomplete for this run" in md
@@ -662,7 +672,7 @@ class TestEvaluateWiring:
 
         result = self._result()
         provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
-        report = _score("VZ", result, provider, 100_000.0,
+        report = _score("VZ", result, provider.bars(), 100_000.0,
                         DividendSchedule.from_table())
         md = render_markdown(report)
         assert "Dividend data is incomplete for this run" not in md

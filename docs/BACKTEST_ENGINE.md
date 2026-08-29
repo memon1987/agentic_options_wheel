@@ -283,7 +283,8 @@ cache, and `ChainStore` uses it write-through:
   model, ≥ DTE reach, ⊇ strike window). A narrowing is refused and logged as
   `chain_lake_overwrite_skipped`; every upload carries an `if_generation_match`
   precondition so concurrent writers cannot clobber each other. Merging two partial windows
-  into their union on write is the **Layer 2** follow-up.
+  into their union on write is **still outstanding** — Layer 2 shipped without it (it went
+  to the scenario runner instead), so it belongs to Layer 3 or its own FC.
 - **A model change needs a prefix bump.** The `model` fingerprint is part of the format
   contract, and a different model is never a *wider* answer — such an upload is skipped, so
   without bumping `CHAIN_LAKE_PREFIX` a model change silently stops populating the lake.
@@ -325,6 +326,240 @@ cache, and `ChainStore` uses it write-through:
   storage everyone reads. The Job runs UTC at 02:00 ET, well after the close, so it is
   correct today; treat it as a constraint on where the engine may be run, not as a
   guarantee.
+
+
+### The bars cache (FC-060 Layer 2)
+
+Chains have had a parquet cache since FC-042 Track A; **underlying bars never did**. Every
+replay re-fetched them, four network calls per symbol per `evaluate_symbol`
+(`Simulator._load_stock_bars` twice, `evaluate._closes` twice), so a "warm" run was never
+actually offline — the chains came off disk and then the first bar fetch went to Alpaca.
+
+`BarStore` closes that. Settled daily bars are immutable, same premise as the chain cache.
+
+| | |
+|---|---|
+| Layout | `cache/backtest/bars/<SYMBOL>.parquet`, one file per symbol |
+| Env | `BACKTEST_BARS_CACHE_DIR` (default `cache/backtest/bars`) |
+| Wiring | `evaluate_symbol` wraps the provider in `CachedBarProvider` unless one is injected; the sweep runner shares one across the whole sweep. Composition, never a change to `AlpacaDataProvider` — the cache belongs to the run, not the vendor client |
+| Not mirrored to the lake | deliberate: one call per symbol per run on the Job, and bars are always re-fetchable. The lake exists because *chains* may not be |
+
+- **Coverage is proven, not inferred.** The file records the *request window* it answers
+  (`covered_from`/`covered_to`) exactly as the chain cache records its strike/DTE window,
+  and a read is a hit only against that. Inferring coverage from the stored dates cannot
+  work: a weekday with no row is indistinguishable between "market holiday" and "we never
+  asked", and guessing wrong serves a replay a window with a hole in it.
+- **Coverage stays one contiguous interval.** A request disjoint from the stored window
+  fetches their **union** rather than appending a second range. Bars are one API call, so
+  the extra days are cheaper than interval algebra in the read path.
+- **Today is never stored and never claimed.** Same `_is_settled` rule as the chain cache;
+  `covered_to` is clamped to the last settled session, so a run started mid-session cannot
+  leave a file that freezes a half-formed close as final.
+- A corrupt or old-schema file is discarded and refetched, never raised — same policy as
+  `ChainStore.get`, and local-only. So is a file whose *contents* will not parse (a
+  `bar_date` that is not an ISO date, a volume that will not cast): the alternative is
+  wedging every future run on one bad cell.
+- **An empty answer never becomes a coverage claim.** Alpaca returns HTTP 200 with an empty
+  payload for an unknown symbol, for an unentitled window and for a transient outage —
+  identical on the wire. `put` refuses to widen the window at all when handed no bars, so
+  the next run asks again. Believing one of those would serve "this symbol has no history"
+  for the life of the file.
+- **A truncated non-empty answer cannot be detected from inside**, so the file records both
+  what was asked (`covered_from`/`covered_to`, which the hit test uses — a request whose
+  edge lands on a holiday must still be a hit) and what came back
+  (`data_from`/`data_to`). **What you can rely on is the data span.** When the two diverge
+  by more than a plausible market closure, the file is suspect.
+- **There is no restatement guard.** A settled daily bar is treated as immutable; a vendor
+  that later revises one is not noticed.
+
+**Invalidating the bars cache** — the recipe for both of the above, and for anything else
+that smells wrong:
+
+```bash
+rm cache/backtest/bars/NVDA.parquet     # one symbol
+rm -rf cache/backtest/bars              # all of them
+# or, without deleting anything:
+BACKTEST_BARS_CACHE_DIR=/tmp/throwaway python main.py --command sweep ...
+```
+
+`evaluate_symbol(use_cache=False)` bypasses both caches for a single call.
+
+### Scenario sweeps — `--command sweep` (FC-060 Layer 2)
+
+Ask "what would this config change have done?" across the whole effective universe in one
+pass, instead of one `--command backtest` per arm.
+
+```bash
+python main.py --command sweep \
+    --scenarios examples/scenarios_example.yaml \
+    --symbols AAPL,AMZN,GOOGL,IWM,NVDA,UNH \
+    --start 2025-08-01 --end 2026-07-31 --no-sensitivity \
+    --out sweep.md --json-out sweep.json
+# optional: --holdout-start 2026-02-01   --starting-cash 100000
+```
+
+**How it is affordable: materialise once, replay many.** Data assembly is
+config-independent — the chain model fingerprint takes no `settings.yaml` input and the
+strike window comes from bars alone — so `Simulator.run()` was split into `materialise()`
+(bars, trading days, strike anchors, chains) and `replay()` (the day loop). A sweep pays
+the first once per (symbol, window) and runs the second per scenario, in memory.
+`run()` is exactly `replay(materialise())` and its output is byte-identical to the
+pre-split engine.
+
+**Overrides are restricted to selection-only keys**, and the refusals carry their reason:
+
+| refused | why |
+|---|---|
+| `strategy.put_target_dte` | changes the chain's DTE reach; cached files store `universe_dte=8`, so a wider arm misses the cache on every day and a narrower one is served contracts it did not ask for |
+| `strategy.call_target_dte` **above** the chain reach | does not widen anything — the 9–15 DTE calls are simply absent, so the arm reads as "no call ever qualified" rather than as a test of that reach. **Lowering it is allowed** |
+| `risk.profit_taking.*`, the stop-loss switches | `/monitor`-only; the replay's day loop never runs the monitor, so every arm would return an identical row — which reads as "this knob does not matter" |
+| `strategy.{put,call}_limit_spread_fraction` | the replay does not honour limit prices — `BacktestAlpacaClient.place_option_order` *records* `limit_price` and fills at `mid − fill_haircut × half-spread` regardless. **Measured**: a `put_limit_spread_fraction: 0.0` arm came back byte-identical to base on all six symbols over a year. Vary `fill_haircut` on the scenario instead |
+| `universe.min_open_interest` | the engine has no OI data — `get_options_chain` hardcodes `open_interest: 0` — so any floor ≥ 1 rejects **every** call, and the arm reads as "this threshold kills the call leg" rather than "the engine cannot see the number". (`universe.max_spread_pct` *is* allowed: its input is a documented model with a measured error, not an absent field) |
+| `rolling.fallback_strike_attempts` | governs strike rungs the replay never reaches — the adapter fills rung 1 unconditionally, so rung ≥ 3 came up **0 times over an instrumented 37 rolls × 7 arms**. Live in production, inert here |
+| `stocks.symbols` | the universe is run *scope*: pass `--symbols`. A candidate symbol is a cold materialisation |
+| `alpaca.*`, `strategy_id`, `bigquery_dataset` | not strategy parameters |
+| `earnings.enabled` / `rolling.enabled` **when `EARNINGS_ENABLED` / `ROLLER_ENABLED` is exported** | the env var wins over the yaml key (FC-013 DD-7, FC-078 DD-7), so the arm would be silently identical to base and the sweep would report two arms as tied |
+
+Everything else on the list is in `src/backtesting/scenarios/overrides.py`
+(`ALLOWED_OVERRIDES`) and is reproduced in every report. The **fill haircut is a scenario
+field, not a config key** — `config_hash` hashes the module default, so two arms differing
+only in haircut would share a hash.
+
+**One allowed key is direction-limited.** `risk.max_position_size` binds **downward
+only** until FC-079: the put sizer hardcodes one contract, so raising the cap cannot buy a
+second one and the arm comes back identical to base. Lowering it does bind — it starves a
+position out entirely — which is why the key is allowed rather than refused.
+
+**The test is two-part, and the second half is empirical.** A key must be *selection-only*
+(it must not change what the chain has to contain) **and** the replay must actually
+*honour* it. The three limit-pricing / open-interest rows above pass the first test and
+fail the second, which is only visible by running the arm and finding its rows identical to
+base. Before adding a key to the allowlist, sweep it once and check that it moves something.
+
+**Guardrails, because a sweep is a multiple-comparisons machine:**
+
+- the per-symbol grid always renders; there is no mode that prints one blended number;
+- an `insufficient` cell (no completed cycle in the window) is flagged and excluded from
+  every median/min/max — never rendered as a return, never as 0%;
+- **without `--holdout-start` the report opens with an IN-SAMPLE ONLY banner**, and the
+  JSON carries `"in_sample_only": true`. That is the default path, and it is the dangerous
+  one: 60 numbers chosen on the same window they were measured on, over a single vol
+  regime (option history starts 2024-02-01), means the best-looking arm is more often the
+  luckiest than the best;
+- a `--holdout-start` split adds a **sign-agreement** column: does this arm's advantage
+  *over base* keep its sign out of sample. **The two windows are independent replays** —
+  each starts flat with the full `--starting-cash`, carries no position across the
+  boundary, and derives its own strike anchors from its own bars; the fit window ends the
+  day *before* `--holdout-start`, so they never overlap. A **short holdout inflates
+  `insuf`**, because a cycle needs a put written, held and resolved: read that column
+  before the medians;
+- a cell whose wheel held a position on under `MIN_DAYS_IN_POSITION` (25%) of decision days
+  renders as **`low-act N%`** and is excluded from every median/min/max, exactly like
+  `insuf` — an annualised number earned on capital that mostly sat idle multiplies one
+  lucky trade by 365/days;
+- **`Δ vs base` is computed over the symbols measured in BOTH arms**, with the subset size
+  printed (`+2.0% (n=5)`) and blank when that subset is empty. Differencing two medians
+  taken over different symbol sets systematically flatters whichever arm traded less,
+  which is the wrong direction for a sweep to be wrong in;
+- every row, the scenario table and the JSON carry a **`scenario_hash`** (sha256 over the
+  sorted effective overrides plus `fill_haircut`). `config_hash` is kept for comparability
+  with `backtest_runs` rows but cannot tell two arms apart on its own: 12 of the 19
+  allowlisted keys are outside it, and the haircut it hashes is the module default. Where
+  it matches base's, the table prints `= base` rather than repeating the hex;
+- the report footer carries the engine's known biases plus the one that only matters when
+  comparing arms — the call leg is priced at 0.676 of live (FC-056), so an arm that writes
+  more calls is marked down for doing so;
+- one bad arm records its error on its rows and the sweep continues; the command exits
+  non-zero if any cell never produced a verdict;
+- **zero data-layer reads during replays is asserted on counters**, not logged. Both
+  halves are guarded: network round-trips (counted on a proxy wrapped directly around the
+  vendor client, so a cache hit is *not* one) and bar-cache reads. A regression that
+  re-fetched — or merely re-read disk — per replay would still produce correct numbers, so
+  nothing about the results would reveal it. The report header and the JSON say
+  `provider fetches N (0 during replays), bar-cache hits M`; conflating the two described a
+  fully-offline sweep as having made six provider calls.
+
+**Results are never persisted.** `backtest_runs`'s documented "current demotion
+candidates" query takes the latest `run_kind='full'` row, so a persisted full-universe
+sweep would displace the production screen with a hypothetical. Layer 3 owns a store that
+cannot do that.
+
+That is a statement about *results*, not about I/O. A sweep over a **cold** window does
+write: chains land in the local parquet cache and, when `CHAIN_LAKE_BUCKET` is set, are
+mirrored to the GCS chain lake exactly as a `--command backtest` or a screen would mirror
+them. That is the shared chain store doing its job — the objects are point-in-time vendor
+data, identical whichever command fetched them — and it is independent of anything about
+the sweep's conclusions. Bars land in the local bars cache the same way. If you want a
+sweep to touch neither, unset `CHAIN_LAKE_BUCKET` and point `BACKTEST_BARS_CACHE_DIR`
+somewhere disposable.
+
+**Sequential by design (no `--workers`).** The engine is process-safe but thread-UNSAFE:
+`ExecutionEngine._failed_symbols` is a module global the day loop clears, and
+`RejectionTally` installs itself with a process-global `structlog.configure()`. At the
+measured cost below, multiprocessing is not worth the work.
+
+**No `binding_constraint` column, and that is deliberate.** Only the **first** replay in a
+process gets a working `RejectionTally`: `setup_logging` sets
+`cache_logger_on_first_use=True`, a structlog lazy proxy caches its whole processor chain
+on first use, and `structlog.configure()` — which is how the tally installs itself — does
+not invalidate that cache. So every strategy logger keeps delivering to replay #1's tally
+for the life of the process, and replays 2..N would report an empty
+`blocked_days_by_reason`. Measured on `main` at `7087007`: two `evaluate_symbol` calls in
+one process give `{'already holds this underlying (scan, put)': 16, 'selection: duplicate
+underlying': 4}` then `{}`. **This is pre-existing and also affects the monthly screen**,
+which runs 14 symbols in one process — 13 of every 14 `backtest_runs` rows already carry an
+empty tally and a NULL `binding_constraint`. Fixing it changes what that table means, so it
+needs its own FC; what the sweep will not do is report a column that is NULL by artifact.
+
+#### Measured (dev machine, 2026-08-28, warm caches, no lake)
+
+Ten scenarios (base + 9 selection-only deltas) × the six effective-universe symbols ×
+one year, 2025-08-01 → 2026-07-31:
+
+| | `--no-sensitivity` (60 replays) | with sensitivity (120 replays) |
+|---|---:|---:|
+| materialise, total | 3.66 s (0.50–0.91 s/symbol) | 3.65 s |
+| replay, total | 13.42 s (0.224 s/cell) | 26.80 s (0.447 s/cell) |
+| **wall clock** | **17.1 s** | **30.5 s** |
+| network fetches during replays | 0 | 0 |
+| bar-cache reads during replays | 0 | 0 |
+
+The same 60 cells as independent full runs on `main` — warm caches, no bar cache, which is
+what a shell loop over `--command backtest` would cost — is **190.2 s (3.17 s/cell)**. So
+the sweep is ~11× faster than the thing it replaces, and the gap widens with scenario
+count because materialisation is paid once rather than per arm.
+
+The first sweep of a *cold* window costs its materialisation once — 60.9 s wall on the run
+that warmed the bar cache and refetched the strike windows a year-long window widened. The
+plan's target was under two minutes; the cold case meets it and the warm case is an order
+of magnitude inside it.
+
+**Every allowlisted key has been checked against a live replay**, not just read: all 19
+move at least one row at an extreme value over AAPL+NVDA × one year.
+
+`rolling.fallback_strike_attempts` was the twentieth, was carried as *unproven* on the
+reading that "did not bind" is not "cannot bind", and is now **refused**. A reviewer
+settled it by instrumenting the roller: the knob governs the third and later strike rungs,
+and rung 1 always fills in a replay — `BacktestAlpacaClient.place_option_order` fills
+immediately at the broker's haircut price rather than resting a limit that can go unfilled
+— so over 37 rolls × 7 arms, rung ≥ 3 was reached **0 times**. It is live in production,
+where a real limit can miss; it is inert here. The general lesson is in the allowlist's
+own docstring: *unproven* is a reason to go and measure, not a reason to ship the key.
+
+Single warm pass over one symbol-year, before and after the row-conversion rewrite (D5):
+
+| | `main` | this branch |
+|---|---:|---:|
+| AAPL, chain assembly | 1.63 s | 0.51 s |
+| AAPL, full pass | 3.65 s | 0.90 s |
+| NVDA, full pass | 4.20 s | 0.95 s |
+| row conversion alone, AAPL symbol-year (46,643 quotes) | 1.361 s | 0.267 s (**5.1×**) |
+| row conversion alone, NVDA symbol-year (57,720 quotes) | 1.706 s | 0.303 s (**5.6×**) |
+
+`ChainStore.get` now narrows with a vectorised mask and converts with `itertuples` instead
+of `df.iterrows()` plus a per-cell label lookup. Output is identical, pinned by
+`tests/test_backtest_data.py::TestRowConversionIsIdenticalToTheLegacyLoop`, which keeps a
+verbatim copy of the old converter as its oracle and runs it against real cached files.
 
 ### Operating notes
 

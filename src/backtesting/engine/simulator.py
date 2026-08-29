@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
@@ -104,6 +104,58 @@ def restrict_symbols(config: Config, symbols: Sequence[str]) -> Config:
     narrowed = copy.deepcopy(config)
     narrowed._config["stocks"]["symbols"] = list(symbols)
     return narrowed
+
+
+@dataclass(frozen=True)
+class Materialised:
+    """Everything a replay needs that does NOT depend on the strategy config.
+
+    FC-060 Layer 2. The expensive half of a run is data assembly — bars from the
+    provider and chains from the parquet cache — and it is *config-independent*:
+    the chain model fingerprint takes no ``settings.yaml`` input
+    (``ChainBuilder._model_fingerprint``) and the strike window is derived from
+    bars alone (``Simulator._strike_anchors``). So the same ``Materialised`` can
+    be replayed under many strategy configs, which is what makes a scenario
+    sweep affordable (see ``src/backtesting/scenarios``).
+
+    **A replay must never mutate one.** ``chains`` is shared across every
+    scenario in a sweep; a replay that edited a ``ChainSnapshot`` would silently
+    contaminate every later scenario with the previous one's state. Both
+    ``ChainSnapshot`` and ``ChainQuote`` are frozen dataclasses, and
+    ``BacktestAlpacaClient`` only ever reads them (it appends to local lists it
+    builds itself) — verified, and pinned by
+    ``tests/test_backtest_materialise.py``.
+
+    Attributes:
+        symbols: the universe this was built for. A replay whose simulator
+            carries a different universe is rejected — the chains would not
+            cover it.
+        start/end: the *requested* decision window (not ``days[0]``/``days[-1]``).
+        stock_bars: symbol -> bars, INCLUDING the warm-up buffer before ``start``.
+        days: the decision days (sessions inside ``[start, end]``), ascending.
+        anchors: symbol -> ``(cost_basis_ceiling, low_anchor)``, the strike
+            window the chains were fetched under.
+        chains: symbol -> as_of -> snapshot.
+        splits: symbol -> ``(date, ratio)`` for a split detected inside the
+            WARM-UP buffer, which ``materialise`` tolerates and logs. A split in
+            the decision window raises instead, so it can never appear here.
+        max_dte: the DTE reach the chains were built with.
+        built_at: wall-clock construction time (provenance only).
+        model_fingerprints: symbol -> ``ChainBuilder._model_fingerprint``, so a
+            reader can tell which pricing model produced these quotes.
+    """
+
+    symbols: List[str]
+    start: date
+    end: date
+    stock_bars: Dict[str, List[StockBar]]
+    days: List[date]
+    anchors: Dict[str, "tuple[Optional[float], Optional[float]]"]
+    chains: Dict[str, Dict[date, ChainSnapshot]]
+    splits: Dict[str, Optional[tuple]] = field(default_factory=dict)
+    max_dte: int = 7
+    built_at: Optional[datetime] = None
+    model_fingerprints: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -243,12 +295,23 @@ class Simulator:
         return sorted(days)
 
     def _build_chains(
-        self, stock_bars: Dict[str, List[StockBar]], days: Sequence[date]
+        self,
+        stock_bars: Dict[str, List[StockBar]],
+        days: Sequence[date],
+        anchors: Optional[Dict[str, "tuple[Optional[float], Optional[float]]"]] = None,
     ) -> Dict[str, Dict[date, ChainSnapshot]]:
+        """Build every (symbol, day) chain for the window.
+
+        ``anchors`` is an out-parameter, filled in with the strike window each
+        symbol's chains were fetched under so ``materialise`` can record it.
+        Passing None keeps the pre-FC-060 signature working unchanged.
+        """
         chains: Dict[str, Dict[date, ChainSnapshot]] = {}
         for symbol in self.symbols:
             closes = {b.bar_date: b.close for b in stock_bars.get(symbol, [])}
             ceiling, floor = self._strike_anchors(stock_bars.get(symbol, []))
+            if anchors is not None:
+                anchors[symbol] = (ceiling, floor)
             per_day: Dict[date, ChainSnapshot] = {}
             for day in days:
                 if day not in closes:
@@ -311,9 +374,34 @@ class Simulator:
         return max(closes), min(closes)
 
     # ------------------------------------------------------------------ #
-    # Run
+    # Run = materialise + replay
     # ------------------------------------------------------------------ #
     def run(self) -> SimulationResult:
+        """One replay of this simulator's config over its window.
+
+        FC-060 Layer 2 split this into ``materialise()`` (provider + cache work,
+        config-independent) and ``replay()`` (the day loop). ``run()`` is exactly
+        their composition and its output is byte-identical to the pre-split
+        version — proven by ``tests/test_backtest_materialise.py`` and by the
+        report hashes in the FC-060 Layer 2 PR.
+        """
+        return self.replay(self.materialise())
+
+    def materialise(self) -> Materialised:
+        """Assemble every config-independent input the day loop needs.
+
+        This is the whole of ``run()``'s former prologue: load bars (with the
+        warm-up buffer), derive the decision days, refuse an unmodelled split in
+        the decision window, and build the chains.
+
+        None of it depends on ``self.config``: the chain model fingerprint takes
+        no ``settings.yaml`` input and the strike window comes from bars alone.
+        That is what licenses replaying one ``Materialised`` under many strategy
+        configs — see ``src/backtesting/scenarios``. It is emphatically NOT a
+        licence to vary ``put_target_dte`` (the chains are built to ``max_dte``,
+        fixed here) or anything else that changes what the chain must contain;
+        the scenario allowlist enforces that separately.
+        """
         stock_bars = self._load_stock_bars()
         days = self._trading_days(stock_bars)
         if not days:
@@ -325,8 +413,10 @@ class Simulator:
         # are correct for point-in-time chain work but cannot span a split: the
         # benchmark and the equity curve would both read a -90% crash that
         # never happened.
+        splits: Dict[str, Optional[tuple]] = {}
         for symbol, bars in stock_bars.items():
             split = detect_split(bars)
+            splits[symbol] = split
             if split is not None:
                 split_date, ratio = split
                 # A split inside the WARM-UP buffer is survivable: those bars
@@ -356,12 +446,83 @@ class Simulator:
                     f"{split_date}."
                 )
 
-        chains = self._build_chains(stock_bars, days)
+        anchors: Dict[str, "tuple[Optional[float], Optional[float]]"] = {}
+        chains = self._build_chains(stock_bars, days, anchors)
+
+        return Materialised(
+            symbols=list(self.symbols),
+            start=self.start,
+            end=self.end,
+            stock_bars=stock_bars,
+            days=days,
+            anchors=anchors,
+            chains=chains,
+            splits=splits,
+            max_dte=self.max_dte,
+            built_at=datetime.now(),
+            model_fingerprints={
+                s: self.builder._model_fingerprint(s) for s in self.symbols
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    # Replay
+    # ------------------------------------------------------------------ #
+    def replay(
+        self,
+        materialised: Materialised,
+        *,
+        fill_haircut: Optional[float] = None,
+    ) -> SimulationResult:
+        """Run the day loop against an already-materialised window.
+
+        Args:
+            materialised: the output of ``materialise()`` — bars, days, anchors
+                and chains. **Never mutated.** The same object is replayed by
+                every scenario in a sweep, so a mutation here would leak one
+                scenario's state into the next.
+            fill_haircut: override the simulator's fill assumption for this
+                replay only (0 = mid, 1 = bid). ``None`` uses
+                ``self.fill_haircut``. The simulator's own attribute is left
+                alone, so replaying at the bid does not change what a later
+                replay on the same object does.
+
+        Raises:
+            ValueError: if ``materialised`` was built for a different universe,
+                window or DTE reach. Silently replaying against chains that do
+                not cover this simulator's request would produce a confident,
+                wrong answer — exactly what ``ChainStore._covers`` fails closed
+                on one layer down.
+        """
+        if list(materialised.symbols) != list(self.symbols):
+            raise ValueError(
+                f"Materialised universe {materialised.symbols} does not match "
+                f"this simulator's {self.symbols}; its chains would not cover "
+                "the replay."
+            )
+        if (materialised.start, materialised.end) != (self.start, self.end):
+            raise ValueError(
+                f"Materialised window {materialised.start}..{materialised.end} "
+                f"does not match this simulator's {self.start}..{self.end}."
+            )
+        if materialised.max_dte != self.max_dte:
+            raise ValueError(
+                f"Materialised chains reach {materialised.max_dte} DTE; this "
+                f"simulator asks for {self.max_dte}. A wider reach needs a "
+                "re-materialisation, not a replay."
+            )
+
+        stock_bars = materialised.stock_bars
+        days = materialised.days
+        chains = materialised.chains
+        effective_haircut = (
+            self.fill_haircut if fill_haircut is None else fill_haircut
+        )
 
         broker = BacktestBroker(
             starting_cash=self.starting_cash,
             fees_per_contract=self.fees_per_contract,
-            fill_haircut=self.fill_haircut,
+            fill_haircut=effective_haircut,
         )
         client = BacktestAlpacaClient(broker, chains=chains, stock_bars=stock_bars)
 
