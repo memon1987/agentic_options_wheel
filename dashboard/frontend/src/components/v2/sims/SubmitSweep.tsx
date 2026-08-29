@@ -151,7 +151,8 @@ export default function SubmitSweep({
     setScenariosText(serialiseScenarios([...existing, arm]));
   };
 
-  const onSubmit = async () => {
+  const onSubmit = async (event?: React.FormEvent) => {
+    event?.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
     setOutcome(null);
@@ -175,7 +176,10 @@ export default function SubmitSweep({
   };
 
   return (
-    <section className="rounded-lg border border-gray-700 bg-gray-800 p-4 space-y-4">
+    <form
+      onSubmit={onSubmit}
+      className="rounded-lg border border-gray-700 bg-gray-800 p-4 space-y-4"
+    >
       <div className="flex items-baseline justify-between flex-wrap gap-2">
         <h2 className="text-base font-semibold text-white">New sweep</h2>
         <span className="text-xs text-gray-500">
@@ -432,8 +436,7 @@ export default function SubmitSweep({
 
       <div className="flex items-center gap-3 flex-wrap">
         <button
-          type="button"
-          onClick={onSubmit}
+          type="submit"
           disabled={!canSubmit}
           data-testid="submit-sweep"
           className={cls(
@@ -453,7 +456,7 @@ export default function SubmitSweep({
 
       {/* --- the server's answer, verbatim --- */}
       {outcome && <Outcome outcome={outcome} />}
-    </section>
+    </form>
   );
 }
 
@@ -500,11 +503,6 @@ function Outcome({ outcome }: { outcome: SubmitOutcome }) {
       <pre className="text-xs text-red-200/90 whitespace-pre-wrap break-words font-mono">
         {outcome.detail}
       </pre>
-      {outcome.kind === 'conflict' && outcome.runningRunId && (
-        <p className="text-xs text-red-200/80">
-          Already running: <span className="font-mono">{outcome.runningRunId}</span>
-        </p>
-      )}
       {outcome.kind === 'error' && (
         <p className="text-xs text-red-200/80">
           Nothing was retried. Check the runs list before submitting again — a submit that failed to

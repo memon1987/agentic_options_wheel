@@ -13,17 +13,17 @@
     "engine_version": "fc-069-scanner-rewire",
     "base_config_hash": "a1b2c3d4e5f60718",
     "base_config_json": null,
-    "spec_json": "{\"symbols\": [\"AAPL\", \"NVDA\"], \"start\": \"2026-03-01\", \"end\": \"2026-05-29\", \"scenarios\": [{\"name\": \"puts_15_25\", \"overrides\": {\"strategy.put_delta_range\": [0.15, 0.25]}}, {\"name\": \"call_floor_0_50\", \"overrides\": {\"strategy.min_call_premium\": 0.5}}, {\"name\": \"at_the_bid\", \"overrides\": {}, \"fill_haircut\": 1.0}], \"starting_cash\": 100000.0, \"run_sensitivity\": false}",
+    "spec_json": "{\"symbols\": [\"AAPL\", \"NVDA\"], \"start\": \"2026-03-01\", \"end\": \"2026-05-29\", \"scenarios\": [{\"name\": \"puts_15_25\", \"overrides\": {\"strategy.put_delta_range\": [0.15, 0.25]}}, {\"name\": \"call_floor_0_50\", \"overrides\": {\"strategy.min_call_premium\": 0.5}}, {\"name\": \"at_the_bid\", \"overrides\": {}, \"fill_haircut\": 1.0}], \"starting_cash\": 100000.0, \"run_sensitivity\": false, \"holdout_start\": \"2026-05-01\"}",
     "symbols": [
       "AAPL",
       "NVDA"
     ],
     "window_start": "2026-03-01",
     "window_end": "2026-05-29",
-    "holdout_start": null,
-    "in_sample_only": true,
+    "holdout_start": "2026-05-01",
+    "in_sample_only": false,
     "scenario_count": 3,
-    "cell_count": 8,
+    "cell_count": 16,
     "wall_seconds": 98.4,
     "materialise_seconds": 60.1,
     "replay_seconds": 11.5,
@@ -62,7 +62,8 @@
       }
     ],
     "starting_cash": 100000.0,
-    "run_sensitivity": false
+    "run_sensitivity": false,
+    "holdout_start": "2026-05-01"
   },
   "scenarios": [
     "base",
@@ -75,23 +76,24 @@
     "NVDA"
   ],
   "splits": [
-    "all"
+    "fit",
+    "holdout"
   ],
   "grid": {
-    "all": {
+    "fit": {
       "base": {
         "AAPL": {
           "state": "measured",
           "verdict": "fit",
           "demote": false,
           "annualized_return": 0.184,
-          "total_return": null,
+          "total_return": 0.061,
           "days_in_position_fraction": 0.71,
           "cycles_completed": 2,
-          "puts_sold": null,
-          "calls_sold": null,
-          "bid_fill_return": null,
-          "verdict_flips_on_fill": null,
+          "puts_sold": 6,
+          "calls_sold": 3,
+          "bid_fill_return": 0.15,
+          "verdict_flips_on_fill": false,
           "error": null
         },
         "NVDA": {
@@ -99,13 +101,13 @@
           "verdict": "marginal",
           "demote": false,
           "annualized_return": 0.061,
-          "total_return": null,
+          "total_return": 0.021,
           "days_in_position_fraction": 0.55,
           "cycles_completed": 1,
-          "puts_sold": null,
-          "calls_sold": null,
-          "bid_fill_return": null,
-          "verdict_flips_on_fill": null,
+          "puts_sold": 5,
+          "calls_sold": 2,
+          "bid_fill_return": 0.02,
+          "verdict_flips_on_fill": true,
           "error": null
         }
       },
@@ -115,13 +117,13 @@
           "verdict": "fit",
           "demote": false,
           "annualized_return": 0.241,
-          "total_return": null,
+          "total_return": 0.081,
           "days_in_position_fraction": 0.78,
           "cycles_completed": 3,
-          "puts_sold": null,
-          "calls_sold": null,
-          "bid_fill_return": null,
-          "verdict_flips_on_fill": null,
+          "puts_sold": 7,
+          "calls_sold": 4,
+          "bid_fill_return": 0.2,
+          "verdict_flips_on_fill": false,
           "error": null
         },
         "NVDA": {
@@ -171,7 +173,7 @@
       },
       "at_the_bid": {
         "AAPL": {
-          "state": "measured",
+          "state": "unknown",
           "verdict": "marginal",
           "demote": false,
           "annualized_return": 0.071,
@@ -199,12 +201,134 @@
           "error": null
         }
       }
+    },
+    "holdout": {
+      "base": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "fit",
+          "demote": false,
+          "annualized_return": 0.121,
+          "total_return": 0.061,
+          "days_in_position_fraction": 0.71,
+          "cycles_completed": 2,
+          "puts_sold": 6,
+          "calls_sold": 3,
+          "bid_fill_return": 0.15,
+          "verdict_flips_on_fill": false,
+          "error": null
+        },
+        "NVDA": {
+          "state": "measured",
+          "verdict": "marginal",
+          "demote": false,
+          "annualized_return": -0.014,
+          "total_return": 0.021,
+          "days_in_position_fraction": 0.55,
+          "cycles_completed": 1,
+          "puts_sold": 5,
+          "calls_sold": 2,
+          "bid_fill_return": 0.02,
+          "verdict_flips_on_fill": true,
+          "error": null
+        }
+      },
+      "puts_15_25": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "fit",
+          "demote": false,
+          "annualized_return": 0.166,
+          "total_return": 0.081,
+          "days_in_position_fraction": 0.78,
+          "cycles_completed": 3,
+          "puts_sold": 7,
+          "calls_sold": 4,
+          "bid_fill_return": 0.2,
+          "verdict_flips_on_fill": false,
+          "error": null
+        },
+        "NVDA": {
+          "state": "insufficient",
+          "verdict": "insufficient",
+          "demote": null,
+          "annualized_return": null,
+          "total_return": null,
+          "days_in_position_fraction": 0.0,
+          "cycles_completed": 0,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      },
+      "call_floor_0_50": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "fit",
+          "demote": false,
+          "annualized_return": 0.131,
+          "total_return": null,
+          "days_in_position_fraction": 0.62,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        },
+        "NVDA": {
+          "state": "measured",
+          "verdict": "unfit",
+          "demote": true,
+          "annualized_return": -0.088,
+          "total_return": null,
+          "days_in_position_fraction": 0.51,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      },
+      "at_the_bid": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "marginal",
+          "demote": false,
+          "annualized_return": 0.044,
+          "total_return": null,
+          "days_in_position_fraction": 0.7,
+          "cycles_completed": 2,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        },
+        "NVDA": {
+          "state": "measured",
+          "verdict": "unfit",
+          "demote": true,
+          "annualized_return": -0.051,
+          "total_return": null,
+          "days_in_position_fraction": 0.54,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      }
     }
   },
   "summary": [
     {
       "scenario": "base",
-      "split": "all",
+      "split": "fit",
       "median": 0.1225,
       "min": 0.061,
       "max": 0.184,
@@ -218,7 +342,7 @@
     },
     {
       "scenario": "puts_15_25",
-      "split": "all",
+      "split": "fit",
       "median": 0.241,
       "min": 0.241,
       "max": 0.241,
@@ -232,7 +356,7 @@
     },
     {
       "scenario": "call_floor_0_50",
-      "split": "all",
+      "split": "fit",
       "median": -0.052,
       "min": -0.052,
       "max": -0.052,
@@ -246,21 +370,77 @@
     },
     {
       "scenario": "at_the_bid",
-      "split": "all",
-      "median": 0.024999999999999994,
+      "split": "fit",
+      "median": -0.021,
       "min": -0.021,
-      "max": 0.071,
-      "measured": 2,
+      "max": -0.021,
+      "measured": 1,
       "insufficient": 0,
       "low_activity": 0,
       "errors": 0,
       "demote_flags": 1,
       "delta_vs_base": -0.0975,
       "delta_symbols": 2
+    },
+    {
+      "scenario": "base",
+      "split": "holdout",
+      "median": 0.0535,
+      "min": -0.014,
+      "max": 0.121,
+      "measured": 2,
+      "insufficient": 0,
+      "low_activity": 0,
+      "errors": 0,
+      "demote_flags": 0,
+      "delta_vs_base": null,
+      "delta_symbols": 0
+    },
+    {
+      "scenario": "puts_15_25",
+      "split": "holdout",
+      "median": 0.166,
+      "min": 0.166,
+      "max": 0.166,
+      "measured": 1,
+      "insufficient": 1,
+      "low_activity": 0,
+      "errors": 0,
+      "demote_flags": 0,
+      "delta_vs_base": 0.04500000000000001,
+      "delta_symbols": 1
+    },
+    {
+      "scenario": "call_floor_0_50",
+      "split": "holdout",
+      "median": 0.021500000000000005,
+      "min": -0.088,
+      "max": 0.131,
+      "measured": 2,
+      "insufficient": 0,
+      "low_activity": 0,
+      "errors": 0,
+      "demote_flags": 1,
+      "delta_vs_base": -0.031999999999999994,
+      "delta_symbols": 2
+    },
+    {
+      "scenario": "at_the_bid",
+      "split": "holdout",
+      "median": -0.0034999999999999996,
+      "min": -0.051,
+      "max": 0.044,
+      "measured": 2,
+      "insufficient": 0,
+      "low_activity": 0,
+      "errors": 0,
+      "demote_flags": 1,
+      "delta_vs_base": -0.056999999999999995,
+      "delta_symbols": 2
     }
   ],
   "delta_vs_base": {
-    "all": {
+    "fit": {
       "base": {
         "median": 0.0,
         "symbols": 2
@@ -277,10 +457,45 @@
         "median": -0.0975,
         "symbols": 2
       }
+    },
+    "holdout": {
+      "base": {
+        "median": 0.0,
+        "symbols": 2
+      },
+      "puts_15_25": {
+        "median": 0.04500000000000001,
+        "symbols": 1
+      },
+      "call_floor_0_50": {
+        "median": -0.031999999999999994,
+        "symbols": 2
+      },
+      "at_the_bid": {
+        "median": -0.056999999999999995,
+        "symbols": 2
+      }
     }
   },
-  "sign_agreement": null,
-  "in_sample_only": true,
+  "sign_agreement": {
+    "base": {
+      "agreeing": 2,
+      "comparable": 2
+    },
+    "puts_15_25": {
+      "agreeing": 1,
+      "comparable": 1
+    },
+    "call_floor_0_50": {
+      "agreeing": 1,
+      "comparable": 1
+    },
+    "at_the_bid": {
+      "agreeing": 2,
+      "comparable": 2
+    }
+  },
+  "in_sample_only": false,
   "min_days_in_position": 0.25,
   "known_biases": [
     {
@@ -306,8 +521,8 @@
   ],
   "cross_scenario_caveat": "**Comparisons between scenarios that differ in call-leg activity are biased against the call-heavier one until FC-056 is fixed.** The engine prices identical call contracts at **last measured 0.676** of the live fill (a ~32% shortfall, ~5x the put leg's ~7% error) \u2014 **FC-056; that figure is stale, pending the FC-068/078 re-baseline**, so treat it as an order of magnitude rather than a coefficient. An arm that writes more calls is marked down for doing so. Rank arms that hold call activity roughly constant; treat a ranking across arms with very different `calls_sold` as unproven.",
   "rejection_tally_caveat": "**This report deliberately carries no `binding_constraint` column.** Only the FIRST replay in a process gets a working `RejectionTally`: `setup_logging` sets `cache_logger_on_first_use=True`, a structlog lazy proxy caches its whole processor chain on first use, and `structlog.configure()` \u2014 which is how the tally installs itself \u2014 does not invalidate that cache, so every strategy logger keeps delivering to replay #1's tally for the life of the process. Replays 2..N would report an empty `blocked_days_by_reason`, i.e. \"the strategy was never blocked\". That is a pre-existing defect (it also empties 13 of every 14 rows the monthly screen writes to `backtest_runs`), and reporting a column that is NULL by artifact would launder it. Every other number here comes from the broker ledger and the equity curve and is unaffected.",
-  "in_sample_banner": "> ## IN-SAMPLE ONLY \u2014 this ranking has not been validated\n>\n> Every arm below was measured on the same window it would be chosen from, over a **single volatility regime** (Alpaca's option history begins 2024-02-01). With 10 arms x 6 symbols there are 60 numbers here, and the best-looking arm is more often the luckiest one than the best one.\n>\n> **Re-run with `--holdout-start` and act on the sign-agreement column, not on this table.** A ranking that does not survive out of sample has been refuted, not merely unconfirmed.",
-  "holdout_semantics": null,
+  "in_sample_banner": null,
+  "holdout_semantics": "**How the split is run.** The two windows are independent replays, not one run cut in half: each starts flat with the full `--starting-cash`, carries no position across the boundary, and derives its own strike anchors from its own bars. So a holdout does not inherit the fit window's assigned shares \u2014 the wheel begins its cycle again \u2014 and the fit window ends the day BEFORE `--holdout-start`, so the two never overlap. **A short holdout inflates `insuf`**: a cycle needs a put to be written, held and resolved, so a window of a few weeks can end with nothing completed on symbols that traded perfectly well. Read the `insuf` column before reading the medians.",
   "scenario_hashes": {
     "base": "0000000000000000",
     "puts_15_25": "1111111111111111",
@@ -321,8 +536,12 @@
     "at_the_bid": "a1b2c3d4e5f60718"
   },
   "windows": {
-    "all": {
+    "fit": {
       "start": "2026-03-01",
+      "end": "2026-04-30"
+    },
+    "holdout": {
+      "start": "2026-05-01",
       "end": "2026-05-29"
     }
   },

@@ -209,16 +209,16 @@ describe("SubmitSweep — the server's answer is shown verbatim", () => {
     await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('old1'));
   });
 
-  it('shows a 409 with the run already in flight', async () => {
+  it('shows a 409 with the server detail, which names the run in flight', async () => {
     fetchMock.mockResolvedValue(
-      response(409, { detail: 'a sweep is already running', running_run_id: 'run-old' }),
+      response(409, { detail: 'sweep run-old is running; one sweep runs at a time.' }),
     );
     setup();
     fill();
     fireEvent.click(submitButton());
     const outcome = await screen.findByTestId('submit-outcome');
     expect(outcome.textContent).toMatch(/already in flight/i);
-    expect(outcome.textContent).toMatch(/run-old/);
+    expect(outcome.textContent).toContain('sweep run-old is running; one sweep runs at a time.');
   });
 
   it('shows a 422 reason unaltered', async () => {
@@ -247,6 +247,15 @@ describe("SubmitSweep — the server's answer is shown verbatim", () => {
     const outcome = await screen.findByTestId('submit-outcome');
     expect(outcome.textContent).toMatch(/Submits are disabled/);
     expect(outcome.textContent).toMatch(/no SWEEP_SUBMIT_TOKEN/);
+  });
+
+  it('submits on Enter from a field, not only on the button', async () => {
+    fetchMock.mockResolvedValue(response(200, { run_id: 'entered', status: 'submitted' }));
+    const { onSubmitted } = setup();
+    fill();
+    fireEvent.submit(submitButton().closest('form')!);
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('entered'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('says a failed submit was NOT retried — it may still have launched', async () => {

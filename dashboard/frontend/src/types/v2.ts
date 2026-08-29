@@ -410,6 +410,15 @@ export interface SweepRow {
   bar_cache_hits: number | null;
   lake_summary_json: string | null;
   error: string | null;
+  /**
+   * Server-computed: still `submitted` past the container-start window (D3).
+   *
+   * A LABEL and nothing more — this backend cannot cancel an execution. It is
+   * read rather than re-derived so the dashboard and the API can never disagree
+   * about whether a run is stuck, which is exactly the kind of split-brain a
+   * second clock buys you.
+   */
+  stuck?: boolean;
 }
 
 /**
@@ -463,6 +472,31 @@ export interface SweepWindow {
   end: string;
 }
 
+/** `windows` on the wire: `{split: {start, end}}`, from the stored columns. */
+export type SweepWindowMap = Record<string, { start: string; end: string }>;
+
+/**
+ * One row of the server's per-(scenario, split) summary.
+ *
+ * READ, never recomputed. Every median, min, max and count on the page comes
+ * from here — three implementations of "which cells count" would be three
+ * chances to average an `insuf` cell into a ranking.
+ */
+export interface SweepSummaryRow {
+  scenario: string;
+  split: string;
+  median: number | null;
+  min: number | null;
+  max: number | null;
+  measured: number;
+  insufficient: number;
+  low_activity: number;
+  errors: number;
+  demote_flags: number;
+  delta_vs_base: number | null;
+  delta_symbols: number;
+}
+
 export interface SweepDeltaCell {
   /** Median of the per-symbol deltas over the COMMON measured subset. */
   median: number | null;
@@ -505,6 +539,8 @@ export interface SweepReport {
     during_replays?: number;
   };
   rows: SweepResultRow[];
+  /** The server's aggregates. The page renders these; it never derives them. */
+  summary: SweepSummaryRow[];
   /** null when the run had no holdout — there is nothing to agree about. */
   sign_agreement: Record<string, SweepSignAgreement> | null;
   /** split -> scenario -> delta. */
@@ -518,15 +554,22 @@ export interface SweepReport {
   persisted?: boolean;
 }
 
-/** `GET /api/v2/sweeps/{run_id}`. `results` is null until the run is `done`. */
+/**
+ * `GET /api/v2/sweeps/{run_id}`.
+ *
+ * `results` is non-null ONLY for a `done` run. A `submitted`/`running` sweep
+ * comes back with `grid: {}` and `splits: []`, which would otherwise render as
+ * a finished report that measured nothing — the opposite of the truth.
+ */
 export interface SweepDetail {
   sweep: SweepRow;
   results: SweepReport | null;
-}
-
-/** `GET /api/v2/sweeps`. */
-export interface SweepListResponse {
-  sweeps: SweepRow[];
+  /**
+   * The response exactly as served. "Download JSON" exports THIS, not the
+   * normalised reconstruction: an export that quietly differed from what the
+   * API returned would be useless for reproducing or filing a bug.
+   */
+  raw: unknown;
 }
 
 export interface SweepCaps {
@@ -535,6 +578,11 @@ export interface SweepCaps {
   max_cells: number;
   max_window_days: number;
   min_holdout_days: number;
+  /** Present on the live allowlist; the form prefers these over its fallbacks. */
+  min_starting_cash?: number;
+  max_starting_cash?: number;
+  max_spec_bytes?: number;
+  running_lock_hours?: number;
 }
 
 export interface SweepPreset {

@@ -9,11 +9,17 @@
 //     were `insuf`.
 //   * NO BELOW-FLOOR CELL STYLED AS A RETURN. Enforced in `renderCell`.
 //
-// Everything narrative here — the in-sample banner, the holdout semantics, the
-// bias footer, the cross-scenario and rejection-tally caveats — is printed
-// VERBATIM from the API payload. These are the runner's own words about how far
-// its numbers can be trusted; paraphrasing them in a second place is how the two
-// copies drift and the weaker one gets quoted.
+// Nothing here computes a statistic. Median, min, max and the state counts are
+// read from the server's `summary`; deltas from `delta_vs_base`; agreement from
+// `sign_agreement`. The one thing counted client-side is `unknown` cells, which
+// the server's summary has no column for and without which the row would not
+// add up to the cells on screen.
+//
+// Everything narrative — the in-sample banner, the holdout semantics, the bias
+// footer, the cross-scenario and rejection-tally caveats — is printed BYTE FOR
+// BYTE from the API. These are the runner's own words about how far its numbers
+// can be trusted. An earlier cut stripped markdown out of them, which quietly
+// edited a warning; the fix is to render the string and nothing but the string.
 
 import type { SweepReport, SweepRow } from '../../../types/v2';
 import { fmtNumber, cls } from '../../../utils/format';
@@ -22,42 +28,56 @@ import {
   lookupCell,
   pctOrDash,
   renderCell,
-  summarise,
   splitsOf,
+  summaryFor,
+  unknownCount,
 } from './resultCells';
 
 interface Props {
   sweep: SweepRow;
   report: SweepReport;
+  /** The response exactly as served — what "Download JSON" writes out. */
+  raw?: unknown;
 }
 
 const SPLIT_LABEL: Record<string, string> = { fit: 'Fit', holdout: 'Holdout', all: 'Full window' };
 const splitLabel = (s: string) => SPLIT_LABEL[s] ?? s;
 
 /**
- * Markdown-ish blockquote text (the banner ships as `> ## …` lines) rendered as
- * plain text with the quote markers stripped. Deliberately NOT a markdown
- * renderer: no dependency, and no chance of an upstream string being swallowed
- * by a parser that does not like it.
+ * Shown when `in_sample_only` is true but the payload carried no banner string.
+ *
+ * The banner keys on the FLAG, never on the presence of the text: a missing
+ * string must not be able to suppress the warning. This copy is the fallback of
+ * last resort — the payload's own words are used whenever they arrive.
  */
-function Prose({ text, className }: { text: string; className?: string }) {
-  const stripped = text
-    .split('\n')
-    .map((line) => line.replace(/^>\s?/, '').replace(/^#+\s*/, ''))
-    .join('\n')
-    .replace(/\*\*/g, '')
-    .replace(/`/g, '')
-    .trim();
-  return <p className={cls('whitespace-pre-wrap', className)}>{stripped}</p>;
+const IN_SAMPLE_FALLBACK =
+  'IN-SAMPLE ONLY — this ranking has not been validated. Every arm below was ' +
+  'measured on the same window it would be chosen from, over a single volatility ' +
+  'regime. The best-looking arm is more often the luckiest one than the best one. ' +
+  'Re-run with a holdout and act on the sign-agreement column, not on this table.';
+
+/** An arm that varies only the fill assumption, not any config key. */
+const isHaircutOnly = (report: SweepReport, scenario: string): boolean =>
+  report.scenario_fill_haircuts?.[scenario] != null &&
+  Object.keys(report.scenario_overrides?.[scenario] ?? {}).length === 0;
+
+/** The server's prose, rendered exactly as sent. No parsing, no stripping. */
+function Verbatim({ text, className }: { text: string; className?: string }) {
+  return <p className={cls('whitespace-pre-wrap', className)}>{text}</p>;
 }
 
-export default function SweepResults({ sweep, report }: Props) {
+export default function SweepResults({ sweep, report, raw }: Props) {
   const splits = splitsOf(report);
   const index = indexRows(report.rows);
   const hasHoldout = splits.includes('holdout');
+  const baseConfigHash = report.scenario_config_hashes?.base ?? report.base_config_hash ?? null;
 
   const download = () => {
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    // The RAW response, not the normalised reconstruction. An export that
+    // differed from what the API served would be useless for reproducing a run
+    // or filing a bug against it.
+    const payload = raw === undefined ? report : raw;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -70,16 +90,16 @@ export default function SweepResults({ sweep, report }: Props) {
 
   return (
     <section className="space-y-5" data-testid="sweep-results">
-      {/* The headline caveat, and the case that needs it most is the default. */}
-      {report.in_sample_only && report.in_sample_banner && (
+      {/* Keyed on the FLAG alone. A missing banner string cannot suppress it. */}
+      {report.in_sample_only && (
         <div
           data-testid="in-sample-banner"
           className="rounded-lg border border-yellow-700/70 bg-yellow-950/40 p-4"
         >
-          <h3 className="text-sm font-semibold text-yellow-300">
-            ⚠ IN-SAMPLE ONLY — this ranking has not been validated
-          </h3>
-          <Prose text={report.in_sample_banner} className="text-xs text-yellow-200/90 mt-2" />
+          <Verbatim
+            text={report.in_sample_banner ?? IN_SAMPLE_FALLBACK}
+            className="text-xs text-yellow-200/90"
+          />
         </div>
       )}
 
@@ -119,11 +139,17 @@ export default function SweepResults({ sweep, report }: Props) {
                     {report.symbols.map((sym) => (
                       <th key={sym} className="text-right px-3 py-2 font-mono">{sym}</th>
                     ))}
-                    <th className="text-right px-3 py-2" title="Cells carrying a number worth ranking / no completed cycle / held on too few days / errored">
-                      measured · insuf · low-act · err
+                    <th
+                      className="text-right px-3 py-2"
+                      title="Cells carrying a number worth ranking / no completed cycle / held on too few days / errored / never classified. These sum to the cells in the row."
+                    >
+                      measured · insuf · low-act · err · unk
                     </th>
-                    <th className="text-right px-3 py-2" title="Median annualised return over the MEASURED cells only">
+                    <th className="text-right px-3 py-2" title="Server-computed median over the MEASURED cells only">
                       median
+                    </th>
+                    <th className="text-right px-3 py-2" title="Server-computed min and max over the MEASURED cells only">
+                      min / max
                     </th>
                     <th className="text-right px-4 py-2" title="Median of the per-symbol deltas over the common measured subset">
                       Δ vs base
@@ -132,16 +158,36 @@ export default function SweepResults({ sweep, report }: Props) {
                 </thead>
                 <tbody>
                   {report.scenarios.map((scenario) => {
-                    const summary = summarise(report.rows, scenario, split);
+                    const summary = summaryFor(report, scenario, split);
+                    const unk = unknownCount(report.rows, scenario, split);
                     const delta = report.delta_vs_base?.[split]?.[scenario];
                     const isBase = scenario === 'base';
+                    const measured = summary?.measured ?? 0;
                     return (
                       <tr key={scenario} className="border-t border-gray-700/60">
                         <td className="px-4 py-2 font-mono text-blue-300 whitespace-nowrap">
                           {scenario}
-                          {report.scenario_fill_haircuts?.[scenario] != null && (
-                            <span className="text-gray-500 text-xs ml-2">
-                              haircut {report.scenario_fill_haircuts[scenario]}
+                          {isHaircutOnly(report, scenario) ? (
+                            <span
+                              className="text-amber-400/80 text-xs ml-2 font-sans"
+                              title="This arm changes no config key — only the assumed fill price. It measures how sensitive the result is to the fill model, not whether a different strategy is better."
+                            >
+                              fill-model sensitivity (haircut{' '}
+                              {report.scenario_fill_haircuts?.[scenario]})
+                            </span>
+                          ) : (
+                            report.scenario_fill_haircuts?.[scenario] != null && (
+                              <span className="text-gray-500 text-xs ml-2">
+                                haircut {report.scenario_fill_haircuts[scenario]}
+                              </span>
+                            )
+                          )}
+                          {(summary?.demote_flags ?? 0) > 0 && (
+                            <span
+                              className="text-xs text-gray-500 ml-2 font-sans"
+                              title="Cells the engine flagged as demotion candidates."
+                            >
+                              {summary?.demote_flags} demote
                             </span>
                           )}
                         </td>
@@ -160,23 +206,28 @@ export default function SweepResults({ sweep, report }: Props) {
                             </td>
                           );
                         })}
-                        <td className="px-3 py-2 text-right text-xs whitespace-nowrap">
-                          <span className="text-gray-200">{summary.measured}</span>
+                        <td
+                          className="px-3 py-2 text-right text-xs whitespace-nowrap"
+                          data-testid={`counts-${scenario}-${split}`}
+                        >
+                          <span className="text-gray-200">{measured}</span>
                           <span className="text-gray-600"> · </span>
-                          <span className={summary.insufficient ? 'text-gray-300' : 'text-gray-600'}>
-                            {summary.insufficient}
+                          <span className={summary?.insufficient ? 'text-gray-300' : 'text-gray-600'}>
+                            {summary?.insufficient ?? 0}
                           </span>
                           <span className="text-gray-600"> · </span>
-                          <span className={summary.lowActivity ? 'text-amber-300' : 'text-gray-600'}>
-                            {summary.lowActivity}
+                          <span className={summary?.low_activity ? 'text-amber-300' : 'text-gray-600'}>
+                            {summary?.low_activity ?? 0}
                           </span>
                           <span className="text-gray-600"> · </span>
-                          <span className={summary.errored ? 'text-red-300' : 'text-gray-600'}>
-                            {summary.errored}
+                          <span className={summary?.errors ? 'text-red-300' : 'text-gray-600'}>
+                            {summary?.errors ?? 0}
                           </span>
+                          <span className="text-gray-600"> · </span>
+                          <span className={unk ? 'text-purple-300' : 'text-gray-600'}>{unk}</span>
                         </td>
                         <td className="px-3 py-2 text-right text-gray-200">
-                          {summary.measured === 0 ? (
+                          {measured === 0 ? (
                             <span
                               className="text-xs text-gray-500"
                               title="Nothing was measured in this row, so there is no median to take."
@@ -184,8 +235,13 @@ export default function SweepResults({ sweep, report }: Props) {
                               no measured cell
                             </span>
                           ) : (
-                            pctOrDash(summary.median)
+                            pctOrDash(summary?.median ?? null)
                           )}
+                        </td>
+                        <td className="px-3 py-2 text-right text-gray-400 text-xs whitespace-nowrap">
+                          {measured === 0
+                            ? '—'
+                            : `${pctOrDash(summary?.min ?? null)} / ${pctOrDash(summary?.max ?? null)}`}
                         </td>
                         <td className="px-4 py-2 text-right whitespace-nowrap">
                           {isBase ? (
@@ -229,7 +285,7 @@ export default function SweepResults({ sweep, report }: Props) {
                   <th className="text-right px-3 py-2">Δ vs base (holdout)</th>
                   <th
                     className="text-right px-4 py-2"
-                    title="Symbols where the arm's sign vs base is the SAME in both windows, over the symbols comparable in both. This is the column to act on."
+                    title="Symbols where the arm's sign vs base is the SAME in both windows, over the symbols comparable in both. Read it as evidence, not as a pass mark: 1/1 is one symbol agreeing with itself."
                   >
                     sign agreement
                   </th>
@@ -237,8 +293,8 @@ export default function SweepResults({ sweep, report }: Props) {
               </thead>
               <tbody>
                 {report.scenarios.map((scenario) => {
-                  const fit = summarise(report.rows, scenario, 'fit');
-                  const hold = summarise(report.rows, scenario, 'holdout');
+                  const fit = summaryFor(report, scenario, 'fit');
+                  const hold = summaryFor(report, scenario, 'holdout');
                   const dFit = report.delta_vs_base?.fit?.[scenario];
                   const dHold = report.delta_vs_base?.holdout?.[scenario];
                   const agree = report.sign_agreement?.[scenario];
@@ -247,10 +303,18 @@ export default function SweepResults({ sweep, report }: Props) {
                     <tr key={scenario} className="border-t border-gray-700/60">
                       <td className="px-4 py-2 font-mono text-blue-300">{scenario}</td>
                       <td className="px-3 py-2 text-right text-gray-200">
-                        {fit.measured === 0 ? <span className="text-xs text-gray-500">—</span> : pctOrDash(fit.median)}
+                        {(fit?.measured ?? 0) === 0 ? (
+                          <span className="text-xs text-gray-500">—</span>
+                        ) : (
+                          pctOrDash(fit?.median ?? null)
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right text-gray-200">
-                        {hold.measured === 0 ? <span className="text-xs text-gray-500">—</span> : pctOrDash(hold.median)}
+                        {(hold?.measured ?? 0) === 0 ? (
+                          <span className="text-xs text-gray-500">—</span>
+                        ) : (
+                          pctOrDash(hold?.median ?? null)
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right text-gray-200">
                         {isBase ? '—' : `${pctOrDash(dFit?.median ?? null)} (n=${dFit?.symbols ?? 0})`}
@@ -258,19 +322,15 @@ export default function SweepResults({ sweep, report }: Props) {
                       <td className="px-3 py-2 text-right text-gray-200">
                         {isBase ? '—' : `${pctOrDash(dHold?.median ?? null)} (n=${dHold?.symbols ?? 0})`}
                       </td>
-                      <td className="px-4 py-2 text-right">
-                        {isBase || !agree || agree.comparable === 0 ? (
-                          <span className="text-gray-600 text-xs">—</span>
-                        ) : (
-                          <span
-                            className={cls(
-                              'font-mono',
-                              agree.agreeing === agree.comparable ? 'text-green-400' : 'text-yellow-300',
-                            )}
-                          >
-                            {agree.agreeing}/{agree.comparable}
-                          </span>
-                        )}
+                      {/* Plain text, deliberately uncoloured. Green on 1/1 read
+                          as "validated" — it is one symbol agreeing with itself. */}
+                      <td
+                        className="px-4 py-2 text-right font-mono text-gray-200"
+                        data-testid={`agreement-${scenario}`}
+                      >
+                        {isBase || !agree || agree.comparable === 0
+                          ? '—'
+                          : `${agree.agreeing}/${agree.comparable}`}
                       </td>
                     </tr>
                   );
@@ -280,7 +340,7 @@ export default function SweepResults({ sweep, report }: Props) {
           </div>
           {report.holdout_semantics && (
             <div className="px-4 py-3 border-t border-gray-700">
-              <Prose text={report.holdout_semantics} className="text-xs text-gray-400" />
+              <Verbatim text={report.holdout_semantics} className="text-xs text-gray-400" />
             </div>
           )}
         </div>
@@ -308,7 +368,7 @@ export default function SweepResults({ sweep, report }: Props) {
           </div>
           <div>
             <dt className="text-gray-500">base config hash</dt>
-            <dd className="font-mono text-gray-300 break-all">{report.base_config_hash ?? '—'}</dd>
+            <dd className="font-mono text-gray-300 break-all">{baseConfigHash ?? '—'}</dd>
           </div>
           <div>
             <dt className="text-gray-500">starting cash</dt>
@@ -323,7 +383,10 @@ export default function SweepResults({ sweep, report }: Props) {
             </dd>
           </div>
           <div>
-            <dt className="text-gray-500" title="Network round-trips to the vendor. A bar served from the cache is a cache hit, not a fetch.">
+            <dt
+              className="text-gray-500"
+              title="Network round-trips to the vendor. A bar served from the cache is a cache hit, not a fetch."
+            >
               provider fetches
             </dt>
             <dd className="text-gray-300">
@@ -337,7 +400,10 @@ export default function SweepResults({ sweep, report }: Props) {
             <thead className="text-gray-500">
               <tr>
                 <th className="text-left py-1">arm</th>
-                <th className="text-left py-1" title="Identity of the ARM. config_hash cannot separate two arms that differ outside its nine strategy keys.">
+                <th
+                  className="text-left py-1"
+                  title="Identity of the ARM. config_hash cannot separate two arms that differ outside its nine strategy keys."
+                >
                   scenario_hash
                 </th>
                 <th className="text-left py-1">config_hash</th>
@@ -345,39 +411,65 @@ export default function SweepResults({ sweep, report }: Props) {
               </tr>
             </thead>
             <tbody>
-              {report.scenarios.map((s) => (
-                <tr key={s} className="border-t border-gray-700/50">
-                  <td className="py-1 font-mono text-blue-300 pr-3">{s}</td>
-                  <td className="py-1 font-mono text-gray-400 pr-3">{report.scenario_hashes?.[s] ?? '—'}</td>
-                  <td className="py-1 font-mono text-gray-400 pr-3">{report.scenario_config_hashes?.[s] ?? '—'}</td>
-                  <td className="py-1 font-mono text-gray-400">
-                    {JSON.stringify(report.scenario_overrides?.[s] ?? {})}
-                  </td>
-                </tr>
-              ))}
+              {report.scenarios.map((s) => {
+                const configHash = report.scenario_config_hashes?.[s] ?? null;
+                // An equality check against base's hash, NOT a recomputation.
+                // An arm whose config hashes to base's changed nothing the hash
+                // covers — worth saying out loud, because it will read as base.
+                const sameAsBase = s !== 'base' && !!configHash && configHash === baseConfigHash;
+                return (
+                  <tr key={s} className="border-t border-gray-700/50">
+                    <td className="py-1 font-mono text-blue-300 pr-3 whitespace-nowrap">
+                      {s}
+                      {isHaircutOnly(report, s) && (
+                        <span className="text-amber-400/80 ml-2 font-sans">fill-model sensitivity</span>
+                      )}
+                    </td>
+                    <td className="py-1 font-mono text-gray-400 pr-3">
+                      {report.scenario_hashes?.[s] ?? '—'}
+                    </td>
+                    <td className="py-1 font-mono text-gray-400 pr-3 whitespace-nowrap">
+                      {configHash ?? '—'}
+                      {sameAsBase && (
+                        <span
+                          className="text-gray-500 ml-2 font-sans"
+                          title="This arm's config_hash equals base's: it changed nothing the hash covers. Either the difference lives outside the nine hashed keys (a fill_haircut does), or the override did not bind."
+                        >
+                          = base
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-1 font-mono text-gray-400">
+                      {JSON.stringify(report.scenario_overrides?.[s] ?? {})}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
       </div>
 
-      {/* ---- The bias footer, verbatim. ---- */}
+      {/* ---- The bias footer, byte for byte. ---- */}
       <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-4" data-testid="bias-footer">
         <h3 className="text-sm font-semibold text-gray-300">How far to trust these numbers</h3>
-        <Prose text={report.cross_scenario_caveat} className="text-xs text-gray-400 mt-3" />
-        <Prose text={report.rejection_tally_caveat} className="text-xs text-gray-400 mt-3" />
+        <Verbatim text={report.cross_scenario_caveat} className="text-xs text-gray-400 mt-3" />
+        <Verbatim text={report.rejection_tally_caveat} className="text-xs text-gray-400 mt-3" />
         <ul className="mt-3 space-y-2">
           {report.known_biases.map((bias) => (
             <li key={bias.title}>
               <p className="text-xs font-semibold text-gray-300">{bias.title}</p>
-              <Prose text={bias.detail} className="text-xs text-gray-500" />
+              <Verbatim text={bias.detail} className="text-xs text-gray-500" />
             </li>
           ))}
         </ul>
         <p className="text-xs text-gray-500 mt-3">
           A cell is <span className="font-mono text-gray-300">insuf</span> when the window contained no
-          completed cycle, and <span className="font-mono text-amber-300">low-act N%</span> when a position
-          was held on under {Math.round((report.min_days_in_position ?? 0.25) * 100)}% of decision days.
-          Neither is a small return: both are excluded from every median and every Δ on this page.
+          completed cycle, <span className="font-mono text-amber-300">low-act N%</span> when a position
+          was held on under {Math.round((report.min_days_in_position ?? 0.25) * 100)}% of decision days,
+          and <span className="font-mono text-purple-300">unknown</span> when the stored row carries no
+          state flag at all. None of the three is a small return: all are excluded from every median
+          and every Δ on this page.
         </p>
       </div>
     </section>

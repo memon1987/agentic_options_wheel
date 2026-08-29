@@ -13,7 +13,7 @@
 
 import { useEffect, useState } from 'react';
 import { useApi } from '../../hooks/useApi';
-import type { LiveStrategyConfig } from '../../types/v2';
+import type { LiveStrategyConfig, SweepDetail } from '../../types/v2';
 import {
   readStoredToken,
   useSweepAllowlist,
@@ -36,14 +36,13 @@ export default function Simulations() {
   const { data: list, loading: listLoading, error: listError, refetch: refetchList } = useSweepList();
   const { data: detail, error: detailError } = useSweepDetail(selectedRunId);
 
-  const sweeps = list?.sweeps ?? [];
+  const sweeps = list ?? [];
 
   // Land on the newest run so the page is not empty on arrival. Only until the
-  // operator picks one — after that their choice sticks.
-  // Depends on `list`, not the derived `sweeps`: `data?.sweeps ?? []` is a fresh
-  // array identity every render, which would re-run this effect on every poll.
+  // operator picks one — after that their choice sticks. Depends on `list`, not
+  // the derived `sweeps`: `?? []` is a fresh identity on every render.
   useEffect(() => {
-    const first = list?.sweeps?.[0];
+    const first = list?.[0];
     if (selectedRunId === null && first) setSelectedRunId(first.run_id);
   }, [selectedRunId, list]);
 
@@ -78,21 +77,33 @@ export default function Simulations() {
         error={listError}
       />
 
-      {selectedRunId && <ResultsRegion detailError={detailError} detail={detail} />}
+      {selectedRunId && (
+        <ResultsRegion detail={detail} detailError={detailError} onSelect={setSelectedRunId} />
+      )}
     </div>
   );
 }
 
-type Detail = ReturnType<typeof useSweepDetail>['data'];
-
 /**
- * The three-state card: unreadable, not-yet-there, and rendered.
+ * The results region, gated on the run's STATUS — not on whether a payload
+ * happened to parse.
  *
- * A finished-but-empty report is NOT rendered as an empty grid — that reads as
- * "the sweep measured nothing", which is a different claim from "the results
- * could not be read".
+ * A `submitted` or `running` sweep comes back with `grid: {}` and `splits: []`.
+ * Rendering that as a report would tell the operator their sweep finished and
+ * measured nothing, which is the opposite of the truth and unrecoverable from
+ * the screen. So `results` is populated only for `done` (see
+ * `normaliseSweepDetail`), and every other status gets a message that says what
+ * is actually happening.
  */
-function ResultsRegion({ detail, detailError }: { detail: Detail; detailError: string | null }) {
+function ResultsRegion({
+  detail,
+  detailError,
+  onSelect,
+}: {
+  detail: SweepDetail | null;
+  detailError: string | null;
+  onSelect: (runId: string) => void;
+}) {
   if (detailError && !detail) {
     return (
       <section className="rounded-lg border border-yellow-700/60 bg-gray-800 p-5">
@@ -112,43 +123,94 @@ function ResultsRegion({ detail, detailError }: { detail: Detail; detailError: s
     );
   }
 
-  const { sweep, results } = detail;
+  const { sweep, results, raw } = detail;
+  const id = <span className="font-mono">{sweep.run_id}</span>;
 
-  if (!results) {
-    const waiting = sweep.status === 'submitted' || sweep.status === 'running';
-    return (
-      <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-        <h2 className="text-base font-semibold text-white">Results</h2>
+  const shell = (body: React.ReactNode, tone: 'neutral' | 'bad' = 'neutral') => (
+    <section
+      data-testid="results-status"
+      data-run-status={sweep.status}
+      className={`rounded-lg border bg-gray-800 p-5 ${
+        tone === 'bad' ? 'border-red-800/60' : 'border-gray-700'
+      }`}
+    >
+      <h2 className="text-base font-semibold text-white">Results</h2>
+      {body}
+    </section>
+  );
+
+  if (sweep.status === 'submitted' || sweep.status === 'running') {
+    return shell(
+      <>
         <p className="text-sm text-gray-400 mt-2">
-          {waiting ? (
-            <>
-              <span className="font-mono">{sweep.run_id}</span> is <strong>{sweep.status}</strong>.
-              A 6-symbol x 10-arm sweep takes roughly 6-8 minutes; this page refreshes every 15
-              seconds until it finishes.
-            </>
-          ) : sweep.status === 'failed' ? (
-            <>
-              <span className="font-mono">{sweep.run_id}</span> failed and produced no report.
-            </>
-          ) : (
-            <>
-              <span className="font-mono">{sweep.run_id}</span> is{' '}
-              <strong>{sweep.status}</strong> but carries no report rows.
-            </>
-          )}
+          {id} is <strong>{sweep.status}</strong>. A 6-symbol x 10-arm sweep takes roughly 6-8
+          minutes; this page refreshes every 15 seconds until it finishes.
         </p>
-        {sweep.error && (
+        {sweep.stuck && (
+          <p
+            className="text-sm text-yellow-400 mt-2"
+            title="Container start is 3-4 minutes. Past that with no `running` row, the execution probably never came up. Nothing is cancelled automatically."
+          >
+            ⚠ Still <span className="font-mono">submitted</span> past the container-start window —
+            check the execution
+            {sweep.execution_name && (
+              <span className="block text-xs text-gray-500 font-mono break-all">
+                {sweep.execution_name}
+              </span>
+            )}
+          </p>
+        )}
+      </>,
+    );
+  }
+
+  if (sweep.status === 'failed') {
+    return shell(
+      <>
+        <p className="text-sm text-gray-300 mt-2">{id} failed and produced no report.</p>
+        {sweep.error ? (
           <pre className="mt-2 text-xs text-red-300 whitespace-pre-wrap break-words font-mono">
             {sweep.error}
           </pre>
-        )}
-        {sweep.deduplicated_to && (
-          <p className="text-sm text-gray-400 mt-2">
-            Deduplicated to <span className="font-mono">{sweep.deduplicated_to}</span> — select that
-            run above to read its results.
+        ) : (
+          <p className="text-xs text-gray-500 mt-2">
+            The run recorded no error text. Check the execution
+            {sweep.execution_name ? ` (${sweep.execution_name})` : ''}.
           </p>
         )}
-      </section>
+      </>,
+      'bad',
+    );
+  }
+
+  if (sweep.status === 'deduplicated') {
+    return shell(
+      <p className="text-sm text-gray-400 mt-2">
+        {id} was deduplicated: this exact spec had already completed on this engine and commit, so
+        nothing was replayed.{' '}
+        {sweep.deduplicated_to ? (
+          <button
+            type="button"
+            onClick={() => onSelect(sweep.deduplicated_to as string)}
+            className="text-blue-400 hover:text-blue-300 underline font-mono"
+          >
+            Open {sweep.deduplicated_to}
+          </button>
+        ) : (
+          'The original run is not recorded on this row.'
+        )}
+      </p>,
+    );
+  }
+
+  // `done`, but the payload carried nothing renderable.
+  if (!results) {
+    return shell(
+      <p className="text-sm text-gray-400 mt-2">
+        {id} is <strong>{sweep.status}</strong> but carries no report rows. That is a gap in the
+        store, not a sweep that measured nothing.
+      </p>,
+      'bad',
     );
   }
 
@@ -159,7 +221,7 @@ function ResultsRegion({ detail, detailError }: { detail: Detail; detailError: s
           ⚠ Could not refresh this run ({detailError}) — showing the last good read.
         </p>
       )}
-      <SweepResults sweep={sweep} report={results} />
+      <SweepResults sweep={sweep} report={results} raw={raw} />
     </>
   );
 }

@@ -32,8 +32,14 @@ export const FALLBACK_CAPS: SweepCaps = {
 
 const SYMBOL_RE = /^[A-Z.]{1,6}$/;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const SCENARIO_NAME_RE = /^[A-Za-z0-9_]{1,40}$/;
 
+// The server's `validate_spec` requires only a non-empty name after trimming —
+// no character class, no length cap. A stricter client rule would refuse a spec
+// the API accepts, which is the one direction client validation must never fail
+// in: the operator would be blocked by a rule that does not exist.
+const isUsableScenarioName = (name: string): boolean => name.trim().length > 0;
+
+/** Fallbacks only; the live `caps` from `/allowlist` always win. */
 export const MIN_STARTING_CASH = 10_000;
 export const MAX_STARTING_CASH = 1_000_000;
 
@@ -281,11 +287,8 @@ export function validateSpec(args: ValidateArgs): SpecValidation {
           message: '`base` is reserved — it runs implicitly and must not be declared.',
         });
       }
-      if (!SCENARIO_NAME_RE.test(arm.name)) {
-        issues.push({
-          field: 'scenarios',
-          message: `"${arm.name}" is not a usable arm name (letters, digits, underscore; 1-40 chars).`,
-        });
+      if (!isUsableScenarioName(arm.name)) {
+        issues.push({ field: 'scenarios', message: 'An arm has an empty name.' });
       }
       if (seen.has(arm.name)) {
         issues.push({ field: 'scenarios', message: `Two arms are both named "${arm.name}".` });
@@ -318,10 +321,14 @@ export function validateSpec(args: ValidateArgs): SpecValidation {
 
   // --- starting cash ---
   const cash = spec.starting_cash;
-  if (cash !== undefined && (!Number.isFinite(cash) || cash < MIN_STARTING_CASH || cash > MAX_STARTING_CASH)) {
+  // Bounds from the served caps when they are there — a hard-coded pair would
+  // silently diverge the first time the server moved one.
+  const minCash = caps.min_starting_cash ?? MIN_STARTING_CASH;
+  const maxCash = caps.max_starting_cash ?? MAX_STARTING_CASH;
+  if (cash !== undefined && (!Number.isFinite(cash) || cash < minCash || cash > maxCash)) {
     issues.push({
       field: 'cash',
-      message: `Starting cash must be between $${MIN_STARTING_CASH.toLocaleString()} and $${MAX_STARTING_CASH.toLocaleString()}.`,
+      message: `Starting cash must be between $${minCash.toLocaleString()} and $${maxCash.toLocaleString()}.`,
     });
   }
 

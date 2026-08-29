@@ -10,7 +10,6 @@
 
 import type { SweepRow } from '../../../types/v2';
 import { fmtDateTime, fmtRelativeAge, cls } from '../../../utils/format';
-import { isStuck } from '../../../hooks/useSweeps';
 
 interface Props {
   sweeps: SweepRow[];
@@ -81,13 +80,26 @@ export default function RunsList({ sweeps, selectedRunId, onSelect, loading, err
             </thead>
             <tbody>
               {sweeps.map((row) => {
-                const stuck = isStuck(row);
+                const stuck = row.stuck === true;
                 return (
                   <tr
                     key={row.run_id}
                     onClick={() => onSelect(row.run_id)}
+                    // Selecting a run is a real action, so it has to be reachable
+                    // without a mouse. A row is the click target rather than a
+                    // cell, so the role and the key handler go here.
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selectedRunId === row.run_id}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        onSelect(row.run_id);
+                      }
+                    }}
                     className={cls(
                       'border-t border-gray-700/60 cursor-pointer hover:bg-gray-700/40',
+                      'focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500',
                       selectedRunId === row.run_id && 'bg-gray-700/50',
                     )}
                   >
@@ -109,6 +121,7 @@ export default function RunsList({ sweeps, selectedRunId, onSelect, loading, err
                         <div className="mt-1">
                           <button
                             type="button"
+                            data-testid={`dedup-link-${row.run_id}`}
                             onClick={(e) => {
                               e.stopPropagation();
                               onSelect(row.deduplicated_to as string);

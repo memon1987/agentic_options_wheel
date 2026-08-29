@@ -10,21 +10,21 @@
 //     `submitSweep` therefore issues EXACTLY ONE request and reports what it
 //     got — the operator decides whether to try again.
 //
-// Polling: 15s, and only while a run is non-terminal. A finished sweep is
-// insert-only history; re-reading it forever would be a standing BigQuery bill
-// for a page left open on a monitor.
+// Polling: 15s. A run that has reached a terminal status is insert-only history,
+// so polling stops; but a list that has never loaded, or whose last read failed,
+// keeps trying — otherwise one 500 on mount leaves the page permanently blank
+// with no way back short of a reload.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   SweepAllowlist,
   SweepDetail,
-  SweepListResponse,
   SweepRow,
   SweepSpec,
   SweepSubmitAccepted,
 } from '../types/v2';
 import { isTerminalSweepStatus } from '../types/v2';
-import { normaliseSweepDetail } from '../components/v2/sims/normaliseReport';
+import { normaliseSweepDetail, normaliseSweepList } from '../components/v2/sims/normaliseReport';
 
 export const SWEEP_POLL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -66,8 +66,8 @@ export type SubmitOutcome =
   | { kind: 'accepted'; body: SweepSubmitAccepted }
   /** 401/403 — the token is missing or wrong. */
   | { kind: 'unauthorized'; status: number; detail: string }
-  /** 409 — another sweep is already in flight. */
-  | { kind: 'conflict'; runningRunId: string | null; detail: string }
+  /** 409 — another sweep is already in flight. The detail names it. */
+  | { kind: 'conflict'; detail: string }
   /** 422 — the spec was refused. `detail` is the runner's reason, verbatim. */
   | { kind: 'invalid'; detail: string }
   /** 502 — the Job could not be launched (usually an IAM grant). */
@@ -149,7 +149,11 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
   if (response.ok) {
     const b = (body ?? {}) as Partial<SweepSubmitAccepted>;
     if (typeof b.run_id !== 'string') {
-      return { kind: 'error', status: response.status, detail: 'The API accepted the sweep but returned no run_id.' };
+      return {
+        kind: 'error',
+        status: response.status,
+        detail: 'The API accepted the sweep but returned no run_id.',
+      };
     }
     return {
       kind: 'accepted',
@@ -166,18 +170,10 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
     case 401:
     case 403:
       return { kind: 'unauthorized', status: response.status, detail };
-    case 409: {
-      const running =
-        body && typeof body === 'object'
-          ? ((body as { running_run_id?: unknown }).running_run_id ??
-             (body as { detail?: { running_run_id?: unknown } }).detail?.running_run_id)
-          : undefined;
-      return {
-        kind: 'conflict',
-        runningRunId: typeof running === 'string' ? running : null,
-        detail,
-      };
-    }
+    // The 409 body is `{detail}` only — the detail already names the blocking
+    // run and why one sweep runs at a time, so there is nothing to dig out.
+    case 409:
+      return { kind: 'conflict', detail };
     case 422:
       return { kind: 'invalid', detail };
     case 502:
@@ -209,13 +205,25 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
 }
 
 /**
- * Fetch `url` once, then every `SWEEP_POLL_MS` for as long as `shouldPoll` says
- * the data is still live. A single GET failure keeps the last good data and
- * shows the error beside it — a transient 500 must not blank a rendered grid.
+ * Fetch `url` once, then every `SWEEP_POLL_MS` while there is a reason to.
+ *
+ * Three behaviours worth stating, because each fixes a way this page could lie:
+ *
+ *   * On a URL CHANGE the state is cleared to `{null, loading: true, null}`
+ *     before the new request goes out. Without that, selecting run B showed run
+ *     A's grid under B's heading until B answered — the worst kind of wrong,
+ *     because it looks right.
+ *   * A read failure keeps the last good data and reports the error beside it,
+ *     and keeps polling. A transient 500 must neither blank a rendered grid nor
+ *     permanently stop the refresh.
+ *   * An IN-FLIGHT GUARD stops the interval stacking requests. A read slower
+ *     than 15s would otherwise queue one per tick against a backend that is
+ *     already struggling.
  */
 function usePolledGet<T>(
   url: string | null,
-  shouldPoll: (data: T | null) => boolean,
+  /** Whether a SUCCESSFUL read should be polled again. */
+  shouldPoll: (data: T) => boolean,
   /** Adapts the wire payload. A null result is reported as a shape error. */
   normalise?: (raw: unknown) => T | null,
 ): PollState<T> & { refetch: () => void } {
@@ -227,8 +235,8 @@ function usePolledGet<T>(
   shouldPollRef.current = shouldPoll;
   const normaliseRef = useRef(normalise);
   normaliseRef.current = normalise;
-  const dataRef = useRef<T | null>(null);
-  dataRef.current = state.data;
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const refetch = useCallback(() => setTick((t) => t + 1), []);
 
@@ -246,8 +254,14 @@ function usePolledGet<T>(
     }
     const controller = new AbortController();
     let cancelled = false;
+    let inFlight = false;
+
+    // Clear FIRST: nothing from the previous url may survive under the new one.
+    setState({ data: null, loading: true, error: null });
 
     const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const raw = await getJson<unknown>(url, controller.signal);
         const adapt = normaliseRef.current;
@@ -261,15 +275,18 @@ function usePolledGet<T>(
         const e = err as Error;
         if (e.name === 'AbortError') return;
         setState((prev) => ({ data: prev.data, loading: false, error: e.message }));
+      } finally {
+        inFlight = false;
       }
     };
 
-    setState((prev) => ({ ...prev, loading: prev.data === null }));
     void load();
 
     const interval = setInterval(() => {
-      // The whole point of the hook: a terminal run is history, so stop asking.
-      if (!shouldPollRef.current(dataRef.current)) return;
+      const { data, error } = stateRef.current;
+      // Nothing loaded yet, or the last read failed: keep trying. Only a
+      // SUCCESSFUL read gets to say "this is final, stop asking".
+      if (data !== null && !error && !shouldPollRef.current(data)) return;
       void load();
     }, SWEEP_POLL_MS);
 
@@ -283,45 +300,36 @@ function usePolledGet<T>(
   return { ...state, refetch };
 }
 
-const anyLive = (list: SweepListResponse | null): boolean =>
-  (list?.sweeps ?? []).some((s) => !isTerminalSweepStatus(s.status));
+const anyLive = (rows: SweepRow[]): boolean =>
+  rows.some((s) => !isTerminalSweepStatus(s.status));
 
-/** Recent sweeps. Polls only while at least one of them is non-terminal. */
+/**
+ * Recent sweeps. Polls while at least one is non-terminal — and while the list
+ * has never loaded or its last read failed.
+ *
+ * `GET /api/v2/sweeps` serves a BARE ARRAY; `normaliseSweepList` is what keeps
+ * an envelope change from silently emptying the page.
+ */
 export function useSweepList() {
-  return usePolledGet<SweepListResponse>('/api/v2/sweeps', anyLive);
+  return usePolledGet<SweepRow[]>('/api/v2/sweeps', anyLive, normaliseSweepList);
 }
 
 /**
  * One sweep + its report. Polls only while THAT sweep is non-terminal.
  *
- * The response runs through `normaliseSweepDetail` because the API may send
- * either `{sweep, results}` with the Layer 2 `render_json` payload or a bare
- * `shape_results` payload (plan D11). See `normaliseReport.ts` for why both are
- * accepted rather than one being picked.
+ * The response is a bare `shape_results` payload; `normaliseSweepDetail` splits
+ * it into the run row, the report (only when `done`) and the raw payload the
+ * export button serves.
  */
 export function useSweepDetail(runId: string | null) {
   return usePolledGet<SweepDetail>(
     runId ? `/api/v2/sweeps/${encodeURIComponent(runId)}` : null,
-    (d) => !isTerminalSweepStatus(d?.sweep?.status),
+    (d) => !isTerminalSweepStatus(d.sweep?.status),
     normaliseSweepDetail,
   );
 }
 
-/** The allowlist, caps and presets. Static per deploy — fetched once, never polled. */
+/** The allowlist, caps and presets. Static per deploy — fetched once. */
 export function useSweepAllowlist() {
   return usePolledGet<SweepAllowlist>('/api/v2/sweeps/allowlist', () => false);
-}
-
-/**
- * A `submitted` row older than this with no `running` row means the execution
- * never came up. Container start is 3-4 minutes, so 10 is a real signal rather
- * than impatience (plan D3). It is a HINT: nothing is cancelled automatically.
- */
-export const STUCK_AFTER_MS = 10 * 60_000;
-
-export function isStuck(row: SweepRow, now: number = Date.now()): boolean {
-  if (row.status !== 'submitted') return false;
-  const t = Date.parse(row.submitted_at);
-  if (Number.isNaN(t)) return false;
-  return now - t > STUCK_AFTER_MS;
 }

@@ -1,24 +1,23 @@
 // FC-060 Layer 4 (PR-B): the /sims data layer.
 //
-// Two contracts, both of which cost real money if they break:
+// Contracts under test, each of which costs something real if it breaks:
 //
 //   * The POST is issued EXACTLY ONCE. `useApi` would retry it three times; a
 //     retried submit can launch a second 6-8 minute Cloud Run Job against the
 //     one-at-a-time slot, or come back 409 against the run it just started.
-//   * Polling STOPS the moment a run reaches a terminal status. A page left open
-//     on a monitor otherwise bills a BigQuery read every 15 seconds forever.
+//   * Polling STOPS on a terminal status, but KEEPS GOING while nothing has
+//     loaded or the last read failed — one 500 on mount must not leave the page
+//     blank forever.
+//   * A URL change clears the old data before the new request goes out, so run
+//     A's grid is never shown under run B's heading.
+//   * The interval never stacks requests on a slow backend.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
-import {
-  SWEEP_POLL_MS,
-  isStuck,
-  submitSweep,
-  useSweepDetail,
-  useSweepList,
-} from './useSweeps';
-import type { SweepDetail, SweepRow, SweepSpec } from '../types/v2';
+import { SWEEP_POLL_MS, submitSweep, useSweepDetail, useSweepList } from './useSweeps';
+import type { SweepRow, SweepSpec } from '../types/v2';
 import shapedHoldout from '../test/fixtures/sweep_shaped_holdout.json';
+import shapedPending from '../test/fixtures/sweep_shaped_pending.json';
 
 const SPEC: SweepSpec = {
   symbols: ['AAPL'],
@@ -83,6 +82,12 @@ const settle = async () => {
   });
 };
 
+const advance = async (ms: number) => {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+};
+
 beforeEach(() => {
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
@@ -135,67 +140,83 @@ describe('submitSweep — one request, never a retry', () => {
     const reason =
       'strategy.put_target_dte — cached chains store universe_dte=8; a scenario needs a re-materialisation.';
     fetchMock.mockResolvedValue(jsonResponse(422, { detail: reason }));
-    const outcome = await submitSweep(SPEC, 'tok');
-    expect(outcome).toEqual({ kind: 'invalid', detail: reason });
+    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'invalid', detail: reason });
   });
 
   it('surfaces a 502 grant text VERBATIM', async () => {
     const grant = 'The dashboard SA lacks run.jobs.run. Grant: gcloud run jobs add-iam-policy-binding …';
     fetchMock.mockResolvedValue(jsonResponse(502, { detail: grant }));
-    const outcome = await submitSweep(SPEC, 'tok');
-    expect(outcome).toEqual({ kind: 'launch_failed', detail: grant });
+    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'launch_failed', detail: grant });
   });
 
-  it('pulls running_run_id out of a 409 so the UI can point at the run in flight', async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse(409, { detail: 'a sweep is already running', running_run_id: 'run-in-flight' }),
-    );
-    const outcome = await submitSweep(SPEC, 'tok');
-    expect(outcome).toMatchObject({ kind: 'conflict', runningRunId: 'run-in-flight' });
+  it('surfaces the 409 detail, which already names the blocking run', async () => {
+    // The server sends `{detail}` and nothing else — the detail carries the run
+    // id and why one sweep runs at a time.
+    const detail =
+      'sweep run-old is running; one sweep runs at a time (the Job is a single vCPU).';
+    fetchMock.mockResolvedValue(jsonResponse(409, { detail }));
+    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'conflict', detail });
   });
 
   it('reports a dedup hit as accepted with the run it points at', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(200, { run_id: 'new', status: 'deduplicated', deduplicated_to: 'old' }),
     );
-    const outcome = await submitSweep(SPEC, 'tok');
-    expect(outcome).toMatchObject({ kind: 'accepted', body: { deduplicated_to: 'old' } });
+    expect(await submitSweep(SPEC, 'tok')).toMatchObject({
+      kind: 'accepted',
+      body: { deduplicated_to: 'old' },
+    });
   });
 
   it('flattens FastAPI’s list-shaped 422 rather than printing [object Object]', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(422, { detail: [{ loc: ['body', 'symbols'], msg: 'field required' }] }),
     );
-    const outcome = await submitSweep(SPEC, 'tok');
-    expect(outcome).toEqual({ kind: 'invalid', detail: 'body.symbols: field required' });
+    expect(await submitSweep(SPEC, 'tok')).toEqual({
+      kind: 'invalid',
+      detail: 'body.symbols: field required',
+    });
   });
 });
 
-describe('polling stops on a terminal status', () => {
+describe('useSweepList — the endpoint serves a BARE ARRAY', () => {
+  it('reads a bare array', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ run_id: 'a' }), row({ run_id: 'b' })]));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toHaveLength(2);
+    expect(result.current.data?.[0].run_id).toBe('a');
+  });
+
+  it('also reads a {sweeps: [...]} envelope rather than rendering an empty list', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, { sweeps: [row()] }));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toHaveLength(1);
+  });
+});
+
+describe('polling stops on a terminal status — and only then', () => {
   it('keeps polling the list while a run is running, and stops when it is done', async () => {
     vi.useFakeTimers();
-    fetchMock.mockResolvedValue(jsonResponse(200, { sweeps: [row({ status: 'running' })] }));
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'running' })]));
     const { result } = renderHook(() => useSweepList());
 
     await settle();
     expect(result.current.data).not.toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS);
-    });
+    await advance(SWEEP_POLL_MS);
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     // The run finishes. From here nothing more should be requested, ever.
-    fetchMock.mockResolvedValue(jsonResponse(200, { sweeps: [row({ status: 'done' })] }));
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS);
-    });
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'done' })]));
+    await advance(SWEEP_POLL_MS);
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS * 6);
-    });
+    await advance(SWEEP_POLL_MS * 6);
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
@@ -203,32 +224,26 @@ describe('polling stops on a terminal status', () => {
     'never polls a run that is already %s',
     async (status) => {
       vi.useFakeTimers();
-      const detail: SweepDetail = { sweep: row({ status }), results: null };
-      fetchMock.mockResolvedValue(jsonResponse(200, detail));
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, { ...shapedPending, status, run: { ...shapedPending.run, status } }),
+      );
       const { result } = renderHook(() => useSweepDetail('run1'));
-
       await settle();
       expect(result.current.data).not.toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS * 5);
-      });
+      await advance(SWEEP_POLL_MS * 5);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
   );
 
   it('keeps polling a status it does not recognise — unknown is a reason to look, not to stop', async () => {
     vi.useFakeTimers();
-    const detail = { sweep: row({ status: 'quarantined' as never }), results: null };
-    fetchMock.mockResolvedValue(jsonResponse(200, detail));
+    fetchMock.mockResolvedValue(jsonResponse(200, { ...shapedPending, status: 'quarantined' }));
     const { result } = renderHook(() => useSweepDetail('run1'));
-
     await settle();
     expect(result.current.data).not.toBeNull();
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS);
-    });
+    await advance(SWEEP_POLL_MS);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -236,19 +251,130 @@ describe('polling stops on a terminal status', () => {
     renderHook(() => useSweepDetail(null));
     expect(fetchMock).not.toHaveBeenCalled();
   });
+});
 
-  it('normalises a bare shape_results payload into {sweep, results}', async () => {
+describe('reads recover instead of dead-ending', () => {
+  it('keeps polling after an initial failure — one 500 must not blank the page forever', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValue(new Error('BigQuery timeout'));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toBeNull();
+    expect(result.current.error).toMatch(/BigQuery timeout/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // It must try again — `anyLive([])` is false, so an unguarded implementation
+    // would decide an empty list is terminal and never ask again.
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'done' })]));
+    await advance(SWEEP_POLL_MS);
+    expect(result.current.data).toHaveLength(1);
+    expect(result.current.error).toBeNull();
+  });
+
+  it('keeps the last good data when a refresh fails, and keeps retrying', async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, [row({ status: 'running' })]))
+      .mockRejectedValue(new Error('BigQuery timeout'));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toHaveLength(1);
+
+    await advance(SWEEP_POLL_MS);
+    expect(result.current.error).toMatch(/BigQuery timeout/);
+    // A transient failure must never blank a list the operator is watching.
+    expect(result.current.data).toHaveLength(1);
+
+    // And it must keep trying: the last read failed, so the run's own status is
+    // not trustworthy evidence that there is nothing left to watch.
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'done' })]));
+    await advance(SWEEP_POLL_MS);
+    expect(result.current.error).toBeNull();
+    expect(result.current.data?.[0].status).toBe('done');
+  });
+
+  it('does not stack requests when a read outlives the poll interval', async () => {
+    vi.useFakeTimers();
+    let release: ((r: Response) => void) | null = null;
+    fetchMock.mockImplementation(
+      () => new Promise<Response>((resolve) => {
+        release = resolve;
+      }),
+    );
+    renderHook(() => useSweepList());
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Three intervals pass with the first request still outstanding.
+    await advance(SWEEP_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    release!(jsonResponse(200, [row({ status: 'running' })]));
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('useSweepDetail — one run’s data never shows under another run’s id', () => {
+  it('clears data and shows loading the moment the selected run changes', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, shapedHoldout));
+    const { result, rerender } = renderHook(({ id }) => useSweepDetail(id), {
+      initialProps: { id: 'runA' as string | null },
+    });
+    await settle();
+    expect(result.current.data?.sweep.run_id).toBe('0f1e2d3c4b5a6978');
+
+    // Selecting run B must not leave run A's grid on screen while B loads.
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    rerender({ id: 'runB' });
+    expect(result.current.data).toBeNull();
+    expect(result.current.loading).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
+  it('clears a stale error when the selection changes', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValue(new Error('boom'));
+    const { result, rerender } = renderHook(({ id }) => useSweepDetail(id), {
+      initialProps: { id: 'runA' as string | null },
+    });
+    await settle();
+    expect(result.current.error).toMatch(/boom/);
+
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    rerender({ id: 'runB' });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('normalises the bare shape_results payload into {sweep, results, raw}', async () => {
     vi.useFakeTimers();
     fetchMock.mockResolvedValue(jsonResponse(200, shapedHoldout));
     const { result } = renderHook(() => useSweepDetail('run1'));
     await settle();
     expect(result.current.data?.sweep.run_id).toBe('0f1e2d3c4b5a6978');
-    expect(result.current.data?.results?.rows).toHaveLength(12);
-    // status is terminal in the fixture, so nothing more is asked for.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS * 3);
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.current.data?.results?.rows).toHaveLength(16);
+    expect(result.current.data?.raw).toBeTruthy();
+    await advance(SWEEP_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // terminal
+  });
+
+  it('gives a non-done run null results rather than an empty report', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, shapedPending));
+    const { result } = renderHook(() => useSweepDetail('run1'));
+    await settle();
+    expect(result.current.data?.sweep.status).toBe('submitted');
+    expect(result.current.data?.results).toBeNull();
+    // Non-terminal, so it keeps watching.
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('reports an unreadable payload as an error rather than an empty page', async () => {
@@ -258,45 +384,5 @@ describe('polling stops on a terminal status', () => {
     await settle();
     expect(result.current.data).toBeNull();
     expect(result.current.error).toMatch(/cannot read/);
-  });
-
-  it('keeps the last good data when a refresh fails', async () => {
-    // Fake timers must be installed BEFORE the hook mounts: the poll interval is
-    // registered on mount, and one created against the real clock is untouched
-    // by `advanceTimersByTime`.
-    vi.useFakeTimers();
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(200, { sweeps: [row({ status: 'running' })] }))
-      .mockRejectedValue(new Error('BigQuery timeout'));
-    const { result } = renderHook(() => useSweepList());
-    await settle();
-    expect(result.current.data).not.toBeNull();
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SWEEP_POLL_MS);
-    });
-    await vi.waitFor(() => expect(result.current.error).toBe('BigQuery timeout'));
-    // A transient read failure must never blank a list the operator is watching.
-    expect(result.current.data?.sweeps).toHaveLength(1);
-  });
-});
-
-describe('isStuck', () => {
-  const now = Date.parse('2026-08-29T13:00:00Z');
-
-  it('is false for a fresh submit — container start is 3-4 minutes', () => {
-    expect(isStuck(row({ status: 'submitted', submitted_at: '2026-08-29T12:55:00Z' }), now)).toBe(false);
-  });
-
-  it('is true for a submit older than 10 minutes with no running row', () => {
-    expect(isStuck(row({ status: 'submitted', submitted_at: '2026-08-29T12:45:00Z' }), now)).toBe(true);
-  });
-
-  it('is false once the run reports running, however old', () => {
-    expect(isStuck(row({ status: 'running', submitted_at: '2026-08-29T10:00:00Z' }), now)).toBe(false);
-  });
-
-  it('is false on an unparseable timestamp rather than crying wolf', () => {
-    expect(isStuck(row({ status: 'submitted', submitted_at: 'not-a-time' }), now)).toBe(false);
   });
 });

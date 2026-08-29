@@ -57,12 +57,13 @@ describe('RunsList', () => {
     expect(screen.getByTestId('status-failed')).toBeInTheDocument();
   });
 
-  it('hints "stuck" on a submitted row older than 10 minutes, and not before', () => {
-    const old = new Date(Date.now() - 11 * 60_000).toISOString();
-    const fresh = new Date(Date.now() - 2 * 60_000).toISOString();
+  it('hints "stuck" from the SERVER flag, never from a browser clock', () => {
+    // The API computes `stuck` with `sweeps.is_stuck` against the server clock.
+    // A second implementation here would disagree on any machine whose time is
+    // off, and the two would never be reconciled.
     const { unmount } = render(
       <RunsList
-        sweeps={[row({ status: 'submitted', submitted_at: fresh })]}
+        sweeps={[row({ status: 'submitted', stuck: false })]}
         selectedRunId={null}
         onSelect={vi.fn()}
         loading={false}
@@ -71,14 +72,25 @@ describe('RunsList', () => {
     );
     expect(screen.queryByText(/stuck/)).toBeNull();
     unmount();
-    view([row({ status: 'submitted', submitted_at: old, execution_name: 'exec-xyz' })]);
+    view([row({ status: 'submitted', stuck: true, execution_name: 'exec-xyz' })]);
     expect(screen.getByText(/stuck — check the execution/)).toBeInTheDocument();
     expect(screen.getByText('exec-xyz')).toBeInTheDocument();
   });
 
+  it('is selectable by keyboard — a run is a real action, not a mouse-only one', () => {
+    const onSelect = view([row({ run_id: 'kb1' })]);
+    const target = screen.getByText('kb1').closest('tr')!;
+    expect(target).toHaveAttribute('role', 'button');
+    expect(target).toHaveAttribute('tabIndex', '0');
+    fireEvent.keyDown(target, { key: 'Enter' });
+    expect(onSelect).toHaveBeenCalledWith('kb1');
+    fireEvent.keyDown(target, { key: ' ' });
+    expect(onSelect).toHaveBeenCalledTimes(2);
+  });
+
   it('links a deduplicated run at the run it points to', () => {
     const onSelect = view([row({ status: 'deduplicated', deduplicated_to: 'older-run' })]);
-    fireEvent.click(screen.getByRole('button', { name: /older-run/ }));
+    fireEvent.click(screen.getByTestId('dedup-link-run1'));
     expect(onSelect).toHaveBeenCalledWith('older-run');
   });
 

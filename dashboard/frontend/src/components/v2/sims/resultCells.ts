@@ -1,21 +1,23 @@
-// FC-060 Layer 4 (PR-B): how one sweep cell is rendered, and the aggregates the
-// grid is read with.
+// FC-060 Layer 4 (PR-B): how one sweep cell is rendered.
 //
-// This mirrors `src/backtesting/scenarios/report.py` `_cell()` / `_median_of()`
-// / `_scenario_summary()` exactly. Two rules from the plan are load-bearing and
-// are enforced here rather than in the JSX:
+// Rendering only. There is no `median()` and no `summarise()` in this file, and
+// there must never be: every median, min, max and count on the page is READ from
+// the server's `summary` (plan D11). A second implementation of "which cells
+// count" is a second chance to average an `insuf` cell into a ranking, and only
+// one of the two would be the one under test.
 //
-//   * `measured` / `insufficient` / `low_activity` / errored PARTITION the
-//     cells. Exactly one is true, so the four render as four visually distinct
-//     kinds and the summary counts sum to the cell total. (The runner had this
-//     bug once: `position_size_20pct` reported `measured 1 | insuf 2 | low-act 5`
-//     over six symbols. A reader who cannot add up the row stops trusting it.)
+// The rules this file enforces, both from the plan:
+//
+//   * `measured` / `insufficient` / `low_activity` / errored PARTITION the cells
+//     that resolved, and `unknown` names the ones that did not. Five kinds, five
+//     visually distinct renderings, and the counts add up to the cells shown.
 //   * A cell that is not `measured` NEVER renders as a return. No number, no
-//     P&L colour, no glyph. "insufficient" is a statement about the window.
+//     P&L colour, no verdict glyph. "insufficient" is a statement about the
+//     window; "unknown" is a statement about our records.
 
-import type { SweepReport, SweepResultRow } from '../../../types/v2';
+import type { SweepReport, SweepResultRow, SweepSummaryRow } from '../../../types/v2';
 
-export type CellKind = 'return' | 'insuf' | 'low-act' | 'err' | 'missing';
+export type CellKind = 'return' | 'insuf' | 'low-act' | 'err' | 'unknown' | 'missing';
 
 export interface RenderedCell {
   kind: CellKind;
@@ -44,10 +46,16 @@ export const pctOrDash = (value: number | null | undefined, digits = 1): string 
 /**
  * Classify + render one cell.
  *
- * Order matters and is the runner's: error, then `insufficient`, then
- * `low_activity`, then measured. `insufficient` wins over `low_activity`
+ * Order is the runner's: error, then `insufficient`, then `low_activity`, then
+ * — and ONLY then — a measured return. `insufficient` wins over `low_activity`
  * because a window with no completed cycle also has a tiny days-in-position
  * fraction, and the two answer different questions.
+ *
+ * The final branch is gated on `row.measured` rather than reached by
+ * fall-through. A cell whose state the server could not classify (`unknown`:
+ * no flag set, e.g. a row written before a flag existed) previously fell
+ * through and rendered as a green return — an unresolved verdict presented as
+ * a result, which is the single worst thing this page could do.
  */
 export function renderCell(row: SweepResultRow | undefined | null): RenderedCell {
   if (!row) {
@@ -88,10 +96,28 @@ export function renderCell(row: SweepResultRow | undefined | null): RenderedCell
         '365/days). Counted, never averaged.',
     };
   }
+  if (!row.measured) {
+    return {
+      kind: 'unknown',
+      text: 'unknown',
+      className: 'bg-purple-950/50 text-purple-300 border border-dashed border-purple-700 font-mono',
+      title:
+        'The stored row carries none of the four state flags, so this cell was never ' +
+        'classified — a row written before a flag existed, or a verdict that never ' +
+        'resolved. It is NOT a measurement: it is excluded from every median and Δ, ' +
+        'and it is counted separately so the row still adds up.',
+    };
+  }
   const glyph = VERDICT_GLYPH[row.verdict ?? ''] ?? '?';
   const r = row.annualized_return;
   const sign =
-    r === null || r === undefined ? 'text-gray-300' : r > 0 ? 'text-green-400' : r < 0 ? 'text-red-400' : 'text-gray-300';
+    r === null || r === undefined
+      ? 'text-gray-300'
+      : r > 0
+        ? 'text-green-400'
+        : r < 0
+          ? 'text-red-400'
+          : 'text-gray-300';
   return {
     kind: 'return',
     text: `${pctOrDash(r)} ${glyph}`,
@@ -104,12 +130,12 @@ export function renderCell(row: SweepResultRow | undefined | null): RenderedCell
   };
 }
 
-// --- lookups + aggregates --------------------------------------------------- //
+// --- lookups ---------------------------------------------------------------- //
 
 export type RowIndex = Map<string, SweepResultRow>;
 
-// The separator is an escaped NUL, which no scenario name, symbol or split
-// can contain -- so two different triples can never collide on one key.
+// The separator is an escaped NUL, which no scenario name, symbol or split can
+// contain -- so two different triples can never collide on one key.
 const cellKey = (scenario: string, symbol: string, split: string) =>
   `${scenario}\u0000${symbol}\u0000${split}`;
 
@@ -126,45 +152,32 @@ export const lookupCell = (
   split: string,
 ): SweepResultRow | undefined => index.get(cellKey(scenario, symbol, split));
 
-export interface ScenarioSummary {
-  scenario: string;
-  split: string;
-  measured: number;
-  insufficient: number;
-  lowActivity: number;
-  errored: number;
-  /** Total cells in this (scenario, split) — equals the four counts summed. */
-  total: number;
-  /** Median annualised return over the MEASURED cells only. */
-  median: number | null;
-}
+/** The server's summary row for one (scenario, split), or undefined. */
+export const summaryFor = (
+  report: SweepReport,
+  scenario: string,
+  split: string,
+): SweepSummaryRow | undefined =>
+  report.summary.find((s) => s.scenario === scenario && s.split === split);
 
-/** `statistics.median` — the mean of the two middles on an even count. */
-export function median(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-export function summarise(rows: SweepResultRow[], scenario: string, split: string): ScenarioSummary {
-  const cells = rows.filter((r) => r.scenario === scenario && r.split === split);
-  const measured = cells.filter((r) => r.measured);
-  return {
-    scenario,
-    split,
-    measured: measured.length,
-    insufficient: cells.filter((r) => !r.error && r.insufficient).length,
-    lowActivity: cells.filter((r) => !r.error && r.low_activity).length,
-    errored: cells.filter((r) => !!r.error).length,
-    total: cells.length,
-    median: median(
-      measured
-        .map((r) => r.annualized_return)
-        .filter((v): v is number => v !== null && v !== undefined),
-    ),
-  };
-}
+/**
+ * How many cells in this (scenario, split) the server could not classify.
+ *
+ * This is a COUNT OF A RENDERED STATE, not a statistic: the server's summary has
+ * no `unknown` column, and without this the four counts would not add up to the
+ * cells actually on screen — and a reader who cannot add up the row stops
+ * trusting the table (the exact bug the runner's own summary once had).
+ */
+export const unknownCount = (rows: SweepResultRow[], scenario: string, split: string): number =>
+  rows.filter(
+    (r) =>
+      r.scenario === scenario &&
+      r.split === split &&
+      !r.error &&
+      !r.insufficient &&
+      !r.low_activity &&
+      !r.measured,
+  ).length;
 
 /** The splits present in the report, in the order the runner ran them. */
 export const splitsOf = (report: SweepReport): string[] => report.windows.map((w) => w.split);
