@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-060 (Layers 3 and 4; Layers 1–2 shipped 2026-08-28)
 **Plan file:** `docs/plans/fc-060-scenario-store-ui.md`
 **Scope:** shared (backtest engine + a new Cloud Run Job + dashboard backend/frontend + `cloudbuild.yaml`)
-**Status:** Published — build-ready as **two PRs** (PR-A store + Job + API; PR-B UI). Each gets two adversarial reviews.
+**Status:** Executing — PR-A merged (`1ad06c8`, 2026-08-29); PR-B (#102) pending Job verification. Each PR got two adversarial reviews + confirmation.
 **Size:** L (two M PRs)
 **Author:** Fable (plan), for Opus (build)
 **Last updated:** 2026-08-29
@@ -112,5 +112,5 @@ All four reviews (PR-A #103: security/reliability, data/BQ; PR-B #102: frontend,
 
 _Filled in after implementation is complete (PR-A, then PR-B)._
 
-- **PR-A:** · **Commit:** · **Date:** · **Notes:**
+- **PR-A:** https://github.com/memon1987/agentic_options_wheel/pull/103 · **Commit:** `1ad06c8` (squash of `344b1ac` → `a0b433b` → `0d1d4fd` → `77ff204`) · **Date:** 2026-08-29 · **Notes:** two adversarial reviews (security/reliability; data/BQ), both REQUEST_CHANGES; round 1 (13 items) → confirmation FIXES-INCOMPLETE (self-referential API dedup hash; SIGTERM before `run_sweep`); round 2 (6 items) → CONFIRMED-CLEAN; two LOW drifts fixed in `77ff204`. Design changes vs. the plan recorded in §Review addendum: the API never dedups; `done` requires persisted rows; SIGTERM handled end-to-end; `--task-timeout` 10800; `deploy-sweep-job` behind all promotes; `force`. Suite 2185 → 2478. Deferred residuals → FC-095.
 - **PR-B:** · **Commit:** · **Date:** · **Notes:**
