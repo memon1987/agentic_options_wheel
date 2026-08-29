@@ -13,11 +13,14 @@ The whole bet is in the indentation: data assembly is config-independent (see
 before the split, 10 scenarios x 6 symbols was 4-6 minutes; after, tens of
 seconds.
 
-**Zero provider calls during replays is asserted, not hoped for.** A regression
-that reintroduced a per-replay fetch would still produce correct numbers — just
-slowly, and only on a machine with network — so nothing about the results would
-reveal it. ``_CountingProvider`` wraps whatever provider is supplied and the
-sweep raises if the count moves inside the scenario loop.
+**Zero data-layer reads during replays is asserted, not hoped for.** A
+regression that reintroduced a per-replay fetch would still produce correct
+numbers — just slowly, and only on a machine with network — so nothing about the
+results would reveal it. Both halves are counted: network round-trips on a
+``_CountingProvider`` wrapped directly around the vendor client, and bar-cache
+reads on ``CachedBarProvider.hits``. The sweep raises if either moves inside the
+scenario loop; counting only the network would let a replay that re-read bars
+off disk pass unnoticed.
 
 SEQUENTIAL, DELIBERATELY (D10). Do NOT add a ``ThreadPoolExecutor`` here. Two
 process-global hazards make this code thread-UNSAFE, and neither is local to
@@ -67,6 +70,8 @@ dishonest-metric class, so the sweep does not carry one at all.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -84,6 +89,7 @@ from ..data.chain_store import ChainStore
 from ..data.dividends import load_default_schedule
 from ..engine.simulator import Materialised, Simulator
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
+from ..metrics.fitness import MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
 from .overrides import apply_overrides, validate_overrides
 
@@ -142,6 +148,30 @@ class Scenario:
     overrides: Dict[str, Any] = field(default_factory=dict)
     fill_haircut: Optional[float] = None
 
+    def scenario_hash(self) -> str:
+        """Identity of this ARM: its effective overrides plus its fill haircut.
+
+        ``config_hash`` cannot do this job. It hashes nine strategy parameters
+        plus the module-level scoring constants — 12 of the 19 allowlisted
+        override keys are outside it entirely (every ``rolling.*`` and
+        ``earnings.*`` key, ``universe.*``, ``min_avg_volume``), and the fill
+        haircut it hashes is the MODULE default, not this scenario's. So two
+        arms that differ in a roller knob, or only in ``fill_haircut``, carry the
+        SAME ``config_hash`` and are indistinguishable in any stored record.
+
+        Both hashes are reported. ``config_hash`` keeps a sweep row comparable
+        with a ``backtest_runs`` row; ``scenario_hash`` is what makes two rows of
+        this sweep distinguishable from each other.
+        """
+        payload = json.dumps(
+            {
+                "overrides": {k: self.overrides[k] for k in sorted(self.overrides)},
+                "fill_haircut": self.fill_haircut,
+            },
+            sort_keys=True, default=str,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
 
 @dataclass
 class ScenarioResult:
@@ -153,6 +183,9 @@ class ScenarioResult:
     end: date
     split: str  # 'fit' | 'holdout' | 'all'
     config_hash: str
+    # Identity of the ARM (overrides + fill haircut). See Scenario.scenario_hash:
+    # config_hash does not separate arms that differ outside its nine keys.
+    scenario_hash: str = ""
     verdict: Optional[str] = None
     demote: Optional[bool] = None
     total_return: Optional[float] = None
@@ -192,6 +225,31 @@ class ScenarioResult:
         """
         return self.verdict == "insufficient"
 
+    @property
+    def low_activity(self) -> bool:
+        """The wheel held a position on too few days to mean anything.
+
+        ``MIN_DAYS_IN_POSITION`` (0.25) is the same floor ``FitnessReport``
+        already uses to refuse to call a symbol fit, and it is the difference
+        between "this arm earned 4% on capital that was working" and "this arm
+        earned 4% on capital that sat idle 95% of the time and got lucky twice".
+        Annualising the second is how a sweep manufactures a winner: the fewer
+        days deployed, the more a single good trade is multiplied by 365/days.
+
+        Counted and shown, never averaged — same treatment as ``insufficient``,
+        for the same reason.
+        """
+        return (
+            self.ok
+            and self.days_in_position_fraction is not None
+            and self.days_in_position_fraction < MIN_DAYS_IN_POSITION
+        )
+
+    @property
+    def measured(self) -> bool:
+        """Whether this cell carries a number worth ranking."""
+        return self.ok and not self.insufficient and not self.low_activity
+
     def as_dict(self) -> Dict[str, Any]:
         out = {
             k: v for k, v in self.__dict__.items()
@@ -199,6 +257,8 @@ class ScenarioResult:
         out["start"] = self.start.isoformat()
         out["end"] = self.end.isoformat()
         out["insufficient"] = self.insufficient
+        out["low_activity"] = self.low_activity
+        out["measured"] = self.measured
         return out
 
 
@@ -212,11 +272,18 @@ class SweepResult:
     windows: List[Tuple[str, date, date]] = field(default_factory=list)
     base_config_hash: str = ""
     scenario_config_hashes: Dict[str, str] = field(default_factory=dict)
+    scenario_hashes: Dict[str, str] = field(default_factory=dict)
     scenario_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    scenario_fill_haircuts: Dict[str, Optional[float]] = field(default_factory=dict)
     materialise_seconds: Dict[str, float] = field(default_factory=dict)
     replay_seconds: Dict[str, float] = field(default_factory=dict)
     wall_seconds: float = 0.0
-    provider_calls_total: int = 0
+    # Round-trips that reached the RAW vendor client. A bar served from the
+    # cache is NOT one of these — it is a `bar_cache_hits`. Conflating the two
+    # (which the first cut did) reports a fully-offline sweep as having made six
+    # provider calls, which is the opposite of the claim being made.
+    provider_fetches_total: int = 0
+    bar_cache_hits: int = 0
     provider_calls_during_replays: int = 0
     starting_cash: float = 0.0
     run_sensitivity: bool = False
@@ -229,6 +296,17 @@ class SweepResult:
     def has_holdout(self) -> bool:
         return any(split == "holdout" for split, _s, _e in self.windows)
 
+    @property
+    def in_sample_only(self) -> bool:
+        """No holdout was asked for, so nothing here has been validated.
+
+        Not a footnote: it is the default, and the default is the dangerous
+        case. A ranking chosen on the same data it was measured on, over a
+        single vol regime (Alpaca's option history starts 2024-02), is a
+        hypothesis — the report says so at the top rather than at the bottom.
+        """
+        return not self.has_holdout
+
     def cell(self, scenario: str, symbol: str, split: str = "all") -> Optional[ScenarioResult]:
         for row in self.rows:
             if row.scenario == scenario and row.symbol == symbol and row.split == split:
@@ -239,10 +317,17 @@ class SweepResult:
 class _CountingProvider:
     """Counts every call that reaches the wrapped data provider.
 
-    The "zero provider calls during replays" contract is the whole reason the
-    sweep is affordable, and it is invisible in the results: a regression that
-    re-fetched per replay would still produce correct numbers. So it is asserted
-    on a counter rather than inferred from wall-clock or read off a log line.
+    Sits INNERMOST, directly around the vendor client, so what it counts is
+    network round-trips — a bar served from ``BarStore`` never reaches it. The
+    outer layer's cache hits are counted separately (``CachedBarProvider.hits``),
+    because reporting the two as one number describes a fully-offline sweep as
+    having made six provider calls, which is the opposite of the claim.
+
+    The "zero I/O during replays" contract is the whole reason the sweep is
+    affordable, and it is invisible in the results: a regression that re-fetched
+    per replay would still produce correct numbers. So it is asserted on these
+    counters rather than inferred from wall-clock or read off a log line — and
+    the assertion covers cache hits too, since a replay must read neither.
     """
 
     def __init__(self, provider) -> None:
@@ -294,13 +379,14 @@ def _windows(
 
 def _row_from_report(
     *, scenario: str, symbol: str, window: Tuple[str, date, date],
-    cfg_hash: str, report, sensitivity: Optional[dict], seconds: float,
+    cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
+    seconds: float,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
     return ScenarioResult(
         scenario=scenario, symbol=symbol, start=start, end=end, split=split,
-        config_hash=cfg_hash,
+        config_hash=cfg_hash, scenario_hash=scenario_hash,
         verdict=verdict,
         # Same rule as `bq_writer.build_row`: 'insufficient' is a statement about
         # the window and a verdict that flips on the fill assumption is not a
@@ -387,9 +473,20 @@ def run_sweep(
     symbols = [s.upper() for s in symbols]
     windows = _windows(start, end, holdout_start)
 
-    provider = _CountingProvider(
+    # The counter sits INNERMOST, around the vendor client, so `fetches` means
+    # network round-trips and a bar served off disk is not one. The bar cache
+    # then wraps it, and its `hits` are reported separately. Counting at the
+    # outer edge (the first cut) described a fully-offline sweep as having made
+    # six provider calls.
+    fetch_counter = _CountingProvider(
         bar_provider if bar_provider is not None
-        else CachedBarProvider(AlpacaDataProvider.from_config(base_config), BarStore())
+        else AlpacaDataProvider.from_config(base_config)
+    )
+    # An injected provider is used as given — the caller owns its caching, and
+    # the sweep must not silently wrap a test double in a real disk cache.
+    provider = (
+        fetch_counter if bar_provider is not None
+        else CachedBarProvider(fetch_counter, BarStore())
     )
     if chain_store is None:
         chain_store = ChainStore.from_env()
@@ -408,7 +505,9 @@ def run_sweep(
         scenario_config_hashes={
             name: config_hash(cfg) for name, cfg in scenario_configs.items()
         },
+        scenario_hashes={s.name: s.scenario_hash() for s in scenarios},
         scenario_overrides={s.name: dict(s.overrides) for s in scenarios},
+        scenario_fill_haircuts={s.name: s.fill_haircut for s in scenarios},
         starting_cash=starting_cash,
         run_sensitivity=run_sensitivity,
     )
@@ -418,13 +517,14 @@ def run_sweep(
         scenarios=len(scenarios), symbols=len(symbols),
         windows=[f"{sp}:{s}..{e}" for sp, s, e in windows],
         base_config_hash=result.base_config_hash,
+        in_sample_only=result.in_sample_only,
     )
 
     for symbol in symbols:
         for window in windows:
             split, w_start, w_end = window
             key = f"{symbol}:{split}"
-            calls_before_materialise = provider.calls
+            io_before_materialise = _io_signature(fetch_counter, provider)
             t0 = time.perf_counter()
             try:
                 materialised = _materialise_window(
@@ -448,6 +548,7 @@ def run_sweep(
                         scenario=scenario.name, symbol=symbol,
                         start=w_start, end=w_end, split=split,
                         config_hash=result.scenario_config_hashes[scenario.name],
+                        scenario_hash=result.scenario_hashes[scenario.name],
                         error=message,
                     ))
                 continue
@@ -459,17 +560,19 @@ def run_sweep(
                 window=f"{w_start}..{w_end}",
                 decision_days=len(materialised.days),
                 seconds=result.materialise_seconds[key],
-                provider_calls=provider.calls - calls_before_materialise,
+                provider_fetches=fetch_counter.calls - io_before_materialise[0],
+                bar_cache_hits=_cache_hits(provider) - io_before_materialise[1],
             )
 
-            calls_before_replays = provider.calls
-            by_method_before = dict(provider.by_method)
+            io_before_replays = _io_signature(fetch_counter, provider)
+            by_method_before = dict(fetch_counter.by_method)
             with quiet_strategy_logs(quiet_logs):
                 for scenario in scenarios:
                     row = _replay_one(
                         scenario=scenario,
                         config=scenario_configs[scenario.name],
                         cfg_hash=result.scenario_config_hashes[scenario.name],
+                        scenario_hash=result.scenario_hashes[scenario.name],
                         provider=provider, builder=builder,
                         symbol=symbol, window=window,
                         materialised=materialised,
@@ -480,26 +583,34 @@ def run_sweep(
                     result.rows.append(row)
                     rkey = f"{scenario.name}:{symbol}:{split}"
                     result.replay_seconds[rkey] = row.replay_seconds or 0.0
-            leaked = provider.calls - calls_before_replays
+            io_after = _io_signature(fetch_counter, provider)
+            leaked = sum(a - b for a, b in zip(io_after, io_before_replays))
             result.provider_calls_during_replays += leaked
             if leaked:
-                # Hard failure, not a warning. A replay that reaches the network
-                # invalidates the entire premise of the sweep — and it does so
-                # invisibly, because the numbers still come out right.
+                # Hard failure, not a warning. A replay that reads ANYTHING —
+                # the network or even the bar cache — invalidates the premise of
+                # the sweep, and does so invisibly, because the numbers still
+                # come out right. Cache hits count here for exactly that reason:
+                # a replay that re-read bars off disk would be caught by no other
+                # signal.
                 escaped = {
                     method: count - by_method_before.get(method, 0)
-                    for method, count in provider.by_method.items()
+                    for method, count in fetch_counter.by_method.items()
                     if count - by_method_before.get(method, 0) > 0
                 }
+                hits = io_after[1] - io_before_replays[1]
+                if hits:
+                    escaped["bar_cache_read"] = hits
                 raise RuntimeError(
-                    f"{leaked} provider call(s) escaped during the replay loop "
+                    f"{leaked} data-layer read(s) escaped during the replay loop "
                     f"for {symbol} ({split}): {escaped}. A replay must read only "
                     "the Materialised it was handed; something is re-fetching per "
                     "scenario and the sweep's cost model is void."
                 )
 
     result.wall_seconds = round(time.perf_counter() - began, 3)
-    result.provider_calls_total = provider.calls
+    result.provider_fetches_total = fetch_counter.calls
+    result.bar_cache_hits = _cache_hits(provider)
     logger.info(
         "Scenario sweep complete",
         event_category="backtest", event_type="sweep_completed",
@@ -507,21 +618,54 @@ def run_sweep(
         wall_seconds=result.wall_seconds,
         materialise_seconds=round(sum(result.materialise_seconds.values()), 3),
         replay_seconds=round(sum(result.replay_seconds.values()), 3),
-        provider_calls_total=result.provider_calls_total,
+        provider_fetches=result.provider_fetches_total,
+        bar_cache_hits=result.bar_cache_hits,
         provider_calls_during_replays=result.provider_calls_during_replays,
+        in_sample_only=result.in_sample_only,
     )
     return result
+
+
+def _cache_hits(provider) -> int:
+    """Bar-cache hits, or 0 for a provider that has no cache in front of it."""
+    return int(getattr(provider, "hits", 0) or 0)
+
+
+def _io_signature(fetch_counter: "_CountingProvider", provider) -> Tuple[int, int]:
+    """``(network fetches, bar-cache reads)`` so far.
+
+    Both halves are guarded during replays. Counting only the network would let
+    a replay that re-read bars off disk pass — slower, still correct, and
+    completely silent.
+    """
+    return fetch_counter.calls, _cache_hits(provider)
 
 
 # --------------------------------------------------------------------------- #
 # Internals
 # --------------------------------------------------------------------------- #
 def _with_base_first(scenarios: Sequence[Scenario]) -> List[Scenario]:
-    """``base`` first, always. Every other row is read relative to it."""
+    """``base`` first, always. Every other row is read relative to it.
+
+    A scenario NAMED ``base`` that carries overrides or a fill haircut is
+    refused outright. ``base`` is the comparator: every delta in the report,
+    and the whole sign-agreement column, is measured against it. An arm that
+    quietly redefined it would move every other number in the table while
+    looking like an ordinary row — the reader would be comparing nine arms
+    against a tenth arm and calling it the status quo.
+    """
     ordered = list(scenarios)
     existing = next((s for s in ordered if s.name == BASE_SCENARIO_NAME), None)
     if existing is None:
         return [Scenario(BASE_SCENARIO_NAME, {})] + ordered
+    if existing.overrides or existing.fill_haircut is not None:
+        raise ValueError(
+            f"the scenario named {BASE_SCENARIO_NAME!r} must carry no overrides "
+            f"and no fill_haircut — it is the comparator every other row is read "
+            f"against. Got overrides={existing.overrides!r}, "
+            f"fill_haircut={existing.fill_haircut!r}. Rename it, and the implicit "
+            f"{BASE_SCENARIO_NAME!r} arm will be added back."
+        )
     ordered.remove(existing)
     return [existing] + ordered
 
@@ -570,9 +714,10 @@ def _materialise_window(
 
 
 def _replay_one(
-    *, scenario: Scenario, config, cfg_hash: str, provider, builder,
-    symbol: str, window: Tuple[str, date, date], materialised: Materialised,
-    starting_cash: float, max_dte: int, dividends, run_sensitivity: bool,
+    *, scenario: Scenario, config, cfg_hash: str, scenario_hash: str, provider,
+    builder, symbol: str, window: Tuple[str, date, date],
+    materialised: Materialised, starting_cash: float, max_dte: int, dividends,
+    run_sensitivity: bool,
 ) -> ScenarioResult:
     split, w_start, w_end = window
     haircut = (
@@ -608,7 +753,8 @@ def _replay_one(
             }
         return _row_from_report(
             scenario=scenario.name, symbol=symbol, window=window,
-            cfg_hash=cfg_hash, report=report, sensitivity=sensitivity,
+            cfg_hash=cfg_hash, scenario_hash=scenario_hash,
+            report=report, sensitivity=sensitivity,
             seconds=time.perf_counter() - t0,
         )
     except Exception as exc:  # noqa: BLE001 - one arm must not lose the others
@@ -621,7 +767,8 @@ def _replay_one(
         )
         return ScenarioResult(
             scenario=scenario.name, symbol=symbol, start=w_start, end=w_end,
-            split=split, config_hash=cfg_hash, error=message,
+            split=split, config_hash=cfg_hash, scenario_hash=scenario_hash,
+            error=message,
             replay_seconds=round(time.perf_counter() - t0, 3),
         )
 

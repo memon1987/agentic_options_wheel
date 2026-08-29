@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
@@ -1297,31 +1296,15 @@ class TestRowConversionIsIdenticalToTheLegacyLoop:
         assert snap.puts == old_puts
         assert snap.calls == old_calls
 
-    @pytest.mark.skipif(
-        not Path("cache/backtest/chains").is_dir(),
-        reason="no developer chain cache present (gitignored; absent in CI)",
-    )
-    def test_identical_on_real_cached_files(self):
-        """The same assertion against files the vendor actually produced.
-
-        The synthetic fixtures above go through this repo's own writer, so they
-        cannot contain a shape the writer never emits — a column dtype promoted
-        by a whole-file NaN, an integer volume that landed as a float. Real files
-        can. Sampled rather than exhaustive: the point is to touch data nobody in
-        this test constructed.
-        """
-        all_files = sorted(Path("cache/backtest/chains").glob("*/*.parquet"))
-        assert all_files, "cache directory exists but holds no parquet files"
-        step = max(1, len(all_files) // 25)
-        for path in all_files[::step][:25]:
-            df = pd.read_parquet(path)
-            spot = float(df["underlying_price"].iloc[0])
-            for bounds in ({}, {"universe_dte": 7}, {"strike_gte": spot * 0.95},
-                           {"strike_lte": spot * 1.05}):
-                new_puts, new_calls = ChainStore._rows_to_quotes(
-                    df, bounds.get("universe_dte"), bounds.get("strike_gte"),
-                    bounds.get("strike_lte"),
-                )
-                old_puts, old_calls = _legacy_narrow_and_convert(df, **bounds)
-                assert sorted(new_puts, key=lambda x: x.strike) == old_puts, path
-                assert sorted(new_calls, key=lambda x: x.strike) == old_calls, path
+    # The same assertion against REAL vendor files lives in
+    # tools/diagnostics/chain_store_identity_check.py, not here. It needs
+    # `cache/backtest/chains`, which is gitignored and absent in CI, so as a test
+    # it was either skipped (proving nothing where it matters) or quietly
+    # dependent on one developer's disk — the ambient-state defect this suite has
+    # already fixed four times. Run it on demand:
+    #
+    #     python tools/diagnostics/chain_store_identity_check.py
+    #
+    # It walks every cached session under six narrowings and compares field by
+    # field INCLUDING Python type, which is the part fixtures cannot cover: a
+    # writer-produced file can only contain shapes the writer emits.

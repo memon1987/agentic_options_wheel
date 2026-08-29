@@ -521,7 +521,16 @@ class TestCliWriteInterlockRemoved:
                             ["main.py", "--command", "scan",
                              "--config", "config/covered_call.yaml"])
         alpaca = Mock()
-        with patch("main.AlpacaClient", return_value=alpaca), \
+        # `setup_logging` is stubbed for the same reason the sweep's CLI tests
+        # stub it (FC-060 Layer 2, review round 2): it installs a root
+        # FileHandler on logs/options_wheel.log and flips
+        # `cache_logger_on_first_use=True` PROCESS-WIDE, and restores neither, so
+        # every test that ran after this one inherited a reconfigured structlog
+        # and the suite wrote megabytes to disk. `conftest`'s
+        # `_logging_config_is_not_leaked` guard now catches that; nothing here is
+        # about logging, so the cheapest fix is not to call it.
+        with patch("main.setup_logging", lambda *a, **kw: None), \
+             patch("main.AlpacaClient", return_value=alpaca), \
              patch("main.MarketDataManager", return_value=Mock()), \
              patch("main.PortfolioTracker", return_value=Mock()), \
              patch("main.OptionsScanner", return_value=Mock()), \

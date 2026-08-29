@@ -18,19 +18,25 @@ it produce a number that means something other than what it says":
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+import uuid
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
 from src.backtesting.data.chain_store import ChainStore
 from src.backtesting.engine.simulator import Simulator
+from src.backtesting.metrics.fitness import MIN_DAYS_IN_POSITION
 from src.backtesting.scenarios import (
+    ALLOWED_OVERRIDES,
+    REJECTED_OVERRIDES,
     OverrideError,
     Scenario,
     ScenarioResult,
     SweepResult,
     apply_overrides,
+    common_delta,
     render_json,
     render_markdown,
     run_sweep,
@@ -451,6 +457,48 @@ class TestRunSweep:
         assert logging.getLogger("src").level == before
 
 
+@contextmanager
+def _cli_structlog_config():
+    """The CLI's structlog processor chain, WITHOUT ``setup_logging``'s side effects.
+
+    ``setup_logging`` is the right thing in production and the wrong thing in a
+    test: it installs a root ``FileHandler`` on ``logs/options_wheel.log`` and
+    flips ``cache_logger_on_first_use=True`` **process-wide**, and it restores
+    neither. Calling it here (the first cut did) leaked both into every test that
+    ran afterwards — the suite started writing 7.7 MB of replay logs to disk, and
+    the cached-proxy flag produced a genuine order-dependent failure three files
+    away in `test_backtest_simulator`.
+
+    So this reproduces only the part the assertion needs — ``filter_by_level``
+    sitting where ``setup_logging`` puts it, second in the chain — and restores
+    the previous configuration unconditionally. `conftest`'s
+    `_logging_config_is_not_leaked` guard now fails any test that forgets to.
+    """
+    import structlog
+
+    previous = structlog.get_config()
+    try:
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,
+                structlog.stdlib.filter_by_level,
+                structlog.stdlib.add_log_level,
+                structlog.processors.JSONRenderer(),
+            ],
+            context_class=dict,
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            wrapper_class=structlog.stdlib.BoundLogger,
+            # Deliberately FALSE here even though production sets it True: this
+            # test is about processor ORDER, and the cache is what makes order
+            # unobservable after the first bind. The caching defect has its own
+            # coverage in `runner`'s docstring and its own FC.
+            cache_logger_on_first_use=False,
+        )
+        yield
+    finally:
+        structlog.configure(**previous)
+
+
 class TestTheRejectionTallySurvivesQuietLogs:
     """D11's actual claim, isolated from the structlog proxy cache.
 
@@ -459,36 +507,33 @@ class TestTheRejectionTallySurvivesQuietLogs:
     event the stdlib level then DROPS is still counted. If that ordering is ever
     reversed, a sweep silently reports zero blocked days for every arm.
 
-    Tested on a logger created inside the tally rather than through a full
-    replay, because the strategy's module loggers cache their processor chain on
-    first use and therefore cannot answer this question after the first replay in
-    a process — see ``runner``'s module docstring, and treat that as the separate
+    Tested on a purpose-made logger rather than through a full replay, because
+    the strategy's module loggers cache their processor chain on first use and
+    therefore cannot answer this question after the first replay in a process —
+    see ``runner``'s module docstring, and treat that as the separate
     pre-existing defect it is.
     """
 
-    def test_an_event_the_stdlib_level_drops_is_still_counted(self, monkeypatch):
-        import itertools
+    def test_an_event_the_stdlib_level_drops_is_still_counted(self):
         import logging
 
         import structlog
 
         from src.backtesting.engine.rejections import RejectionTally
         from src.utils import clock
-        from src.utils.logger import setup_logging
 
-        setup_logging("INFO")  # the config the CLI actually runs under
-        name = f"src.fc060b_probe_{next(itertools.count())}_{id(self)}"
-        logging.getLogger(name).setLevel(logging.WARNING)
-        clock.set_now(__import__("datetime").datetime(2024, 6, 3, 16, 0))
+        name = f"src.fc060b_probe_{uuid.uuid4().hex}"
+        probe = logging.getLogger(name)
+        probe.setLevel(logging.WARNING)
+        clock.set_now(datetime(2024, 6, 3, 16, 0))
         try:
-            tally = RejectionTally()
-            with tally:
-                # Bound inside the tally, exactly as a fresh process's strategy
-                # loggers are: the chain it caches includes the tally.
-                structlog.get_logger(name).info(
-                    "blocked",
-                    event_type="stage_7_complete_not_found",
-                )
+            with _cli_structlog_config():
+                tally = RejectionTally()
+                with tally:
+                    structlog.get_logger(name).info(
+                        "blocked",
+                        event_type="stage_7_complete_not_found",
+                    )
             assert tally.summary() == {
                 "no put cleared delta/DTE/premium (stage 7)": 1
             }, (
@@ -498,7 +543,31 @@ class TestTheRejectionTallySurvivesQuietLogs:
             )
         finally:
             clock.set_now(None)
-            logging.getLogger(name).setLevel(logging.NOTSET)
+            probe.setLevel(logging.NOTSET)
+            logging.Logger.manager.loggerDict.pop(name, None)
+
+    def test_this_test_file_leaves_no_log_file_behind(self):
+        """The regression that motivated the rewrite, stated as a fact.
+
+        `setup_logging` writes to `logs/options_wheel.log`; a test that calls it
+        without restoring turns every later test in the session into a log
+        producer. Asserting on the absence of a root FileHandler catches that at
+        the source rather than by noticing the suite got slower.
+        """
+        import logging
+
+        # pytest's own logging plugin installs a /dev/null FileHandler; the one
+        # that matters is a handler pointed at a real path under logs/.
+        leaked = [
+            h for h in logging.getLogger().handlers
+            if isinstance(h, logging.FileHandler)
+            and "null" not in str(getattr(h, "baseFilename", "")).lower()
+        ]
+        assert not leaked, (
+            f"a root FileHandler is installed ({leaked}); some test called "
+            "setup_logging() without restoring it, and the whole suite is now "
+            "writing replay logs to disk"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -598,6 +667,10 @@ def _hand_built_holdout() -> SweepResult:
         base_config_hash="basehash00000000",
         scenario_config_hashes={n: f"hash{n}" for n in
                                 ("base", "winner", "flipper", "partial")},
+        scenario_hashes={n: f"arm{n}" for n in
+                         ("base", "winner", "flipper", "partial")},
+        scenario_fill_haircuts={"base": None, "winner": None,
+                                "flipper": None, "partial": 1.0},
         scenario_overrides={"base": {}, "winner": {"risk.max_position_size": 0.2},
                             "flipper": {"strategy.min_put_premium": 0.3},
                             "partial": {"strategy.max_stock_price": 800.0}},
@@ -647,12 +720,34 @@ class TestReport:
         assert "Known biases" in markdown
         assert "FC-056" in markdown
         assert "biased against the call-heavier one" in markdown
-        assert "Premium understated" in markdown
+        # The 0.676 figure must carry its staleness marker, or a reader treats a
+        # pre-FC-068/078 measurement as a current coefficient.
+        assert "last measured 0.676" in markdown
+        assert "stale, pending the FC-068/078 re-baseline" in markdown
+        # ...and the footer is the SWEEP's, not the single-symbol report's.
+        assert "DIFFERENCES survive" in markdown
+        assert "One vol regime" in markdown
+
+    def test_the_footer_does_not_point_at_sections_this_report_lacks(self):
+        """`reporting.report.KNOWN_BIASES` refers the reader to a data-quality
+        block, an attribution section and a buy-and-hold table. A sweep report has
+        none of the three, so quoting it verbatim sends the reader hunting."""
+        markdown = render_markdown(_hand_built_holdout())
+        for phrase in ("data-quality block above",
+                       "the attribution section",
+                       "comparison below",
+                       "dividend_coverage"):
+            assert phrase not in markdown, (
+                f"the footer refers to {phrase!r}, which this report does not have"
+            )
 
     def test_the_report_says_it_was_not_persisted(self):
         markdown = render_markdown(_hand_built_holdout())
         assert "backtest_runs" in markdown
-        assert "Not persisted" in markdown
+        assert "Results are not persisted" in markdown
+        # ...but it must NOT claim the run writes nothing at all: a cold window
+        # does populate the local chain cache, and the GCS lake when configured.
+        assert "CHAIN_LAKE_BUCKET" in markdown
 
     def test_the_holdout_table_carries_sign_agreement(self):
         markdown = render_markdown(_hand_built_holdout())
@@ -857,3 +952,484 @@ class TestScenarioFileParsing:
         with pytest.raises(SystemExit) as exc:
             self._load(tmp_path, body)
         assert fragment in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2 — the fixes the two adversarial reviews required
+# --------------------------------------------------------------------------- #
+class TestKeysTheReplayCannotReach:
+    """Q1. `rolling.fallback_strike_attempts` joins the refused list.
+
+    It was the one allowlisted key the build could not demonstrate moved a
+    replay, and it was kept on the reading that "unproven is not dead". A
+    reviewer settled it by instrumenting the roller: the knob governs the THIRD
+    and later strike rungs, and rung 1 always fills here — the adapter fills
+    immediately at the broker's haircut price rather than resting a limit that
+    can go unfilled — so over 37 rolls x 7 arms, rung >= 3 was reached 0 times.
+    Live in production, where a real limit can miss; inert in a replay.
+    """
+
+    def test_fallback_strike_attempts_is_refused(self, sweep_config):
+        with pytest.raises(OverrideError) as exc:
+            apply_overrides(sweep_config, {"rolling.fallback_strike_attempts": 5})
+        message = str(exc.value)
+        assert "unreachable in a replay" in message
+        assert "rung 1 always fills" in message
+
+    def test_the_other_roller_knobs_are_still_allowed(self, sweep_config):
+        """The refusal is about this one rung counter, not about the roller."""
+        scenario = apply_overrides(sweep_config, {
+            "rolling.itm_trigger_ratio": 0.90,
+            "rolling.max_extension_days": 7,
+        })
+        assert scenario.rolling_itm_trigger_ratio == 0.90
+        assert scenario.rolling_max_extension_days == 7
+
+    def test_the_allowlist_carries_no_key_without_a_demonstrated_effect(self):
+        """A ledger, so a key cannot be re-added without re-running the check.
+
+        Every name here was swept at an extreme value and observed to move at
+        least one row; the four names in the refusal set below were swept and
+        observed NOT to. Adding a key without doing that is what put three dead
+        knobs on the list in the first place.
+        """
+        assert "rolling.fallback_strike_attempts" not in ALLOWED_OVERRIDES
+        for dead in ("strategy.put_limit_spread_fraction",
+                     "strategy.call_limit_spread_fraction",
+                     "universe.min_open_interest",
+                     "rolling.fallback_strike_attempts"):
+            assert dead in REJECTED_OVERRIDES
+
+
+class TestTheBaseScenarioIsTheComparator:
+    """Q4. A `base` arm carrying overrides would move every other number."""
+
+    def test_a_base_scenario_with_overrides_is_refused(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        with pytest.raises(ValueError, match="must carry no overrides"):
+            run_sweep(sweep_config,
+                      [Scenario("base", {"strategy.min_put_premium": 0.30})],
+                      ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+                      chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+                      quiet_logs=False)
+        assert provider.calls == 0, "the sweep started before validating base"
+
+    def test_a_base_scenario_with_a_fill_haircut_is_refused(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        with pytest.raises(ValueError, match="must carry no overrides"):
+            run_sweep(sweep_config, [Scenario("base", {}, 1.0)], ["AAA"],
+                      days[0], days[-1], starting_cash=50_000.0,
+                      chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+                      quiet_logs=False)
+
+    def test_an_empty_base_scenario_is_still_accepted(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        result = run_sweep(sweep_config, [Scenario("base", {})], ["AAA"],
+                           days[0], days[-1], starting_cash=50_000.0,
+                           chain_store=ChainStore(str(tmp_path)),
+                           bar_provider=provider, quiet_logs=False)
+        assert result.scenarios == ["base"]
+
+
+class TestScenarioHash:
+    """Q5. `config_hash` cannot tell two arms apart; `scenario_hash` can."""
+
+    def test_arms_outside_config_hash_still_get_distinct_scenario_hashes(self):
+        """12 of the 19 allowlisted keys do not move `config_hash` at all."""
+        base = Scenario("base", {})
+        roller = Scenario("roller", {"rolling.itm_trigger_ratio": 0.9})
+        earnings = Scenario("earnings", {"earnings.blackout_days": 5})
+        assert len({base.scenario_hash(), roller.scenario_hash(),
+                    earnings.scenario_hash()}) == 3
+
+    def test_two_arms_differing_only_in_fill_haircut_are_distinguishable(self):
+        """The exact case `config_hash` provably cannot see: it hashes the
+        MODULE default haircut, not the scenario's."""
+        mid = Scenario("mid", {"strategy.min_put_premium": 0.3})
+        bid = Scenario("bid", {"strategy.min_put_premium": 0.3}, 1.0)
+        assert mid.scenario_hash() != bid.scenario_hash()
+
+    def test_the_hash_is_stable_and_ignores_key_order(self):
+        a = Scenario("a", {"strategy.min_put_premium": 0.3,
+                           "risk.max_position_size": 0.2})
+        b = Scenario("b", {"risk.max_position_size": 0.2,
+                           "strategy.min_put_premium": 0.3})
+        assert a.scenario_hash() == b.scenario_hash()
+        assert len(a.scenario_hash()) == 16
+
+    def test_every_row_carries_it_and_the_report_shows_it(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        result = run_sweep(
+            sweep_config, [Scenario("cheaper", {"strategy.min_put_premium": 0.30})],
+            ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=False)
+        assert all(r.scenario_hash for r in result.rows)
+        assert (result.cell("base", "AAA").scenario_hash
+                != result.cell("cheaper", "AAA").scenario_hash)
+        markdown = render_markdown(result)
+        assert "scenario hash" in markdown
+        assert result.scenario_hashes["cheaper"] in markdown
+        payload = json.loads(render_json(result))
+        assert payload["scenario_hashes"]["cheaper"] == \
+            result.scenario_hashes["cheaper"]
+        assert payload["rows"][0]["scenario_hash"]
+
+    def test_a_config_hash_equal_to_base_renders_as_such(self):
+        """A column of identical hex reads as a bug; "= base" reads as the fact."""
+        result = _hand_built_holdout()
+        result.scenario_config_hashes = {n: "samehash00000000"
+                                         for n in result.scenarios}
+        result.scenario_hashes = {n: f"arm{n}" for n in result.scenarios}
+        markdown = render_markdown(result)
+        assert "= base" in markdown
+        assert markdown.count("samehash00000000") == 1, (
+            "only base should print the shared config hash; the rest say '= base'"
+        )
+
+
+class TestInSampleBanner:
+    """Q6. Out-of-sample is opt-in, so in-sample must be loudly labelled."""
+
+    def test_a_sweep_without_a_holdout_carries_the_banner(self):
+        result = _hand_built_holdout()
+        result.windows = [("all", date(2025, 1, 1), date(2025, 6, 30))]
+        for row in result.rows:
+            row.split = "all"
+        assert result.in_sample_only
+        markdown = render_markdown(result)
+        assert "IN-SAMPLE ONLY" in markdown
+        assert "--holdout-start" in markdown
+        # At the TOP: before any number a reader could act on.
+        assert markdown.index("IN-SAMPLE ONLY") < markdown.index("| scenario |")
+        assert json.loads(render_json(result))["in_sample_only"] is True
+
+    def test_a_sweep_with_a_holdout_does_not(self):
+        result = _hand_built_holdout()
+        assert not result.in_sample_only
+        markdown = render_markdown(result)
+        assert "IN-SAMPLE ONLY" not in markdown
+        assert json.loads(render_json(result))["in_sample_only"] is False
+
+    def test_holdout_semantics_are_documented_where_the_split_is_shown(self):
+        markdown = render_markdown(_hand_built_holdout())
+        assert "independent replays" in markdown
+        assert "carries no position across the boundary" in markdown
+        assert "A short holdout" in markdown and "inflates `insuf`" in markdown
+
+    def test_the_two_windows_really_are_independent_replays(
+            self, tmp_path, two_symbols, sweep_config):
+        """The claim the semantics note makes, checked against the engine.
+
+        Each window is its own `Simulator`, so both start at the full
+        `--starting-cash` and neither inherits the other's assigned shares.
+        """
+        days, provider = two_symbols
+        result = run_sweep(
+            sweep_config, [Scenario("a", {})], ["AAA"], days[0], days[-1],
+            holdout_start=days[15], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=False)
+        fit = result.cell("a", "AAA", "fit")
+        holdout = result.cell("a", "AAA", "holdout")
+        assert fit is not None and holdout is not None
+        # Both windows priced their own benchmark off their own bars, and both
+        # were handed the same starting capital.
+        for row in (fit, holdout):
+            assert row.decision_days and row.decision_days > 0
+        assert fit.end < holdout.start
+
+
+class TestLowActivityCells:
+    """Q7. An annualised return earned on idle capital is not a measurement."""
+
+    def _result_with(self, fraction):
+        result = _hand_built_holdout()
+        for row in result.rows:
+            row.split = "all"
+        result.windows = [("all", date(2025, 1, 1), date(2025, 6, 30))]
+        cell = result.cell("winner", "AAA", "all")
+        cell.days_in_position_fraction = fraction
+        cell.annualized_return = 4.0  # a spectacular number off two lucky days
+        return result, cell
+
+    def test_a_thinly_deployed_cell_is_flagged_not_ranked(self):
+        result, cell = self._result_with(0.04)
+        assert cell.low_activity and not cell.measured
+        markdown = render_markdown(result)
+        assert "`low-act 4%`" in markdown, (
+            "the fraction must be printed: 'low-act 4%' and 'low-act 24%' are "
+            "very different amounts of evidence"
+        )
+        assert "+400.0%" not in markdown, "a low-activity cell was ranked"
+
+    def test_it_is_excluded_from_median_min_and_max(self):
+        result, _cell = self._result_with(0.04)
+        winner = [line for line in render_markdown(result).splitlines()
+                  if line.startswith("| winner | all |")]
+        assert winner, "per-scenario summary row missing"
+        assert "+400.0%" not in winner[0], (
+            "the low-activity cell reached an aggregate; a 4% deployment must "
+            "not set a scenario's max"
+        )
+        # columns: scenario | split | median | min | max | measured | insuf |
+        #          low-act | demote | err
+        cells = [c.strip() for c in winner[0].strip("|").split("|")]
+        measured, insuf, low_act = cells[5], cells[6], cells[7]
+        assert (insuf, low_act) == ("0", "1"), (
+            f"expected insuf=0 and low-act=1 in {winner[0]!r}"
+        )
+        assert measured == "3", (
+            f"the low-activity cell was counted as measured in {winner[0]!r}"
+        )
+
+    def test_the_threshold_is_the_one_fitness_already_uses(self):
+        just_over, _ = self._result_with(MIN_DAYS_IN_POSITION + 0.01)
+        assert not just_over.cell("winner", "AAA", "all").low_activity
+        just_under, _ = self._result_with(MIN_DAYS_IN_POSITION - 0.01)
+        assert just_under.cell("winner", "AAA", "all").low_activity
+
+    def test_it_is_excluded_from_sign_agreement(self):
+        result = _hand_built_holdout()
+        result.cell("winner", "AAA", "holdout").days_in_position_fraction = 0.02
+        assert sign_agreement(result, "winner") == (1, 1), (
+            "a low-activity holdout cell was still counted as out-of-sample "
+            "confirmation"
+        )
+
+    def test_json_carries_the_flag_rather_than_making_a_consumer_re_derive_it(self):
+        result, _cell = self._result_with(0.04)
+        payload = json.loads(render_json(result))
+        flagged = [r for r in payload["rows"]
+                   if r["scenario"] == "winner" and r["symbol"] == "AAA"][0]
+        assert flagged["low_activity"] is True
+        assert flagged["measured"] is False
+        assert payload["min_days_in_position"] == MIN_DAYS_IN_POSITION
+
+
+class TestDeltasUseTheCommonMeasuredSubset:
+    """Q7. Two medians over different symbol sets are not a difference."""
+
+    def test_the_delta_is_taken_over_symbols_measured_in_both_arms(self):
+        result = _hand_built_holdout()
+        # `partial` measures BBB in fit but not in holdout, so the holdout delta
+        # must fall back to AAA alone — and say so.
+        value, n = common_delta(result, "partial", "holdout")
+        assert n == 1
+        assert value == pytest.approx(0.01)
+        markdown = render_markdown(result)
+        assert "(n=1)" in markdown
+
+    def test_an_empty_common_subset_renders_blank_not_zero(self):
+        """"no comparable symbol" and "performed identically" are opposites."""
+        result = _hand_built_holdout()
+        for symbol in result.symbols:
+            result.cell("partial", symbol, "fit").verdict = "insufficient"
+        value, n = common_delta(result, "partial", "fit")
+        assert (value, n) == (None, 0)
+        row = [line for line in render_markdown(result).splitlines()
+               if line.startswith("| partial |") and line.endswith("|")]
+        assert row, "holdout row missing"
+        assert "+0.0%" not in " ".join(row)
+
+    def test_it_is_not_the_difference_of_the_two_medians(self):
+        """The failure mode: an arm that trades less looks better.
+
+        `flatterer` beats base by 1pt on the one symbol both measure, and is
+        `insuf` on the symbol where base does badly. Difference-of-medians would
+        credit it with base's weak symbol; the common subset does not.
+        """
+        result = _hand_built_holdout()
+        result.cell("base", "BBB", "fit").annualized_return = -0.50
+        result.cell("partial", "BBB", "fit").verdict = "insufficient"
+        value, n = common_delta(result, "partial", "fit")
+        assert n == 1
+        assert value == pytest.approx(0.01), (
+            "the delta absorbed base's unmatched symbol"
+        )
+
+
+class TestProviderFetchAccounting:
+    """Q9. A cache hit is not a provider call."""
+
+    def test_fetches_and_cache_hits_are_reported_separately(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        result = run_sweep(
+            sweep_config, [Scenario("a", {})], ["AAA", "BBB"],
+            days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=False)
+        assert result.provider_fetches_total == provider.calls
+        assert result.provider_calls_during_replays == 0
+        markdown = render_markdown(result)
+        assert "provider fetches" in markdown
+        assert "bar-cache hits" in markdown
+        payload = json.loads(render_json(result))
+        assert payload["provider_calls"]["fetches"] == provider.calls
+        assert payload["provider_calls"]["bar_cache_hits"] == 0
+        assert payload["provider_calls"]["during_replays"] == 0
+
+    def test_a_bar_cache_read_during_a_replay_is_also_a_leak(
+            self, tmp_path, two_symbols, sweep_config):
+        """Counting only the network would let a disk re-read pass silently.
+
+        It would be slower and completely correct, which is exactly the kind of
+        regression no result reveals. Exercised on the REAL wiring (the runner
+        builds its own `CachedBarProvider`), because that is the only shape in
+        which a `get_stock_bars` call can be a pure cache read: after
+        materialisation the store already covers the window, so the fetch
+        counter never moves and only `hits` does.
+        """
+        from src.backtesting.scenarios import runner as runner_module
+
+        days, raw = two_symbols
+
+        class _Factory:
+            @staticmethod
+            def from_config(config):
+                return raw
+
+        real_replay = Simulator.replay
+
+        def _reads_the_cache(self, materialised, **kw):
+            self.provider.get_stock_bars("AAA", days[0], days[-1])
+            return real_replay(self, materialised, **kw)
+
+        with patch.object(runner_module, "AlpacaDataProvider", _Factory), \
+                patch.object(Simulator, "replay", _reads_the_cache):
+            with pytest.raises(RuntimeError,
+                               match="escaped during the replay loop") as exc:
+                run_sweep(sweep_config, [Scenario("a", {})], ["AAA"],
+                          days[0], days[-1], starting_cash=50_000.0,
+                          chain_store=ChainStore(str(tmp_path / "chains")),
+                          quiet_logs=False)
+        assert "bar_cache_read" in str(exc.value), (
+            "the leak was attributed to the network; a pure cache read must be "
+            "named as one, or the next reader debugs the wrong layer"
+        )
+
+
+class TestTheCLIBannerCountsArmsCorrectly:
+    """Q12. `base` is implicit UNLESS the file declares it.
+
+    The banner is the first thing an operator checks against their YAML, so a
+    count that is one too high reads as "the file I edited is not the file it
+    loaded".
+    """
+
+    def _yaml(self, tmp_path, body):
+        path = tmp_path / "banner.yaml"
+        path.write_text(body)
+        return str(path)
+
+    def _banner(self, tmp_path, two_symbols, body, capsys, extra=()):
+        import main as main_module
+        from src.backtesting.scenarios import runner as runner_module
+
+        days, provider = two_symbols
+        store = ChainStore(str(tmp_path / "chains"))
+
+        class _Factory:
+            @staticmethod
+            def from_config(config):
+                return provider
+
+        argv = [
+            "main.py", "--command", "sweep",
+            "--scenarios", self._yaml(tmp_path, body),
+            "--symbols", "AAA",
+            "--start", days[0].isoformat(), "--end", days[-1].isoformat(),
+            "--starting-cash", "50000", "--no-sensitivity",
+        ] + list(extra)
+        with patch.object(runner_module, "AlpacaDataProvider", _Factory), \
+                patch.object(runner_module.ChainStore, "from_env",
+                             classmethod(lambda cls, *a, **kw: store)), \
+                patch.object(main_module, "setup_logging", lambda *a, **kw: None), \
+                patch("sys.argv", argv):
+            try:
+                main_module.main()
+            except SystemExit:
+                pass
+        return capsys.readouterr().out
+
+    def test_an_implicit_base_is_counted_once(self, tmp_path, two_symbols, capsys):
+        out = self._banner(tmp_path, two_symbols, (
+            "scenarios:\n"
+            "  - name: a\n"
+            "    overrides:\n"
+            "      strategy.min_put_premium: 0.30\n"
+        ), capsys)
+        assert "Sweeping 2 scenarios (base + 1)" in out
+
+    def test_an_explicit_base_is_not_counted_twice(self, tmp_path, two_symbols,
+                                                   capsys):
+        out = self._banner(tmp_path, two_symbols, (
+            "scenarios:\n"
+            "  - name: base\n"
+            "  - name: a\n"
+            "    overrides:\n"
+            "      strategy.min_put_premium: 0.30\n"
+        ), capsys)
+        assert "Sweeping 2 scenarios (base + 1)" in out, (
+            "an explicitly declared `base` was counted on top of the implicit one"
+        )
+
+    def test_the_in_sample_note_is_printed_before_the_run(
+            self, tmp_path, two_symbols, capsys):
+        out = self._banner(tmp_path, two_symbols,
+                           "scenarios:\n  - name: a\n", capsys)
+        assert "IN-SAMPLE ONLY" in out
+        assert out.index("IN-SAMPLE ONLY") < out.index("# Scenario sweep")
+
+    def test_a_holdout_run_does_not_print_the_note(self, tmp_path, two_symbols,
+                                                   capsys):
+        days, _provider = two_symbols
+        out = self._banner(tmp_path, two_symbols,
+                           "scenarios:\n  - name: a\n", capsys,
+                           extra=["--holdout-start", days[15].isoformat()])
+        assert "NOTE: no --holdout-start" not in out
+
+
+class TestTheSuiteOrderThatUsedToFail:
+    """Q2 regression, as an executable record of the failing sequence.
+
+    Two adversarial reviewers reproduced an order-dependent failure:
+
+        test_scenarios.py::TestTheRejectionTallySurvivesQuietLogs
+        test_scenarios.py::TestHoldout
+        test_backtest_simulator.py::TestTheCallLegActuallyRuns::
+            test_no_dead_path_events_in_replay
+
+    The first test called `setup_logging("INFO")` and never restored it, which
+    installed a root FileHandler on `logs/options_wheel.log` and flipped
+    `cache_logger_on_first_use=True` process-wide. The third test then read a
+    structlog stream that had been reconfigured underneath it.
+
+    `conftest._logging_config_is_not_leaked` is the general guard; this pins the
+    specific sequence, because a general guard can be weakened without anyone
+    noticing which concrete bug it was protecting against.
+    """
+
+    def test_the_three_tests_pass_in_the_order_that_used_to_fail(self):
+        import subprocess
+        import sys
+
+        order = [
+            "tests/test_scenarios.py::TestTheRejectionTallySurvivesQuietLogs",
+            "tests/test_scenarios.py::TestHoldout",
+            "tests/test_backtest_simulator.py::TestTheCallLegActuallyRuns::"
+            "test_no_dead_path_events_in_replay",
+        ]
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *order],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            "the order-dependent failure is back — a test in this file is "
+            f"leaking global logging state again:\n{result.stdout[-3000:]}"
+        )

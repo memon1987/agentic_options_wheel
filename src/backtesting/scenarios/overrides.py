@@ -28,11 +28,15 @@ not do what it says*:
   ``mid - haircut x half-spread`` anyway. Vary ``Scenario(fill_haircut=...)``.
 * ``universe.min_open_interest`` reads a field the engine hardcodes to ``0``, so
   any floor rejects every call — a deterministic wipe-out dressed as a finding.
+* ``rolling.fallback_strike_attempts`` governs rungs the replay never reaches:
+  the adapter fills rung 1 unconditionally, so rung >= 3 came up 0 times over an
+  instrumented 37 rolls x 7 arms. Live in production, inert here.
 
-The last three were on the plan's allowlist and were moved here by measurement,
-not by reading: **selection-only is necessary but not sufficient**. A key also
-has to be one the replay HONOURS, and the cheapest way to find out is to run the
-arm and see whether its rows differ from base at all.
+All four were on the plan's allowlist and were moved here by measurement, not by
+reading: **selection-only is necessary but not sufficient**. A key also has to be
+one the replay HONOURS, and the cheapest way to find out is to run the arm and
+see whether any row differs from base. Every key that remains has been checked
+that way.
 
 Each of those gets a rejection message that names the actual reason, because a
 generic "not allowed" invites the reader to assume the sweep is being
@@ -81,8 +85,14 @@ ALLOWED_OVERRIDES: Dict[str, str] = {
     "strategy.min_stock_price": "stage-1 price floor",
     "strategy.max_stock_price": "stage-1 price ceiling",
     "strategy.min_avg_volume": "stage-1 average-volume floor",
-    # Sizing
-    "risk.max_position_size": "per-position fraction of portfolio value",
+    # Sizing. DOWNWARD ONLY until FC-079: the put sizer hardcodes one contract,
+    # so raising the cap cannot buy a second one and the arm comes back as base.
+    # Lowering it does bind (it starves a position out entirely), which is why
+    # the key is allowed at all rather than refused outright.
+    "risk.max_position_size": (
+        "per-position fraction of portfolio value — DOWNWARD ONLY until FC-079 "
+        "(the sizer never sizes above 1 contract, so raising it is inert)"
+    ),
     # Inventory / operator opt-outs. NOTE the section: these live under
     # `universe:`, not `strategy:` — the plan's D3 text says `strategy.*` and is
     # wrong about the path. `universe:` is absent from config/settings.yaml
@@ -106,7 +116,6 @@ ALLOWED_OVERRIDES: Dict[str, str] = {
     "rolling.max_replacement_delta": "upper delta rail on a replacement call",
     "rolling.min_net_credit_per_contract": "minimum net credit, $/contract",
     "rolling.imminence_extrinsic_threshold": "extrinsic $/share below which pricing goes mid-based",
-    "rolling.fallback_strike_attempts": "how many strikes up the roller will try",
 }
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +167,15 @@ REJECTED_OVERRIDES: Dict[str, str] = {
         "threshold kills the call leg' when the truth is 'the engine cannot see "
         "the number'. `universe.max_spread_pct` is allowed because its input is "
         "a documented model with a measured error, not an absent field."
+    ),
+    "rolling.fallback_strike_attempts": (
+        "unreachable in a replay. The knob decides how many FURTHER strikes the "
+        "roller tries after the first two rungs, and rung 1 always fills here: "
+        "`BacktestAlpacaClient.place_option_order` fills immediately at the "
+        "broker's haircut price rather than resting a limit that can go unfilled. "
+        "Instrumented over 37 rolls x 7 arms, rung >= 3 was reached 0 times, so "
+        "every arm returns the base row. It is live in production, where a real "
+        "limit can miss; it is inert here."
     ),
     "strategy.opportunity_max_age_minutes": (
         "the replay hands opportunities from scan to execute in memory; there is "

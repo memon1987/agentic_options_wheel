@@ -671,13 +671,17 @@ python main.py --command sweep --scenarios examples/scenarios_example.yaml \
 
 **Scenario sweeps are local and are NEVER persisted (FC-060 Layer 2).**
 `--command sweep` replays many config variants over many symbols and writes
-markdown/JSON to disk only. It must stay that way while `backtest_runs` is the
+markdown/JSON to disk only (a cold window does still populate the shared chain
+cache and, when `CHAIN_LAKE_BUCKET` is set, the chain lake — that is vendor data,
+not results). It must stay that way while `backtest_runs` is the
 production screen's table: the documented "current demotion candidates" query
 takes the latest `run_kind='full'` row, so a persisted full-universe sweep would
 displace a real screen with a hypothetical. A sweep report is a hypothesis, not a
 record of the universe. Overrides are restricted to a **selection-only
 allowlist** — a key that changes what the cached chain must contain, or that the
-replay never reads, is refused with the reason. See `docs/BACKTEST_ENGINE.md`
+replay never reads, is refused with the reason. **Without `--holdout-start` the
+report is labelled IN-SAMPLE ONLY**: a ranking chosen on the window it was
+measured on is a hypothesis, not a result. See `docs/BACKTEST_ENGINE.md`
 §"Scenario sweeps"; FC-060 Layer 3 owns a store for sweep results that cannot
 displace the screen.
 

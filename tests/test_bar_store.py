@@ -326,3 +326,133 @@ class TestASecondRunOfAWindowIsOffline:
             "the warm run produced a different result; a cache must be invisible"
         )
         assert warm_provider.fetches == 0 and warm_provider.hits == 1
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2 — an empty answer must never become a coverage claim (Q3)
+# --------------------------------------------------------------------------- #
+class TestAnEmptyResponseIsNeverCoverage:
+    """Alpaca answers "unknown symbol", "not entitled" and "we fell over" the
+    same way: HTTP 200, empty payload. A cache that believed any of them would
+    serve "this symbol has no history" for the life of the file, and the only
+    escape would be `use_cache=False` or deleting it by hand.
+    """
+
+    def test_an_empty_fetch_writes_no_file_at_all(self, tmp_path):
+        provider = _SpyProvider({})
+        store = BarStore(str(tmp_path))
+        cached = CachedBarProvider(provider, store)
+
+        assert cached.get_stock_bars("XYZ", date(2025, 1, 6), date(2025, 1, 17)) == []
+        assert len(provider.calls) == 1
+        assert not store.has("XYZ"), "an outage was frozen into the cache"
+        assert store.covered_window("XYZ") is None
+
+    def test_the_next_run_refetches_and_then_stores(self, tmp_path):
+        """The recovery this exists for: the vendor comes back, so do we."""
+        prices = _weekday_prices(date(2025, 1, 6), 10)
+        days = sorted(prices)
+        provider = _SpyProvider({})
+        store = BarStore(str(tmp_path))
+        cached = CachedBarProvider(provider, store)
+
+        assert cached.get_stock_bars("XYZ", days[0], days[-1]) == []
+        assert len(provider.calls) == 1
+
+        provider._prices = dict(prices)  # the outage clears
+        recovered = cached.get_stock_bars("XYZ", days[0], days[-1])
+        assert len(provider.calls) == 2, (
+            "the empty answer was cached; the second run never asked again"
+        )
+        assert [b.bar_date for b in recovered] == days
+        assert store.covered_window("XYZ") == (days[0], days[-1])
+
+        # ...and NOW it is a hit, because there is real data behind the claim.
+        cached.get_stock_bars("XYZ", days[0], days[-1])
+        assert len(provider.calls) == 2
+
+    def test_an_empty_fetch_does_not_widen_an_existing_claim(self, tmp_path):
+        """The subtler half: a later empty answer must not extend a good file.
+
+        Widening on empty would mark a range as covered that the vendor never
+        answered for, and every future read of it would return silence.
+        """
+        prices = _weekday_prices(date(2025, 1, 6), 10)
+        days = sorted(prices)
+        provider = _SpyProvider(prices)
+        store = BarStore(str(tmp_path))
+        cached = CachedBarProvider(provider, store)
+        cached.get_stock_bars("XYZ", days[0], days[-1])
+        before = store.covered_window("XYZ")
+
+        provider._prices = {}  # the vendor falls over on the extension
+        cached.get_stock_bars("XYZ", days[0], days[-1] + timedelta(days=30))
+        assert store.covered_window("XYZ") == before, (
+            "an empty response widened the covered window"
+        )
+
+    def test_the_returned_span_is_recorded_beside_the_request(self, tmp_path):
+        """A truncated non-empty answer cannot be detected from inside.
+
+        Nothing here can tell "the vendor returned January of the year I asked
+        for" from "the symbol only traded in January". So both are recorded and
+        an auditor can see them diverge in one read; `data_*` is what you can
+        rely on, `covered_*` is what the hit test has to use (a request whose
+        edge lands on a holiday must still be a hit).
+        """
+        prices = _weekday_prices(date(2025, 1, 6), 5)
+        days = sorted(prices)
+        provider = _SpyProvider(prices)
+        store = BarStore(str(tmp_path))
+        CachedBarProvider(provider, store).get_stock_bars(
+            "XYZ", days[0] - timedelta(days=10), days[-1] + timedelta(days=10))
+
+        df = pd.read_parquet(Path(tmp_path) / "XYZ.parquet")
+        assert df["covered_from"].iloc[0] == (days[0] - timedelta(days=10)).isoformat()
+        assert df["data_from"].iloc[0] == days[0].isoformat()
+        assert df["data_to"].iloc[0] == days[-1].isoformat()
+
+
+class TestAMalformedFrameIsAMiss:
+    """Q12. Content garbage behaves like a corrupt parquet: discard and refetch.
+
+    Same policy as `ChainStore.get`'s unreadable-file path, and for the same
+    reason — a cache that can wedge every future run on one bad cell is worse
+    than no cache.
+    """
+
+    def test_an_unparseable_bar_date_is_discarded_rather_than_raised(self, tmp_path):
+        prices = _weekday_prices(date(2025, 1, 6), 10)
+        days = sorted(prices)
+        provider = _SpyProvider(prices)
+        store = BarStore(str(tmp_path))
+        cached = CachedBarProvider(provider, store)
+        cached.get_stock_bars("XYZ", days[0], days[-1])
+        assert len(provider.calls) == 1
+
+        path = Path(tmp_path) / "XYZ.parquet"
+        df = pd.read_parquet(path)
+        df.loc[0, "bar_date"] = "not-a-date"
+        df.to_parquet(path, index=False)
+
+        out = cached.get_stock_bars("XYZ", days[0], days[-1])
+        assert len(provider.calls) == 2, "a bad cell must be a miss, not a crash"
+        assert [b.bar_date for b in out] == days
+        assert not path.with_suffix(".parquet.tmp").exists()
+
+    def test_a_non_castable_volume_is_discarded_too(self, tmp_path):
+        prices = _weekday_prices(date(2025, 1, 6), 6)
+        days = sorted(prices)
+        provider = _SpyProvider(prices)
+        store = BarStore(str(tmp_path))
+        cached = CachedBarProvider(provider, store)
+        cached.get_stock_bars("XYZ", days[0], days[-1])
+
+        path = Path(tmp_path) / "XYZ.parquet"
+        df = pd.read_parquet(path)
+        df["volume"] = df["volume"].astype(str)
+        df.loc[0, "volume"] = "many"
+        df.to_parquet(path, index=False)
+
+        assert store.get("XYZ", days[0], days[-1]) is None
+        assert not path.exists(), "the unusable file was left in place"

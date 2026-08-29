@@ -22,7 +22,16 @@
 #                                    Vary the fill with `fill_haircut:` instead.
 #   universe.min_open_interest     - the engine hardcodes open_interest to 0, so
 #                                    any floor >= 1 rejects every call.
+#   rolling.fallback_strike_attempts - governs strike rungs the replay never
+#                                    reaches (the adapter fills rung 1 always);
+#                                    rung >=3 came up 0 times over 37 rolls.
 #   stocks.symbols                 - the universe is run SCOPE; pass --symbols.
+#
+# NOTE risk.max_position_size binds DOWNWARD only until FC-079: the put sizer
+# hardcodes one contract, so raising the cap cannot buy a second one.
+#
+# Without --holdout-start every ranking below is IN-SAMPLE ONLY and unvalidated;
+# the report says so in a banner. Pass --holdout-start before acting on one.
 
 scenarios:
   # --- selection band -----------------------------------------------------

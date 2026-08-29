@@ -481,9 +481,24 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     if not symbols:
         raise SystemExit("sweep has no symbols: pass --symbols or configure stocks.symbols")
 
-    print(f"\nSweeping {len(scenarios) + 1} scenarios (base + {len(scenarios)}) "
+    # `base` is implicit UNLESS the file already declares it, so the banner must
+    # not blindly add one — a file with an explicit `base` would be announced as
+    # running one more arm than it does, and the count is the first thing an
+    # operator sanity-checks against their YAML.
+    from src.backtesting.scenarios import BASE_SCENARIO_NAME
+
+    declares_base = any(s.name == BASE_SCENARIO_NAME for s in scenarios)
+    total_arms = len(scenarios) + (0 if declares_base else 1)
+    extra = total_arms - 1
+    print(f"\nSweeping {total_arms} scenarios (base + {extra}) "
           f"over {len(symbols)} symbols, {start} -> {end}"
           f"{f' (holdout from {holdout_start})' if holdout_start else ''}...\n")
+    if not holdout_start:
+        # Said before the run as well as in the report: an operator who walks
+        # away from a two-minute sweep should already know the answer is
+        # in-sample.
+        print("  NOTE: no --holdout-start, so this ranking will be IN-SAMPLE "
+              "ONLY and unvalidated.\n")
 
     result = run_sweep(
         config, scenarios, symbols, start, end,

@@ -42,6 +42,56 @@ def _reset_cloud_run_caches():
 
 
 @pytest.fixture(autouse=True)
+def _logging_config_is_not_leaked():
+    """No test may leave structlog or the root logger reconfigured.
+
+    A test that calls ``setup_logging()`` and does not restore it changes the
+    process for every test that follows: it installs a root ``FileHandler`` on
+    ``logs/options_wheel.log`` (so the suite starts writing megabytes of replay
+    logs to disk) and flips ``cache_logger_on_first_use=True``, which makes
+    structlog's lazy proxies cache their processor chain — the exact mechanism
+    that blinds ``RejectionTally`` after the first replay in a process.
+
+    That is not hypothetical: it produced a real order-dependent failure in this
+    suite (`test_scenarios.py` leaking into `test_backtest_simulator.py`'s
+    dead-path assertions). Ambient global state is the same class of defect as a
+    test depending on live BigQuery or a real Alpaca key, and it gets the same
+    treatment — a blanket autouse guard, so a future leak fails in the test that
+    caused it rather than three files later.
+    """
+    import logging
+
+    import structlog
+
+    before_structlog = structlog.get_config()
+    root = logging.getLogger()
+    before_handlers = list(root.handlers)
+    before_level = root.level
+    yield
+    after_structlog = structlog.get_config()
+    leaked = []
+    if after_structlog != before_structlog:
+        leaked.append("structlog.configure()")
+    if list(root.handlers) != before_handlers:
+        leaked.append("root logging handlers")
+    if root.level != before_level:
+        leaked.append(f"root log level ({before_level} -> {root.level})")
+    if leaked:
+        # Restore first, so ONE leaking test does not cascade into a hundred
+        # confusing failures; then fail the test that actually did it.
+        structlog.configure(**before_structlog)
+        root.handlers[:] = before_handlers
+        root.setLevel(before_level)
+        raise AssertionError(
+            "this test left global logging state modified: "
+            + ", ".join(leaked)
+            + ". Restore it in a finally block — see "
+            "tests/test_scenarios.py::TestTheRejectionTallySurvivesQuietLogs "
+            "for the pattern."
+        )
+
+
+@pytest.fixture(autouse=True)
 def _reset_time_seam():
     """Ensure the backtest time-seam is never left frozen between tests.
 
@@ -128,8 +178,14 @@ def _no_chain_lake(monkeypatch):
     yield
 
 
+@pytest.fixture(scope="session")
+def _bars_cache_root(tmp_path_factory):
+    """One temp root for the whole session; each test gets a subpath under it."""
+    return tmp_path_factory.mktemp("bars_cache")
+
+
 @pytest.fixture(autouse=True)
-def _isolated_bars_cache(monkeypatch, tmp_path_factory):
+def _isolated_bars_cache(monkeypatch, request, _bars_cache_root):
     """No test may read or write the developer's bar cache (FC-060 Layer 2).
 
     ``BarStore`` defaults to ``cache/backtest/bars`` relative to the working
@@ -139,13 +195,14 @@ def _isolated_bars_cache(monkeypatch, tmp_path_factory):
     unit test's behaviour must not depend on ambient state, and here the failure
     would be a silent cross-test data dependency rather than an error.
 
-    Pointed at a per-session temp directory rather than cleared, so a test that
-    exercises the cache's own round-trip still has somewhere to write. Tests
-    that want a specific store pass their own ``tmp_path``.
+    The path is per-test but **not created** — ``BarStore`` mkdirs on write, and
+    the overwhelming majority of tests never construct one. Calling
+    ``tmp_path_factory.mktemp`` per test instead (the first cut) made ~2,100
+    directories nobody used and cost ~6 s of wall clock on every suite run.
     """
     monkeypatch.setenv(
         "BACKTEST_BARS_CACHE_DIR",
-        str(tmp_path_factory.mktemp("bars_cache", numbered=True)),
+        str(_bars_cache_root / request.node.nodeid.replace("/", "_").replace(":", "_")),
     )
     yield
 
