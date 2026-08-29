@@ -501,10 +501,6 @@ def _median_of(result: SweepResult, scenario: str, split: str) -> Optional[float
     return median(values) if values else None
 
 
-def _delta(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    return None if (a is None or b is None) else a - b
-
-
 def render_json(result: SweepResult) -> str:
     """Machine-readable form: the rows, plus everything needed to trust them."""
     payload: Dict[str, Any] = {

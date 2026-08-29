@@ -1433,3 +1433,124 @@ class TestTheSuiteOrderThatUsedToFail:
             "the order-dependent failure is back — a test in this file is "
             f"leaking global logging state again:\n{result.stdout[-3000:]}"
         )
+
+
+class TestTheCellStatesPartition:
+    """S1. `measured` / `insuf` / `low-act` / `err` must sum to the cell count.
+
+    They did not. `low_activity` tested only the days-in-position fraction, and a
+    window with no completed cycle also has a tiny fraction — so an `insufficient`
+    cell was BOTH, and `_scenario_summary` counted it twice. On the acceptance
+    sweep `position_size_20pct` reported `measured 1 | insuf 2 | low-act 5` over
+    six symbols, which sums to eight. A reader who cannot add up the row stops
+    trusting the table, and the JSON carried both flags on the same object.
+
+    `insufficient` wins: it is the more specific statement, and "the window
+    contained no completed cycle" is a different finding from "the wheel was
+    barely deployed".
+    """
+
+    def _row(self, **kw):
+        base = dict(
+            scenario="a", symbol="AAA", start=date(2025, 1, 1),
+            end=date(2025, 6, 30), split="all", config_hash="h",
+        )
+        base.update(kw)
+        return ScenarioResult(**base)
+
+    def test_an_insufficient_row_is_not_also_low_activity(self):
+        row = self._row(verdict="insufficient", days_in_position_fraction=0.0)
+        assert row.insufficient
+        assert not row.low_activity, (
+            "an insufficient cell was double-counted as low-activity"
+        )
+        assert not row.measured
+
+    def test_a_genuinely_thin_row_is_still_low_activity(self):
+        """The guard must not swallow the case the flag exists for."""
+        row = self._row(verdict="marginal", days_in_position_fraction=0.04)
+        assert row.low_activity and not row.insufficient and not row.measured
+
+    def test_an_errored_row_is_only_errored(self):
+        row = self._row(error="boom", days_in_position_fraction=0.0)
+        assert not row.ok and not row.insufficient
+        assert not row.low_activity and not row.measured
+
+    def test_exactly_one_state_is_true_for_every_shape(self):
+        shapes = [
+            self._row(verdict="fit", days_in_position_fraction=0.90),
+            self._row(verdict="marginal", days_in_position_fraction=0.30),
+            self._row(verdict="unfit", days_in_position_fraction=0.02),
+            self._row(verdict="insufficient", days_in_position_fraction=0.0),
+            self._row(verdict="insufficient", days_in_position_fraction=None),
+            self._row(verdict="fit", days_in_position_fraction=None),
+            self._row(error="corporate_action: ..."),
+        ]
+        for row in shapes:
+            states = [row.measured, row.insufficient, row.low_activity,
+                      row.error is not None]
+            assert sum(states) == 1, (
+                f"{states} for verdict={row.verdict!r} "
+                f"fraction={row.days_in_position_fraction!r} "
+                f"error={row.error!r} — the four states must partition"
+            )
+
+    def test_the_summary_columns_add_up_on_a_real_sweep(
+            self, tmp_path, two_symbols, sweep_config):
+        """The arithmetic a reader actually does, on a sweep the engine ran."""
+        days, provider = two_symbols
+        result = run_sweep(
+            sweep_config,
+            [Scenario("tiny", {"risk.max_position_size": 0.01}),
+             Scenario("cheaper", {"strategy.min_put_premium": 0.30})],
+            ["AAA", "BBB"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=False)
+
+        for name in result.scenarios:
+            rows = [r for r in result.rows if r.scenario == name]
+            counts = (
+                sum(1 for r in rows if r.measured),
+                sum(1 for r in rows if r.insufficient),
+                sum(1 for r in rows if r.low_activity),
+                sum(1 for r in rows if r.error),
+            )
+            assert sum(counts) == len(rows) == len(result.symbols), (
+                f"{name}: measured/insuf/low-act/err = {counts} over "
+                f"{len(rows)} cells — the columns do not partition"
+            )
+
+    def test_the_rendered_summary_row_adds_up(self):
+        """Same invariant, read off the markdown a human sees."""
+        result = _hand_built_holdout()
+        result.windows = [("all", date(2025, 1, 1), date(2025, 6, 30))]
+        for row in result.rows:
+            row.split = "all"
+        # One insufficient cell with a zero fraction: the exact double-count.
+        thin = result.cell("partial", "BBB", "all")
+        thin.verdict = "insufficient"
+        thin.days_in_position_fraction = 0.0
+
+        for line in render_markdown(result).splitlines():
+            if not line.startswith("| partial | all |"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            measured, insuf, low_act, err = (
+                int(cells[5]), int(cells[6]), int(cells[7]), int(cells[9]))
+            total = measured + insuf + low_act + err
+            expected = len([r for r in result.rows
+                            if r.scenario == "partial" and r.split == "all"])
+            assert total == expected, (
+                f"summary row sums to {total} over {expected} cells: {line!r}"
+            )
+            break
+        else:  # pragma: no cover - the row is always rendered
+            raise AssertionError("no per-scenario summary row for 'partial'")
+
+    def test_json_rows_never_carry_both_flags(self):
+        result = _hand_built_holdout()
+        thin = result.cell("partial", "BBB", "holdout")
+        thin.days_in_position_fraction = 0.0
+        payload = json.loads(render_json(result))
+        for row in payload["rows"]:
+            assert not (row["insufficient"] and row["low_activity"]), row

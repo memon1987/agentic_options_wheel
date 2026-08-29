@@ -238,16 +238,32 @@ class ScenarioResult:
 
         Counted and shown, never averaged — same treatment as ``insufficient``,
         for the same reason.
+
+        **``insufficient`` wins.** A window with no completed cycle also has a
+        tiny days-in-position fraction, so without the guard below one cell was
+        both, and ``_scenario_summary`` counted it twice: ``position_size_20pct``
+        reported ``measured 1 | insuf 2 | low-act 5`` over six symbols, which
+        sums to eight. The columns are a partition of the cells or they are
+        decoration, and a reader who cannot add up the row stops trusting the
+        table. They also answer different questions — "the window contained no
+        cycle" is not "the wheel was barely deployed" — so the more specific
+        verdict is the one that should be shown.
         """
         return (
             self.ok
+            and not self.insufficient
             and self.days_in_position_fraction is not None
             and self.days_in_position_fraction < MIN_DAYS_IN_POSITION
         )
 
     @property
     def measured(self) -> bool:
-        """Whether this cell carries a number worth ranking."""
+        """Whether this cell carries a number worth ranking.
+
+        ``measured``, ``insufficient``, ``low_activity`` and "errored" partition
+        every cell — exactly one is true. Pinned by
+        ``tests/test_scenarios.py::TestTheCellStatesPartition``.
+        """
         return self.ok and not self.insufficient and not self.low_activity
 
     def as_dict(self) -> Dict[str, Any]:

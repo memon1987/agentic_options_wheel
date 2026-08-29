@@ -32,9 +32,10 @@ cache can lie.** So:
   handed no bars.
 * **A TRUNCATED answer is the same class and cannot be detected from inside.**
   If the vendor returns January when a year was asked for, nothing here can tell
-  that from "the symbol only traded in January". The file records the returned
-  bars' actual span in ``data_from``/``data_to`` alongside the request window, so
-  an auditor can see the two diverge in one query; the hit test still uses the
+  that from "the symbol only traded in January". So the file records
+  ``data_from``/``data_to`` — the span of the bars it actually HOLDS, after
+  merging any earlier fetch with this one — alongside the request window, and an
+  auditor can see the two diverge in one query. The hit test still uses the
   request window, because it has to. **What you can rely on is the data span.**
   When the two disagree by more than a plausible market closure, the file is
   suspect — delete it (``rm cache/backtest/bars/<SYMBOL>.parquet``) and re-run.
@@ -295,8 +296,19 @@ class BarStore:
         existing = self._read(symbol)
         existing_window = None if existing is None else self._window(existing)
         if existing is not None:
-            for bar in (self._decode(existing, symbol, date.min, settled_to) or []):
-                merged[bar.bar_date] = bar
+            previous = self._decode(existing, symbol, date.min, settled_to)
+            if previous is None:
+                # The old file's schema passed but its CONTENT would not parse,
+                # so `_decode` discarded it. Its window has to go with it: keeping
+                # it would let the file we are about to write claim the old
+                # coverage while holding only `fresh`, which is the "claim
+                # without data behind it" failure this whole store is built to
+                # avoid — and worse than the empty-response case, because it
+                # would look like a healthy file.
+                existing_window = None
+            else:
+                for bar in previous:
+                    merged[bar.bar_date] = bar
         for bar in fresh:
             merged[bar.bar_date] = bar
 
@@ -305,9 +317,12 @@ class BarStore:
             covered_to = max(covered_to, min(existing_window[1], settled_to))
 
         ordered = sorted(merged.values(), key=lambda x: x.bar_date)
-        # What the vendor actually answered with, recorded beside what was asked.
-        # These two diverging by more than a market closure is the truncation
-        # signal; the module docstring carries the recipe.
+        # The span this file actually HOLDS, after merging what was already
+        # stored with what just arrived — not "what the vendor answered on this
+        # call", which is only the `fresh` half. Recorded beside the request
+        # window so the two can be compared in one read: a stored span far
+        # narrower than the claimed window is the truncation signal, and the
+        # module docstring carries the recipe.
         data_from, data_to = ordered[0].bar_date, ordered[-1].bar_date
         rows = [
             {

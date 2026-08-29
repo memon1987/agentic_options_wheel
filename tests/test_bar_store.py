@@ -456,3 +456,57 @@ class TestAMalformedFrameIsAMiss:
 
         assert store.get("XYZ", days[0], days[-1]) is None
         assert not path.exists(), "the unusable file was left in place"
+
+
+class TestADiscardedExistingFileTakesItsWindowWithIt:
+    """S4. A rewrite must not inherit coverage it can no longer back with data.
+
+    `_decode` discards a file whose schema passed but whose contents will not
+    parse. If `put` then kept the OLD file's `covered_from`/`covered_to` while
+    holding only the newly-fetched bars, the file it writes would claim a window
+    it has no rows for — and unlike the empty-response case it would look
+    perfectly healthy, so nothing would ever re-ask for the missing days.
+    """
+
+    def test_the_rewritten_file_claims_only_what_it_can_serve(self, tmp_path):
+        prices = _weekday_prices(date(2025, 1, 6), 30)
+        days = sorted(prices)
+        provider = _SpyProvider(prices)
+        store = BarStore(str(tmp_path))
+        CachedBarProvider(provider, store).get_stock_bars("XYZ", days[0], days[-1])
+        assert store.covered_window("XYZ") == (days[0], days[-1])
+
+        # Corrupt the CONTENTS (not the schema) of the stored file.
+        path = Path(tmp_path) / "XYZ.parquet"
+        df = pd.read_parquet(path)
+        df["bar_date"] = "not-a-date"
+        df.to_parquet(path, index=False)
+
+        # A later, NARROWER fetch rewrites the file from scratch.
+        store.put("XYZ", [
+            StockBar("XYZ", d, 1.0, 1.0, 1.0, 1.0, 100) for d in days[20:25]
+        ], covered_from=days[20], covered_to=days[24])
+
+        window = store.covered_window("XYZ")
+        assert window == (days[20], days[24]), (
+            f"the rewritten file claims {window} while holding only "
+            f"{days[20]}..{days[24]} — it inherited the discarded file's window"
+        )
+        # ...so the days it lost are a MISS, and get refetched.
+        assert store.get("XYZ", days[0], days[-1]) is None
+        served = store.get("XYZ", days[20], days[24])
+        assert served is not None and len(served) == 5
+
+    def test_a_readable_existing_file_still_widens_normally(self, tmp_path):
+        """The guard must not break the merge it sits inside."""
+        prices = _weekday_prices(date(2025, 1, 6), 30)
+        days = sorted(prices)
+        store = BarStore(str(tmp_path))
+        store.put("XYZ", [StockBar("XYZ", d, 1.0, 1.0, 1.0, 1.0, 10)
+                          for d in days[0:10]],
+                  covered_from=days[0], covered_to=days[9])
+        store.put("XYZ", [StockBar("XYZ", d, 1.0, 1.0, 1.0, 1.0, 10)
+                          for d in days[10:20]],
+                  covered_from=days[10], covered_to=days[19])
+        assert store.covered_window("XYZ") == (days[0], days[19])
+        assert len(store.get("XYZ", days[0], days[19]) or []) == 20
