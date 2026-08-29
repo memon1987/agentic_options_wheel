@@ -989,7 +989,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
 
 **Scope:** shared (backtest engine)
-**Status:** Filed 2026-08-28 from the first production run of the lake (execution `backtest-screen-9qc6x`)
+**Status:** Done (code) — merged 2026-08-28 (PR #101, `6d7f6be`), plan `docs/plans/fc-091.md`; **verify on the 2026-09-01 monthly screen** (SPY/IWM/PFE should merge once, then be warm). Rule as shipped: DTE-equal, strike-union, same model/close, overlap-consistent; refusals counted and surfaced
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** `docs/plans/fc-091.md`
