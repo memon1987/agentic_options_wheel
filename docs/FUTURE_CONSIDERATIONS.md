@@ -605,7 +605,7 @@ Counted across `src/` + `deploy/` + `cloudbuild.yaml`: **`GCP_PROJECT` appears 1
 
 ### FC-060: scenario-analysis platform — parameter exploration, an owned option-data history, and persisted scenarios
 
-**Status:** **Layer 1 (chain lake) SHIPPED 2026-08-28** — PR #99 (`63e04d5`), plan `docs/plans/fc-060-chain-lake.md`; rollout (bucket, IAM, Job image/env, seed) is an operator step. Layers 2–4 remain Consideration; Layer 2 (split chain-materialisation from replay + prove a warm 10-scenario sweep runs in minutes) is the next plan. *(Deferral condition met 2026-07-30 — Track D screen Job live.)*
+**Status:** **Layer 1 (chain lake) SHIPPED 2026-08-28** — PR #99 (`63e04d5`), plan `docs/plans/fc-060-chain-lake.md`; rollout complete 2026-08-28: seeded 5,424 chain-days; first production screen read 231/251 days per symbol from the lake (`lake_errors=0`) at ~50 s/symbol vs ~5.5 min cold. Layers 2–4 remain Consideration; Layer 2 (split chain-materialisation from replay + prove a warm 10-scenario sweep runs in minutes) is the next plan. *(Deferral condition met 2026-07-30 — Track D screen Job live.)*
 **Size estimate:** XL (four separable layers; each is L on its own)
 **Owner:** zeshan
 **Plan file:** not yet — needs its own plan, and probably one plan per layer
