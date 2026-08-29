@@ -87,6 +87,19 @@ PR-B: form validation state machine; result-cell renderings (`return`, `insuf`, 
 4. Merge PR-B; open `/sims`; run the FC-055 ceiling sweep as the first real one (SPY/QQQ/AMD + `strategy.max_stock_price` arms, holdout on).
 5. FC-060 entry: Layers 3–4 shipped; Layer 3b (candidate-symbol onboarding) and the remaining open questions carried.
 
+## Review addendum (2026-08-29) — contract changes decided after the four adversarial reviews
+
+All four reviews (PR-A #103: security/reliability, data/BQ; PR-B #102: frontend, guardrails) returned REQUEST_CHANGES. The following are **plan-level** decisions taken while dispositioning them; the builders code against these, and D1–D12 stand where not amended here.
+
+- **`done` is defined** (was not — the data review's strongest critique): the Job writes `done` only when `write_runs` succeeded; the done row carries `rows_persisted` and `error_cells`. Both dedup predicates (persist.py, sweeps.py) require `error_cells = 0`, `rows_persisted = cell_count`, and `base_config_hash` equality (effective values — env-shadowed `EARNINGS_ENABLED`/`ROLLER_ENABLED`/`ROLLER_DRY_RUN` included). A spec field `force: true` (excluded from `sweep_key`) skips dedup on both sides — the recompute path "revisit, not recompute" lacked.
+- **Termination is not cooperative.** Cloud Run sends SIGTERM (SIGKILL +10 s); `main.py` installs a handler that raises so the `finally` writes `failed`; `ChainStore.from_env()` moves inside the `try`. `--task-timeout` becomes 10800 (screen rationale: cold materialisation). `running` rows whose latest `written_at` is older than the timeout + 10 min are labelled stuck, and the 409 lock expires on that rule, not `submitted_at` + 1 h.
+- **Launch failures of any class terminalise the row** (`httpx.HTTPError` → 502 + `failed`), not only `HTTPException`.
+- **`deploy-sweep-job` runs behind the last promote steps** so an IAM failure cannot strand the service deploys (still fails loudly).
+- **`shape_results` wire contract (D11 amended):** adds top-level `scenario_hashes`, `scenario_config_hashes`, `windows` (from stored `window_start/end`); `summary` is authoritative — **the UI computes nothing** (no client median, no partition counts, no window arithmetic). `GET /api/v2/sweeps` is a bare array. The UI's `render_json` input path is dropped: one wire shape. `symbols` column order = declaration order on both sides.
+- **UI honesty rules added:** explicit `unknown` cell kind (never a return); non-done runs gate on `run.status` (an empty grid is not a report); sign-agreement column carries no colour; in-sample banner keys on the boolean with a fallback string; prose fields byte-verbatim; haircut-only arms labelled "fill-model sensitivity"; Download JSON exports the raw server payload.
+- **Table-missing** → 503 with the rollout instruction (rollout step 3 ordering stands).
+- **Deferred with justification → FC-095:** dedicated Alpaca data key / market-hours guard, submit race, `git_commit` dedup granularity, `run.executions.get` polling, `.dockerignore`.
+
 ## Open questions
 
 - **Blocking for PR-A rollout, not for the build:** does the compute SA hold `run.jobs.create` (for `jobs deploy` from Cloud Build) and `run.jobs.run` on the new job? Both are console-verifiable only; the plan fails loudly at the first build / first submit with the exact grant named.

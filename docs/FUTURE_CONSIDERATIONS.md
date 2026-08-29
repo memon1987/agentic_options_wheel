@@ -1050,6 +1050,26 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-095: sweep Job hygiene — dedicated Alpaca data key / market-hours guard, submit race, dedup granularity, execution-state polling
+
+**Scope:** shared (backtest Job + dashboard)
+**Status:** Filed 2026-08-29 (deferred from the PR #103 adversarial reviews, with written justification)
+**Size estimate:** S each; M together
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-060 Layers 3+4 (PR #103) shipped a public-facing (token-gated) submit path that launches the `backtest-sweep` Cloud Run Job. Both reviewers accepted these residuals for merge but required them on the record:
+
+- **The Job spends the live bot's Alpaca quota** (same key pair, shared 200 req/min) with no market-hours guard. An ad-hoc sweep at 10:00 ET materialising cold symbols competes with `/scan`. Options: a dedicated data-only Alpaca key for backtests (separates quota from the live book), or refuse/queue submits during the scan/execute windows. *Deferred because:* the operator is the only submitter and the lake makes cold materialisation rare.
+- **Check-then-insert submit race**: two `POST /api/v2/sweeps` inside BigQuery streaming visibility (~1–3 s) both pass the 409 gate and both launch; Jobs allow parallel executions. *Deferred because:* single operator; the UI disables the button on submit; the Job does not self-check.
+- **Dedup keyed on `git_commit`** invalidates every prior `done` on any push to `main` (docs-only included, since both images carry a new `GIT_COMMIT`). A key on `engine_version` + a hash of `src/backtesting/**` would make "revisit, not recompute" fire more than once a day. *Deferred because:* correctness first; a stale-but-cached answer is worse than a recompute. `force: true` (PR #103 rev 2) already gives the operator the recompute path.
+- **Status is BigQuery-only.** A `running` row is labelled stuck by age, never confirmed against `run.executions.get`. The SA's `run.jobs.run` is project-level, so `executions.get` is almost certainly held; one call on `execution_name` for a non-terminal row would turn the label into a fact. *Deferred because:* the SIGTERM handler + age rule (rev 2) closes the common case.
+- **No `.dockerignore`** — `.env`/`cache/` enter the local build context (never the image; every `COPY` is explicit). *Deferred because:* Cloud Build's context is the GitHub fetch; local builds are the only exposure.
+
+**Links:** FC-060 (`docs/plans/fc-060-scenario-store-ui.md`), PR #103 review findings, FC-094 (public dashboard).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
