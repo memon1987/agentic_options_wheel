@@ -14,6 +14,7 @@ Same import trick as `tests/test_dashboard_pause_alert.py`: put
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -22,7 +23,12 @@ from statistics import median
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dashboard" / "backend"))
+# See tests/_dashboard_path.py: the backend is APPENDED and the repo root
+# kept ahead of it, so `import main` still resolves to the CLI rather than
+# to dashboard/backend/main.py for every module collected after this one.
+from tests._dashboard_path import add_dashboard_backend_to_path  # noqa: E402
+
+add_dashboard_backend_to_path()
 
 from services import sweeps as S  # noqa: E402
 from services import sweep_report_text as T  # noqa: E402
@@ -292,6 +298,120 @@ class TestScenarioShape:
         S.validate_spec(spec(scenarios=arms))
 
 
+class TestOverrideValueValidation:
+    """The allowlist says which knobs may be turned; this says what a legal
+    setting of one is.
+
+    Without it `{"strategy.min_put_premium": "not-a-number"}` is accepted and
+    the arm either dies three minutes into a container start with a TypeError
+    from deep inside the strategy, or — worse — does not die: a string where a
+    float is expected can compare false everywhere and read as "this floor
+    rejected everything", which is a finding, not a bug report.
+    """
+
+    def arm(self, key, value):
+        return spec(scenarios=[{"name": "x", "overrides": {key: value}}])
+
+    def test_a_string_where_a_number_belongs_is_422(self):
+        with pytest.raises(S.SweepValidationError, match="must be a number"):
+            S.validate_spec(self.arm("strategy.min_put_premium", "not-a-number"))
+
+    def test_a_nested_dict_is_422(self):
+        with pytest.raises(S.SweepValidationError, match="must be a number"):
+            S.validate_spec(self.arm("strategy.min_put_premium", {"lo": 1}))
+
+    def test_a_bool_is_not_a_number(self):
+        """`bool` is an `int` subclass in Python; without the explicit check
+        `min_put_premium: true` would silently mean a $1.00 floor."""
+        with pytest.raises(S.SweepValidationError, match="must be a number"):
+            S.validate_spec(self.arm("strategy.min_put_premium", True))
+
+    def test_a_number_where_a_bool_belongs_is_422(self):
+        with pytest.raises(S.SweepValidationError, match="true or false"):
+            S.validate_spec(self.arm("earnings.enabled", 1))
+
+    def test_a_float_where_a_day_count_belongs_is_422(self):
+        with pytest.raises(S.SweepValidationError, match="whole number of days"):
+            S.validate_spec(self.arm("earnings.blackout_days", 2.5))
+
+    @pytest.mark.parametrize("band", [
+        pytest.param(0.2, id="scalar"),
+        pytest.param([0.2], id="one element"),
+        pytest.param([0.2, 0.1], id="inverted"),
+        pytest.param([0.2, 1.4], id="above 1"),
+        pytest.param([-0.1, 0.2], id="below 0"),
+        pytest.param(["a", "b"], id="strings"),
+        pytest.param([0.2, 0.2], id="empty band"),
+    ])
+    def test_a_malformed_delta_band_is_422(self, band):
+        with pytest.raises(S.SweepValidationError):
+            S.validate_spec(self.arm("strategy.call_delta_range", band))
+
+    def test_a_well_formed_band_passes(self):
+        S.validate_spec(self.arm("strategy.call_delta_range", [0.15, 0.25]))
+
+    def test_excluded_symbols_must_be_tickers(self):
+        with pytest.raises(S.SweepValidationError, match="list of tickers"):
+            S.validate_spec(self.arm("universe.excluded_symbols", "F"))
+        S.validate_spec(self.arm("universe.excluded_symbols", ["F", "PFE"]))
+
+    def test_every_allowlisted_key_has_a_declared_value_type(self):
+        """Otherwise `validate_override_value` refuses it outright — a knob
+        nobody can set is worse than one nobody validated, so this failing is
+        the signal to add the row rather than to loosen the check."""
+        missing = set(ALLOWED_OVERRIDES) - set(S.OVERRIDE_VALUE_TYPES)
+        assert missing == set(), missing
+
+    def test_no_value_type_describes_a_key_that_is_not_allowed(self):
+        extra = set(S.OVERRIDE_VALUE_TYPES) - set(ALLOWED_OVERRIDES)
+        assert extra == set(), extra
+
+
+class TestScenarioNames:
+    def test_an_over_long_name_is_422(self):
+        long = "a" * (S.MAX_SCENARIO_NAME_CHARS + 1)
+        with pytest.raises(S.SweepValidationError, match="the cap is"):
+            S.validate_spec(spec(scenarios=[{"name": long}]))
+
+    def test_a_name_at_the_cap_passes(self):
+        S.validate_spec(spec(scenarios=[{"name": "a" * S.MAX_SCENARIO_NAME_CHARS}]))
+
+    @pytest.mark.parametrize("name", [
+        "has space", "semi;colon", "-leading", "quote'd", "new\nline", "sym$bol",
+    ])
+    def test_a_malformed_name_is_422(self, name):
+        with pytest.raises(S.SweepValidationError, match="must start alphanumeric"):
+            S.validate_spec(spec(scenarios=[{"name": name}]))
+
+    @pytest.mark.parametrize("name", [
+        "tighter_puts", "ceiling-1000", "v1.2", "A1",
+    ])
+    def test_ordinary_names_pass(self, name):
+        S.validate_spec(spec(scenarios=[{"name": name}]))
+
+
+class TestForce:
+    """`force` skips the dedup lookup and is EXCLUDED from `sweep_key`."""
+
+    def test_force_must_be_a_bool(self):
+        with pytest.raises(S.SweepValidationError, match="true or false"):
+            S.validate_spec(spec(force="yes"))
+
+    def test_force_survives_normalisation(self):
+        assert S.validate_spec(spec(force=True))["force"] is True
+
+    def test_force_is_absent_when_not_asked_for(self):
+        assert "force" not in S.validate_spec(spec())
+
+    def test_force_does_not_change_the_key(self):
+        """A forced re-run must key IDENTICALLY to the run it is deliberately
+        reproducing. If it did not, the two would never be comparable and a
+        second force would not dedup either."""
+        plain = S.compute_sweep_key(S.validate_spec(spec()), "abc")
+        forced = S.compute_sweep_key(S.validate_spec(spec(force=True)), "abc")
+        assert plain == forced
+
+
 class TestTheToken:
     def test_matching_token_passes(self):
         assert S.token_matches("s3cret", "s3cret") is True
@@ -304,6 +424,18 @@ class TestTheToken:
         prefix compare and this fails."""
         assert S.token_matches("s3c", "s3cret") is False
         assert S.token_matches("s3cretXXX", "s3cret") is False
+
+    def test_a_non_ascii_bearer_is_rejected_not_a_500(self):
+        """`hmac.compare_digest` on `str` raises TypeError for non-ASCII.
+
+        The bearer is attacker-controlled input on a publicly reachable service
+        (FC-094), so `Authorization: Bearer \u00e9` was a one-request uncaught
+        500, not a hypothetical. Comparing bytes makes it an ordinary 401.
+        """
+        assert S.token_matches("s3cr\u00e9t", "s3cret") is False
+        assert S.token_matches("s3cret", "s3cr\u00e9t") is False
+        assert S.token_matches("\u00e9\u00e9\u00e9", "\u00e9\u00e9\u00e9") is True
+        assert S.token_matches("\U0001f512", "s3cret") is False
 
     def test_an_unconfigured_token_never_matches(self):
         """Fail CLOSED. `None == None` would otherwise let an empty
@@ -355,14 +487,46 @@ class TestTheOneAtATimeGate:
     def test_terminal_sweeps_do_not_block(self, status):
         assert S.blocking_sweep([self.row(status)], now=self.now()) is None
 
-    def test_an_hour_old_running_row_stops_blocking(self):
-        """A Job killed before its `finally` leaves a `running` row nothing will
-        ever terminalise. A permanent lock on a dead run takes the feature
-        offline with no way back except a manual BigQuery insert."""
-        stale = self.row("running", minutes_ago=61)
-        assert S.blocking_sweep([stale], now=self.now()) is None
-        fresh = self.row("running", minutes_ago=59)
-        assert S.blocking_sweep([fresh], now=self.now()) is not None
+    def test_a_long_running_sweep_still_blocks(self):
+        """The lock must outlive a legitimate COLD sweep.
+
+        The first cut expired it at 1 h, measured from `submitted_at`. Cold
+        materialisation is ~5.5 min/symbol, so a 12-symbol year is comfortably
+        past that — the lock would have released mid-replay and let a second
+        execution contend with the first for the same chain cache, each
+        reporting the other's fetches as its own.
+        """
+        alive = self.row("running", minutes_ago=90)
+        assert S.blocking_sweep([alive], now=self.now()) is not None
+
+    def test_the_lock_expires_once_cloud_run_must_have_killed_the_task(self):
+        """Past `--task-timeout` + grace there is no process behind the row.
+
+        A Job killed before its `finally` (eviction, cancelled execution) leaves
+        a `running` row nothing will ever terminalise, and a permanent lock on a
+        dead run takes the feature offline with no way back except a manual
+        BigQuery insert.
+        """
+        beyond = (S.JOB_TASK_TIMEOUT_SECONDS + S.STALE_GRACE_MINUTES * 60) / 60 + 1
+        dead = self.row("running", minutes_ago=beyond)
+        assert S.blocking_sweep([dead], now=self.now()) is None
+
+        just_inside = self.row(
+            "running",
+            minutes_ago=(S.JOB_TASK_TIMEOUT_SECONDS
+                         + S.STALE_GRACE_MINUTES * 60) / 60 - 1)
+        assert S.blocking_sweep([just_inside], now=self.now()) is not None
+
+    def test_liveness_is_measured_from_written_at_not_submitted_at(self):
+        """`written_at` is the last sign of life; `submitted_at` is when it
+        started. A run that reported in five minutes ago is alive however long
+        ago it was submitted — and every row of a submission shares
+        `submitted_at`, so that column cannot say anything about liveness."""
+        old_submit = (self.now() - timedelta(days=2)).isoformat()
+        recent_write = (self.now() - timedelta(minutes=5)).isoformat()
+        row = {"run_id": "r", "status": "running",
+               "submitted_at": old_submit, "written_at": recent_write}
+        assert S.blocking_sweep([row], now=self.now()) is not None
 
     def test_empty_history_does_not_block(self):
         assert S.blocking_sweep([], now=self.now()) is None
@@ -388,10 +552,30 @@ class TestStuckDetection:
                  "submitted_at": (now - timedelta(minutes=4)).isoformat()}
         assert S.is_stuck(young, now=now) is False
 
-    def test_a_running_row_is_never_stuck(self):
+    def test_a_running_row_is_not_stuck_while_the_task_could_still_be_alive(self):
         now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
         row = {"status": "running",
-               "submitted_at": (now - timedelta(hours=3)).isoformat()}
+               "written_at": (now - timedelta(hours=2)).isoformat(),
+               "submitted_at": (now - timedelta(hours=2)).isoformat()}
+        assert S.is_stuck(row, now=now) is False
+
+    def test_a_running_row_past_the_task_timeout_is_stuck(self):
+        """Cloud Run has killed the task by now, so nothing will ever write its
+        terminal row. Saying so is the honest alternative to polling an API
+        (`run.executions.get`) this service account is not proven to hold."""
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        dead = now - timedelta(seconds=S.JOB_TASK_TIMEOUT_SECONDS
+                               + S.STALE_GRACE_MINUTES * 60 + 60)
+        row = {"status": "running", "written_at": dead.isoformat(),
+               "submitted_at": dead.isoformat()}
+        assert S.is_stuck(row, now=now) is True
+
+    @pytest.mark.parametrize("status", ["done", "failed", "deduplicated"])
+    def test_a_terminal_row_is_never_stuck(self, status):
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        row = {"status": status,
+               "written_at": (now - timedelta(days=30)).isoformat(),
+               "submitted_at": (now - timedelta(days=30)).isoformat()}
         assert S.is_stuck(row, now=now) is False
 
 
@@ -442,6 +626,45 @@ class TestTheLaunchBody:
         assert "sa@example.com" in detail
         assert "console" in detail.lower()
         assert "Nothing was launched" in detail
+
+
+class TestTheDedupPredicate:
+    """`status = 'done'` alone is not "we already have this answer"."""
+
+    def test_requires_no_errored_cells(self):
+        """A run every arm of which errored is a page of `err`, not a result.
+        Serving it means the operator never learns it is worth re-running."""
+        assert "error_cells = 0" in S.done_by_key_sql("p.d")
+
+    def test_requires_the_cells_to_have_landed(self):
+        """A run whose `scenario_runs` insert failed has an EMPTY grid; the
+        cached answer would be nothing at all."""
+        sql = S.done_by_key_sql("p.d")
+        assert "rows_persisted = cell_count" in sql
+        assert "rows_persisted IS NOT NULL" in sql
+
+    def test_requires_the_effective_config_to_match(self):
+        """`sweep_key` covers the spec, the engine version and the commit. It
+        cannot see an operator flipping EARNINGS_ENABLED on the Job between two
+        otherwise identical submissions — that value is not in the yaml it
+        hashes."""
+        assert "base_config_hash = @base_config_hash" in S.done_by_key_sql("p.d")
+
+    def test_a_null_config_hash_is_a_no_op_not_a_wipeout(self):
+        """The API cannot compute the Job's effective config; when it has never
+        seen a run on this commit it passes NULL, and the JOB's own lookup —
+        which knows the real hash — is the exact backstop."""
+        assert "@base_config_hash IS NULL OR" in S.done_by_key_sql("p.d")
+
+    def test_matches_the_writers_predicate(self):
+        """Two dedup implementations, one meaning. The Job's must not be looser
+        than the API's, or a Job launched by hand would reuse a run the API
+        would have refused."""
+        import inspect
+        job_sql = inspect.getsource(store.ScenarioRunWriter.find_done_sweep)
+        for clause in ("error_cells = 0", "rows_persisted = cell_count",
+                       "base_config_hash = @base_config_hash"):
+            assert clause in job_sql, clause
 
 
 class TestSql:
@@ -613,6 +836,75 @@ class TestShapeResultsEqualsTheEngineReport:
         assert shaped["rejection_tally_caveat"] == rendered["rejection_tally_caveat"]
 
 
+class TestShapeResultsPrBContract:
+    """The fields PR-B's page renders directly. Added in review round 1 so the
+    UI never recomputes something the store already holds."""
+
+    def test_scenario_hashes_come_from_the_persisted_rows(self, shaped_and_engine):
+        shaped, sweep, _ = shaped_and_engine
+        assert shaped["scenario_hashes"] == {
+            name: f"h-{name}" for name in sweep.scenarios}
+
+    def test_scenario_config_hashes_come_from_the_persisted_rows(
+            self, shaped_and_engine):
+        shaped, sweep, _ = shaped_and_engine
+        assert shaped["scenario_config_hashes"] == {
+            name: "cfg" for name in sweep.scenarios}
+
+    def test_windows_are_per_split_iso_dates(self, shaped_and_engine):
+        shaped, _sweep, _ = shaped_and_engine
+        assert shaped["windows"] == {
+            "fit": {"start": "2025-08-01", "end": "2026-04-30"},
+            "holdout": {"start": "2025-08-01", "end": "2026-07-31"},
+        }
+
+    def test_a_non_done_run_has_empty_grid_splits_and_windows(self):
+        """A `submitted` or `running` sweep has a status row and no cells. The
+        page has to render that, not 500."""
+        shaped = S.shape_results({"run_id": "r", "status": "running"}, [])
+        assert shaped["grid"] == {}
+        assert shaped["splits"] == []
+        assert shaped["windows"] == {}
+        assert shaped["scenario_hashes"] == {}
+        assert shaped["scenario_config_hashes"] == {}
+
+
+class TestSymbolOrderIsDeclarationOrder:
+    """Pinned on BOTH sides. The grid's columns are read in the order the
+    operator typed their universe; if the store sorted and the shaper did not
+    (or the reverse), a dashboard-launched sweep would silently render its
+    columns transposed relative to the spec that produced it."""
+
+    UNSORTED = ["NVDA", "AAPL", "UNH"]
+
+    def test_the_api_row_keeps_declaration_order(self):
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec(symbols=self.UNSORTED)),
+            sweep_key_value="k", submitted_at="2026-08-29T12:00:00+00:00",
+            git_commit=None)
+        assert row["symbols"] == self.UNSORTED
+
+    def test_the_job_row_keeps_declaration_order(self):
+        row = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00",
+            spec={"symbols": self.UNSORTED})
+        assert row["symbols"] == self.UNSORTED
+
+    def test_the_job_row_de_duplicates_in_place(self):
+        row = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00",
+            spec={"symbols": ["NVDA", "aapl", "NVDA"]})
+        assert row["symbols"] == ["NVDA", "AAPL"]
+
+    def test_the_shaper_keeps_declaration_order(self):
+        shaped = S.shape_results(
+            {"run_id": "r", "spec_json": json.dumps({"symbols": self.UNSORTED})},
+            [])
+        assert shaped["symbols"] == self.UNSORTED
+
+
 class TestShapeResultsGrid:
     def test_the_grid_is_always_present(self, shaped_and_engine):
         """There is no shape in which a caller gets aggregates without the
@@ -741,6 +1033,428 @@ print(json.dumps({"key": S.compute_sweep_key(spec, "abc123"),
                 {"name": "t", "overrides": {"strategy.min_put_premium": 0.75}}],
                 symbols=["AAPL"])), "abc123")
         assert payload["key"] == here
+
+
+# The endpoint tests import routers.v2, which needs FastAPI — present in the
+# dashboard image but NOT in the bot CI image where this suite runs. Skip is
+# CLASS-scoped for the reason tests/test_dashboard_pause_alert.py gives: a
+# module-level importorskip would abort collection of the whole file and
+# silently skip every pure test above it too, turning CI green while testing
+# nothing.
+_HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+
+
+class FakeBQ:
+    """A BigQueryService stand-in that records writes and can be made to fail."""
+
+    def __init__(self, *, prior=None, history=None, raises=None,
+                 config_hash="cfg0123456789ab"):
+        self.rows = []
+        self.prior = prior
+        self.history = history or []
+        self.raises = raises
+        self.config_hash = config_hash
+
+    def _maybe_raise(self):
+        if self.raises is not None:
+            raise self.raises
+
+    def latest_base_config_hash(self, git_commit):
+        self._maybe_raise()
+        return self.config_hash
+
+    def find_done_sweep(self, key, base_config_hash=None):
+        self._maybe_raise()
+        return self.prior
+
+    def get_recent_sweeps(self, limit=25):
+        self._maybe_raise()
+        return list(self.history)
+
+    def get_sweep(self, run_id):
+        self._maybe_raise()
+        return None
+
+    def get_sweep_rows(self, run_id):
+        self._maybe_raise()
+        return []
+
+    def insert_sweep_status(self, row):
+        self.rows.append(row)
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
+class TestTheSubmitEndpoint:
+    """The one route that CAUSES something, and every way its launch can fail.
+
+    Each of these used to end as an uncaught 500 with the `submitted` row left
+    non-terminal — which holds the one-at-a-time lock until the stale cutoff and
+    hands the operator a stack trace instead of a reason.
+    """
+
+    TOKEN = "s3cret-token-value"
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    @pytest.fixture
+    def wired(self, monkeypatch):
+        import routers.v2 as v2
+
+        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        monkeypatch.setenv("GIT_COMMIT", "cafebabe")
+        bq = FakeBQ()
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: bq)
+        return v2, bq
+
+    def submit(self, v2, body=None, token=None):
+        return self._run(v2.submit_sweep(
+            spec=body or spec(),
+            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+
+    # -- transport failures ------------------------------------------------
+    def test_an_httpx_timeout_becomes_502_and_a_failed_row(self, wired, monkeypatch):
+        """The headline fix. `httpx` RAISES on a timeout rather than returning a
+        response, so an escaping `ReadTimeout` was a 500 — and the `submitted`
+        row it had already written was never terminalised, wedging the gate."""
+        import httpx
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def timeout(*_a, **_k):
+            raise httpx.ReadTimeout("timed out")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", timeout)
+
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 502
+        assert "ReadTimeout" in str(exc.value.detail)
+        # ...and it says the ambiguity out loud rather than guessing.
+        assert "may or may not have started" in str(exc.value.detail)
+
+        statuses = [r["status"] for r in bq.rows]
+        assert statuses == ["submitted", "failed"], statuses
+        assert "ReadTimeout" in bq.rows[-1]["error"]
+        assert bq.rows[-1]["finished_at"] is not None
+
+    def test_the_failed_row_reopens_the_gate(self, wired, monkeypatch):
+        """A terminal row is what stops the next submit getting a 409 for an
+        hour over a launch that never happened."""
+        import httpx
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def refused(*_a, **_k):
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", refused)
+        with pytest.raises(HTTPException):
+            self.submit(v2)
+
+        # `get_recent_sweeps` returns the LATEST row per run_id (that is what
+        # the window function in `recent_sweeps_sql` is for), so the gate sees
+        # the terminal row, not the `submitted` one underneath it.
+        assert bq.rows[-1]["status"] in S.TERMINAL_STATUSES
+        assert S.blocking_sweep([bq.rows[-1]]) is None
+
+    def test_a_credential_failure_becomes_502_not_500(self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+
+        def boom():
+            raise RuntimeError("metadata server unreachable")
+
+        monkeypatch.setattr(v2, "_access_token", boom)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 502
+        assert "credential" in str(exc.value.detail)
+        assert [r["status"] for r in bq.rows] == ["submitted", "failed"]
+
+    def test_an_unexpected_transport_error_is_still_502(self, wired, monkeypatch):
+        """Nothing may escape as a 500 — the `submitted` row is already written
+        by the time the POST happens."""
+        import httpx
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def weird(*_a, **_k):
+            raise ValueError("something nobody predicted")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", weird)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 502
+        assert [r["status"] for r in bq.rows] == ["submitted", "failed"]
+
+    def test_a_403_names_the_grant(self, wired, monkeypatch):
+        import httpx
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def forbidden(*_a, **_k):
+            return httpx.Response(403, text="forbidden")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", forbidden)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 502
+        assert "run.jobs.run" in str(exc.value.detail)
+        assert [r["status"] for r in bq.rows] == ["submitted", "failed"]
+
+    # -- auth --------------------------------------------------------------
+    def test_a_wrong_token_is_401_and_writes_nothing(self, wired):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2, token="wrong")
+        assert exc.value.status_code == 401
+        assert bq.rows == []
+
+    def test_a_non_ascii_token_is_401_not_500(self, wired):
+        """`hmac.compare_digest` on `str` raises TypeError for non-ASCII; from
+        inside a handler that is an uncaught 500 on attacker-controlled input."""
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2, token="s3cr\u00e9t")
+        assert exc.value.status_code == 401
+
+    def test_an_unconfigured_secret_is_503_and_writes_nothing(
+            self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 503
+        assert "sweeps are disabled" in str(exc.value.detail)
+        assert bq.rows == []
+
+    # -- store not created yet --------------------------------------------
+    def test_missing_tables_are_503_with_the_rollout_step(self, wired, monkeypatch):
+        """The tables are created by the JOB's writer, so between merge and the
+        operator's first execution they do not exist. A bare 500 says "the
+        dashboard is broken"; the truth is "step 3 has not been run"."""
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        v2, _bq = wired
+        broken = FakeBQ(raises=NotFound("Not found: Table scenario_sweeps"))
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: broken)
+
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 503
+        assert "rollout step 3" in str(exc.value.detail)
+
+    def test_missing_tables_are_503_on_the_list_route(self, wired, monkeypatch):
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        v2, _bq = wired
+        monkeypatch.setattr(v2, "get_bigquery_service",
+                            lambda: FakeBQ(raises=NotFound("Not found: Table")))
+        with pytest.raises(HTTPException) as exc:
+            self._run(v2.list_sweeps(limit=10))
+        assert exc.value.status_code == 503
+
+    def test_missing_tables_are_503_on_the_detail_route(self, wired, monkeypatch):
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        v2, _bq = wired
+        monkeypatch.setattr(v2, "get_bigquery_service",
+                            lambda: FakeBQ(raises=NotFound("Not found: Table")))
+        with pytest.raises(HTTPException) as exc:
+            self._run(v2.get_sweep("abc123"))
+        assert exc.value.status_code == 503
+
+    def test_an_ordinary_bigquery_failure_is_not_disguised_as_503(
+            self, wired, monkeypatch):
+        """Only a MISSING TABLE gets the friendly message. A permissions error
+        or a genuine outage must not be reported as "run the CLI sweep first"."""
+        v2, _bq = wired
+        monkeypatch.setattr(v2, "get_bigquery_service",
+                            lambda: FakeBQ(raises=RuntimeError("quota exceeded")))
+        with pytest.raises(RuntimeError, match="quota"):
+            self._run(v2.list_sweeps(limit=10))
+
+    # -- gates -------------------------------------------------------------
+    def test_a_running_sweep_is_409(self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        live = FakeBQ(history=[{
+            "run_id": "other", "status": "running",
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "submitted_at": datetime.now(timezone.utc).isoformat()}])
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: live)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 409
+        assert "other" in str(exc.value.detail)
+        assert live.rows == []
+
+    def test_a_prior_done_run_returns_200_and_launches_nothing(
+            self, wired, monkeypatch):
+        v2, _bq = wired
+        cached = FakeBQ(prior={"run_id": "earlierrun000001"})
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: cached)
+        launched = []
+        monkeypatch.setattr(v2, "_launch_job",
+                            lambda body: launched.append(body))
+
+        out = self.submit(v2)
+        assert out["status"] == "deduplicated"
+        assert out["deduplicated_to"] == "earlierrun000001"
+        assert out["launched"] is False
+        assert launched == []
+
+    def test_force_skips_the_dedup_lookup(self, wired, monkeypatch):
+        import httpx
+
+        v2, _bq = wired
+        cached = FakeBQ(prior={"run_id": "earlierrun000001"})
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: cached)
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def ok(*_a, **_k):
+            return httpx.Response(200, json={"metadata": {"name": "exec-1"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+
+        out = self.submit(v2, body=spec(force=True))
+        assert out["launched"] is True
+        assert out["forced"] is True
+        assert out["deduplicated_to"] is None
+
+    def test_a_422_writes_nothing(self, wired):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2, body=spec(scenarios=[
+                {"name": "x", "overrides": {"strategy.put_target_dte": 14}}]))
+        assert exc.value.status_code == 422
+        assert "universe_dte" in str(exc.value.detail)
+        assert bq.rows == []
+
+    # -- the happy path ----------------------------------------------------
+    def test_a_successful_launch_records_the_execution_name(
+            self, wired, monkeypatch):
+        import httpx
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+        seen = {}
+
+        async def ok(self, url, **kwargs):
+            seen["url"] = url
+            seen["json"] = kwargs.get("json")
+            return httpx.Response(200, json={"metadata": {"name": "exec-42"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+
+        out = self.submit(v2)
+        assert out["status"] == "submitted"
+        assert out["execution_name"] == "exec-42"
+        assert seen["url"].endswith("/jobs/backtest-sweep:run")
+        env = seen["json"]["overrides"]["containerOverrides"][0]["env"]
+        assert {e["name"] for e in env} == {
+            "SWEEP_SPEC_JSON", "SWEEP_RUN_ID", "SWEEP_SUBMITTED_AT",
+            "SWEEP_SUBMITTED_VIA"}
+        # `args` is deliberately not overridden — the v2 API REPLACES args (it
+        # merges env), so sending them would duplicate the Job's entry point.
+        assert "args" not in seen["json"]["overrides"]["containerOverrides"][0]
+        assert [r["status"] for r in bq.rows] == ["submitted", "submitted"]
+        assert bq.rows[-1]["execution_name"] == "exec-42"
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
+class TestTheAuthCallsDoNotBlockTheEventLoop:
+    def test_the_token_is_fetched_in_a_threadpool(self):
+        """`google.auth.default()` and `credentials.refresh()` both do blocking
+        I/O (the metadata server on Cloud Run). Awaited inline in an `async def`
+        they stall the whole event loop, so a metadata hiccup would freeze every
+        other dashboard request, not just this one."""
+        import inspect
+
+        import routers.v2 as v2
+        source = inspect.getsource(v2._launch_job)
+        assert "run_in_threadpool(_access_token)" in source
+        # ...and the blocking work really is in the sync helper, not inline.
+        helper = inspect.getsource(v2._access_token)
+        assert "google.auth.default" in helper
+        assert "credentials.refresh" in helper
+        assert "google.auth.default" not in source
+
+
+class TestTheDashboardPathDoesNotShadowTheCli:
+    """`import main` must still be the repo's CLI after this module loads.
+
+    `sys.path` is process-global and outlives the module that edited it. Putting
+    `dashboard/backend` at the FRONT (the first cut, copied from
+    test_dashboard_pause_alert.py) makes `import main` resolve to the FastAPI app
+    for every test module collected after this one — alphabetically, everything
+    from `test_e*` onwards. It stayed invisible until `test_scenario_persist.py`
+    imported `main`, and then presented as an AttributeError about a function
+    that plainly exists.
+
+    Asserted here rather than left to collection order, because the symptom
+    appears in a different file from the cause.
+    """
+
+    def test_main_resolves_to_the_repo_cli_not_the_fastapi_app(self):
+        """Asked of `sys.path`, not of `sys.modules`.
+
+        `import main` would be answered from the module cache if anything
+        earlier in the session already imported it — which makes the obvious
+        version of this test pass even when the path is wrong. `find_spec`
+        re-runs the search, so it fails exactly when a later module's `import
+        main` would get the wrong file.
+        """
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.find_spec("main")
+        assert spec is not None and spec.origin
+        assert Path(spec.origin).resolve() == repo_root / "main.py", (
+            f"`import main` would resolve to {spec.origin}; something put "
+            f"dashboard/backend ahead of the repo root on sys.path"
+        )
+
+    def test_the_cli_entry_points_are_reachable(self):
+        import main as main_mod
+        assert hasattr(main_mod, "run_sweep_cmd")
+        assert hasattr(main_mod, "SweepTerminated")
+
+    def test_the_repo_root_precedes_the_backend_on_sys_path(self):
+        repo_root = str(Path(__file__).resolve().parents[1])
+        backend = str(Path(repo_root) / "dashboard" / "backend")
+        assert backend in sys.path
+        assert sys.path.index(repo_root) < sys.path.index(backend)
+
+    def test_services_still_resolves_from_the_backend(self):
+        import services.sweeps as reimported
+        assert reimported is S
 
 
 class TestTheAllowlistPayload:

@@ -1,6 +1,6 @@
 {
   "_source": "captured from `git show origin/main:cloudbuild.yaml` at 0910192 (FC-081 merged). This fixture pins MAIN's deploy flags. FC-084 intentionally adds --revision-suffix on top of them; that exception is declared in ALLOWED_NEW_DEPLOY_FLAGS in tests/test_cloudbuild_contract.py. Regenerate only alongside a deliberate, reviewed deploy-flag change.",
-  "_deviations": "One value here is deliberately NOT main's: `timeout` is 1500s, main is 1200s. FC-084 raises it because a build that waits for an older one needs ~1158s worst case (wait <=798s for the older build + its own ~360s deploy chain), which left only ~42s of headroom under 1200s. Both adversarial reviews called the original 1200s must-not-change a plan defect. serialize-builds' BUILD_TIMEOUT_SECONDS is asserted equal to this value by test_gate_deadline_tracks_the_build_timeout. SECOND DEVIATION (FC-060 Layer 3): `deploy-sweep-job` is added to `step_ids` and `wait_for`, and `deploy-dashboard-canary`'s `--set-env-vars` gains `SWEEP_JOB_NAME=backtest-sweep`. The env VALUE is part of the frozen flag string, so it cannot be absorbed by ALLOWED_NEW_DEPLOY_FLAGS the way a new flag NAME can - a deliberate env change to a service has to be re-frozen here, in the reviewed commit that makes it. `--set-env-vars` replaces the whole env set, so the value is edited in place rather than appended: dropping any of the four existing entries would silently unset them on the dashboard.",
+  "_deviations": "One value here is deliberately NOT main's: `timeout` is 1500s, main is 1200s. FC-084 raises it because a build that waits for an older one needs ~1158s worst case (wait <=798s for the older build + its own ~360s deploy chain), which left only ~42s of headroom under 1200s. Both adversarial reviews called the original 1200s must-not-change a plan defect. serialize-builds' BUILD_TIMEOUT_SECONDS is asserted equal to this value by test_gate_deadline_tracks_the_build_timeout. SECOND DEVIATION (FC-060 Layer 3): `deploy-sweep-job` is added to `step_ids` (LAST, behind all three promotes) and `wait_for`, and `deploy-dashboard-canary`'s `--set-env-vars` gains `SWEEP_JOB_NAME=backtest-sweep`. The env VALUE is part of the frozen flag string, so it cannot be absorbed by ALLOWED_NEW_DEPLOY_FLAGS the way a new flag NAME can - a deliberate env change to a service has to be re-frozen here, in the reviewed commit that makes it. `--set-env-vars` replaces the whole env set, so the value is edited in place rather than appended: dropping any of the four existing entries would silently unset them on the dashboard. Its position is load-bearing: the step can fail because the build service account lacks run.jobs.create, and placed anywhere earlier that failure would abort the build before the wheel/CC/dashboard revisions got their traffic — an ad-hoc measurement tool taking production deploys down with it. Behind the promotes it still fails the build loudly, but only after the services are out.",
   "timeout": "1500s",
   "step_ids": [
     "run-tests",
@@ -8,7 +8,6 @@
     "build-dashboard-image",
     "push-bot-image",
     "push-dashboard-image",
-    "deploy-sweep-job",
     "deploy-bot-canary",
     "smoke-test-bot",
     "promote-bot",
@@ -17,7 +16,8 @@
     "promote-cc",
     "deploy-dashboard-canary",
     "smoke-test-dashboard",
-    "promote-dashboard"
+    "promote-dashboard",
+    "deploy-sweep-job"
   ],
   "wait_for": {
     "run-tests": null,
@@ -61,7 +61,9 @@
       "smoke-test-dashboard"
     ],
     "deploy-sweep-job": [
-      "push-bot-image"
+      "promote-bot",
+      "promote-cc",
+      "promote-dashboard"
     ]
   },
   "deploy_flags": {

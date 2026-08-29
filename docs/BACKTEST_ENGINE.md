@@ -483,6 +483,24 @@ is delimiter-parsed.
 sweep always runs current `main`. `backtest-screen` stays SHA-pinned and untouched: a
 monthly screen must be reproducible, and an ad-hoc sweep must answer a question about
 the code as it is now. Those are opposite requirements, which is why they are two Jobs.
+The step runs **last**, behind all three service promotes — it can fail because the
+build service account lacks `run.jobs.create`, and a measurement tool must not be able
+to strand a production deploy.
+
+**Persistence is recorded honestly.** With `--persist` (or in Job mode) the markdown
+report names the dataset, the `run_id` and the `sweep_key`, and the JSON carries
+`persisted: true` with the same three. Without it both say so. A `done` row is written
+only when the cell rows actually landed; a sweep whose insert failed is `failed`, and
+the CLI exits non-zero rather than printing a "Stored as" line that points at nothing.
+
+**`force: true`** in a spec skips the dedup lookup on both sides, for re-running a
+question whose answer you no longer trust. It is excluded from `sweep_key`, so a forced
+run stays comparable with the run it reproduces.
+
+**The Job's `--task-timeout` is 10800s (3h)**, matching `backtest-screen`'s rationale:
+a cold window materialises at ~5.5 min/symbol. A task killed at the timeout receives
+SIGTERM, which the CLI turns into a recorded `failed` row rather than a sweep that
+sits as `running` for ever.
 
 **How it is affordable: materialise once, replay many.** Data assembly is
 config-independent — the chain model fingerprint takes no `settings.yaml` input and the

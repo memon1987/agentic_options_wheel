@@ -212,6 +212,107 @@ class TestRowsFromSweep:
         assert "SECRET" not in json.dumps(snap)
 
 
+class TestTheSchemaGuards:
+    def test_only_identity_columns_are_required(self):
+        """Everything else must be NULLABLE.
+
+        A REQUIRED column is a column every writer must know about, and the two
+        writers here are in different images with different knowledge — the API
+        has no Config and cannot fill `base_config_hash`, the Job has no
+        `submitted` row to copy from. A REQUIRED field nobody can supply makes
+        `insert_rows_json` reject the WHOLE request, so one row's gap costs the
+        run all of its rows.
+        """
+        pytest.importorskip("google.cloud.bigquery")
+        required = {f.name for f in store._sweeps_schema() if f.mode == "REQUIRED"}
+        assert required == {"run_id", "status", "submitted_at", "written_at"}
+
+        required_runs = {f.name for f in store._runs_schema() if f.mode == "REQUIRED"}
+        assert required_runs == {"run_id", "submitted_at"}
+
+    def test_a_retyped_column_raises_rather_than_being_ignored(self):
+        """Additive reconcile cannot fix a type change, and silently leaving one
+        means every insert fails on that field — the sweep writes ZERO rows and
+        reports a clean run, which is exactly the failure the reconcile exists
+        to prevent, arriving through the one door it did not watch."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        good = store._sweeps_schema()
+        drifted = [
+            bigquery.SchemaField("wall_seconds", "STRING")
+            if f.name == "wall_seconds" else f
+            for f in good
+        ]
+
+        class FakeClient:
+            def create_table(self, table, exists_ok=False):
+                existing = bigquery.Table(table.reference, schema=drifted)
+                return existing
+
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._client = FakeClient()
+        writer._dataset_id = "options_wheel"
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        with pytest.raises(RuntimeError, match="MIGRATION"):
+            writer._ensure_table(ref, store.SWEEPS_TABLE, good,
+                                 partition_field="submitted_at", clustering=None)
+
+    def test_a_missing_column_is_added_not_refused(self):
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        good = store._sweeps_schema()
+        trimmed = [f for f in good if f.name != "error_cells"]
+        updated = {}
+
+        class FakeClient:
+            def create_table(self, table, exists_ok=False):
+                return bigquery.Table(table.reference, schema=trimmed)
+
+            def update_table(self, table, fields):
+                updated["names"] = {f.name for f in table.schema}
+
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._client = FakeClient()
+        writer._dataset_id = "options_wheel"
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        writer._ensure_table(ref, store.SWEEPS_TABLE, good,
+                             partition_field="submitted_at", clustering=None)
+        assert "error_cells" in updated["names"]
+
+
+class TestNonFiniteValuesAreScrubbed:
+    """NaN / inf serialise as the bare JSON tokens `NaN` / `Infinity`, which
+    BigQuery rejects — and it rejects the WHOLE request, so one pathological
+    cell costs the sweep every row it was going to write. NULL is also the
+    honest value: an undefined ratio is not a number."""
+
+    def test_nan_and_inf_become_null(self, sweep):
+        sweep.rows[0].annualized_return = float("nan")
+        sweep.rows[0].total_return = float("inf")
+        sweep.rows[1].max_drawdown = float("-inf")
+        rows = store.rows_from_sweep(
+            sweep, run_id="r", submitted_at="2026-08-29T12:00:00+00:00",
+            engine_version=ENGINE_VERSION)
+        assert rows[0]["annualized_return"] is None
+        assert rows[0]["total_return"] is None
+        assert rows[1]["max_drawdown"] is None
+
+    def test_ordinary_numbers_survive(self, sweep):
+        rows = store.rows_from_sweep(
+            sweep, run_id="r", submitted_at="2026-08-29T12:00:00+00:00",
+            engine_version=ENGINE_VERSION)
+        assert rows[0]["annualized_return"] == pytest.approx(0.12)
+        assert rows[0]["win_rate"] == pytest.approx(0.85)
+
+    def test_every_written_row_is_json_serialisable_by_bigquery(self, sweep):
+        """`json.dumps(..., allow_nan=False)` is the same rule BigQuery applies."""
+        sweep.rows[0].annualized_return = float("nan")
+        rows = store.rows_from_sweep(
+            sweep, run_id="r", submitted_at="2026-08-29T12:00:00+00:00",
+            engine_version=ENGINE_VERSION)
+        json.dumps(rows, allow_nan=False)
+
+
 class TestTheLatestStatusOrderBy:
     def test_orders_by_written_at_not_submitted_at(self):
         """Every row of a submission shares `submitted_at` — it is the partition
@@ -225,6 +326,15 @@ class TestTheLatestStatusOrderBy:
         assert store.STATUS_RANK[store.STATUS_DONE] > store.STATUS_RANK[store.STATUS_RUNNING]
         assert store.STATUS_RANK[store.STATUS_FAILED] > store.STATUS_RANK[store.STATUS_RUNNING]
         assert store.STATUS_RANK[store.STATUS_RUNNING] > store.STATUS_RANK[store.STATUS_SUBMITTED]
+
+    def test_done_outranks_failed(self):
+        """The one realistic same-microsecond collision is the launch path: the
+        API writes `failed` when `jobs.run` errors while an execution that in
+        fact started writes `done`. A sweep whose cells are in the table is
+        done, whatever a launch-side timeout thought — and ranking it below
+        `failed` would additionally keep it out of the dedup, so it would be
+        replayed."""
+        assert store.STATUS_RANK[store.STATUS_DONE] > store.STATUS_RANK[store.STATUS_FAILED]
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +397,58 @@ class TestSweepKey:
         which is the one cache miss that is worse than no cache at all."""
         assert self.key(mutate(SPEC)) != self.key(SPEC)
 
+    def test_an_integer_and_a_float_threshold_are_the_same_sweep(self):
+        """A price ceiling typed as an integer in YAML and as a float by a JSON
+        form is the same threshold — the engine coerces both before it compares
+        anything. Without the fold the CLI and the dashboard never dedup against
+        each other, which is precisely the pair D4 exists to connect."""
+        as_int = dict(SPEC, scenarios=[
+            {"name": "c", "overrides": {"strategy.max_stock_price": 1000}}])
+        as_float = dict(SPEC, scenarios=[
+            {"name": "c", "overrides": {"strategy.max_stock_price": 1000.0}}])
+        assert self.key(as_int) == self.key(as_float)
+
+    def test_a_band_of_ints_matches_a_band_of_floats(self):
+        a = dict(SPEC, scenarios=[
+            {"name": "b", "overrides": {"strategy.call_delta_range": [0, 1]}}])
+        b = dict(SPEC, scenarios=[
+            {"name": "b", "overrides": {"strategy.call_delta_range": [0.0, 1.0]}}])
+        assert self.key(a) == self.key(b)
+
+    def test_a_bool_does_not_fold_into_a_number(self):
+        """`True` is not `1.0` here; folding it would make
+        `earnings.enabled: true` collide with an integer 1 elsewhere."""
+        as_bool = dict(SPEC, scenarios=[
+            {"name": "e", "overrides": {"earnings.enabled": True}}])
+        as_one = dict(SPEC, scenarios=[
+            {"name": "e", "overrides": {"earnings.enabled": 1}}])
+        assert self.key(as_bool) != self.key(as_one)
+
+    def test_the_default_haircut_spelled_out_is_the_default_haircut(self):
+        """The runner substitutes DEFAULT_FILL_HAIRCUT for None, so an arm that
+        spells it out and one that omits it run identically."""
+        from src.backtesting.evaluate import DEFAULT_FILL_HAIRCUT
+        spelled = dict(SPEC, scenarios=[
+            {"name": "d", "overrides": {}, "fill_haircut": DEFAULT_FILL_HAIRCUT}])
+        omitted = dict(SPEC, scenarios=[{"name": "d", "overrides": {}}])
+        assert self.key(spelled) == self.key(omitted)
+
+    def test_the_identity_haircut_constant_matches_the_engine(self):
+        from src.backtesting.evaluate import DEFAULT_FILL_HAIRCUT
+        from src.backtesting.scenarios import identity
+        assert identity.DEFAULT_FILL_HAIRCUT == DEFAULT_FILL_HAIRCUT
+
+    def test_a_non_default_haircut_still_changes_the_key(self):
+        other = dict(SPEC, scenarios=[
+            {"name": "d", "overrides": {}, "fill_haircut": 1.0}])
+        omitted = dict(SPEC, scenarios=[{"name": "d", "overrides": {}}])
+        assert self.key(other) != self.key(omitted)
+
+    def test_force_is_not_part_of_the_key(self):
+        """A forced re-run must key identically to the run it deliberately
+        reproduces, or the two are never comparable."""
+        assert self.key(dict(SPEC, force=True)) == self.key(SPEC)
+
     def test_engine_version_and_commit_are_in_the_key(self):
         assert self.key(SPEC, engine="fc-999-other") != self.key(SPEC)
         assert self.key(SPEC, commit="feedface") != self.key(SPEC)
@@ -313,21 +475,26 @@ class TestSweepKey:
 class FakeWriter:
     """Records what a real ScenarioRunWriter would have inserted."""
 
-    def __init__(self, *_a, prior=None, **_kw):
+    def __init__(self, *_a, prior=None, enabled=True, runs_ok=True, **_kw):
         self.statuses = []
         self.runs = []
         self.prior = prior
-        self.enabled = True
+        self.enabled = enabled
+        self.runs_ok = runs_ok
+        self.dedup_calls = []
 
     def write_status(self, row):
         self.statuses.append(row)
         return True
 
     def write_runs(self, rows):
+        if not self.runs_ok:
+            return False
         self.runs.extend(rows)
         return True
 
-    def find_done_sweep(self, key):
+    def find_done_sweep(self, key, base_config_hash=None):
+        self.dedup_calls.append((key, base_config_hash))
         return self.prior
 
 
@@ -440,6 +607,230 @@ class TestTheJobStatusSequence:
         assert writer.statuses == [] and writer.runs == []
 
 
+class TestDoneMeansTheRowsAreThere:
+    """`done` is not "the process exited" (review round 1).
+
+    It used to be chosen from `failure is None` alone, so a `write_runs` that
+    returned False still produced a `done` row — and the dedup would then serve
+    that run as a cached answer whose grid is empty. `done` now means "the
+    process finished AND its rows are in the table".
+    """
+
+    def test_a_failed_cell_write_produces_failed_not_done(
+            self, monkeypatch, wired, cli_args, job_env):
+        main_mod, writer = wired
+        writer.runs_ok = False
+
+        rc = main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert [r["status"] for r in writer.statuses] == ["running", "failed"]
+        assert "cell rows not persisted" in writer.statuses[-1]["error"]
+        # ...and the CLI says so rather than printing a "Stored as" line that
+        # points at rows nobody can read.
+        assert rc == 1
+
+    def test_a_done_row_records_how_many_rows_landed(
+            self, wired, cli_args, job_env):
+        main_mod, writer = wired
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        done = writer.statuses[-1]
+        assert done["status"] == "done"
+        assert done["rows_persisted"] == 6 == done["cell_count"]
+
+    def test_a_done_row_counts_its_errored_cells(self, wired, cli_args, job_env):
+        """The fixture sweep has two errored cells, so this run is `done` and
+        must NOT be dedup-eligible. `error_cells` is what says so."""
+        main_mod, writer = wired
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert writer.statuses[-1]["error_cells"] == 2
+
+    def test_a_failed_row_never_claims_rows_persisted(
+            self, monkeypatch, wired, cli_args, job_env):
+        main_mod, writer = wired
+        import src.backtesting.scenarios as scenarios_pkg
+        monkeypatch.setattr(scenarios_pkg, "run_sweep",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+        with pytest.raises(RuntimeError):
+            main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert writer.statuses[-1]["rows_persisted"] is None
+
+
+class TestTerminationIsRecorded:
+    """Cloud Run sends SIGTERM then SIGKILL 10 s later.
+
+    Python's default SIGTERM handler exits immediately: no `finally`, no
+    terminal row. The sweep would sit as `running` for ever, hold the
+    one-at-a-time lock until the stale cutoff, and tell an operator nothing.
+    Ten seconds is comfortably enough for two streaming inserts.
+    """
+
+    def test_the_handler_raises_so_the_finally_runs(
+            self, monkeypatch, wired, cli_args, job_env):
+        import signal
+
+        main_mod, writer = wired
+        import src.backtesting.scenarios as scenarios_pkg
+
+        def terminated_mid_replay(*_a, **_k):
+            # Exactly what Cloud Run does, from inside the replay.
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        monkeypatch.setattr(scenarios_pkg, "run_sweep", terminated_mid_replay)
+        with pytest.raises(main_mod.SweepTerminated):
+            main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+
+        assert [r["status"] for r in writer.statuses] == ["running", "failed"]
+        assert "SIGKILL" in writer.statuses[-1]["error"]
+
+    def test_a_sweep_terminated_is_not_an_ordinary_exception(self):
+        """`run_sweep` catches `Exception` per scenario so one bad arm does not
+        cost the others their results. A termination caught THERE would be
+        recorded as "this arm errored" while the container died around it."""
+        import main as main_mod
+        assert not issubclass(main_mod.SweepTerminated, Exception)
+        assert issubclass(main_mod.SweepTerminated, BaseException)
+
+    def test_the_previous_handler_is_restored(self):
+        import signal
+
+        import main as main_mod
+        before = signal.getsignal(signal.SIGTERM)
+        with main_mod.terminate_on_sigterm(_Logger()):
+            assert signal.getsignal(signal.SIGTERM) is not before
+        assert signal.getsignal(signal.SIGTERM) is before
+
+    def test_the_status_row_is_attempted_even_when_the_lake_summary_raises(
+            self, monkeypatch, wired, cli_args, job_env):
+        """Every step of the `finally` can itself raise, and a raise inside a
+        `finally` skips whatever it had not reached. The one thing that must
+        survive is the terminal row."""
+        main_mod, writer = wired
+        from src.backtesting.data.chain_store import ChainStore
+
+        def boom(self):
+            raise RuntimeError("GCS exploded")
+
+        monkeypatch.setattr(ChainStore, "summary", boom)
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert writer.statuses[-1]["status"] == "done"
+        assert writer.statuses[-1]["lake_summary_json"] is None
+
+
+class TestTheJobRefusesToReplayWithNowhereToStore:
+    def test_spec_env_mode_exits_non_zero_before_replaying(
+            self, monkeypatch, cli_args, job_env, sweep):
+        """An execution launched from the dashboard exists solely to put rows in
+        the store. Eight minutes of 1-vCPU compute whose output goes to a log
+        nobody reads is worse than an immediate, loud failure — and the
+        submitter would sit on `submitted` until the lock expired with no
+        explanation anywhere."""
+        import main as main_mod
+        from src.backtesting.scenarios import persist as persist_mod
+        import src.backtesting.scenarios as scenarios_pkg
+
+        dead = FakeWriter(enabled=False)
+        monkeypatch.setattr(persist_mod, "ScenarioRunWriter", lambda *a, **k: dead)
+        replayed = []
+        monkeypatch.setattr(scenarios_pkg, "run_sweep",
+                            lambda *a, **k: replayed.append(1) or sweep)
+
+        rc = main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert rc == 2
+        assert replayed == [], "nothing may be replayed with nowhere to store it"
+        assert dead.statuses == []
+
+    def test_the_cli_still_degrades_to_report_only(
+            self, monkeypatch, cli_args, tmp_path, sweep):
+        """`--persist` from a terminal is a human watching the report come out;
+        losing the store there costs a warning, not the run."""
+        import main as main_mod
+        from src.backtesting.scenarios import persist as persist_mod
+        import src.backtesting.scenarios as scenarios_pkg
+
+        dead = FakeWriter(enabled=False)
+        monkeypatch.setattr(persist_mod, "ScenarioRunWriter", lambda *a, **k: dead)
+        monkeypatch.setattr(scenarios_pkg, "run_sweep", lambda *a, **k: sweep)
+
+        spec_file = tmp_path / "s.yaml"
+        spec_file.write_text("scenarios:\n  - name: t\n")
+        cli_args.spec_env = None
+        cli_args.scenarios = str(spec_file)
+        cli_args.persist = True
+        cli_args.symbols = "AAPL"
+        cli_args.start, cli_args.end = "2025-08-01", "2026-07-31"
+
+        rc = main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert rc == 1   # warned, not crashed
+
+
+class TestForceSkipsTheDedup:
+    def test_force_true_never_queries_for_a_prior_run(
+            self, monkeypatch, wired, cli_args, job_env):
+        main_mod, writer = wired
+        writer.prior = {"run_id": "earlierrun000001"}
+        monkeypatch.setenv("SWEEP_SPEC_JSON", json.dumps(dict(job_env, force=True)))
+
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert writer.dedup_calls == []
+        assert [r["status"] for r in writer.statuses] == ["running", "done"]
+
+    def test_without_force_the_lookup_carries_the_effective_config_hash(
+            self, wired, cli_args, job_env):
+        main_mod, writer = wired
+        main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
+        assert len(writer.dedup_calls) == 1
+        key, cfg_hash = writer.dedup_calls[0]
+        assert cfg_hash and len(cfg_hash) == 16
+        # ...and it is the hash of the EFFECTIVE snapshot, not config_hash.
+        from src.backtesting.scenarios import persist as store_mod
+        assert cfg_hash == store_mod.base_config_hash(
+            store_mod.base_config_snapshot(_config()))
+
+
+class TestTheEffectiveConfigSnapshot:
+    """The yaml is not the configuration.
+
+    ``EARNINGS_ENABLED`` / ``ROLLER_ENABLED`` / ``ROLLER_DRY_RUN`` win over their
+    keys at runtime (FC-013 DD-7, FC-078 DD-7), so a snapshot read from
+    ``_config`` alone records a gate as ON that the run had OFF — and, since the
+    dedup reads ``base_config_hash``, two sweeps either side of a kill switch
+    would have been served as one another's answer.
+    """
+
+    def test_env_shadowed_switches_are_reflected(self, monkeypatch):
+        from src.backtesting.scenarios import persist as store_mod
+
+        monkeypatch.setenv("EARNINGS_ENABLED", "false")
+        monkeypatch.setenv("ROLLER_ENABLED", "false")
+        off = store_mod.base_config_snapshot(_config())
+        assert off["effective"]["earnings.enabled"] is False
+        assert off["effective"]["rolling.enabled"] is False
+
+        monkeypatch.setenv("EARNINGS_ENABLED", "true")
+        monkeypatch.setenv("ROLLER_ENABLED", "true")
+        on = store_mod.base_config_snapshot(_config())
+        assert on["effective"]["earnings.enabled"] is True
+        assert store_mod.base_config_hash(on) != store_mod.base_config_hash(off)
+
+    def test_the_raw_sections_are_still_carried(self):
+        """A hash proves two runs matched and says nothing about what they
+        matched on."""
+        from src.backtesting.scenarios import persist as store_mod
+        snap = store_mod.base_config_snapshot(_config())
+        assert "strategy" in snap and "effective" in snap
+
+    def test_every_allowlisted_key_has_an_effective_reading(self):
+        from src.backtesting.scenarios import persist as store_mod
+        from src.backtesting.scenarios.overrides import ALLOWED_OVERRIDES
+        snap = store_mod.base_config_snapshot(_config())
+        missing = set(ALLOWED_OVERRIDES) - set(snap["effective"])
+        assert missing == set(), missing
+
+    def test_credentials_never_reach_the_snapshot(self):
+        from src.backtesting.scenarios import persist as store_mod
+        blob = json.dumps(store_mod.base_config_snapshot(_config()), default=str)
+        assert "alpaca" not in blob.lower()
+
+
 class TestSpecEnvParsing:
     def test_missing_variable_fails_fast(self, monkeypatch):
         import main as main_mod
@@ -495,6 +886,57 @@ class TestSpecEnvParsing:
         import main as main_mod
         with pytest.raises(SystemExit, match="'end' must be YYYY-MM-DD"):
             main_mod._spec_date({"end": "31/07/2026"}, "end")
+
+
+class TestTheReportTellsTheTruthAboutPersistence:
+    """`render_markdown` asserted "this report is the only record of the run"
+    unconditionally, and `render_json` hardcoded `"persisted": false`. Both
+    became false statements the moment `--persist` existed — in the two places a
+    reader trusts most."""
+
+    def persistence(self, persisted=True):
+        import main as main_mod
+        return main_mod.SweepPersistence(
+            persisted=persisted, run_id="run0123456789ab",
+            sweep_key="key0123456789ab", dataset="options_wheel")
+
+    def test_a_stored_run_says_where_it_is(self, sweep):
+        from src.backtesting.scenarios.report import render_markdown
+        text = render_markdown(sweep, self.persistence())
+        assert "Results are persisted" in text
+        assert "options_wheel.scenario_sweeps" in text
+        assert "run0123456789ab" in text
+        assert "this report is the only record" not in text
+
+    def test_an_unstored_run_still_says_so(self, sweep):
+        from src.backtesting.scenarios.report import render_markdown
+        text = render_markdown(sweep)
+        assert "Results are not persisted" in text
+        assert "this report is the only record of it" in text
+
+    def test_both_forms_keep_the_backtest_runs_prohibition(self, sweep):
+        from src.backtesting.scenarios.report import render_markdown
+        for persistence in (None, self.persistence()):
+            assert "backtest_runs" in render_markdown(sweep, persistence)
+
+    def test_the_json_carries_the_run_id_when_stored(self, sweep):
+        from src.backtesting.scenarios.report import render_json
+        payload = json.loads(render_json(sweep, self.persistence()))
+        assert payload["persisted"] is True
+        assert payload["run_id"] == "run0123456789ab"
+        assert payload["sweep_key"] == "key0123456789ab"
+        assert payload["dataset"] == "options_wheel"
+
+    def test_the_json_defaults_to_not_persisted(self, sweep):
+        from src.backtesting.scenarios.report import render_json
+        payload = json.loads(render_json(sweep))
+        assert payload["persisted"] is False
+        assert payload["run_id"] is None
+
+    def test_a_run_whose_rows_did_not_land_is_not_reported_as_stored(self, sweep):
+        from src.backtesting.scenarios.report import render_markdown
+        text = render_markdown(sweep, self.persistence(persisted=False))
+        assert "Results are not persisted" in text
 
 
 class _Logger:

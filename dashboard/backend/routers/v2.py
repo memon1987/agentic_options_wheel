@@ -423,35 +423,72 @@ def _service_account_email() -> str:
                      "799970961417-compute@developer.gserviceaccount.com")
 
 
-async def _launch_job(body: Dict[str, Any]) -> Dict[str, Any]:
-    """POST Cloud Run v2 `jobs.run`. Returns the operation, or raises HTTPException.
+def _access_token() -> str:
+    """An ADC OAuth access token for the Cloud Run control plane.
 
-    The bearer is an ADC access token (metadata server on Cloud Run, gcloud ADC
-    locally) — NOT the identity token `routers/live.py` uses for
-    service-to-service calls. `run.googleapis.com` is the control plane and takes
-    an OAuth access token with the cloud-platform scope; an identity token is
-    rejected there, and the two are easy to confuse because the same service
-    account issues both.
+    NOT the identity token `routers/live.py` uses for service-to-service calls.
+    `run.googleapis.com` is the control plane and takes an OAuth access token
+    with the cloud-platform scope; an identity token is rejected there, and the
+    two are easy to confuse because the same service account issues both.
+
+    Synchronous on purpose — it is called through `run_in_threadpool`. Both
+    `google.auth.default()` and `credentials.refresh()` do blocking I/O (the
+    metadata server on Cloud Run, the filesystem locally); awaiting them inline
+    in an `async def` stalls the whole event loop, so a metadata-server hiccup
+    would freeze every other dashboard request, not just this one.
     """
     import google.auth
     import google.auth.transport.requests
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    credentials.refresh(google.auth.transport.requests.Request())
+    return credentials.token
+
+
+async def _launch_job(body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST Cloud Run v2 `jobs.run`. Returns the operation, or raises HTTPException.
+
+    **Every failure leaves here as an HTTPException**, including a transport
+    error. `httpx` raises `ReadTimeout` / `ConnectError` rather than returning a
+    response, and an escaping one used to surface as a 500 — with the
+    `submitted` row already written and never terminalised, so the one-at-a-time
+    gate stayed locked and the operator got a stack trace instead of a reason.
+    The caller relies on that guarantee to record a `failed` row.
+    """
     import httpx
+    from starlette.concurrency import run_in_threadpool
 
     try:
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        credentials.refresh(google.auth.transport.requests.Request())
+        token = await run_in_threadpool(_access_token)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=502,
             detail=(f"could not obtain a Google credential to launch the sweep "
-                    f"Job: {exc}"))
+                    f"Job: {type(exc).__name__}: {exc}"))
 
     url = sweeps.job_run_url(_project(), SWEEP_JOB_NAME, SWEEP_REGION)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            url, json=body,
-            headers={"Authorization": f"Bearer {credentials.token}"})
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url, json=body,
+                headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        # A timeout is genuinely ambiguous: the execution may or may not have
+        # started. Said plainly rather than guessed at — and the run is recorded
+        # `failed`, so the gate reopens and the operator can look at Cloud Run
+        # and re-submit rather than waiting out a lock on an unknown.
+        raise HTTPException(
+            status_code=502,
+            detail=(f"could not reach Cloud Run to launch the sweep Job "
+                    f"({type(exc).__name__}: {exc}). The execution may or may "
+                    f"not have started — check `gcloud run jobs executions list "
+                    f"--job {SWEEP_JOB_NAME}` before re-submitting."))
+    except Exception as exc:  # noqa: BLE001 - nothing may escape as a 500
+        raise HTTPException(
+            status_code=502,
+            detail=(f"launching the sweep Job failed unexpectedly: "
+                    f"{type(exc).__name__}: {exc}"))
 
     if response.status_code == 403:
         # The one failure mode with a specific, actionable cause. Named in full
@@ -478,6 +515,22 @@ async def _launch_job(body: Dict[str, Any]) -> Dict[str, Any]:
         return response.json()
     except ValueError:
         return {}
+
+
+def _sweep_store_missing(exc: Exception) -> bool:
+    """Whether this failure is "the sweep tables do not exist yet"."""
+    from google.cloud.exceptions import NotFound
+    return isinstance(exc, NotFound)
+
+
+def _tables_missing() -> HTTPException:
+    return HTTPException(status_code=503,
+                         detail=sweeps_bq_missing_detail())
+
+
+def sweeps_bq_missing_detail() -> str:
+    from services.bigquery import BigQueryService
+    return BigQueryService.TABLES_MISSING_DETAIL
 
 
 @router.get("/sweeps/allowlist")
@@ -508,7 +561,12 @@ async def list_sweeps(
     the row so an operator can go and look.
     """
     bq = get_bigquery_service()
-    rows = bq.get_recent_sweeps(limit=limit)
+    try:
+        rows = bq.get_recent_sweeps(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
     for row in rows:
         row["stuck"] = sweeps.is_stuck(row)
     return rows
@@ -526,10 +584,17 @@ async def get_sweep(run_id: str) -> Dict[str, Any]:
     if not run_id or len(run_id) > 64:
         raise HTTPException(status_code=400, detail="Invalid run_id")
     bq = get_bigquery_service()
-    row = bq.get_sweep(run_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"No sweep {run_id}")
-    rows = bq.get_sweep_rows(run_id)
+    try:
+        row = bq.get_sweep(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No sweep {run_id}")
+        rows = bq.get_sweep_rows(run_id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
     shaped = sweeps.shape_results(row, rows)
     shaped["stuck"] = sweeps.is_stuck(row)
     shaped["status"] = row.get("status")
@@ -585,8 +650,21 @@ async def submit_sweep(
     git_commit = os.getenv("GIT_COMMIT") or None
     key = sweeps.compute_sweep_key(normalised, git_commit)
     submitted_at = datetime.now(timezone.utc).isoformat()
+    force = bool(normalised.get("force"))
 
-    prior = bq.find_done_sweep(key)
+    try:
+        # The best the API can do about effective config: the last hash any run
+        # on this commit recorded. The Job re-checks against the config it
+        # actually has, which is the only exact check available.
+        config_hash = bq.latest_base_config_hash(git_commit)
+        prior = (None if force
+                 else bq.find_done_sweep(key, base_config_hash=config_hash))
+        history = bq.get_recent_sweeps(limit=25)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+
     if prior is not None:
         run_id = sweeps.new_run_id()
         bq.insert_sweep_status(sweeps.submitted_row(
@@ -600,15 +678,18 @@ async def submit_sweep(
                 "detail": ("this exact spec already completed on this engine and "
                            "commit; nothing was replayed")}
 
-    blocking = sweeps.blocking_sweep(bq.get_recent_sweeps(limit=25))
+    blocking = sweeps.blocking_sweep(history)
     if blocking is not None:
         raise HTTPException(
             status_code=409,
             detail=(f"sweep {blocking.get('run_id')} is {blocking.get('status')}; "
                     f"one sweep runs at a time (the Job is a single vCPU and two "
-                    f"executions would contend on one chain cache). Wait for it, "
-                    f"or re-submit after {sweeps.RUNNING_LOCK_HOURS}h if it never "
-                    f"reported in."))
+                    f"executions would contend on one chain cache). Wait for it "
+                    f"— the lock releases on its own once the run is older than "
+                    f"the Job's task timeout "
+                    f"({sweeps.JOB_TASK_TIMEOUT_SECONDS // 3600}h + "
+                    f"{sweeps.STALE_GRACE_MINUTES}m), because Cloud Run has "
+                    f"killed the task by then."))
 
     run_id = sweeps.new_run_id()
     row = sweeps.submitted_row(
@@ -622,8 +703,10 @@ async def submit_sweep(
             run_id=run_id, submitted_at=submitted_at))
     except HTTPException as exc:
         # The row already exists, so the failure has to be recorded on it —
-        # otherwise the submit shows as pending forever and blocks the next one
-        # for an hour for no reason.
+        # otherwise the submit shows as pending forever and holds the
+        # one-at-a-time lock until the stale cutoff for no reason. `_launch_job`
+        # guarantees every failure arrives here as an HTTPException, transport
+        # errors included, which is what makes this reachable at all.
         try:
             failed = dict(row)
             failed.update(status=sweeps.STATUS_FAILED,
@@ -653,4 +736,5 @@ async def submit_sweep(
             "sweep_key": key, "launched": True,
             "execution_name": execution_name,
             "cell_count": sweeps.cell_count(normalised),
+            "forced": force,
             "deduplicated_to": None}

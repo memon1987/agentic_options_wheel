@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 import json
 
@@ -488,7 +489,7 @@ def _scenarios_from_entries(raw, where: str):
 # `holdout` would run IN-SAMPLE ONLY and report itself as validated.
 SPEC_FIELDS = frozenset({
     'symbols', 'start', 'end', 'holdout_start', 'starting_cash',
-    'run_sensitivity', 'scenarios',
+    'run_sensitivity', 'scenarios', 'force',
 })
 
 # Cloud Run caps a container's whole environment at 32 KiB and the spec is one
@@ -566,6 +567,76 @@ def _spec_date(spec: dict, field: str):
         )
 
 
+class SweepTerminated(BaseException):
+    """Cloud Run asked this task to stop. Raised from the SIGTERM handler.
+
+    A ``BaseException`` rather than an ``Exception`` on purpose: it must not be
+    swallowed by any `except Exception` inside the replay loop — `run_sweep`
+    catches per-scenario failures broadly so one bad arm does not cost the others
+    their results, and a termination caught there would be recorded as "this arm
+    errored" while the container died around it.
+    """
+
+
+@contextmanager
+def terminate_on_sigterm(logger):
+    """Turn SIGTERM into an exception so the store's ``finally`` still runs.
+
+    Cloud Run sends SIGTERM and then SIGKILL **10 seconds later** — on a task
+    timeout, on a cancelled execution, on an infrastructure eviction. Python's
+    default SIGTERM handler exits the interpreter immediately: no `finally`, no
+    terminal status row. The sweep would then sit in the store as `running`
+    forever, block the next submission until the lock expires, and tell an
+    operator nothing about why.
+
+    Ten seconds is comfortably enough for two streaming inserts, which is the
+    whole reason this is worth doing rather than accepting the loss.
+
+    Restores the previous handler on the way out, and no-ops off the main thread
+    (`signal.signal` raises there) so tests and library callers are unaffected.
+    """
+    import signal
+
+    def _raise(signum, _frame):
+        logger.warning(
+            "SIGTERM received — recording a terminal sweep status before the "
+            "container is killed",
+            event_category="backtest", event_type="sweep_sigterm", signal=signum)
+        raise SweepTerminated(
+            f"the container received signal {signum} (Cloud Run sends SIGTERM "
+            f"then SIGKILL 10s later): task timeout, cancelled execution, or "
+            f"eviction")
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _raise)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. Nothing to install
+        # and nothing to restore; the sweep runs exactly as before.
+        yield None
+        return
+    try:
+        yield _raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+class SweepPersistence:
+    """Where a sweep was stored, handed to the renderers so they tell the truth.
+
+    Before FC-060 Layer 3 the report asserted "this report is the only record of
+    the run" unconditionally and the JSON hardcoded ``"persisted": false``. Both
+    became false statements the moment `--persist` existed, in the two places a
+    reader trusts most.
+    """
+
+    def __init__(self, *, persisted: bool, run_id: str, sweep_key: str,
+                 dataset: str) -> None:
+        self.persisted = persisted
+        self.run_id = run_id
+        self.sweep_key = sweep_key
+        self.dataset = dataset
+
+
 def run_sweep_cmd(args, config: Config, logger) -> int:
     """Replay many scenarios over many symbols (FC-060 Layers 2/3).
 
@@ -590,11 +661,10 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     from src.backtesting.scenarios import persist as sweep_store
     from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
     from src.backtesting.scenarios.report import render_json, render_markdown
-    from src.backtesting.screen import (
-        DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION, accumulate_lake_summary,
-    )
+    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION
 
     spec_env = getattr(args, 'spec_env', None)
+    spec = None
     if spec_env and args.scenarios:
         raise SystemExit(
             "sweep: pass either --scenarios <yaml> or --spec-env <VAR>, not "
@@ -685,12 +755,19 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     }
 
     persist = bool(spec_env) or bool(getattr(args, 'persist', False))
+    # `force` is an instruction about THIS submission, not a property of the
+    # question being asked, so it is excluded from `sweep_key`
+    # (identity.NON_IDENTITY_FIELDS). Including it would give a forced re-run a
+    # different key from the run it deliberately reproduces.
+    force = bool((spec or {}).get('force', False)) if spec_env else False
     run_id = os.environ.get('SWEEP_RUN_ID') or uuid.uuid4().hex[:16]
     submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
                     or datetime.now(timezone.utc).isoformat())
     git_commit = os.environ.get('GIT_COMMIT') or None
     key = compute_sweep_key(spec_payload, engine_version=ENGINE_VERSION,
                             git_commit=git_commit)
+    snapshot = sweep_store.base_config_snapshot(config)
+    effective_hash = sweep_store.base_config_hash(snapshot)
     provenance = dict(
         run_id=run_id,
         submitted_at=submitted_at,
@@ -704,8 +781,16 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         # `run.executions.get` is unproven for the dashboard's service account.
         execution_name=os.environ.get('CLOUD_RUN_EXECUTION'),
         spec=spec_payload,
-        base_config=sweep_store.base_config_snapshot(config),
-        base_config_hash=config_hash(config),
+        base_config=snapshot,
+        # The hash of the EFFECTIVE snapshot, not `config_hash`. `config_hash`
+        # covers nine strategy keys and cannot see an operator flipping
+        # EARNINGS_ENABLED or ROLLER_ENABLED on the Job between two otherwise
+        # identical submissions — and the dedup reads this column, so that blind
+        # spot would have served one experiment's numbers as another's. The
+        # engine hash is still stored, separately, for the `backtest_runs`
+        # linkage.
+        base_config_hash=sweep_store.base_config_hash(snapshot),
+        engine_config_hash=config_hash(config),
     )
 
     writer = None
@@ -714,6 +799,24 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         # covered-call profile running a sweep writes to its own dataset rather
         # than into the wheel's store.
         writer = sweep_store.ScenarioRunWriter(dataset_id=config.bigquery_dataset)
+        if not writer.enabled and spec_env:
+            # FAIL BEFORE REPLAYING, in Job mode only. An execution launched from
+            # the dashboard exists solely to put rows in the store: eight minutes
+            # of 1-vCPU compute whose output goes to a log nobody reads is worse
+            # than an immediate, loud failure, and the submitter would sit on
+            # `submitted` until the lock expired with no explanation anywhere.
+            # `--persist` from the CLI still degrades to "report only" — there a
+            # human is watching the report come out.
+            logger.error(
+                "Sweep store unavailable — refusing to replay in Job mode",
+                event_category="backtest",
+                event_type="sweep_store_unavailable",
+                run_id=run_id, dataset=config.bigquery_dataset)
+            print("\nFAILED: the scenario store is unavailable (no BigQuery "
+                  "client, no GCP project, or the tables could not be "
+                  "reconciled). Refusing to replay: a Job execution exists to "
+                  "produce rows, and there is nowhere to put them.")
+            return 2
 
     started_at = datetime.now(timezone.utc).isoformat()
     if writer is not None:
@@ -724,7 +827,8 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         writer.write_status(sweep_store.status_row(
             status=sweep_store.STATUS_RUNNING, started_at=started_at, **provenance))
 
-        prior = writer.find_done_sweep(key)
+        prior = (None if force else
+                 writer.find_done_sweep(key, base_config_hash=effective_hash))
         if prior is not None and prior.get('run_id') != run_id:
             writer.write_status(sweep_store.status_row(
                 status=sweep_store.STATUS_DEDUPLICATED,
@@ -740,47 +844,42 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                         deduplicated_to=prior['run_id'])
             return 0
 
-    # ONE chain store for the run, so its lake counters can be reported on the
-    # sweep row. This is exactly the object `run_sweep` builds for itself when
-    # none is injected (`ChainStore.from_env()`), so passing it changes nothing
-    # about the replay.
-    chain_store = ChainStore.from_env()
-
     result = None
     failure = None
+    chain_store = None
+    rows_persisted = None
     try:
-        result = run_sweep(
-            config, scenarios, symbols, start, end,
-            holdout_start=holdout_start,
-            starting_cash=starting_cash,
-            run_sensitivity=run_sensitivity,
-            chain_store=chain_store,
-        )
+        # INSIDE the try: `ChainStore.from_env()` builds a GCS client and probes
+        # the bucket, so it can raise — and a raise out here would skip the
+        # `finally` and leave the sweep `running` for ever, which is the exact
+        # failure the `finally` exists to prevent.
+        chain_store = ChainStore.from_env()
+        with terminate_on_sigterm(logger):
+            result = run_sweep(
+                config, scenarios, symbols, start, end,
+                holdout_start=holdout_start,
+                starting_cash=starting_cash,
+                run_sensitivity=run_sensitivity,
+                chain_store=chain_store,
+            )
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
         failure = f"{type(exc).__name__}: {exc}"
         raise
     finally:
         if writer is not None:
-            lake_totals: dict = {}
-            accumulate_lake_summary(lake_totals, chain_store.summary())
-            lake_summary = dict(chain_store.summary())
-            lake_summary.update(lake_totals)
-            # Cells BEFORE the terminal status row: a reader that sees `done`
-            # must be able to trust the rows are already there. The reverse order
-            # leaves a window in which a finished sweep has no results.
-            if result is not None:
-                writer.write_runs(sweep_store.rows_from_sweep(
-                    result, run_id=run_id, submitted_at=submitted_at,
-                    engine_version=ENGINE_VERSION, git_commit=git_commit))
-            writer.write_status(sweep_store.status_row(
-                status=(sweep_store.STATUS_DONE if failure is None
-                        else sweep_store.STATUS_FAILED),
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                result=result, error=failure, lake_summary=lake_summary,
-                **provenance))
+            rows_persisted = _finalise_sweep_status(
+                writer=writer, logger=logger, result=result, failure=failure,
+                chain_store=chain_store, started_at=started_at,
+                run_id=run_id, submitted_at=submitted_at,
+                engine_version=ENGINE_VERSION, git_commit=git_commit,
+                provenance=provenance,
+            )
 
-    markdown = render_markdown(result)
+    persistence = SweepPersistence(
+        persisted=bool(writer is not None and rows_persisted is not None),
+        run_id=run_id, sweep_key=key, dataset=config.bigquery_dataset)
+
+    markdown = render_markdown(result, persistence)
     print(markdown)
     if args.out:
         with open(args.out, 'w') as fh:
@@ -788,12 +887,19 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         print(f"\nMarkdown report -> {args.out}")
     if args.json_out:
         with open(args.json_out, 'w') as fh:
-            fh.write(render_json(result))
+            fh.write(render_json(result, persistence))
         print(f"JSON report -> {args.json_out}")
     if persist:
-        print(f"\nStored as run_id {run_id} (sweep_key {key}) in "
-              f"{config.bigquery_dataset}.{sweep_store.SWEEPS_TABLE} / "
-              f"{sweep_store.RUNS_TABLE}.")
+        if persistence.persisted:
+            print(f"\nStored as run_id {run_id} (sweep_key {key}) in "
+                  f"{config.bigquery_dataset}.{sweep_store.SWEEPS_TABLE} / "
+                  f"{sweep_store.RUNS_TABLE}.")
+        else:
+            # A `done` row is never written in this state (see
+            # `_finalise_sweep_status`), so the store and this message agree.
+            print(f"\nWARNING: results were NOT persisted for run_id {run_id}. "
+                  f"This report is the only record of the run.")
+            return 1
 
     # Exit non-zero when any cell never produced a verdict. A sweep that
     # half-ran reads as a complete one, and a missing cell is exactly where a
@@ -804,6 +910,90 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
               f"{', '.join(failed[:12])}{' ...' if len(failed) > 12 else ''}")
         return 1
     return 0
+
+
+def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
+                           started_at, run_id, submitted_at, engine_version,
+                           git_commit, provenance):
+    """Write the cells and the terminal status row. Returns rows persisted, or None.
+
+    Extracted from the `finally` because **every step in here can itself raise**,
+    and a raise inside a `finally` replaces the original exception with a
+    confusing one AND skips whatever the `finally` had not reached yet. The one
+    thing that must survive is the terminal status row: without it the sweep is
+    `running` for ever, blocks the next submission until the lock expires, and
+    says nothing about why.
+
+    So the lake summary and the cell write are each guarded independently, and
+    the status write is attempted last with its own guard. Worst case the row
+    says `failed` with a truthful reason; the unacceptable case is no row at all.
+
+    **`done` requires the cells to have landed** (review round 1). Previously the
+    status was chosen from `failure is None` alone, so a `write_runs` that
+    returned False still produced `done` — a run the dedup would then serve as a
+    cached answer whose grid is empty. `done` now means "the process finished AND
+    its rows are in the table"; anything else is `failed`.
+    """
+    from datetime import datetime, timezone
+
+    from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.screen import accumulate_lake_summary
+
+    lake_summary = None
+    try:
+        if chain_store is not None:
+            summary = chain_store.summary()
+            lake_totals: dict = {}
+            accumulate_lake_summary(lake_totals, summary)
+            lake_summary = dict(summary)
+            lake_summary.update(lake_totals)
+    except Exception:  # noqa: BLE001 - cosmetic beside the status row
+        logger.warning("Could not summarise chain-lake usage for this sweep",
+                       event_category="backtest",
+                       event_type="sweep_lake_summary_failed", exc_info=True)
+
+    # Cells BEFORE the terminal status row: a reader that sees `done` must be
+    # able to trust the rows are already there. The reverse order leaves a window
+    # in which a finished sweep has no results.
+    rows_ok = False
+    rows_written = 0
+    if result is not None:
+        try:
+            rows = sweep_store.rows_from_sweep(
+                result, run_id=run_id, submitted_at=submitted_at,
+                engine_version=engine_version, git_commit=git_commit)
+            rows_ok = writer.write_runs(rows)
+            rows_written = len(rows) if rows_ok else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Sweep cell rows could not be written",
+                         event_category="backtest",
+                         event_type="sweep_rows_write_failed",
+                         run_id=run_id, error=str(exc)[:300])
+            failure = failure or f"cell rows not persisted: {type(exc).__name__}: {exc}"
+
+    if result is not None and not rows_ok and failure is None:
+        failure = ("cell rows not persisted: the sweep completed but its "
+                   "scenario_runs insert did not land, so there are no results "
+                   "to read")
+
+    status = (sweep_store.STATUS_DONE
+              if failure is None and result is not None and rows_ok
+              else sweep_store.STATUS_FAILED)
+    try:
+        writer.write_status(sweep_store.status_row(
+            status=status, started_at=started_at,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            result=result, error=failure, lake_summary=lake_summary,
+            rows_persisted=(rows_written if rows_ok else None),
+            **provenance))
+    except Exception:  # noqa: BLE001 - nothing left to fall back to
+        logger.error("Terminal sweep status row could not be written — this run "
+                     "will read as `running` until the lock expires",
+                     event_category="backtest",
+                     event_type="sweep_status_write_failed",
+                     run_id=run_id, status=status, exc_info=True)
+        return None
+    return rows_written if status == sweep_store.STATUS_DONE else None
 
 
 def _sensitivity_section(s: dict) -> str:

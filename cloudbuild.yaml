@@ -326,47 +326,6 @@ steps:
     id: 'push-dashboard-image'
     waitFor: ['build-dashboard-image']
 
-  # Step 5b: Deploy the ad-hoc scenario-sweep Cloud Run JOB (FC-060 Layer 3, D9).
-  #
-  # `gcloud run jobs deploy` is create-or-update, so this step both creates the
-  # job on the merging build and keeps it on current `main` thereafter. That is
-  # the whole point: `backtest-screen` is deliberately SHA-pinned (a monthly
-  # screen must be reproducible), and nothing in this file used to update a Job
-  # at all — which is how that job sat on a Layer-1 image with no `sweep`
-  # command. An ad-hoc sweep has the opposite requirement: it answers a question
-  # about the code as it is now.
-  #
-  # NOT gated by `serialize-builds`: this deploys no traffic and no revision, so
-  # two builds racing here simply leaves the newer image on the job — which is
-  # what serialization would have produced anyway. It DOES honour the superseded
-  # marker, because a superseded build must not push its image onto the job that
-  # the winning build is about to point at current code.
-  #
-  # `--set-env-vars` REPLACES the whole env set on every deploy, so every
-  # persistent Job env var must be listed here. GIT_COMMIT is the FC-081 wiring:
-  # it is half of the sweep dedup key (D4), so a Job that ran without it would
-  # key every sweep as if it had no commit.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
-        gcloud run jobs deploy backtest-sweep \
-          --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
-          --region=us-central1 \
-          --command=python \
-          --args=main.py,--command,sweep,--spec-env,SWEEP_SPEC_JSON \
-          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA \
-          --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
-          --memory=1Gi \
-          --cpu=1 \
-          --task-timeout=3600 \
-          --max-retries=0 \
-          --service-account=799970961417-compute@developer.gserviceaccount.com
-    id: 'deploy-sweep-job'
-    waitFor: ['push-bot-image']
-
   # Step 6: Deploy trading bot to Cloud Run (canary - no traffic)
   # The revision name is chosen here, before the deploy, via --revision-suffix, and
   # confirmed to exist afterwards. The retry covers Cloud Run's optimistic-concurrency
@@ -853,6 +812,65 @@ steps:
         done
     id: 'promote-dashboard'
     waitFor: ['smoke-test-dashboard']
+
+  # Step 12: Deploy the ad-hoc scenario-sweep Cloud Run JOB (FC-060 Layer 3, D9).
+  #
+  # `gcloud run jobs deploy` is create-or-update, so this step both creates the
+  # job on the merging build and keeps it on current `main` thereafter. That is
+  # the whole point: `backtest-screen` is deliberately SHA-pinned (a monthly
+  # screen must be reproducible), and nothing in this file used to update a Job
+  # at all — which is how that job sat on a Layer-1 image with no `sweep`
+  # command. An ad-hoc sweep has the opposite requirement: it answers a question
+  # about the code as it is now.
+  #
+  # NOT gated by `serialize-builds`: this deploys no traffic and no revision, so
+  # two builds racing here simply leaves the newer image on the job — which is
+  # what serialization would have produced anyway. It DOES honour the superseded
+  # marker, because a superseded build must not push its image onto the job that
+  # the winning build is about to point at current code.
+  #
+  # It runs LAST, behind all three promotes, and that ordering is the point
+  # (review round 1). This step can fail for a reason that has nothing to do
+  # with the services — the build service account may lack `run.jobs.create`
+  # until an operator grants it in the console. Placed earlier, or in parallel,
+  # a failure here aborts the build and the wheel, covered-call and dashboard
+  # revisions never get their traffic: an ad-hoc measurement tool would have
+  # taken production deploys down with it. Behind the promotes it still fails
+  # loudly and still blocks the build's SUCCESS — the operator finds out — but
+  # only after the services are safely out.
+  #
+  # `--set-env-vars` REPLACES the whole env set on every deploy, so every
+  # persistent Job env var must be listed here. GIT_COMMIT is the FC-081 wiring:
+  # it is half of the sweep dedup key (D4), so a Job that ran without it would
+  # key every sweep as if it had no commit.
+  #
+  # `--task-timeout=10800` (3h) for the same reason `backtest-screen` needs it:
+  # a COLD window materialises at ~5.5 min/symbol (the warm figure is ~50 s), and
+  # a 12-symbol sweep over a year of unseeded chains is comfortably over an hour.
+  # A task killed at the timeout gets SIGTERM, which `main.py` turns into a
+  # recorded `failed` row — but only if the timeout is generous enough that
+  # hitting it means something is actually wrong. `services/sweeps.py` mirrors
+  # this number as JOB_TASK_TIMEOUT_SECONDS; a contract test pins them equal.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        gcloud run jobs deploy backtest-sweep \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+          --region=us-central1 \
+          --command=python \
+          --args=main.py,--command,sweep,--spec-env,SWEEP_SPEC_JSON \
+          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA \
+          --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
+          --memory=1Gi \
+          --cpu=1 \
+          --task-timeout=10800 \
+          --max-retries=0 \
+          --service-account=799970961417-compute@developer.gserviceaccount.com
+    id: 'deploy-sweep-job'
+    waitFor: ['promote-bot', 'promote-cc', 'promote-dashboard']
 
 # Build configuration
 options:

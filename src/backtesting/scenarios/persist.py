@@ -40,7 +40,9 @@ of two rows sharing a microsecond.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -78,12 +80,19 @@ TERMINAL_STATUSES = (STATUS_DONE, STATUS_FAILED, STATUS_DEDUPLICATED)
 # reachable if two writers stamp the same microsecond, which is why it exists at
 # all: a reader that resolved such a tie by row order would report a finished
 # sweep as still running roughly half the time.
+#
+# `done` outranks `failed` DELIBERATELY. The one realistic collision is the
+# launch path: the API writes a `failed` row when `jobs.run` errors, and an
+# execution that in fact started can write `done` in the same microsecond. A
+# sweep whose cells are in the table is done, whatever a launch-side timeout
+# thought. The reverse ranking would hide a completed run behind a spurious
+# failure — and, worse, keep it out of the dedup so it would be replayed.
 STATUS_RANK: Dict[str, int] = {
     STATUS_SUBMITTED: 0,
     STATUS_RUNNING: 1,
     STATUS_DEDUPLICATED: 2,
     STATUS_FAILED: 3,
-    STATUS_DONE: 3,
+    STATUS_DONE: 4,
 }
 
 
@@ -146,6 +155,19 @@ def _sweeps_schema():
         f("bar_cache_hits", "INTEGER"),
         f("lake_summary_json", "STRING"),
         f("error", "STRING"),
+        # Completeness. `done` is not "the process exited" — it is "the cells are
+        # in the table and every one of them was measured". Both numbers are on
+        # the row because the DEDUP reads them: returning a prior run whose rows
+        # never landed, or whose cells errored, would serve an absence as a
+        # result. See `find_done_sweep`.
+        f("rows_persisted", "INTEGER"),
+        f("error_cells", "INTEGER"),
+        # `bq_writer.config_hash` — nine strategy keys plus the scoring
+        # constants. Kept SEPARATE from `base_config_hash` (which is the hash of
+        # the whole EFFECTIVE snapshot) because the two answer different
+        # questions: this one lines a sweep row up with a `backtest_runs` row;
+        # that one decides whether two sweeps ran the same engine configuration.
+        f("engine_config_hash", "STRING"),
     ]
 
 
@@ -297,7 +319,32 @@ class ScenarioRunWriter:
             table.clustering_fields = clustering
         existing = self._client.create_table(table, exists_ok=True)
 
-        have = {f.name for f in (existing.schema or [])}
+        # A column that EXISTS but with the wrong type is not an additive
+        # change and must not be papered over. Left alone, every subsequent
+        # `insert_rows_json` fails on that field and the sweep writes ZERO rows
+        # while reporting a clean run — the exact silent-empty-table failure the
+        # additive reconcile below exists to prevent, arriving through the one
+        # door the reconcile does not watch. Retyping is an operator migration.
+        by_name = {f.name: f for f in (existing.schema or [])}
+        conflicts = [
+            f"{f.name}: table has {by_name[f.name].field_type}/"
+            f"{by_name[f.name].mode}, code expects {f.field_type}/{f.mode}"
+            for f in schema
+            if f.name in by_name
+            and (by_name[f.name].field_type != f.field_type
+                 or (by_name[f.name].mode or "NULLABLE") != (f.mode or "NULLABLE"))
+        ]
+        if conflicts:
+            raise RuntimeError(
+                f"`{self._dataset_id}.{name}` has column(s) whose type or mode "
+                f"disagrees with this build's schema: {'; '.join(conflicts)}. "
+                "This is a MIGRATION, not an additive change: every insert would "
+                "fail on that field and the sweep would write zero rows while "
+                "reporting success. Recreate the table (it is insert-only and "
+                "cheap to rebuild) or ALTER the column deliberately."
+            )
+
+        have = set(by_name)
         missing = [f for f in schema if f.name not in have]
         if missing:
             existing.schema = list(existing.schema) + missing
@@ -312,8 +359,10 @@ class ScenarioRunWriter:
     def enabled(self) -> bool:
         return self._enabled
 
-    def find_done_sweep(self, sweep_key: str) -> Optional[Dict[str, Any]]:
-        """The most recent run that reached ``done`` under ``sweep_key``, or None.
+    def find_done_sweep(self, sweep_key: str,
+                        base_config_hash: Optional[str] = None
+                        ) -> Optional[Dict[str, Any]]:
+        """The most recent run that COMPLETED under ``sweep_key``, or None.
 
         A read on the write path, deliberately: the Job asks before it replays,
         so a re-submitted spec costs one query instead of eight minutes of
@@ -321,31 +370,55 @@ class ScenarioRunWriter:
         anything; this is the backstop for the CLI path and for the race where
         two submissions arrive together.
 
+        **"Completed" is four conditions, not one status string** (D4, review
+        round 1). ``status = 'done'`` alone would return:
+
+        * a run whose ``write_runs`` failed — the cells are not in the table, so
+          the "cached" answer is an empty grid;
+        * a run every cell of which errored — a page of ``err`` served as a
+          result, and the operator never learns the sweep is worth re-running;
+        * a run under a different EFFECTIVE base config. ``sweep_key`` covers
+          the spec, the engine version and the commit; it cannot see an operator
+          flipping ``EARNINGS_ENABLED`` on the Job between two otherwise
+          identical submissions, because that value is not in the yaml the key
+          hashes. ``base_config_hash`` is the hash of the effective snapshot and
+          closes exactly that hole.
+
+        A duplicate replay costs eight minutes. A wrong dedup hit serves one
+        experiment's numbers as another's, and nothing in the UI says so.
+
         **A query failure returns None.** "We could not tell" must mean "run
-        it", never "assume it is a duplicate" — the cost of the first is a
-        redundant replay, the cost of the second is silently serving one
-        experiment's numbers as another's.
+        it", never "assume it is a duplicate".
         """
         if not self._enabled or not sweep_key:
             return None
         table = f"{self._project_id}.{self._dataset_id}.{SWEEPS_TABLE}"
         query = f"""
         WITH latest AS (
-          SELECT run_id, status, submitted_at, finished_at,
+          SELECT run_id, status, submitted_at, finished_at, cell_count,
+                 rows_persisted, error_cells, base_config_hash,
                  ROW_NUMBER() OVER (
                    PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
           FROM `{table}`
           WHERE sweep_key = @sweep_key
         )
-        SELECT run_id, submitted_at, finished_at
+        SELECT run_id, submitted_at, finished_at, cell_count, rows_persisted,
+               error_cells, base_config_hash
         FROM latest
-        WHERE rn = 1 AND status = '{STATUS_DONE}'
+        WHERE rn = 1
+          AND status = '{STATUS_DONE}'
+          AND error_cells = 0
+          AND rows_persisted IS NOT NULL
+          AND rows_persisted = cell_count
+          AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)
         ORDER BY submitted_at DESC
         LIMIT 1
         """
         try:
             job_config = bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+                bigquery.ScalarQueryParameter("base_config_hash", "STRING",
+                                              base_config_hash),
             ])
             rows = list(self._client.query(query, job_config=job_config).result(
                 timeout=60))
@@ -418,6 +491,8 @@ def status_row(
     result: Optional[Any] = None,
     lake_summary: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
+    rows_persisted: Optional[int] = None,
+    engine_config_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One ``scenario_sweeps`` row.
 
@@ -453,7 +528,13 @@ def status_row(
         "base_config_json": (json.dumps(base_config, sort_keys=True, default=str)
                              if base_config is not None else None),
         "spec_json": json.dumps(spec, sort_keys=True, default=str) if spec else None,
-        "symbols": sorted({str(s).upper() for s in (spec.get("symbols") or [])}),
+        # DECLARATION order, de-duplicated in place — never sorted. The grid's
+        # columns are read in the order the operator typed their universe, and
+        # the API shapes the grid from this same list, so sorting here and not
+        # there would silently transpose the columns of a dashboard-launched
+        # sweep relative to the spec that produced it.
+        "symbols": _ordered_unique(
+            str(sym).upper() for sym in (spec.get("symbols") or [])),
         "window_start": _iso_date(spec.get("start")),
         "window_end": _iso_date(spec.get("end")),
         "holdout_start": _iso_date(spec.get("holdout_start")),
@@ -478,6 +559,9 @@ def status_row(
         "replay_seconds": None,
         "provider_fetches": None,
         "bar_cache_hits": None,
+        "rows_persisted": rows_persisted,
+        "error_cells": None,
+        "engine_config_hash": engine_config_hash,
     }
 
     if result is not None:
@@ -495,6 +579,13 @@ def status_row(
             "in_sample_only": getattr(result, "in_sample_only", row["in_sample_only"]),
             "scenario_count": len(getattr(result, "scenarios", []) or [])
                               or row["scenario_count"],
+            # Counted from the cells themselves, not inferred from the exit code.
+            # A sweep in which every arm errored exits 1 and is still `done` as a
+            # process; it is emphatically not a result, and this is the number
+            # the dedup reads to know that.
+            "error_cells": sum(
+                1 for cell in (getattr(result, "rows", []) or [])
+                if getattr(cell, "error", None)),
         })
     return row
 
@@ -520,7 +611,7 @@ def rows_from_sweep(
     haircuts = getattr(result, "scenario_fill_haircuts", {}) or {}
 
     for cell in getattr(result, "rows", []) or []:
-        out.append({
+        out.append(_finite({
             "run_id": run_id,
             "submitted_at": submitted_at,
             "written_at": written,
@@ -571,18 +662,113 @@ def rows_from_sweep(
 
             "engine_version": engine_version,
             "git_commit": git_commit,
-        })
+        }))
     return out
 
 
-def base_config_snapshot(config: Any) -> Dict[str, Any]:
-    """The sections of the effective base config a sweep row carries (D1).
+def _finite(row: Dict[str, Any]) -> Dict[str, Any]:
+    """NaN / +-inf -> NULL.
 
-    Only the strategy-shaping sections, and only as they are *after* env
-    substitution — this is the payload that makes a stored verdict readable a
-    year later. ``alpaca:`` is excluded on purpose: it holds credentials and an
-    account number, and the store is read by a public dashboard.
+    A zero-day window or a zero-collateral cycle can produce a NaN or an inf in
+    an annualised ratio. `insert_rows_json` serialises those as the bare JSON
+    tokens `NaN` / `Infinity`, which BigQuery rejects — and it rejects the WHOLE
+    request, so one pathological cell would silently cost the sweep all of its
+    rows. NULL is also the honest value: "this ratio is not defined here" is not
+    a number, and rendering it as one is the FC-057 dishonest-metric class.
+    """
+    for key, value in row.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            row[key] = None
+    return row
+
+
+def _ordered_unique(values) -> List[str]:
+    """De-duplicate while preserving first-seen order."""
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+# Every knob a scenario may override, plus the three env-shadowed switches,
+# mapped to the ``Config`` ACCESSOR that yields its effective value. The yaml is
+# not the configuration: ``EARNINGS_ENABLED`` / ``ROLLER_ENABLED`` /
+# ``ROLLER_DRY_RUN`` win over their keys at runtime (FC-013 DD-7, FC-078 DD-7),
+# so a snapshot taken from ``_config`` alone records a gate as ON that the run
+# had OFF. Two sweeps either side of a kill switch would then be
+# indistinguishable in the store — and, before the dedup started reading
+# ``base_config_hash``, one would have been served as the other's answer.
+_EFFECTIVE_KEYS: Dict[str, str] = {
+    "strategy.put_target_dte": "put_target_dte",
+    "strategy.call_target_dte": "call_target_dte",
+    "strategy.put_delta_range": "put_delta_range",
+    "strategy.call_delta_range": "call_delta_range",
+    "strategy.min_put_premium": "min_put_premium",
+    "strategy.min_call_premium": "min_call_premium",
+    "strategy.min_stock_price": "min_stock_price",
+    "strategy.max_stock_price": "max_stock_price",
+    "strategy.min_avg_volume": "min_avg_volume",
+    "risk.max_position_size": "max_position_size",
+    "earnings.enabled": "earnings_enabled",
+    "earnings.blackout_days": "earnings_blackout_days",
+    "rolling.enabled": "rolling_enabled",
+    "rolling.dry_run": "roller_dry_run",
+    "rolling.itm_trigger_ratio": "rolling_itm_trigger_ratio",
+    "rolling.max_extension_days": "rolling_max_extension_days",
+    "rolling.max_replacement_delta": "rolling_max_replacement_delta",
+    "rolling.min_net_credit_per_contract": "rolling_min_net_credit_per_contract",
+    "rolling.imminence_extrinsic_threshold": "rolling_imminence_extrinsic_threshold",
+    "universe.excluded_symbols": "excluded_symbols",
+    "universe.max_spread_pct": "max_spread_pct",
+}
+
+
+def base_config_snapshot(config: Any) -> Dict[str, Any]:
+    """The EFFECTIVE base config a sweep row carries (D1, review round 1).
+
+    Two layers, and the order matters:
+
+    1. the raw ``strategy`` / ``risk`` / ``earnings`` / ``rolling`` /
+       ``universe`` sections, so the payload stays complete and readable a year
+       later — a hash proves two runs matched and says nothing about what they
+       matched on;
+    2. an ``effective`` block read through ``Config``'s ACCESSORS, which is what
+       the run actually used. Where the two disagree, (2) is the truth and (1)
+       is the file.
+
+    ``alpaca:`` is excluded on purpose: it holds credentials and an account
+    number, and this store is read by a public dashboard.
     """
     raw = getattr(config, "_config", None) or {}
     sections = ("strategy", "risk", "earnings", "rolling", "universe")
-    return {name: raw.get(name) for name in sections if raw.get(name) is not None}
+    snapshot: Dict[str, Any] = {
+        name: raw.get(name) for name in sections if raw.get(name) is not None
+    }
+    effective: Dict[str, Any] = {}
+    for key, accessor in _EFFECTIVE_KEYS.items():
+        try:
+            value = getattr(config, accessor)
+        except Exception:  # noqa: BLE001 - a missing knob is not a sweep failure
+            continue
+        # `excluded_symbols` is a set; JSON needs a stable list.
+        effective[key] = sorted(value) if isinstance(value, (set, frozenset)) else value
+    snapshot["effective"] = effective
+    return snapshot
+
+
+def base_config_hash(snapshot: Dict[str, Any]) -> str:
+    """sha256[:16] of the EFFECTIVE snapshot — the dedup's configuration guard.
+
+    Deliberately not ``bq_writer.config_hash``: that hashes nine strategy keys
+    plus the scoring constants, so every ``rolling.*`` and ``earnings.*`` knob —
+    including the two the environment can flip out from under the yaml — is
+    invisible to it. Two sweeps that differed only in ``EARNINGS_ENABLED`` would
+    share it, and the dedup would serve one as the other. ``config_hash`` is
+    still stored, as ``engine_config_hash``, because it is what lines a sweep row
+    up with a ``backtest_runs`` row; the two answer different questions.
+    """
+    blob = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]

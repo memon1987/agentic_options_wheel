@@ -11,7 +11,7 @@ unchanged — they remain on ``AnalyticsWriter``-written tables.
 """
 
 from google.cloud import bigquery
-from google.cloud.exceptions import GoogleCloudError
+from google.cloud.exceptions import GoogleCloudError, NotFound
 from typing import Dict, Any, List, Optional
 import os
 import logging
@@ -1709,11 +1709,46 @@ class BigQueryService:
     # displace a real demotion candidate.
     # ------------------------------------------------------------------
 
+    # The sweep tables are created by the JOB's writer, not here (one schema
+    # owner, and it is the side that knows every column). Between this PR's
+    # merge and the operator's first Job execution they therefore do not exist,
+    # and BigQuery answers a query against a missing table with `NotFound`,
+    # which `_run_query` re-raises as a bare Exception -> HTTP 500. A 500 says
+    # "the dashboard is broken"; the truth is "step 3 of the rollout has not
+    # been run yet", which is a completely different thing to hand an operator.
+    TABLES_MISSING_DETAIL = (
+        "scenario tables not created yet — run the CLI sweep with --persist "
+        "first (rollout step 3)"
+    )
+
+    def _sweep_query(self, sql: str, params) -> List[Dict[str, Any]]:
+        """Run a sweep-store query, translating a missing table into `NotFound`.
+
+        `_run_query` wraps every failure into a generic Exception, so the
+        NotFound has to be recognised before it gets there. The router turns it
+        into a 503 with `TABLES_MISSING_DETAIL`.
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            job = self.client.query(sql, job_config=job_config)
+            return [dict(row.items()) for row in job.result(timeout=60)]
+        except NotFound:
+            raise
+        except GoogleCloudError as e:
+            # BigQuery reports a missing table as a 404 whose message names it;
+            # some client paths surface that as a generic GoogleCloudError
+            # rather than NotFound, so the message is checked too.
+            if "Not found" in str(e) and ("scenario_sweeps" in str(e)
+                                          or "scenario_runs" in str(e)):
+                raise NotFound(str(e))
+            logger.error(f"BigQuery error: {e}")
+            raise Exception(f"Database query failed: {str(e)}")
+
     def get_recent_sweeps(self, limit: int = 25) -> List[Dict[str, Any]]:
         """Latest status per run, newest submission first."""
         from services.sweeps import recent_sweeps_sql
 
-        return self._run_query(
+        return self._sweep_query(
             recent_sweeps_sql(self.dataset),
             [bigquery.ScalarQueryParameter("limit", "INT64", int(limit))],
         )
@@ -1722,7 +1757,7 @@ class BigQueryService:
         """The latest status row for one run, or None."""
         from services.sweeps import one_sweep_sql
 
-        rows = self._run_query(
+        rows = self._sweep_query(
             one_sweep_sql(self.dataset),
             [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
         )
@@ -1732,25 +1767,54 @@ class BigQueryService:
         """Every cell of one run."""
         from services.sweeps import sweep_rows_sql
 
-        return self._run_query(
+        return self._sweep_query(
             sweep_rows_sql(self.dataset),
             [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
         )
 
-    def find_done_sweep(self, sweep_key: str) -> Optional[Dict[str, Any]]:
+    def latest_base_config_hash(self, git_commit: Optional[str]
+                                ) -> Optional[str]:
+        """The last effective-config hash any run on ``git_commit`` recorded.
+
+        The API cannot compute the Job's effective configuration — it has no
+        ``Config`` and no yaml — so its dedup asks the weaker question the store
+        can answer: has the effective config changed since the run we are about
+        to reuse? The Job's own lookup, which knows the real hash, is the exact
+        backstop.
+        """
+        from services.sweeps import latest_base_config_hash_sql
+
+        if not git_commit:
+            return None
+        rows = self._sweep_query(
+            latest_base_config_hash_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("git_commit", "STRING", git_commit)],
+        )
+        return rows[0].get("base_config_hash") if rows else None
+
+    def find_done_sweep(self, sweep_key: str,
+                        base_config_hash: Optional[str] = None
+                        ) -> Optional[Dict[str, Any]]:
         """The most recent COMPLETED run under ``sweep_key``, or None (D4).
 
         Goal 5 — "revisit, not recompute" — at the API layer: an identical spec
         on the same engine and commit returns the prior run instead of burning
         another eight minutes of Job time to reproduce it.
+
+        "Completed" excludes a run whose cells never landed, a run every arm of
+        which errored, and a run under a different effective base config. See
+        `services.sweeps.done_by_key_sql` for why each one would otherwise serve
+        an absence, or somebody else's experiment, as a result.
         """
         from services.sweeps import done_by_key_sql
 
         if not sweep_key:
             return None
-        rows = self._run_query(
+        rows = self._sweep_query(
             done_by_key_sql(self.dataset),
-            [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key)],
+            [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+             bigquery.ScalarQueryParameter("base_config_hash", "STRING",
+                                           base_config_hash)],
         )
         return rows[0] if rows else None
 

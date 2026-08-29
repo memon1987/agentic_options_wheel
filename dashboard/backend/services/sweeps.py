@@ -91,12 +91,16 @@ TERMINAL_STATUSES = (STATUS_DONE, STATUS_FAILED, STATUS_DEDUPLICATED)
 # share `submitted_at` (it is the partition key), so `written_at` is the only
 # real clock; the CASE is the tiebreak for two rows stamped in one microsecond.
 # A divergence here would make the API report a finished sweep as still running.
+# `done` outranks `failed`: the one realistic same-microsecond collision is the
+# launch path (this API writes `failed` when `jobs.run` errors, while an
+# execution that in fact started writes `done`), and a sweep whose cells are in
+# the table is done whatever a launch-side timeout thought.
 STATUS_RANK = {
     STATUS_SUBMITTED: 0,
     STATUS_RUNNING: 1,
     STATUS_DEDUPLICATED: 2,
     STATUS_FAILED: 3,
-    STATUS_DONE: 3,
+    STATUS_DONE: 4,
 }
 LATEST_STATUS_ORDER_BY = (
     "written_at DESC, "
@@ -121,11 +125,17 @@ MAX_STARTING_CASH = 1_000_000.0
 # variable among several. Mirrored by `main.MAX_SPEC_BYTES` on the Job side.
 MAX_SPEC_BYTES = 24 * 1024
 
-# How long a `submitted`/`running` sweep blocks the next submission (D6). Past
-# this the row is treated as abandoned rather than as a permanent lock: a Job
-# that died before its `finally` would otherwise wedge the endpoint forever, and
-# a wedged endpoint is worse than a duplicate sweep.
-RUNNING_LOCK_HOURS = 1
+# The Job's `--task-timeout`, in seconds. MUST match `deploy-sweep-job` in
+# cloudbuild.yaml (pinned by a contract test). It is the API's clock for
+# everything about liveness: a `running` sweep cannot outlive it, because Cloud
+# Run kills the task at that point.
+JOB_TASK_TIMEOUT_SECONDS = 10_800   # 3h
+
+# Grace on top of the task timeout before a non-terminal row is declared dead.
+# Covers container start (3-4 min) plus the SIGTERM window in which the Job
+# writes its terminal row.
+STALE_GRACE_MINUTES = 10
+
 # A `submitted` row with no `running` row after this long renders as "stuck".
 # Container start is 3-4 minutes, so 10 leaves real headroom. It is a LABEL, not
 # a cancel: nothing here can stop an execution, and pretending otherwise would
@@ -136,9 +146,107 @@ SYMBOL_RE = re.compile(r"^[A-Z.]{1,6}$")
 
 SPEC_FIELDS = frozenset({
     "symbols", "start", "end", "holdout_start", "starting_cash",
-    "run_sensitivity", "scenarios",
+    "run_sensitivity", "scenarios", "force",
 })
 SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut"})
+
+# Scenario names key the grid, appear in the report and travel in the spec env
+# var. 40 characters is generous for a label and short enough that a pasted blob
+# is refused rather than rendered as a column header three screens wide.
+MAX_SCENARIO_NAME_CHARS = 40
+SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+
+# What each allowlisted key's value must LOOK like. The allowlist says which
+# knobs may be turned; this says what a legal setting of one is.
+#
+# Without it the API accepts `{"strategy.min_put_premium": "not-a-number"}` and
+# the arm dies three minutes into a container start with a TypeError from deep
+# inside the strategy — or worse, does not die: a string where a float is
+# expected can silently compare false everywhere and read as "this floor
+# rejected everything". `validate_override_key` deliberately checks only the KEY
+# (plus the one value rule for `call_target_dte`), so the values are checked
+# here, once, on the boundary.
+_NUM = "number"
+_BOOL = "bool"
+_INT = "int"
+_BAND = "band"          # [lo, hi], both numbers, lo < hi, both in [0, 1]
+_SYMBOLS = "symbols"    # list of tickers
+OVERRIDE_VALUE_TYPES: Dict[str, str] = {
+    "strategy.put_delta_range": _BAND,
+    "strategy.call_delta_range": _BAND,
+    "strategy.min_put_premium": _NUM,
+    "strategy.min_call_premium": _NUM,
+    "strategy.call_target_dte": _INT,
+    "strategy.min_stock_price": _NUM,
+    "strategy.max_stock_price": _NUM,
+    "strategy.min_avg_volume": _NUM,
+    "risk.max_position_size": _NUM,
+    "universe.excluded_symbols": _SYMBOLS,
+    "universe.max_spread_pct": _NUM,
+    "earnings.enabled": _BOOL,
+    "earnings.blackout_days": _INT,
+    "rolling.enabled": _BOOL,
+    "rolling.itm_trigger_ratio": _NUM,
+    "rolling.max_extension_days": _INT,
+    "rolling.max_replacement_delta": _NUM,
+    "rolling.min_net_credit_per_contract": _NUM,
+    "rolling.imminence_extrinsic_threshold": _NUM,
+}
+
+
+def _is_number(value: Any) -> bool:
+    """A real number. `True` is not one: `bool` is an `int` subclass in Python,
+    and accepting it here would let `min_put_premium: true` mean `1.0`."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def validate_override_value(key: str, value: Any) -> None:
+    """Raise ``SweepValidationError`` unless ``value`` is a legal setting of ``key``."""
+    kind = OVERRIDE_VALUE_TYPES.get(key)
+    if kind is None:
+        # An allowlisted key with no declared value shape. Refused rather than
+        # waved through: the table above and `ALLOWED_OVERRIDES` are kept in
+        # step by a test, so reaching here means somebody added a knob without
+        # saying what a legal setting of it is.
+        raise SweepValidationError(
+            f"override '{key}' has no declared value type in this API; it "
+            f"cannot be validated, so it is refused rather than passed through "
+            f"unchecked"
+        )
+    if kind == _BOOL:
+        if not isinstance(value, bool):
+            raise SweepValidationError(
+                f"override '{key}' must be true or false; got {value!r}")
+        return
+    if kind == _INT:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise SweepValidationError(
+                f"override '{key}' must be a whole number of days; got {value!r}")
+        return
+    if kind == _NUM:
+        if not _is_number(value):
+            raise SweepValidationError(
+                f"override '{key}' must be a number; got {value!r}")
+        return
+    if kind == _BAND:
+        if (not isinstance(value, (list, tuple)) or len(value) != 2
+                or not all(_is_number(v) for v in value)):
+            raise SweepValidationError(
+                f"override '{key}' must be a two-element [lo, hi] band of "
+                f"numbers; got {value!r}")
+        lo, hi = float(value[0]), float(value[1])
+        if not 0.0 <= lo < hi <= 1.0:
+            raise SweepValidationError(
+                f"override '{key}' band must satisfy 0 <= lo < hi <= 1 (delta "
+                f"is a probability); got [{lo}, {hi}]")
+        return
+    if kind == _SYMBOLS:
+        if not isinstance(value, list) or not all(
+                isinstance(v, str) and SYMBOL_RE.match(v.strip().upper())
+                for v in value):
+            raise SweepValidationError(
+                f"override '{key}' must be a list of tickers; got {value!r}")
+        return
 
 
 class SweepValidationError(ValueError):
@@ -184,6 +292,9 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
             f"run in-sample and report itself as validated. "
             f"Known fields: {sorted(SPEC_FIELDS)}."
         )
+    force = spec.get("force", False)
+    if not isinstance(force, bool):
+        raise SweepValidationError("'force' must be true or false")
 
     # -- symbols -----------------------------------------------------------
     raw_symbols = spec.get("symbols")
@@ -276,6 +387,16 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
         name = str(entry.get("name") or "").strip()
         if not name:
             raise SweepValidationError(f"scenario #{i + 1} has no 'name'")
+        if len(name) > MAX_SCENARIO_NAME_CHARS:
+            raise SweepValidationError(
+                f"scenario name {name[:20]!r}... is {len(name)} characters; the "
+                f"cap is {MAX_SCENARIO_NAME_CHARS}. Names key the grid and its "
+                f"column headers, and they travel in the spec env var")
+        if not SCENARIO_NAME_RE.match(name):
+            raise SweepValidationError(
+                f"scenario name {name!r} must start alphanumeric and contain "
+                f"only letters, digits, '_', '.' or '-' "
+                f"(pattern {SCENARIO_NAME_RE.pattern})")
         if name == BASE_SCENARIO_NAME:
             raise SweepValidationError(
                 f"'{BASE_SCENARIO_NAME}' is reserved: it is the comparator every "
@@ -304,6 +425,14 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
                 # anything from.
                 validate_override_key(str(key), value)
             except OverrideError as exc:
+                raise SweepValidationError(f"scenario '{name}': {exc}")
+            # ...and then the VALUE. The runner's validator checks the key (plus
+            # the one `call_target_dte` rule); a wrong-typed value would sail
+            # past it and fail three minutes into a container start, or not fail
+            # at all and read as a threshold that rejected everything.
+            try:
+                validate_override_value(str(key), value)
+            except SweepValidationError as exc:
                 raise SweepValidationError(f"scenario '{name}': {exc}")
 
         haircut = entry.get("fill_haircut")
@@ -346,6 +475,12 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
         "run_sensitivity": run_sensitivity,
         "scenarios": scenarios,
     }
+    # Carried into the spec the Job receives, and EXCLUDED from `sweep_key`
+    # (identity.NON_IDENTITY_FIELDS): a forced re-run must key identically to the
+    # run it is deliberately reproducing, or the two are never comparable and a
+    # second force would not dedup either.
+    if force:
+        normalised["force"] = True
     encoded = json.dumps(normalised, sort_keys=True)
     if len(encoded.encode("utf-8")) > MAX_SPEC_BYTES:
         raise SweepValidationError(
@@ -389,7 +524,13 @@ def token_matches(presented: Optional[str], configured: Optional[str]) -> bool:
     """
     if not configured or not presented:
         return False
-    return hmac.compare_digest(str(presented), str(configured))
+    # BYTES, not str. `hmac.compare_digest` on `str` requires both to be ASCII
+    # and raises `TypeError: comparing strings with non-ASCII characters is not
+    # supported` otherwise — which, from inside a request handler, is an
+    # uncaught 500. A bearer token is attacker-controlled input, so a non-ASCII
+    # one is a trivially reachable crash rather than a hypothetical.
+    return hmac.compare_digest(str(presented).encode("utf-8"),
+                               str(configured).encode("utf-8"))
 
 
 # ============================================================================ #
@@ -512,7 +653,39 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any], sweep_key_value: str,
         "bar_cache_hits": None,
         "lake_summary_json": None,
         "error": None,
+        # Completeness, filled in by the Job's terminal row. NULL here is what
+        # keeps a `submitted`/`failed` row out of the dedup: `find_done_sweep`
+        # requires `rows_persisted = cell_count`.
+        "rows_persisted": None,
+        "error_cells": None,
+        # The API has no Config, so it cannot compute the engine hash either.
+        "engine_config_hash": None,
     }
+
+
+def stale_cutoff(now: Optional[datetime] = None) -> datetime:
+    """The moment before which a non-terminal row cannot still be alive.
+
+    ``JOB_TASK_TIMEOUT_SECONDS`` plus a grace, measured from the row's own
+    ``written_at``. Cloud Run kills the task at the timeout, so a `running` row
+    older than that has no process behind it — whatever it says.
+
+    The previous rule (``submitted_at`` + 1 h) was wrong in both directions once
+    the timeout went to 3 h for cold materialisation: it released the lock while
+    a legitimate sweep was still replaying (letting a second one contend for the
+    same chain cache), and it measured from the submission rather than from the
+    last sign of life, so a run that was demonstrably alive 5 minutes ago was
+    judged by when it started.
+    """
+    now = now or datetime.now(timezone.utc)
+    return now - timedelta(seconds=JOB_TASK_TIMEOUT_SECONDS
+                           + STALE_GRACE_MINUTES * 60)
+
+
+def _last_seen(row: Dict[str, Any]) -> Optional[datetime]:
+    """The row's own clock: ``written_at``, falling back to ``submitted_at``."""
+    return (_as_datetime(row.get("written_at"))
+            or _as_datetime(row.get("submitted_at")))
 
 
 def blocking_sweep(rows: Sequence[Dict[str, Any]],
@@ -523,18 +696,17 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
     executions would contend on the same chain cache while each reporting the
     other's fetches as its own.
 
-    A stale lock expires after ``RUNNING_LOCK_HOURS``. That is deliberate: a Job
-    killed before its ``finally`` (OOM, task timeout, a cancelled execution)
-    leaves a ``running`` row nothing will ever terminalise, and a permanent lock
-    on a dead run is a worse failure than an occasional overlap — it takes the
+    A lock expires once the row is older than the Job could possibly still be
+    running (``stale_cutoff``). That is deliberate: a Job killed before its
+    ``finally`` (OOM, eviction, a cancelled execution) leaves a ``running`` row
+    nothing will ever terminalise, and a permanent lock on a dead run takes the
     feature offline with no way back except a manual BigQuery insert.
     """
-    now = now or datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=RUNNING_LOCK_HOURS)
+    cutoff = stale_cutoff(now)
     for row in rows:
         if row.get("status") in TERMINAL_STATUSES:
             continue
-        stamp = _as_datetime(row.get("submitted_at"))
+        stamp = _last_seen(row)
         if stamp is not None and stamp < cutoff:
             continue
         return row
@@ -542,20 +714,41 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
 
 
 def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
-    """A ``submitted`` row with no ``running`` row after ``STUCK_AFTER_MINUTES``.
+    """Whether a non-terminal row should render as "stuck — check the execution".
+
+    Two shapes, because they mean different things:
+
+    * ``submitted`` with no ``running`` row after ``STUCK_AFTER_MINUTES`` — the
+      Job never reported in. Container start is 3-4 minutes, so 10 is real
+      headroom rather than crying wolf.
+    * ``running`` past ``stale_cutoff`` — Cloud Run has killed the task by now
+      (``--task-timeout``), so nothing will ever write its terminal row.
 
     A LABEL, not a cancel. D3 is explicit that nothing here polls or cancels an
     execution: ``run.executions.get`` is unproven for this service account and
-    grantable only in the console, so the honest thing is to tell the operator
-    the Job never reported in and name the execution to look at.
+    grantable only in the console, so the honest thing is to say the Job stopped
+    reporting and name the execution to look at.
     """
-    if row.get("status") != STATUS_SUBMITTED:
+    status = row.get("status")
+    if status in TERMINAL_STATUSES:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if status == STATUS_RUNNING:
+        stamp = _last_seen(row)
+        return stamp is not None and stamp < stale_cutoff(now)
+    if status != STATUS_SUBMITTED:
         return False
     stamp = _as_datetime(row.get("submitted_at"))
     if stamp is None:
         return False
-    return (now or datetime.now(timezone.utc)) - stamp > timedelta(
-        minutes=STUCK_AFTER_MINUTES)
+    return now - stamp > timedelta(minutes=STUCK_AFTER_MINUTES)
+
+
+def _as_date_str(value: Any) -> Optional[str]:
+    """A stored DATE as ``YYYY-MM-DD``. BigQuery hands back ``datetime.date``."""
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 def _as_datetime(value: Any) -> Optional[datetime]:
@@ -611,10 +804,55 @@ def one_sweep_sql(dataset: str) -> str:
 
 
 def done_by_key_sql(dataset: str) -> str:
-    """The most recent COMPLETED run under a ``sweep_key`` — the dedup lookup."""
+    """The most recent COMPLETED run under a ``sweep_key`` — the dedup lookup.
+
+    "Completed" is four conditions, not one status string, and each one exists
+    because ``status = 'done'`` alone would return something that is not an
+    answer:
+
+    * ``error_cells = 0`` — a run every arm of which errored is a page of `err`,
+      not a result, and serving it means the operator never learns to re-run;
+    * ``rows_persisted = cell_count`` — a run whose ``scenario_runs`` insert did
+      not land has an EMPTY grid; the cached answer would be nothing at all;
+    * ``base_config_hash`` equality — ``sweep_key`` covers the spec, the engine
+      version and the commit, and cannot see an operator flipping
+      ``EARNINGS_ENABLED`` on the Job between two otherwise identical
+      submissions. That value is not in the yaml the key hashes.
+
+    A duplicate replay costs eight minutes. A wrong dedup hit serves one
+    experiment's numbers as another's, silently.
+    """
     return latest_status_per_run_sql(dataset, "sweep_key = @sweep_key") + (
-        f" AND status = '{STATUS_DONE}' ORDER BY submitted_at DESC LIMIT 1"
+        f" AND status = '{STATUS_DONE}'"
+        " AND error_cells = 0"
+        " AND rows_persisted IS NOT NULL"
+        " AND rows_persisted = cell_count"
+        " AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)"
+        " ORDER BY submitted_at DESC LIMIT 1"
     )
+
+
+def latest_base_config_hash_sql(dataset: str) -> str:
+    """The most recent effective-config hash observed for one ``git_commit``.
+
+    The API has no ``Config`` — it cannot compute the Job's effective
+    configuration, only read what past runs recorded. So its dedup asks a
+    weaker but still useful question: *has the effective config changed since
+    that run, as far as this store can tell?* If it has, no dedup hit.
+
+    When no run on this commit has been recorded yet the answer is NULL and the
+    predicate is a no-op; the **Job's** own `find_done_sweep`, which knows the
+    real hash, is the backstop that catches a mismatch before it replays. Two
+    checks, and only the second one can be exact — which is why the second one
+    exists rather than trusting this one.
+    """
+    return f"""
+    SELECT base_config_hash
+    FROM `{dataset}.{SWEEPS_TABLE}`
+    WHERE git_commit = @git_commit AND base_config_hash IS NOT NULL
+    ORDER BY written_at DESC
+    LIMIT 1
+    """
 
 
 def sweep_rows_sql(dataset: str) -> str:
@@ -786,6 +1024,25 @@ def shape_results(sweep_row: Dict[str, Any],
     scenarios, symbols, splits, spec = _ordering(sweep_row, run_rows)
     index = _index(run_rows)
 
+    # PR-B contract: the arm hashes and the per-split window bounds, read off the
+    # PERSISTED rows rather than recomputed. The UI renders a "scenario
+    # definitions" table with both hashes (the CLI report has one) and labels
+    # each grid with its window; deriving either client-side would be a third
+    # implementation of something already stored.
+    scenario_hashes: Dict[str, Optional[str]] = {}
+    scenario_config_hashes: Dict[str, Optional[str]] = {}
+    windows: Dict[str, Dict[str, Any]] = {}
+    for row in run_rows:
+        name = str(row.get("scenario_name"))
+        scenario_hashes.setdefault(name, row.get("scenario_hash"))
+        scenario_config_hashes.setdefault(name, row.get("config_hash"))
+        split = str(row.get("split"))
+        if split not in windows:
+            windows[split] = {
+                "start": _as_date_str(row.get("window_start")),
+                "end": _as_date_str(row.get("window_end")),
+            }
+
     grid: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for split in splits:
         by_scenario: Dict[str, Dict[str, Any]] = {}
@@ -861,6 +1118,12 @@ def shape_results(sweep_row: Dict[str, Any],
         "symbols": symbols,
         "splits": splits,
         "grid": grid,
+        # Empty for a run with no cells yet — a `submitted` or `running` sweep
+        # has a status row and nothing else, and the page has to render that
+        # rather than 500. `splits: []` goes with it.
+        "windows": windows,
+        "scenario_hashes": scenario_hashes,
+        "scenario_config_hashes": scenario_config_hashes,
         "summary": summary,
         "delta_vs_base": delta_vs_base,
         "sign_agreement": sign_agreement,
@@ -932,8 +1195,13 @@ def allowlist_payload() -> Dict[str, Any]:
             "min_starting_cash": MIN_STARTING_CASH,
             "max_starting_cash": MAX_STARTING_CASH,
             "max_spec_bytes": MAX_SPEC_BYTES,
-            "running_lock_hours": RUNNING_LOCK_HOURS,
+            "max_scenario_name_chars": MAX_SCENARIO_NAME_CHARS,
+            "job_task_timeout_seconds": JOB_TASK_TIMEOUT_SECONDS,
+            "stale_grace_minutes": STALE_GRACE_MINUTES,
         },
+        # What a legal setting of each knob looks like, so the form can refuse a
+        # bad value before a round trip.
+        "value_types": OVERRIDE_VALUE_TYPES,
         "defaults": {
             "starting_cash": DEFAULT_STARTING_CASH,
             "run_sensitivity": False,

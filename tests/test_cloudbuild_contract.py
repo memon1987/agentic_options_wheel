@@ -650,6 +650,62 @@ def test_sweep_job_step_carries_every_env_var_and_secret_the_sweep_needs(by_id):
     assert "--service-account=799970961417-compute@developer.gserviceaccount.com" in script
 
 
+def test_sweep_job_task_timeout_matches_the_api(by_id):
+    """The Job's `--task-timeout` IS the API's liveness clock.
+
+    `services/sweeps.py` releases the one-at-a-time lock, and labels a `running`
+    sweep as stuck, once the row is older than this number plus a grace — the
+    reasoning being that Cloud Run has killed the task by then. If the two drift
+    apart the API is wrong in one of two ways, both bad: a lower API number
+    releases the lock while a legitimate sweep is still replaying (two
+    executions then contend on one chain cache), and a higher one keeps the
+    endpoint locked on a task that no longer exists.
+
+    3h rather than 1h because a COLD window materialises at ~5.5 min/symbol
+    (~50 s warm), so a 12-symbol year over unseeded chains is comfortably past
+    an hour — and a timeout that fires on ordinary work teaches an operator to
+    ignore it.
+    """
+    from tests._dashboard_path import add_dashboard_backend_to_path
+
+    add_dashboard_backend_to_path()
+    from services.sweeps import JOB_TASK_TIMEOUT_SECONDS
+
+    script = script_of(by_id[SWEEP_JOB_STEP])
+    assert f"--task-timeout={JOB_TASK_TIMEOUT_SECONDS}" in script, (
+        f"{SWEEP_JOB_STEP}'s --task-timeout must equal "
+        f"services/sweeps.JOB_TASK_TIMEOUT_SECONDS ({JOB_TASK_TIMEOUT_SECONDS})."
+    )
+    assert JOB_TASK_TIMEOUT_SECONDS >= 3600, (
+        "a one-hour task timeout kills ordinary cold sweeps; see the step comment"
+    )
+
+
+def test_sweep_job_runs_after_every_service_promote(by_id, steps):
+    """It must not be able to strand a service deploy.
+
+    This step can fail for a reason that has nothing to do with the services —
+    the build service account may lack `run.jobs.create` until an operator
+    grants it in the console (rollout step 2). Placed earlier, or in parallel,
+    that failure aborts the build and the wheel, covered-call and dashboard
+    revisions never get their traffic: an ad-hoc measurement tool taking
+    production deploys down with it. Behind the promotes it still fails the
+    build loudly — the operator finds out — but only after the services are out.
+    """
+    wait = set(by_id[SWEEP_JOB_STEP].get("waitFor") or [])
+    promotes = {roles["promote"] for roles in CHAINS.values()}
+    assert promotes <= wait, (
+        f"{SWEEP_JOB_STEP} must waitFor every promote step {sorted(promotes)}; "
+        f"got {sorted(wait)}."
+    )
+    ids = [st["id"] for st in steps]
+    assert ids[-1] == SWEEP_JOB_STEP, (
+        f"{SWEEP_JOB_STEP} should be the LAST step; got {ids[-1]}. A `waitFor` "
+        "edge alone is not enough — a later step listed after it would inherit "
+        "an implicit dependency on it."
+    )
+
+
 def test_dashboard_service_knows_the_sweep_job_name(by_id):
     """The API cannot launch a job it cannot name.
 

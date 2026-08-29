@@ -48,20 +48,74 @@ BASE_SCENARIO_NAME = "base"
 # identical submissions differently.
 DEFAULT_STARTING_CASH = 100_000.0
 
+# ``evaluate.DEFAULT_FILL_HAIRCUT``. Duplicated for the same reason as
+# ``BASE_SCENARIO_NAME`` — importing ``evaluate`` would drag the engine in — and
+# pinned equal by a test. It is here rather than in the caller because an arm
+# that spells out the default haircut and one that omits it are the SAME arm:
+# the runner substitutes this exact value for ``None``.
+DEFAULT_FILL_HAIRCUT = 0.25
+
+# Spec fields that describe HOW to run rather than WHAT to measure, and are
+# therefore excluded from the identity. ``force`` is an operator's instruction to
+# skip the dedup lookup; including it in the key would make a forced re-run
+# produce a different key from the run it is deliberately reproducing, so the two
+# would never be comparable and a second force would never dedup either.
+NON_IDENTITY_FIELDS = frozenset({"force"})
+
+
+def _canonical_number(value: Any) -> Any:
+    """Fold numeric leaves so ``1000`` and ``1000.0`` hash the same.
+
+    A price ceiling typed as an integer in a YAML file and as a float by a JSON
+    form is the same threshold, and the engine coerces both to float before it
+    compares anything. Without this fold the two spell different sweeps and the
+    dedup never fires between the CLI and the dashboard — which is precisely the
+    pair D4 exists to connect. Booleans are left alone: ``True`` is not ``1.0``
+    here, and folding it would make ``earnings.enabled: true`` collide with an
+    integer 1 in some other key.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return float(value)
+    if isinstance(value, float):
+        # -0.0 and 0.0 are the same threshold; json.dumps spells them
+        # differently.
+        return value + 0.0
+    if isinstance(value, (list, tuple)):
+        return [_canonical_number(v) for v in value]
+    if isinstance(value, Mapping):
+        return {str(k): _canonical_number(v) for k, v in value.items()}
+    return value
+
 
 def scenario_arm_hash(
     overrides: Optional[Mapping[str, Any]], fill_haircut: Optional[float]
 ) -> str:
     """Identity of one arm: its effective overrides plus its fill haircut.
 
-    ``default=str`` is load-bearing rather than defensive — an override value
-    may be any YAML/JSON scalar or list, and a date or Decimal arriving from a
-    hand-written spec must hash rather than raise.
+    Two normalisations, both because the same arm can be *spelled* two ways:
+
+    * numeric leaves are folded to float (``1000`` == ``1000.0``), since the
+      engine coerces before it compares and a YAML integer and a JSON float are
+      the same threshold;
+    * a ``fill_haircut`` equal to ``DEFAULT_FILL_HAIRCUT`` folds to ``None``,
+      because the runner substitutes exactly that value for ``None`` — an arm
+      that spells the default out and one that omits it run identically.
+
+    ``default=str`` is load-bearing rather than defensive: an override value may
+    be any YAML/JSON scalar or list, and a date arriving from a hand-written spec
+    must hash rather than raise.
     """
+    if fill_haircut is not None and float(fill_haircut) == DEFAULT_FILL_HAIRCUT:
+        fill_haircut = None
     payload = json.dumps(
         {
-            "overrides": {k: overrides[k] for k in sorted(overrides or {})},
-            "fill_haircut": fill_haircut,
+            "overrides": {
+                k: _canonical_number(overrides[k]) for k in sorted(overrides or {})
+            },
+            "fill_haircut": (None if fill_haircut is None
+                             else _canonical_number(fill_haircut)),
         },
         sort_keys=True,
         default=str,
@@ -115,6 +169,7 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
         "run_sensitivity": bool(spec.get("run_sensitivity", False)),
         "scenarios": scenarios,
     }
+    # `force` is deliberately absent — see NON_IDENTITY_FIELDS.
 
 
 def sweep_key(
