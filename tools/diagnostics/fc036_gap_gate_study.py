@@ -8,6 +8,16 @@ armed and gap risk is now absent by decision (FC-049 owns any evidence-based
 revival), so this file is kept as the record of the study, not as a runnable
 harness — check out `afb6698` to re-run it.
 
+⚠️ **FC-060 Layer 2 (2026-08-28).** Config-arm studies of this shape now have a
+supported home: ``python main.py --command sweep`` replays many selection-only
+config variants over many symbols, materialising each window once
+(``src/backtesting/scenarios/``, ``docs/BACKTEST_ENGINE.md`` §"Scenario
+sweeps"). It will NOT bring this harness back — the gap knobs it needs no longer
+exist as config, and the sweep's allowlist refuses any key the replay does not
+read. This note exists so nobody rebuilds a bespoke arm-runner from here. The
+file stays for its SHA pointers, which FC-049 relies on.
+
+
 PURPOSE
 -------
 `GapDetector._get_previous_close` read the current session's own daily bar, so the

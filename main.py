@@ -20,7 +20,8 @@ def main():
     parser.add_argument('--config', default='config/settings.yaml', help='Configuration file path')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
-                       choices=['scan', 'status', 'report', 'backtest', 'screen'],
+                       choices=['scan', 'status', 'report', 'backtest', 'screen',
+                                'sweep'],
                        help='Command to execute')
 
     # backtest (FC-032 evaluate mode)
@@ -35,8 +36,16 @@ def main():
                         help='backtest: skip the bid-fill sensitivity replay')
     parser.add_argument('--no-persist', action='store_true',
                         help='screen: do not write results to BigQuery')
-    parser.add_argument('--out', help='backtest/screen: write the markdown report here')
-    parser.add_argument('--json-out', help='backtest: write the JSON report here')
+    parser.add_argument('--out', help='backtest/screen/sweep: write the markdown report here')
+    parser.add_argument('--json-out', help='backtest/sweep: write the JSON report here')
+
+    # sweep (FC-060 Layer 2 — scenario runner)
+    parser.add_argument('--scenarios',
+                        help='sweep: YAML file of scenarios (see docs/BACKTEST_ENGINE.md)')
+    parser.add_argument('--symbols',
+                        help='sweep: comma-separated universe (default: config stocks.symbols)')
+    parser.add_argument('--holdout-start',
+                        help='sweep: split the window here into fit/holdout, YYYY-MM-DD')
 
     args = parser.parse_args()
     
@@ -69,6 +78,14 @@ def main():
             run_backtest(args, config, logger)
             logger.info("Command completed successfully",
                         event_category="system", event_type="command_completed")
+            return
+
+        if args.command == 'sweep':
+            rc = run_sweep_cmd(args, config, logger)
+            logger.info("Command completed",
+                        event_category="system", event_type="command_completed")
+            if rc:
+                sys.exit(rc)
             return
 
         if args.command == 'screen':
@@ -367,6 +384,132 @@ def run_screen_cmd(args, config: Config, logger) -> int:
         return 1
     if not args.no_persist and not result.persisted:
         print("\nWARNING: results were NOT persisted to BigQuery.")
+        return 1
+    return 0
+
+
+def load_scenarios(path: str):
+    """Parse a scenario YAML into ``Scenario`` objects.
+
+    Shape::
+
+        scenarios:
+          - name: tighter_puts
+            overrides:
+              strategy.put_delta_range: [0.08, 0.15]
+          - name: at_the_bid
+            fill_haircut: 1.0
+
+    The ``base`` scenario (no overrides) is implicit and always runs first — the
+    runner prepends it — so a file never has to declare the comparator, and every
+    other row in the report is read relative to it.
+
+    Every field is validated here rather than at replay time: a typo in the tenth
+    scenario must fail in milliseconds, not after nine arms have been replayed.
+    """
+    import yaml
+
+    from src.backtesting.scenarios import Scenario
+
+    with open(path) as fh:
+        payload = yaml.safe_load(fh) or {}
+    raw = payload.get('scenarios')
+    if raw is None:
+        raise SystemExit(
+            f"{path}: expected a top-level 'scenarios:' list "
+            f"(got keys: {sorted(payload) or 'an empty file'})"
+        )
+    if not isinstance(raw, list):
+        raise SystemExit(f"{path}: 'scenarios' must be a list, got {type(raw).__name__}")
+
+    scenarios = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{path}: scenario #{i + 1} must be a mapping")
+        name = entry.get('name')
+        if not name:
+            raise SystemExit(f"{path}: scenario #{i + 1} has no 'name'")
+        overrides = entry.get('overrides') or {}
+        if not isinstance(overrides, dict):
+            raise SystemExit(
+                f"{path}: scenario '{name}' has a non-mapping 'overrides'"
+            )
+        haircut = entry.get('fill_haircut')
+        if haircut is not None:
+            haircut = float(haircut)
+            if not 0.0 <= haircut <= 1.0:
+                raise SystemExit(
+                    f"{path}: scenario '{name}' fill_haircut={haircut} is outside "
+                    "[0, 1] (0 = mid, 1 = at the bid)"
+                )
+        unknown = set(entry) - {'name', 'overrides', 'fill_haircut'}
+        if unknown:
+            raise SystemExit(
+                f"{path}: scenario '{name}' has unknown field(s) "
+                f"{sorted(unknown)}. A misspelled field would silently do nothing."
+            )
+        scenarios.append(Scenario(str(name), dict(overrides), haircut))
+    return scenarios
+
+
+def run_sweep_cmd(args, config: Config, logger) -> int:
+    """Replay many scenarios over many symbols (FC-060 Layer 2). Returns an exit code."""
+    from datetime import date, datetime, timedelta
+
+    from src.backtesting.scenarios import run_sweep
+    from src.backtesting.scenarios.report import render_json, render_markdown
+    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+
+    if not args.scenarios:
+        raise SystemExit("sweep requires --scenarios <yaml>")
+
+    scenarios = load_scenarios(args.scenarios)
+    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
+    start = (datetime.strptime(args.start, '%Y-%m-%d').date() if args.start
+             else end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    if end <= start:
+        raise SystemExit(f"--end ({end}) must be after --start ({start})")
+    holdout_start = (datetime.strptime(args.holdout_start, '%Y-%m-%d').date()
+                     if args.holdout_start else None)
+
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
+    elif args.symbol:
+        symbols = [args.symbol.upper()]
+    else:
+        symbols = list(config.stock_symbols)
+    if not symbols:
+        raise SystemExit("sweep has no symbols: pass --symbols or configure stocks.symbols")
+
+    print(f"\nSweeping {len(scenarios) + 1} scenarios (base + {len(scenarios)}) "
+          f"over {len(symbols)} symbols, {start} -> {end}"
+          f"{f' (holdout from {holdout_start})' if holdout_start else ''}...\n")
+
+    result = run_sweep(
+        config, scenarios, symbols, start, end,
+        holdout_start=holdout_start,
+        starting_cash=args.starting_cash,
+        run_sensitivity=not args.no_sensitivity,
+    )
+
+    markdown = render_markdown(result)
+    print(markdown)
+    if args.out:
+        with open(args.out, 'w') as fh:
+            fh.write(markdown)
+        print(f"\nMarkdown report -> {args.out}")
+    if args.json_out:
+        with open(args.json_out, 'w') as fh:
+            fh.write(render_json(result))
+        print(f"JSON report -> {args.json_out}")
+
+    # Exit non-zero when any cell never produced a verdict. A sweep that
+    # half-ran reads as a complete one, and a missing cell is exactly where a
+    # reader's eye supplies "probably like the others".
+    if result.errors:
+        failed = sorted({f"{r.scenario}/{r.symbol}" for r in result.errors})
+        print(f"\nWARNING: {len(result.errors)} cell(s) produced no verdict: "
+              f"{', '.join(failed[:12])}{' ...' if len(failed) > 12 else ''}")
         return 1
     return 0
 

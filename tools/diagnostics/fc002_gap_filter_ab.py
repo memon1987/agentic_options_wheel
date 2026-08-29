@@ -16,6 +16,16 @@ the record of the study, not as a runnable harness — every mode that imports
 import or attribute access. To re-run it, check out `afb6698`. Gap risk is
 absent by decision; FC-049 owns any evidence-based revival.
 
+⚠️ **FC-060 Layer 2 (2026-08-28).** Config-arm studies of this shape now have a
+supported home: ``python main.py --command sweep`` replays many selection-only
+config variants over many symbols, materialising each window once
+(``src/backtesting/scenarios/``, ``docs/BACKTEST_ENGINE.md`` §"Scenario
+sweeps"). It will NOT bring this harness back — the gap knobs it needs no longer
+exist as config, and the sweep's allowlist refuses any key the replay does not
+read. This note exists so nobody rebuilds a bespoke arm-runner from here. The
+file stays for its SHA pointers, which FC-049 relies on.
+
+
 Consequences for this file, specifically:
   * the `verify` mode asserts *source properties* of `_find_new_opportunities`,
     which no longer exists — that mode will fail;

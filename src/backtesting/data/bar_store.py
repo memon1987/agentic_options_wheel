@@ -1,0 +1,322 @@
+"""Local parquet cache for settled daily underlying bars (FC-060 Layer 2, D4).
+
+Chains have had a cache since FC-042 Track A. **Bars never did.** Every replay
+re-fetched them from Alpaca, which cost four network round-trips per symbol per
+`evaluate_symbol` call (``Simulator._load_stock_bars`` twice, ``evaluate._closes``
+twice) and — much worse for a scenario sweep — meant a warm run was never
+actually offline: the chains came off disk and then the very first bar fetch went
+to the network, so a socket-blocked run died at step one.
+
+A settled daily bar is immutable, which is what makes this safe. The same
+``_is_settled`` rule the chain cache uses applies here: today's session is still
+forming, so it is never stored and never claimed as covered.
+
+**Coverage is proven, never assumed.** The parquet carries the *request* window
+that produced it (``covered_from``/``covered_to``) alongside the bars, exactly as
+``ChainStore`` carries its strike/DTE provenance, and a read is a hit only when
+that window is a superset of the request. Inferring coverage from the stored
+dates instead cannot work: a weekday with no row is indistinguishable between "a
+market holiday" and "we never asked for that range", and guessing wrong serves a
+replay a window with a hole in it — a silently different backtest, which is the
+one failure mode this whole engine exists to avoid.
+
+Coverage is kept as a SINGLE interval. A request that is disjoint from the stored
+window fetches their union rather than appending a second range, so the invariant
+"one file, one contiguous covered window" holds with no interval algebra. Bars
+are one API call per symbol; the extra days are free.
+
+**No lake mirroring.** Deliberately out of scope (see the plan): bars are one
+call per symbol per run on the Cloud Run Job, they are always re-fetchable from
+the vendor, and the chain lake exists because chains may not be.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+import pandas as pd
+import structlog
+
+from .provider import StockBar
+
+logger = structlog.get_logger(__name__)
+
+# Default cache root, and the env var that moves it. Deployment configuration,
+# not strategy configuration — same reasoning as CHAIN_LAKE_BUCKET.
+DEFAULT_BARS_CACHE_DIR = "cache/backtest/bars"
+BARS_CACHE_DIR_ENV = "BACKTEST_BARS_CACHE_DIR"
+
+# Bar columns, then the request-provenance columns (constant within a file).
+_BAR_COLUMNS = ["symbol", "bar_date", "open", "high", "low", "close", "volume"]
+_PROVENANCE_COLUMNS = ["covered_from", "covered_to"]
+_COLUMNS = _BAR_COLUMNS + _PROVENANCE_COLUMNS
+
+
+def _is_settled(bar_date: date) -> bool:
+    """Whether a daily bar is a completed session.
+
+    Deliberately a local copy of ``alpaca_provider._is_settled`` rather than an
+    import: this module must apply the rule to any provider's output, including
+    a test double that has never heard of Alpaca. The two are asserted equal by
+    ``tests/test_bar_store.py`` so they cannot drift.
+    """
+    return bar_date < date.today()
+
+
+def last_settled_day(today: Optional[date] = None) -> date:
+    """The most recent date whose daily bar is final."""
+    return (today or date.today()) - timedelta(days=1)
+
+
+class BarStore:
+    """Parquet-per-symbol cache of settled daily bars."""
+
+    def __init__(self, root: Optional[str] = None) -> None:
+        self._root = Path(root or os.environ.get(BARS_CACHE_DIR_ENV)
+                          or DEFAULT_BARS_CACHE_DIR)
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    def _path(self, symbol: str) -> Path:
+        return self._root / f"{symbol.upper()}.parquet"
+
+    def has(self, symbol: str) -> bool:
+        """Whether a file exists at all (says nothing about coverage)."""
+        return self._path(symbol).exists()
+
+    # ------------------------------------------------------------------ #
+    # Read
+    # ------------------------------------------------------------------ #
+    def _read(self, symbol: str) -> Optional[pd.DataFrame]:
+        """The stored frame, or None when there is nothing usable on disk.
+
+        An unreadable file is deleted and treated as a miss, for the same reason
+        ``ChainStore.get`` does it: the caller can always rebuild from the
+        provider, while propagating the error would wedge every future run on
+        one corrupt byte.
+        """
+        path = self._path(symbol)
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            logger.warning(
+                "Discarding an unreadable bar-cache file",
+                event_category="backtest_data",
+                event_type="bar_cache_corrupt",
+                symbol=symbol, path=str(path),
+            )
+            path.unlink(missing_ok=True)
+            return None
+        for column in _COLUMNS:
+            if column not in df.columns:
+                logger.warning(
+                    "Discarding a bar-cache file with an unexpected schema",
+                    event_category="backtest_data",
+                    event_type="bar_cache_schema_mismatch",
+                    symbol=symbol, path=str(path),
+                    missing=column,
+                )
+                path.unlink(missing_ok=True)
+                return None
+        return df
+
+    def covered_window(self, symbol: str) -> Optional["tuple[date, date]"]:
+        """The request window the stored file proves it covers, or None."""
+        df = self._read(symbol)
+        return None if df is None else self._window(df)
+
+    @staticmethod
+    def _window(df: pd.DataFrame) -> Optional["tuple[date, date]"]:
+        if df.empty:
+            return None
+        lo, hi = df["covered_from"].iloc[0], df["covered_to"].iloc[0]
+        if pd.isna(lo) or pd.isna(hi):
+            return None
+        try:
+            return date.fromisoformat(str(lo)), date.fromisoformat(str(hi))
+        except ValueError:
+            return None
+
+    def get(self, symbol: str, start: date, end: date) -> Optional[List[StockBar]]:
+        """Bars over ``[start, end]``, or None when coverage cannot be proven.
+
+        ``end`` is first clamped to the last settled session: a request that runs
+        into today can be fully answered by a cache that stops at yesterday,
+        because that is all the provider would return either.
+        """
+        effective_end = min(end, last_settled_day())
+        if effective_end < start:
+            # Nothing settled in the window. The provider would return [] too,
+            # so answering from here costs a round-trip and changes nothing.
+            return []
+        df = self._read(symbol)
+        if df is None:
+            return None
+        window = self._window(df)
+        if window is None:
+            return None
+        covered_from, covered_to = window
+        if covered_from > start or covered_to < effective_end:
+            return None
+        return self._to_bars(df, symbol, start, effective_end)
+
+    @staticmethod
+    def _to_bars(
+        df: pd.DataFrame, symbol: str, start: date, end: date
+    ) -> List[StockBar]:
+        out: List[StockBar] = []
+        for row in df.itertuples(index=False):
+            raw = str(row.bar_date)
+            if not raw:
+                continue  # the metadata-only row of a proven-empty window
+            bar_date = date.fromisoformat(raw)
+            if bar_date < start or bar_date > end:
+                continue
+            out.append(
+                StockBar(
+                    symbol=str(row.symbol),
+                    bar_date=bar_date,
+                    open=float(row.open),
+                    high=float(row.high),
+                    low=float(row.low),
+                    close=float(row.close),
+                    volume=int(row.volume),
+                )
+            )
+        out.sort(key=lambda b: b.bar_date)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Write
+    # ------------------------------------------------------------------ #
+    def put(
+        self,
+        symbol: str,
+        bars: Sequence[StockBar],
+        *,
+        covered_from: date,
+        covered_to: date,
+    ) -> None:
+        """Merge ``bars`` into the symbol's file and widen its covered window.
+
+        Unsettled bars are dropped and ``covered_to`` is clamped to the last
+        settled session, so a run started mid-session can never leave a file
+        claiming to cover a day whose close had not happened yet.
+
+        The write is atomic (temp file in the same directory, then
+        ``os.replace``), for the same reason ``ChainStore.put`` is: an interrupted
+        write otherwise leaves a truncated parquet that every later run trips on.
+        """
+        settled_to = last_settled_day()
+        covered_to = min(covered_to, settled_to)
+        if covered_to < covered_from:
+            return  # nothing settled in the requested window; nothing to record
+
+        merged: Dict[date, StockBar] = {}
+        existing = self._read(symbol)
+        existing_window = None if existing is None else self._window(existing)
+        if existing is not None:
+            for bar in self._to_bars(existing, symbol, date.min, settled_to):
+                merged[bar.bar_date] = bar
+        for bar in bars:
+            if not _is_settled(bar.bar_date):
+                continue
+            merged[bar.bar_date] = bar
+
+        if existing_window is not None:
+            covered_from = min(covered_from, existing_window[0])
+            covered_to = max(covered_to, min(existing_window[1], settled_to))
+
+        rows = [
+            {
+                "symbol": b.symbol,
+                "bar_date": b.bar_date.isoformat(),
+                "open": float(b.open),
+                "high": float(b.high),
+                "low": float(b.low),
+                "close": float(b.close),
+                "volume": int(b.volume),
+                "covered_from": covered_from.isoformat(),
+                "covered_to": covered_to.isoformat(),
+            }
+            for b in sorted(merged.values(), key=lambda x: x.bar_date)
+        ]
+        if not rows:
+            # A genuinely empty window (a symbol with no history yet). Store the
+            # coverage claim anyway with a single metadata-only row, so the next
+            # run does not re-ask the vendor the same unanswerable question.
+            rows = [{
+                "symbol": symbol.upper(), "bar_date": "",
+                "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0,
+                "covered_from": covered_from.isoformat(),
+                "covered_to": covered_to.isoformat(),
+            }]
+
+        path = self._path(symbol)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            pd.DataFrame(rows, columns=_COLUMNS).to_parquet(tmp, index=False)
+            os.replace(tmp, path)  # atomic within a filesystem
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+
+class CachedBarProvider:
+    """A data provider whose ``get_stock_bars`` is served from a ``BarStore``.
+
+    Composition, not a change to ``AlpacaDataProvider``: the cache is a property
+    of *this run*, not of the vendor client, and wrapping keeps the provider's
+    own per-process contract memo intact. Everything other than
+    ``get_stock_bars`` delegates untouched.
+
+    ``fetches`` counts the round-trips that actually reached the wrapped
+    provider. It is what the scenario runner asserts is zero during replays —
+    a log line would let a regression pass unnoticed.
+    """
+
+    def __init__(self, provider, store: Optional[BarStore] = None) -> None:
+        self._provider = provider
+        self.store = store if store is not None else BarStore()
+        self.hits = 0
+        self.fetches = 0
+
+    # -- delegation ---------------------------------------------------- #
+    def get_contract_universe(self, *args, **kwargs):
+        return self._provider.get_contract_universe(*args, **kwargs)
+
+    def get_option_bars(self, *args, **kwargs):
+        return self._provider.get_option_bars(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Anything else on the wrapped provider (`_universe_cache`, feed
+        # settings, vendor-specific helpers) stays reachable.
+        return getattr(self._provider, name)
+
+    # -- the cached call ----------------------------------------------- #
+    def get_stock_bars(self, symbol: str, start: date, end: date) -> List[StockBar]:
+        cached = self.store.get(symbol, start, end)
+        if cached is not None:
+            self.hits += 1
+            return cached
+
+        # One fetch for the whole range: the union of what is asked for and what
+        # is already stored, so coverage stays a single contiguous interval.
+        fetch_from, fetch_to = start, end
+        window = self.store.covered_window(symbol)
+        if window is not None:
+            fetch_from = min(fetch_from, window[0])
+            fetch_to = max(fetch_to, window[1])
+
+        self.fetches += 1
+        bars = self._provider.get_stock_bars(symbol, fetch_from, fetch_to)
+        self.store.put(symbol, bars, covered_from=fetch_from, covered_to=fetch_to)
+        return [b for b in bars if start <= b.bar_date <= end]

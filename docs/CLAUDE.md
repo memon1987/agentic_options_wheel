@@ -52,7 +52,7 @@ cp .env.example .env
 ## Commands
 
 **CLI** (`main.py` — `--command` accepts exactly `scan`, `status`, `report`,
-`backtest`, `screen`):
+`backtest`, `screen`, `sweep`):
 ```bash
 python main.py --command scan    # Scan for opportunities (same OptionsScanner as production)
 python main.py --command status  # Portfolio status  (PortfolioTracker — CLI only)
@@ -665,7 +665,21 @@ code over historical Alpaca data and needs no cloud round-trip.
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01
 python main.py --command screen            # whole universe -> options_wheel.backtest_runs
+python main.py --command sweep --scenarios examples/scenarios_example.yaml \
+    --symbols AAPL,AMZN,GOOGL,IWM,NVDA,UNH --start 2025-08-01 --end 2026-07-31
 ```
+
+**Scenario sweeps are local and are NEVER persisted (FC-060 Layer 2).**
+`--command sweep` replays many config variants over many symbols and writes
+markdown/JSON to disk only. It must stay that way while `backtest_runs` is the
+production screen's table: the documented "current demotion candidates" query
+takes the latest `run_kind='full'` row, so a persisted full-universe sweep would
+displace a real screen with a hypothetical. A sweep report is a hypothesis, not a
+record of the universe. Overrides are restricted to a **selection-only
+allowlist** — a key that changes what the cached chain must contain, or that the
+replay never reads, is refused with the reason. See `docs/BACKTEST_ENGINE.md`
+§"Scenario sweeps"; FC-060 Layer 3 owns a store for sweep results that cannot
+displace the screen.
 
 **`docs/BACKTEST_ENGINE.md` is the single home of every measured backtest
 figure. Read it before quoting any backtest number, and quote numbers from

@@ -1031,22 +1031,72 @@ class ChainStore:
                 self.lake_rejected += 1
             return None
 
-        puts, calls = [], []
-        for _, r in df.iterrows():
-            if not r["symbol"]:  # sentinel row for an empty chain
-                continue
-            strike = float(r["strike"])
-            if strike_gte is not None and strike < strike_gte:
-                continue
-            if strike_lte is not None and strike > strike_lte:
-                continue
-            if universe_dte is not None and int(r["dte"]) > universe_dte:
-                continue
-            q = self._row_to_quote(r)
-            (puts if q.option_type == "put" else calls).append(q)
+        puts, calls = self._rows_to_quotes(df, universe_dte, strike_gte, strike_lte)
         puts.sort(key=lambda x: x.strike)
         calls.sort(key=lambda x: x.strike)
         return ChainSnapshot(underlying, as_of, cached_price, puts, calls)
+
+    @staticmethod
+    def _rows_to_quotes(
+        df,
+        universe_dte: Optional[int],
+        strike_gte: Optional[float],
+        strike_lte: Optional[float],
+    ) -> "tuple[list, list]":
+        """Narrow the file to the request and convert it to ``ChainQuote``s.
+
+        FC-060 Layer 2 (D5) rewrote this off ``df.iterrows()``. Row conversion
+        was measured at roughly 80% of a warm replay's entire runtime: a
+        symbol-year is ~250 files of a few hundred rows each, and ``iterrows``
+        materialises a fresh ``Series`` per row and then pays a label lookup per
+        cell. ``itertuples`` walks the same data as C-level tuples, and the
+        strike/DTE narrowing is done as a vectorised mask so the per-row work is
+        only done for rows that survive it.
+
+        **The output is identical, not merely equivalent**, and that is the whole
+        contract: the cache must be invisible to results. Row order out of
+        ``itertuples`` is file order, exactly as ``iterrows`` gives, and both
+        lists are stably sorted by strike afterwards, so ties keep file order
+        either way. ``tests/test_backtest_data.py`` pins this against a
+        line-for-line copy of the old converter on a real cached file.
+        """
+        # Each clause is the NEGATION of the old loop's `continue`, not its
+        # apparent inverse: `strike < gte` is False for a NaN strike, so the old
+        # loop kept such a row. `strike >= gte` would drop it. Identical output
+        # includes identical behaviour on degenerate data.
+        mask = df["symbol"].astype(bool)
+        if strike_gte is not None:
+            mask &= ~(df["strike"].astype(float) < strike_gte)
+        if strike_lte is not None:
+            mask &= ~(df["strike"].astype(float) > strike_lte)
+        if universe_dte is not None:
+            mask &= ~(df["dte"].astype(int) > universe_dte)
+        narrowed = df[mask]
+
+        puts, calls = [], []
+        for row in narrowed.itertuples(index=False):
+            iv = row.implied_volatility
+            delta = row.delta
+            quote = ChainQuote(
+                symbol=row.symbol,
+                underlying=row.underlying,
+                as_of=date.fromisoformat(row.as_of),
+                expiration=date.fromisoformat(row.expiration),
+                strike=float(row.strike),
+                option_type=row.option_type,
+                dte=int(row.dte),
+                underlying_price=float(row.underlying_price),
+                mark=float(row.mark),
+                bid=float(row.bid),
+                ask=float(row.ask),
+                implied_volatility=None if pd.isna(iv) else float(iv),
+                delta=None if pd.isna(delta) else float(delta),
+                volume=int(row.volume),
+                modeled_spread=bool(row.modeled_spread),
+                modeled_greeks=bool(row.modeled_greeks),
+            )
+            (puts if quote.option_type == "put" else calls).append(quote)
+        return puts, calls
 
     @staticmethod
     def _covers(
@@ -1125,25 +1175,8 @@ class ChainStore:
             "modeled_greeks": True,
         }
 
-    @staticmethod
-    def _row_to_quote(r) -> ChainQuote:
-        return ChainQuote(
-            symbol=r["symbol"],
-            underlying=r["underlying"],
-            as_of=date.fromisoformat(r["as_of"]),
-            expiration=date.fromisoformat(r["expiration"]),
-            strike=float(r["strike"]),
-            option_type=r["option_type"],
-            dte=int(r["dte"]),
-            underlying_price=float(r["underlying_price"]),
-            mark=float(r["mark"]),
-            bid=float(r["bid"]),
-            ask=float(r["ask"]),
-            implied_volatility=(
-                None if pd.isna(r["implied_volatility"]) else float(r["implied_volatility"])
-            ),
-            delta=(None if pd.isna(r["delta"]) else float(r["delta"])),
-            volume=int(r["volume"]),
-            modeled_spread=bool(r["modeled_spread"]),
-            modeled_greeks=bool(r["modeled_greeks"]),
-        )
+    # ``_row_to_quote`` (the per-row ``Series`` converter) was deleted by
+    # FC-060 Layer 2 D5 and replaced by ``_rows_to_quotes`` above. A verbatim
+    # copy lives in tests/test_backtest_data.py as ``_row_to_quote_legacy``,
+    # where it serves as the identity oracle for the rewrite — in src it would
+    # be dead code that quietly drifts from the thing it is supposed to pin.

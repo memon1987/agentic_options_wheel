@@ -129,6 +129,28 @@ def _no_chain_lake(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_bars_cache(monkeypatch, tmp_path_factory):
+    """No test may read or write the developer's bar cache (FC-060 Layer 2).
+
+    ``BarStore`` defaults to ``cache/backtest/bars`` relative to the working
+    directory, so without this a test that constructs one — directly or through
+    ``evaluate_symbol`` — would read whatever a real backtest happened to leave
+    there and, worse, write into it. Same principle as ``_no_chain_lake``: a
+    unit test's behaviour must not depend on ambient state, and here the failure
+    would be a silent cross-test data dependency rather than an error.
+
+    Pointed at a per-session temp directory rather than cleared, so a test that
+    exercises the cache's own round-trip still has somewhere to write. Tests
+    that want a specific store pass their own ``tmp_path``.
+    """
+    monkeypatch.setenv(
+        "BACKTEST_BARS_CACHE_DIR",
+        str(tmp_path_factory.mktemp("bars_cache", numbered=True)),
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_alpaca_credentials(monkeypatch):
     """Every test sees the same fake Alpaca credentials.
 

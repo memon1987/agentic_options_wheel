@@ -1,0 +1,79 @@
+# Example scenario file for `python main.py --command sweep --scenarios <this>`.
+#
+# Every override must be a SELECTION-ONLY key — one that changes which contract
+# the strategy picks out of a chain it already has, never which chain it gets.
+# The allowlist and the reason behind each rejection live in
+# src/backtesting/scenarios/overrides.py and are reproduced in the report's
+# "Scenario definitions" section.
+#
+# The `base` scenario (no overrides) is IMPLICIT and always runs first: it is the
+# comparator every other row is read against. Do not declare it.
+#
+# Keys that are refused, and why (short version):
+#   strategy.put_target_dte        - changes the chain's DTE reach; needs a
+#                                    re-materialisation, which Layer 2 has not.
+#   strategy.call_target_dte > 7   - does not widen the chain; the contracts are
+#                                    simply absent, so the arm reads as "nothing
+#                                    qualified". Lowering it is allowed.
+#   risk.profit_taking.*           - /monitor-only; the replay's day loop never
+#   risk.*_stop_loss*                runs it, so every arm would be identical.
+#   strategy.*_limit_spread_fraction - the replay RECORDS a limit price and fills
+#                                    at mid - haircut x half-spread regardless.
+#                                    Vary the fill with `fill_haircut:` instead.
+#   universe.min_open_interest     - the engine hardcodes open_interest to 0, so
+#                                    any floor >= 1 rejects every call.
+#   stocks.symbols                 - the universe is run SCOPE; pass --symbols.
+
+scenarios:
+  # --- selection band -----------------------------------------------------
+  - name: puts_15_25
+    overrides:
+      strategy.put_delta_range: [0.15, 0.25]
+
+  - name: calls_25_35
+    overrides:
+      strategy.call_delta_range: [0.25, 0.35]
+
+  # --- premium floors -----------------------------------------------------
+  - name: put_floor_0_30
+    overrides:
+      strategy.min_put_premium: 0.30
+
+  - name: call_floor_0_50
+    overrides:
+      strategy.min_call_premium: 0.50
+
+  # --- stage-1 universe screening ----------------------------------------
+  # FC-055's question: the $400 ceiling is what excludes SPY/QQQ/AMD, not any
+  # judgement about those symbols. Pair this with --symbols including them.
+  - name: price_ceiling_800
+    overrides:
+      strategy.max_stock_price: 800.0
+
+  # --- sizing -------------------------------------------------------------
+  - name: position_size_20pct
+    overrides:
+      risk.max_position_size: 0.20
+
+  # --- gates --------------------------------------------------------------
+  # NOTE: refused outright if EARNINGS_ENABLED is exported — the env var wins
+  # over the yaml key, so the arm would be silently identical to base.
+  - name: no_earnings_gate
+    overrides:
+      earnings.enabled: false
+
+  # --- stage-1 liquidity floor -------------------------------------------
+  - name: volume_floor_5m
+    overrides:
+      strategy.min_avg_volume: 5000000
+
+  # --- operator opt-out ---------------------------------------------------
+  - name: exclude_nvda
+    overrides:
+      universe.excluded_symbols: ["NVDA"]
+
+  # --- fill assumption ----------------------------------------------------
+  # `fill_haircut` is a scenario FIELD, not a config key: config_hash hashes the
+  # module default, so two arms differing only in haircut would share a hash.
+  # - name: at_the_bid
+  #   fill_haircut: 1.0
