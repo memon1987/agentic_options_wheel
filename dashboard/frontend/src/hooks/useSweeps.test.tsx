@@ -339,6 +339,64 @@ describe('useSweepDetail — one run’s data never shows under another run’s 
     expect(result.current.error).toBeNull();
   });
 
+  it('does NOT clear the list on a manual refetch of the same url', async () => {
+    // `Simulations` calls `refetchList()` on every accepted submit. `refetch`
+    // bumps the same effect that handles a url change, so an unconditional
+    // reset there drops the runs list to "Loading..." the instant the operator
+    // submits — and loses the rows entirely if that read then fails.
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'done' })]));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toHaveLength(1);
+
+    // Hold the refetch open: the rows must still be there while it is in flight.
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    act(() => {
+      result.current.refetch();
+    });
+    expect(result.current.data).toHaveLength(1);
+    expect(result.current.data?.[0].run_id).toBe('run1');
+    expect(result.current.loading).toBe(true);
+  });
+
+  it('keeps the previous rows when a manual refetch FAILS, with the error set', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'done' })]));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.data).toHaveLength(1);
+
+    fetchMock.mockRejectedValue(new Error('BigQuery timeout'));
+    act(() => {
+      result.current.refetch();
+    });
+    await settle();
+    expect(result.current.error).toMatch(/BigQuery timeout/);
+    // The rule from the keep-last-good-data fix, which the reset was breaking.
+    expect(result.current.data).toHaveLength(1);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('still clears everything when the url genuinely changes after a refetch', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, shapedHoldout));
+    const { result, rerender } = renderHook(({ id }) => useSweepDetail(id), {
+      initialProps: { id: 'runA' as string | null },
+    });
+    await settle();
+    act(() => {
+      result.current.refetch();
+    });
+    await settle();
+    expect(result.current.data).not.toBeNull();
+
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    rerender({ id: 'runB' });
+    expect(result.current.data).toBeNull();
+    expect(result.current.loading).toBe(true);
+  });
+
   it('clears a stale error when the selection changes', async () => {
     vi.useFakeTimers();
     fetchMock.mockRejectedValue(new Error('boom'));

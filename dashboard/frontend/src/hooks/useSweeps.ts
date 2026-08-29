@@ -209,10 +209,12 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
  *
  * Three behaviours worth stating, because each fixes a way this page could lie:
  *
- *   * On a URL CHANGE the state is cleared to `{null, loading: true, null}`
- *     before the new request goes out. Without that, selecting run B showed run
- *     A's grid under B's heading until B answered — the worst kind of wrong,
- *     because it looks right.
+ *   * On a URL CHANGE — and ONLY a url change — the state is cleared to
+ *     `{null, loading: true, null}` before the new request goes out. Without
+ *     that, selecting run B showed run A's grid under B's heading until B
+ *     answered: the worst kind of wrong, because it looks right. A manual
+ *     `refetch` of the SAME url keeps the rendered data and only marks it
+ *     loading; clearing there would blank the runs list on every submit.
  *   * A read failure keeps the last good data and reports the error beside it,
  *     and keeps polling. A transient 500 must neither blank a rendered grid nor
  *     permanently stop the refresh.
@@ -237,6 +239,10 @@ function usePolledGet<T>(
   normaliseRef.current = normalise;
   const stateRef = useRef(state);
   stateRef.current = state;
+  // The url the current data belongs to. The effect below re-runs for two very
+  // different reasons — a new url, or a manual refetch — and only the first may
+  // throw away what is on screen.
+  const loadedUrlRef = useRef<string | null | undefined>(undefined);
 
   const refetch = useCallback(() => setTick((t) => t + 1), []);
 
@@ -249,6 +255,7 @@ function usePolledGet<T>(
 
   useEffect(() => {
     if (!url) {
+      loadedUrlRef.current = null;
       setState({ data: null, loading: false, error: null });
       return;
     }
@@ -256,8 +263,22 @@ function usePolledGet<T>(
     let cancelled = false;
     let inFlight = false;
 
-    // Clear FIRST: nothing from the previous url may survive under the new one.
-    setState({ data: null, loading: true, error: null });
+    // A NEW url: clear first, because nothing from the previous one may survive
+    // under it — run A's grid under run B's heading is the worst kind of wrong,
+    // since it looks right.
+    //
+    // The SAME url (a manual `refetch`, which bumps `tick` and re-runs this
+    // effect): keep what is on screen and only mark it loading. Blanking here
+    // would drop the runs list to "Loading..." the instant the operator submits
+    // a sweep — `Simulations` refetches the list on every accepted submit — and
+    // would lose the rows entirely if that read then failed, which is exactly
+    // what the keep-last-good-data rule below exists to prevent.
+    if (loadedUrlRef.current !== url) {
+      loadedUrlRef.current = url;
+      setState({ data: null, loading: true, error: null });
+    } else {
+      setState((prev) => ({ ...prev, loading: true }));
+    }
 
     const load = async () => {
       if (inFlight) return;
