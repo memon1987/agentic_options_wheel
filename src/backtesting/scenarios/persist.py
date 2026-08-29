@@ -113,6 +113,49 @@ LATEST_STATUS_ORDER_BY = (
 )
 
 
+# BigQuery speaks TWO names for the same type, and the API answers in the older
+# one whatever you asked for. A table created with `BOOL` reads back as
+# `BOOLEAN`; `INT64` reads back as `INTEGER`; `FLOAT64` reads back as `FLOAT`.
+#
+# That cost a production execution. `_ensure_table`'s type guard compared the
+# echoed name against the declared one, and the schemas below happen to declare
+# `BOOL` (standard) alongside `INTEGER` and `FLOAT` (legacy) — so INTEGER and
+# FLOAT matched by luck and `in_sample_only` did not. The first real
+# `backtest-sweep` execution aborted at writer init on a table whose schema was
+# in fact correct, and the Job then refused to replay. (The fail-closed posture
+# was right; the guard was wrong.)
+#
+# Both sides are canonicalised to the standard name before comparison, so the
+# guard fires only on a GENUINE retype. The declared strings are deliberately
+# left as they are: the client translates them on the way out, `scenario_sweeps`
+# already exists with the resulting types, and rewriting them would risk
+# changing what `create_table` sends for `scenario_runs`, which does not exist
+# yet and must come out compatible.
+_CANONICAL_FIELD_TYPES: Dict[str, str] = {
+    "BOOLEAN": "BOOL",
+    "INTEGER": "INT64",
+    "FLOAT": "FLOAT64",
+    "RECORD": "STRUCT",
+}
+
+
+def _canonical_type(field_type: Optional[str]) -> str:
+    """The standard-SQL spelling of a BigQuery type name.
+
+    Unknown names pass through upper-cased rather than raising: an unmapped type
+    still compares equal to itself, so a future field cannot be waved through by
+    accident — and `TestTheSchemaTypeNamesAreCovered` fails the build if the
+    schemas ever declare one this map does not know.
+    """
+    name = (field_type or "").upper()
+    return _CANONICAL_FIELD_TYPES.get(name, name)
+
+
+def _canonical_mode(mode: Optional[str]) -> str:
+    """``NULLABLE`` when unset, upper-cased otherwise."""
+    return (mode or "NULLABLE").upper()
+
+
 def _sweeps_schema():
     """One row per status transition of one submitted sweep. See D1."""
     f = bigquery.SchemaField
@@ -325,14 +368,20 @@ class ScenarioRunWriter:
         # while reporting a clean run — the exact silent-empty-table failure the
         # additive reconcile below exists to prevent, arriving through the one
         # door the reconcile does not watch. Retyping is an operator migration.
+        # Compared on CANONICAL names (see `_canonical_type`): BigQuery echoes
+        # `BOOLEAN`/`INTEGER`/`FLOAT` for a table created with
+        # `BOOL`/`INT64`/`FLOAT64`, and comparing the raw strings failed the
+        # first real production execution on a table that was perfectly correct.
         by_name = {f.name: f for f in (existing.schema or [])}
         conflicts = [
             f"{f.name}: table has {by_name[f.name].field_type}/"
             f"{by_name[f.name].mode}, code expects {f.field_type}/{f.mode}"
             for f in schema
             if f.name in by_name
-            and (by_name[f.name].field_type != f.field_type
-                 or (by_name[f.name].mode or "NULLABLE") != (f.mode or "NULLABLE"))
+            and (_canonical_type(by_name[f.name].field_type)
+                 != _canonical_type(f.field_type)
+                 or _canonical_mode(by_name[f.name].mode)
+                 != _canonical_mode(f.mode))
         ]
         if conflicts:
             raise RuntimeError(

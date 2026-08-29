@@ -212,6 +212,200 @@ class TestRowsFromSweep:
         assert "SECRET" not in json.dumps(snap)
 
 
+class TestBigQueryLegacyTypeNames:
+    """BigQuery answers in the OLD type names whatever you asked for.
+
+    A table created with `BOOL` reads back as `BOOLEAN`, `INT64` as `INTEGER`,
+    `FLOAT64` as `FLOAT`. `_ensure_table`'s type guard compared the echoed name
+    against the declared one, and the schemas declare `BOOL` (standard) beside
+    `INTEGER` and `FLOAT` (legacy) — so those two matched by luck and
+    `in_sample_only` did not.
+
+    **This cost the first real production execution.** `backtest-sweep` aborted
+    at writer init against a `scenario_sweeps` whose schema was entirely
+    correct, the Job refused to replay (exit 2, `sweep_store_unavailable`), and
+    `scenario_runs` was never created because init returned first. The
+    fail-closed posture did its job; the guard was the bug.
+
+    The round-1 tests missed it because the fake client echoed the code's OWN
+    schema objects back — the one thing a real BigQuery never does. These build
+    the reply the API actually sends.
+    """
+
+    LEGACY = {"BOOL": "BOOLEAN", "INT64": "INTEGER", "FLOAT64": "FLOAT",
+              "STRUCT": "RECORD"}
+
+    def as_bigquery_echoes_it(self, schema):
+        """The schema as the API would hand it back: legacy type names."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+        return [
+            bigquery.SchemaField(
+                f.name,
+                self.LEGACY.get(f.field_type.upper(), f.field_type),
+                mode=f.mode)
+            for f in schema
+        ]
+
+    def writer_over(self, existing_schema, updated=None):
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        class FakeClient:
+            def create_table(self, table, exists_ok=False):
+                return bigquery.Table(table.reference, schema=existing_schema)
+
+            def update_table(self, table, fields):
+                if updated is not None:
+                    updated["names"] = {f.name for f in table.schema}
+
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._client = FakeClient()
+        writer._dataset_id = "options_wheel"
+        return writer
+
+    @pytest.mark.parametrize("table,schema_fn", [
+        (store.SWEEPS_TABLE, "_sweeps_schema"),
+        (store.RUNS_TABLE, "_runs_schema"),
+    ])
+    def test_legacy_echoes_reconcile_cleanly(self, table, schema_fn):
+        """The live failure, reproduced and fixed. Both tables, because
+        `scenario_runs` never got far enough to fail on its own."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = getattr(store, schema_fn)()
+        writer = self.writer_over(self.as_bigquery_echoes_it(declared))
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        # No raise: every difference here is a spelling, not a retype.
+        writer._ensure_table(ref, table, declared,
+                             partition_field="submitted_at", clustering=None)
+
+    def test_the_exact_live_field_no_longer_trips(self):
+        """`in_sample_only: table has BOOLEAN/NULLABLE, code expects BOOL/NULLABLE`
+        — the message from the production traceback."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._sweeps_schema()
+        echoed = [
+            bigquery.SchemaField("in_sample_only", "BOOLEAN")
+            if f.name == "in_sample_only" else f
+            for f in declared
+        ]
+        writer = self.writer_over(echoed)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        writer._ensure_table(ref, store.SWEEPS_TABLE, declared,
+                             partition_field="submitted_at", clustering=None)
+
+    @pytest.mark.parametrize("legacy,standard", [
+        ("BOOLEAN", "BOOL"), ("INTEGER", "INT64"), ("FLOAT", "FLOAT64"),
+        ("RECORD", "STRUCT"),
+    ])
+    def test_each_legacy_spelling_canonicalises(self, legacy, standard):
+        assert store._canonical_type(legacy) == standard
+        assert store._canonical_type(standard) == standard
+        assert store._canonical_type(legacy.lower()) == standard
+
+    def test_an_unknown_type_passes_through_rather_than_raising(self):
+        """It still compares equal to itself, so nothing is waved through by
+        accident — and the coverage test below fails the build if the schemas
+        ever start using one."""
+        assert store._canonical_type("GEOGRAPHY") == "GEOGRAPHY"
+        assert store._canonical_type(None) == ""
+
+    def test_modes_compare_case_insensitively(self):
+        assert store._canonical_mode(None) == "NULLABLE"
+        assert store._canonical_mode("nullable") == "NULLABLE"
+        assert store._canonical_mode("Required") == "REQUIRED"
+
+    def test_a_genuine_retype_still_raises(self):
+        """The guard has to keep its teeth: a real retype means every insert
+        fails on that field and the sweep writes ZERO rows while reporting a
+        clean run."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._sweeps_schema()
+        echoed = [
+            bigquery.SchemaField("wall_seconds", "STRING")
+            if f.name == "wall_seconds" else f
+            for f in self.as_bigquery_echoes_it(declared)
+        ]
+        writer = self.writer_over(echoed)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        with pytest.raises(RuntimeError, match="MIGRATION"):
+            writer._ensure_table(ref, store.SWEEPS_TABLE, declared,
+                                 partition_field="submitted_at", clustering=None)
+
+    def test_a_genuine_mode_change_still_raises(self):
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._sweeps_schema()
+        echoed = [
+            bigquery.SchemaField("sweep_key", "STRING", mode="REQUIRED")
+            if f.name == "sweep_key" else f
+            for f in self.as_bigquery_echoes_it(declared)
+        ]
+        writer = self.writer_over(echoed)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        with pytest.raises(RuntimeError, match="MIGRATION"):
+            writer._ensure_table(ref, store.SWEEPS_TABLE, declared,
+                                 partition_field="submitted_at", clustering=None)
+
+    def test_a_missing_column_is_still_added_under_legacy_echoes(self):
+        """The additive path has to survive the canonicalisation: a legacy echo
+        must not be mistaken for a missing column either."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._sweeps_schema()
+        echoed = [f for f in self.as_bigquery_echoes_it(declared)
+                  if f.name != "error_cells"]
+        updated = {}
+        writer = self.writer_over(echoed, updated=updated)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        writer._ensure_table(ref, store.SWEEPS_TABLE, declared,
+                             partition_field="submitted_at", clustering=None)
+        assert "error_cells" in updated["names"]
+
+
+class TestTheSchemaTypeNamesAreCovered:
+    """Every type the schemas declare must be one the canonical map knows.
+
+    Not a style rule: an unmapped name compares raw, so the day somebody adds a
+    field whose declared spelling differs from BigQuery's echo, the guard fails
+    at writer init in production — which is exactly what happened. This fails in
+    CI instead.
+    """
+
+    @pytest.mark.parametrize("schema_fn", ["_sweeps_schema", "_runs_schema"])
+    def test_every_declared_type_canonicalises_into_the_value_set(self, schema_fn):
+        pytest.importorskip("google.cloud.bigquery")
+
+        canonical = set(store._CANONICAL_FIELD_TYPES.values())
+        # Types with a single spelling, which the map deliberately does not
+        # carry because there is nothing to translate.
+        single_spelling = {"STRING", "TIMESTAMP", "DATE", "TIME", "DATETIME",
+                           "BYTES", "NUMERIC", "BIGNUMERIC", "JSON"}
+        allowed = canonical | single_spelling
+
+        for field in getattr(store, schema_fn)():
+            resolved = store._canonical_type(field.field_type)
+            assert resolved in allowed, (
+                f"{field.name} declares {field.field_type!r}, which canonicalises "
+                f"to {resolved!r} — not a name this build knows. Add it to "
+                f"_CANONICAL_FIELD_TYPES (with its legacy spelling) or to "
+                f"`single_spelling` here if BigQuery has only one name for it."
+            )
+
+    @pytest.mark.parametrize("schema_fn", ["_sweeps_schema", "_runs_schema"])
+    def test_no_declared_type_is_a_legacy_name_the_map_misses(self, schema_fn):
+        """Both spellings of every declared type must round-trip to the same
+        canonical name — the property the comparison relies on."""
+        pytest.importorskip("google.cloud.bigquery")
+
+        legacy_of = {v: k for k, v in store._CANONICAL_FIELD_TYPES.items()}
+        for field in getattr(store, schema_fn)():
+            resolved = store._canonical_type(field.field_type)
+            if resolved in legacy_of:
+                assert store._canonical_type(legacy_of[resolved]) == resolved
+
+
 class TestTheSchemaGuards:
     def test_only_identity_columns_are_required(self):
         """Everything else must be NULLABLE.
