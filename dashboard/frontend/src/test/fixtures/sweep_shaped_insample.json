@@ -1,0 +1,258 @@
+{
+  "run": {
+    "run_id": "0f1e2d3c4b5a6978",
+    "sweep_key": "deadbeefdeadbeef",
+    "status": "done",
+    "deduplicated_to": null,
+    "submitted_at": "2026-08-29T13:00:00+00:00",
+    "started_at": "2026-08-29T13:04:00+00:00",
+    "finished_at": "2026-08-29T13:12:00+00:00",
+    "submitted_via": "dashboard",
+    "execution_name": "backtest-sweep-abcde",
+    "git_commit": "f9ffd22",
+    "engine_version": "fc-069-scanner-rewire",
+    "base_config_hash": "a1b2c3d4e5f60718",
+    "base_config_json": null,
+    "spec_json": "{\"symbols\": [\"AAPL\", \"NVDA\"], \"start\": \"2026-03-01\", \"end\": \"2026-05-29\", \"scenarios\": [{\"name\": \"puts_15_25\", \"overrides\": {\"strategy.put_delta_range\": [0.15, 0.25]}}, {\"name\": \"call_floor_0_50\", \"overrides\": {\"strategy.min_call_premium\": 0.5}, \"fill_haircut\": 1.0}], \"starting_cash\": 100000.0, \"run_sensitivity\": false}",
+    "symbols": [
+      "AAPL",
+      "NVDA"
+    ],
+    "window_start": "2026-03-01",
+    "window_end": "2026-05-29",
+    "holdout_start": null,
+    "in_sample_only": true,
+    "scenario_count": 2,
+    "cell_count": 6,
+    "wall_seconds": 98.4,
+    "materialise_seconds": 60.1,
+    "replay_seconds": 11.5,
+    "provider_fetches": 4,
+    "bar_cache_hits": 812,
+    "lake_summary_json": null,
+    "error": null
+  },
+  "spec": {
+    "symbols": [
+      "AAPL",
+      "NVDA"
+    ],
+    "start": "2026-03-01",
+    "end": "2026-05-29",
+    "scenarios": [
+      {
+        "name": "puts_15_25",
+        "overrides": {
+          "strategy.put_delta_range": [
+            0.15,
+            0.25
+          ]
+        }
+      },
+      {
+        "name": "call_floor_0_50",
+        "overrides": {
+          "strategy.min_call_premium": 0.5
+        },
+        "fill_haircut": 1.0
+      }
+    ],
+    "starting_cash": 100000.0,
+    "run_sensitivity": false
+  },
+  "scenarios": [
+    "base",
+    "puts_15_25",
+    "call_floor_0_50"
+  ],
+  "symbols": [
+    "AAPL",
+    "NVDA"
+  ],
+  "splits": [
+    "all"
+  ],
+  "grid": {
+    "all": {
+      "base": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "fit",
+          "demote": false,
+          "annualized_return": 0.184,
+          "total_return": null,
+          "days_in_position_fraction": 0.71,
+          "cycles_completed": 2,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        },
+        "NVDA": {
+          "state": "measured",
+          "verdict": "marginal",
+          "demote": false,
+          "annualized_return": 0.061,
+          "total_return": null,
+          "days_in_position_fraction": 0.55,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      },
+      "puts_15_25": {
+        "AAPL": {
+          "state": "measured",
+          "verdict": "fit",
+          "demote": false,
+          "annualized_return": 0.241,
+          "total_return": null,
+          "days_in_position_fraction": 0.78,
+          "cycles_completed": 3,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        },
+        "NVDA": {
+          "state": "low_activity",
+          "verdict": "marginal",
+          "demote": false,
+          "annualized_return": 0.402,
+          "total_return": null,
+          "days_in_position_fraction": 0.09,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      },
+      "call_floor_0_50": {
+        "AAPL": {
+          "state": "error",
+          "verdict": null,
+          "demote": null,
+          "annualized_return": null,
+          "total_return": null,
+          "days_in_position_fraction": null,
+          "cycles_completed": null,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": "UnadjustedCorporateAction: AAPL 4:1 split inside window"
+        },
+        "NVDA": {
+          "state": "measured",
+          "verdict": "unfit",
+          "demote": true,
+          "annualized_return": -0.052,
+          "total_return": null,
+          "days_in_position_fraction": 0.51,
+          "cycles_completed": 1,
+          "puts_sold": null,
+          "calls_sold": null,
+          "bid_fill_return": null,
+          "verdict_flips_on_fill": null,
+          "error": null
+        }
+      }
+    }
+  },
+  "summary": [
+    {
+      "scenario": "base",
+      "split": "all",
+      "median": 0.1225,
+      "min": 0.061,
+      "max": 0.184,
+      "measured": 2,
+      "insufficient": 0,
+      "low_activity": 0,
+      "errors": 0,
+      "demote_flags": 0,
+      "delta_vs_base": null,
+      "delta_symbols": 0
+    },
+    {
+      "scenario": "puts_15_25",
+      "split": "all",
+      "median": 0.241,
+      "min": 0.241,
+      "max": 0.241,
+      "measured": 1,
+      "insufficient": 0,
+      "low_activity": 1,
+      "errors": 0,
+      "demote_flags": 0,
+      "delta_vs_base": 0.056999999999999995,
+      "delta_symbols": 1
+    },
+    {
+      "scenario": "call_floor_0_50",
+      "split": "all",
+      "median": -0.052,
+      "min": -0.052,
+      "max": -0.052,
+      "measured": 1,
+      "insufficient": 0,
+      "low_activity": 0,
+      "errors": 1,
+      "demote_flags": 1,
+      "delta_vs_base": -0.11299999999999999,
+      "delta_symbols": 1
+    }
+  ],
+  "delta_vs_base": {
+    "all": {
+      "base": {
+        "median": 0.0,
+        "symbols": 2
+      },
+      "puts_15_25": {
+        "median": 0.056999999999999995,
+        "symbols": 1
+      },
+      "call_floor_0_50": {
+        "median": -0.11299999999999999,
+        "symbols": 1
+      }
+    }
+  },
+  "sign_agreement": null,
+  "in_sample_only": true,
+  "min_days_in_position": 0.25,
+  "known_biases": [
+    {
+      "title": "Every arm is measured by the same biased engine, so DIFFERENCES survive better than LEVELS",
+      "detail": "Premium is understated on both legs \u2014 puts by ~7% against 204 real decisions, calls far worse (see the call caveat above). Spreads come from a parametric model measured ~2.5x wider than the real book (FC-051). Greeks are Black-Scholes inversions, not published values. None of that cancels perfectly between arms, but it cancels far better than it does in absolute terms: read the ORDER of these rows, and do not quote any single cell as a forecast of what the strategy would have earned."
+    },
+    {
+      "title": "One decision per day, and the replay gets the price it saw",
+      "detail": "Production scans and executes ~15 minutes apart; the replay does both on one snapshot, and holds every contract to expiry or assignment. Early profit-taking closed 52% of real call positions before expiry and is unmodelled. Arms that would have changed monitor-cycle churn cannot be distinguished here at all \u2014 which is why the monitor knobs are refused as overrides rather than swept."
+    },
+    {
+      "title": "Dividends come from a static table; ex-dividend early assignment has never fired on real data",
+      "detail": "Both legs collect from the same committed table, so the two stay on one footing, but a window running past the table's coverage credits nothing after that point on either. The early-assignment path needs a dividend payer holding an ITM short call, and this universe's payers are exactly the symbols that cannot clear the premium floor to open a position \u2014 so it is validated by unit tests only."
+    },
+    {
+      "title": "One vol regime",
+      "detail": "Alpaca's option history starts 2024-02-01, so every window here sits inside a single regime. A shifted start date can flip a marginal verdict, and it can reorder two arms that are close. This is the reason the in-sample banner exists."
+    },
+    {
+      "title": "Splits are refused, not modelled; taxes are not modelled",
+      "detail": "A window spanning a split is refused outright (`UnadjustedCorporateAction`) and shows as an errored cell. Wheel income is short-term gains and buy-and-hold defers to long-term; published estimates put that drag at ~1-2%/yr, which nothing here deducts."
+    }
+  ],
+  "cross_scenario_caveat": "**Comparisons between scenarios that differ in call-leg activity are biased against the call-heavier one until FC-056 is fixed.** The engine prices identical call contracts at **last measured 0.676** of the live fill (a ~32% shortfall, ~5x the put leg's ~7% error) \u2014 **FC-056; that figure is stale, pending the FC-068/078 re-baseline**, so treat it as an order of magnitude rather than a coefficient. An arm that writes more calls is marked down for doing so. Rank arms that hold call activity roughly constant; treat a ranking across arms with very different `calls_sold` as unproven.",
+  "rejection_tally_caveat": "**This report deliberately carries no `binding_constraint` column.** Only the FIRST replay in a process gets a working `RejectionTally`: `setup_logging` sets `cache_logger_on_first_use=True`, a structlog lazy proxy caches its whole processor chain on first use, and `structlog.configure()` \u2014 which is how the tally installs itself \u2014 does not invalidate that cache, so every strategy logger keeps delivering to replay #1's tally for the life of the process. Replays 2..N would report an empty `blocked_days_by_reason`, i.e. \"the strategy was never blocked\". That is a pre-existing defect (it also empties 13 of every 14 rows the monthly screen writes to `backtest_runs`), and reporting a column that is NULL by artifact would launder it. Every other number here comes from the broker ledger and the equity curve and is unaffected.",
+  "in_sample_banner": "> ## IN-SAMPLE ONLY \u2014 this ranking has not been validated\n>\n> Every arm below was measured on the same window it would be chosen from, over a **single volatility regime** (Alpaca's option history begins 2024-02-01). With 10 arms x 6 symbols there are 60 numbers here, and the best-looking arm is more often the luckiest one than the best one.\n>\n> **Re-run with `--holdout-start` and act on the sign-agreement column, not on this table.** A ranking that does not survive out of sample has been refuted, not merely unconfirmed.",
+  "holdout_semantics": null
+}

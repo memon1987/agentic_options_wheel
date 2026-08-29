@@ -10,6 +10,9 @@ const navItems = [
   { path: '/overview', label: 'Overview' },
   { path: '/symbol', label: 'By Symbol' },
   { path: '/bot-health', label: 'Bot Health' },
+  // FC-060 Layer 4. Last in the list on purpose: every page above it shows what
+  // the bot DID; this one shows what a config variant WOULD have done.
+  { path: '/sims', label: 'Sims' },
 ];
 
 export default function LayoutV2() {
