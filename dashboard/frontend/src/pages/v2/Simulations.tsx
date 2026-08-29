@@ -67,6 +67,7 @@ export default function Simulations() {
           setSelectedRunId(runId);
           refetchList();
         }}
+        onSelectRun={setSelectedRunId}
       />
 
       <RunsList

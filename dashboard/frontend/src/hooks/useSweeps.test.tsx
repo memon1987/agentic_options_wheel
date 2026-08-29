@@ -105,7 +105,7 @@ describe('submitSweep — one request, never a retry', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(outcome).toEqual({
       kind: 'accepted',
-      body: { run_id: 'abc', status: 'submitted', deduplicated_to: null },
+      body: { run_id: 'abc', status: 'submitted', deduplicated_to: null, prior_done_run_id: null },
     });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/v2/sweeps');
@@ -158,13 +158,34 @@ describe('submitSweep — one request, never a retry', () => {
     expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'conflict', detail });
   });
 
-  it('reports a dedup hit as accepted with the run it points at', async () => {
+  it('accepts a 202 and carries the prior_done_run_id hint through', async () => {
+    // The submit endpoint answers 202, never decides dedup itself
+    // (`deduplicated_to` is always null), and offers the earlier completed run
+    // only as a hint — the launch happened regardless.
     fetchMock.mockResolvedValue(
-      jsonResponse(200, { run_id: 'new', status: 'deduplicated', deduplicated_to: 'old' }),
+      jsonResponse(202, {
+        run_id: 'new',
+        status: 'submitted',
+        deduplicated_to: null,
+        prior_done_run_id: 'old',
+      }),
     );
+    expect(await submitSweep(SPEC, 'tok')).toEqual({
+      kind: 'accepted',
+      body: {
+        run_id: 'new',
+        status: 'submitted',
+        deduplicated_to: null,
+        prior_done_run_id: 'old',
+      },
+    });
+  });
+
+  it('defaults prior_done_run_id to null when the 202 omits it', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(202, { run_id: 'new', status: 'submitted' }));
     expect(await submitSweep(SPEC, 'tok')).toMatchObject({
       kind: 'accepted',
-      body: { deduplicated_to: 'old' },
+      body: { run_id: 'new', deduplicated_to: null, prior_done_run_id: null },
     });
   });
 

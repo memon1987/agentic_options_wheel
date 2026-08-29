@@ -161,6 +161,7 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
         run_id: b.run_id,
         status: (b.status ?? 'submitted') as SweepSubmitAccepted['status'],
         deduplicated_to: b.deduplicated_to ?? null,
+        prior_done_run_id: b.prior_done_run_id ?? null,
       },
     };
   }

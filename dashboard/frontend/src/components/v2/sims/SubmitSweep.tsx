@@ -39,6 +39,8 @@ interface Props {
   onTokenChange: (token: string) => void;
   /** Called with the accepted run_id so the page can select it immediately. */
   onSubmitted: (runId: string) => void;
+  /** Open another run (the `prior_done_run_id` hint) without submitting. */
+  onSelectRun: (runId: string) => void;
 }
 
 const issuesFor = (issues: SpecIssue[], field: SpecIssue['field']) =>
@@ -62,6 +64,7 @@ export default function SubmitSweep({
   token,
   onTokenChange,
   onSubmitted,
+  onSelectRun,
 }: Props) {
   const end0 = useMemo(() => defaultWindowEnd(), []);
 
@@ -171,7 +174,7 @@ export default function SubmitSweep({
     setSubmitting(false);
     setOutcome(result);
     if (result.kind === 'accepted') {
-      onSubmitted(result.body.deduplicated_to || result.body.run_id);
+      onSubmitted(result.body.run_id);
     }
   };
 
@@ -455,29 +458,47 @@ export default function SubmitSweep({
       </div>
 
       {/* --- the server's answer, verbatim --- */}
-      {outcome && <Outcome outcome={outcome} />}
+      {outcome && <Outcome outcome={outcome} onSelectRun={onSelectRun} />}
     </form>
   );
 }
 
-function Outcome({ outcome }: { outcome: SubmitOutcome }) {
+function Outcome({
+  outcome,
+  onSelectRun,
+}: {
+  outcome: SubmitOutcome;
+  onSelectRun: (runId: string) => void;
+}) {
   if (outcome.kind === 'accepted') {
-    const dedup = outcome.body.deduplicated_to;
+    const prior = outcome.body.prior_done_run_id;
     return (
       <div
         data-testid="submit-outcome"
-        className="rounded border border-green-800/70 bg-green-950/40 p-3 text-sm text-green-300"
+        className="rounded border border-green-800/70 bg-green-950/40 p-3 text-sm text-green-300 space-y-1"
       >
-        {dedup ? (
-          <>
-            An identical spec on this commit had already run — nothing was replayed. Showing{' '}
-            <span className="font-mono">{dedup}</span>.
-          </>
-        ) : (
-          <>
-            Submitted as <span className="font-mono">{outcome.body.run_id}</span>. Container start is
-            3-4 minutes before the first <span className="font-mono">running</span> row appears.
-          </>
+        <p>
+          Submitted as <span className="font-mono">{outcome.body.run_id}</span>. Container start is
+          3-4 minutes before the first <span className="font-mono">running</span> row appears.
+        </p>
+        {/* A HINT, not a verdict, and deliberately uncoloured: the launch DID
+            happen, and only the Job — which alone can see its effective config —
+            decides whether to deduplicate. Nothing auto-redirects; the run just
+            submitted is the one selected. */}
+        {prior && (
+          <p data-testid="prior-done-hint" className="text-gray-400 text-xs">
+            An identical sweep already completed as run{' '}
+            <button
+              type="button"
+              data-testid="prior-done-link"
+              onClick={() => onSelectRun(prior)}
+              className="font-mono underline hover:text-gray-200"
+            >
+              {prior}
+            </button>{' '}
+            (click to open). This submission was launched anyway; the Job may mark it
+            deduplicated.
+          </p>
         )}
       </div>
     );

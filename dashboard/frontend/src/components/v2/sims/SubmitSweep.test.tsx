@@ -29,6 +29,7 @@ let fetchMock: ReturnType<typeof vi.fn>;
 
 const setup = (token = 'a-token') => {
   const onSubmitted = vi.fn();
+  const onSelectRun = vi.fn();
   render(
     <SubmitSweep
       allowlist={ALLOWLIST}
@@ -37,9 +38,10 @@ const setup = (token = 'a-token') => {
       token={token}
       onTokenChange={vi.fn()}
       onSubmitted={onSubmitted}
+      onSelectRun={onSelectRun}
     />,
   );
-  return { onSubmitted };
+  return { onSubmitted, onSelectRun };
 };
 
 const submitButton = () => screen.getByTestId('submit-sweep');
@@ -199,14 +201,46 @@ describe("SubmitSweep — the server's answer is shown verbatim", () => {
     expect(screen.getByTestId('submit-outcome').textContent).toMatch(/abc123/);
   });
 
-  it('selects the ORIGINAL run on a dedup hit — nothing was replayed', async () => {
+  it('offers prior_done_run_id as a HINT and still selects the NEW run', async () => {
+    // 202, `deduplicated_to: null`, `prior_done_run_id` set. The launch happened
+    // — only the Job, which alone sees its effective config, decides dedup — so
+    // nothing may auto-redirect away from the run just submitted.
     fetchMock.mockResolvedValue(
-      response(200, { run_id: 'new1', status: 'deduplicated', deduplicated_to: 'old1' }),
+      response(202, {
+        run_id: 'new1',
+        status: 'submitted',
+        deduplicated_to: null,
+        prior_done_run_id: 'old1',
+      }),
+    );
+    const { onSubmitted, onSelectRun } = setup();
+    fill();
+    fireEvent.click(submitButton());
+
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('new1'));
+    const hint = screen.getByTestId('prior-done-hint');
+    expect(hint.textContent).toMatch(/An identical sweep already completed as run/);
+    expect(hint.textContent).toMatch(/launched anyway; the Job may mark it deduplicated/);
+    // Neutral: this is information, not a warning and not a success.
+    expect(hint.className).not.toMatch(/text-green|text-yellow|text-red/);
+
+    // Clicking opens the prior run, without disturbing what was selected.
+    expect(onSelectRun).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('prior-done-link'));
+    expect(onSelectRun).toHaveBeenCalledWith('old1');
+    expect(onSubmitted).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders no prior-run notice when the 202 carries none', async () => {
+    fetchMock.mockResolvedValue(
+      response(202, { run_id: 'new2', status: 'submitted', deduplicated_to: null }),
     );
     const { onSubmitted } = setup();
     fill();
     fireEvent.click(submitButton());
-    await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('old1'));
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('new2'));
+    expect(screen.queryByTestId('prior-done-hint')).toBeNull();
+    expect(screen.getByTestId('submit-outcome').textContent).toMatch(/Submitted as new2/);
   });
 
   it('shows a 409 with the server detail, which names the run in flight', async () => {

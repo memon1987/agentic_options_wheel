@@ -621,11 +621,27 @@ export interface SweepSpec {
   scenarios: SweepScenarioSpec[];
 }
 
-/** 200 body. `deduplicated_to` means nothing was launched (plan D4). */
+/**
+ * The 202 body from a successful submit.
+ *
+ * `deduplicated_to` is ALWAYS null here: the API no longer decides dedup. It
+ * cannot see the Job's effective configuration, so a spec whose `sweep_key`
+ * matched an earlier run could dedup to a run made under different env-shadowed
+ * settings. The Job decides, against the config it is actually holding, and
+ * writes the `deduplicated` row itself — which the poll then shows.
+ */
 export interface SweepSubmitAccepted {
   run_id: string;
   status: SweepStatus;
+  /** Always null from submit; the Job's own row carries it if it dedups. */
   deduplicated_to?: string | null;
+  /**
+   * HINT ONLY: an earlier run that already completed under this `sweep_key`.
+   *
+   * The launch STILL HAPPENS. This says "you may already have this answer",
+   * never "nothing was run".
+   */
+  prior_done_run_id?: string | null;
 }
 
 /** The bot's sanitized `/config`, proxied by `/api/live/config`. */
