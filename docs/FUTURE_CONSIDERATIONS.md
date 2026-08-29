@@ -1002,6 +1002,24 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-092: `RejectionTally` only counts the first replay per process — 13 of 14 monthly `backtest_runs` rows carry an empty tally; and its summary is order-nondeterministic
+
+**Scope:** shared (backtest engine)
+**Status:** Filed 2026-08-28 (FC-060 Layer 2 build, PR #100)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem (two defects, both pre-existing on `main`):**
+1. `setup_logging` configures structlog with `cache_logger_on_first_use=True`; a lazy logger proxy caches its processor chain on first use and `RejectionTally.__enter__`'s `structlog.configure()` does not invalidate it. Measured: two `evaluate_symbol` calls in one process → the first returns a populated `blocked_days_by_reason`, the second `{}`. **The monthly screen evaluates 14 symbols in one process, so 13 of every 14 `backtest_runs` rows already have an empty tally, `candidate_days=0` and a NULL `binding_constraint`** — the "binding constraint" column FC-057 made nameable has been mostly NULL since the screen went live. The Layer 2 sweep deliberately ships no `binding_constraint` column on its rows rather than one that is NULL by artifact.
+2. `RejectionTally.summary()` iterates a `set` into a `Counter`, so `most_common()` tie-breaks depend on the hash seed — `binding_constraint` (and the NVDA replay's markdown) can flip between runs. Layer 2's identity proof had to pin `PYTHONHASHSEED=0` because `main` alone alternates between two NVDA hashes.
+
+**Fix direction:** stop relying on process-global `structlog.configure()` inside the tally — bind the tally processor through a thread-local/contextvar the configured chain always consults (or disable `cache_logger_on_first_use` for the backtest path and re-bind per replay); make `summary()` deterministic (sorted iteration, explicit tie-break). Then backfill nothing — re-run the screen; note in `docs/bigquery/backtest_runs.md` that `binding_constraint` before the fix is NULL by artifact for all but the first symbol of each run.
+
+**Links:** PR #100 (discovery), FC-057 (the tally's purpose), `src/backtesting/engine/rejections.py`, `src/utils/logger.py`, `src/backtesting/screen.py`.
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
