@@ -3,7 +3,7 @@
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-060 (Layer 2 of four; Layer 1 = `docs/plans/fc-060-chain-lake.md`, shipped 2026-08-28)
 **Plan file:** `docs/plans/fc-060-scenario-runner.md`
 **Scope:** shared (backtest engine only — no live trading path is touched)
-**Status:** Published — build-ready
+**Status:** Executing — PR #100 (`5ee2cd5`); two adversarial reviews in flight. **Corrections found in the build (2026-08-28):** D3's allowlist wrongly included `strategy.{put,call}_limit_spread_fraction` and `min_open_interest` — the replay does not honour them (limit prices are recorded then discarded by the fill model; `open_interest` is hardcoded 0 in the adapter) → moved to REJECTED so a sweep cannot claim to test them; `excluded_symbols`/`max_spread_pct`/`min_open_interest` live under `universe.*` (a section `settings.yaml` does not carry — the allowlist, not `_config`'s shape, decides legality); `call_target_dte` is allowed downward and refused above the chain reach; `Materialised` is multi-symbol; `evaluate_symbol` uses a fresh `Simulator` per haircut over one shared `Materialised` because `HistoricalEarningsCalendar` accumulates state. Acceptance: **10 scenarios × 6 symbols × 1 year = 17.1 s wall (30.5 s with sensitivity), 0 provider calls during replays; same 60 cells as independent runs on main = 190 s.** Pre-existing defects surfaced → FC-092.
 **Size:** M (a materialise/replay split, a bars cache, a hot-path rewrite, a runner + CLI, a report); backtest-only → two adversarial reviews (it produces numbers the operator will act on)
 **Author:** Fable (plan), for Opus (build)
 **Last updated:** 2026-08-28
