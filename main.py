@@ -1,6 +1,7 @@
 """Main entry point for Options Wheel Strategy."""
 
 import argparse
+import os
 import sys
 from datetime import datetime
 import json
@@ -46,6 +47,18 @@ def main():
                         help='sweep: comma-separated universe (default: config stocks.symbols)')
     parser.add_argument('--holdout-start',
                         help='sweep: split the window here into fit/holdout, YYYY-MM-DD')
+    # FC-060 Layer 3 — the Cloud Run Job's entry point. The spec arrives as a
+    # per-execution env override rather than a file because the dashboard has no
+    # writable shared filesystem with the Job and the override is atomic with
+    # the execution (D2). The file path stays for the CLI, unchanged.
+    parser.add_argument('--spec-env',
+                        help='sweep: read the JSON spec from this environment '
+                             'variable instead of --scenarios (Job mode; implies '
+                             '--persist)')
+    parser.add_argument('--persist', action='store_true',
+                        help='sweep: write results to '
+                             'options_wheel.scenario_sweeps / scenario_runs '
+                             '(NEVER backtest_runs)')
 
     args = parser.parse_args()
     
@@ -409,8 +422,6 @@ def load_scenarios(path: str):
     """
     import yaml
 
-    from src.backtesting.scenarios import Scenario
-
     with open(path) as fh:
         payload = yaml.safe_load(fh) or {}
     raw = payload.get('scenarios')
@@ -419,67 +430,220 @@ def load_scenarios(path: str):
             f"{path}: expected a top-level 'scenarios:' list "
             f"(got keys: {sorted(payload) or 'an empty file'})"
         )
+    return _scenarios_from_entries(raw, path)
+
+
+def _scenarios_from_entries(raw, where: str):
+    """Validate a list of scenario mappings into ``Scenario`` objects.
+
+    ``where`` names the source in every message — a YAML path for the CLI, the
+    literal ``'sweep spec'`` for the Job. Shared between the two entry shapes on
+    purpose (FC-060 Layer 3): the API and the file must be held to one standard,
+    or the dashboard eventually accepts an arm the Job then refuses three minutes
+    into a container start.
+    """
+    from src.backtesting.scenarios import Scenario
+
     if not isinstance(raw, list):
-        raise SystemExit(f"{path}: 'scenarios' must be a list, got {type(raw).__name__}")
+        raise SystemExit(f"{where}: 'scenarios' must be a list, got {type(raw).__name__}")
 
     scenarios = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise SystemExit(f"{path}: scenario #{i + 1} must be a mapping")
+            raise SystemExit(f"{where}: scenario #{i + 1} must be a mapping")
         name = entry.get('name')
         if not name:
-            raise SystemExit(f"{path}: scenario #{i + 1} has no 'name'")
+            raise SystemExit(f"{where}: scenario #{i + 1} has no 'name'")
         overrides = entry.get('overrides') or {}
         if not isinstance(overrides, dict):
             raise SystemExit(
-                f"{path}: scenario '{name}' has a non-mapping 'overrides'"
+                f"{where}: scenario '{name}' has a non-mapping 'overrides'"
             )
         haircut = entry.get('fill_haircut')
         if haircut is not None:
-            haircut = float(haircut)
+            try:
+                haircut = float(haircut)
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    f"{where}: scenario '{name}' fill_haircut={haircut!r} is not "
+                    "a number"
+                )
             if not 0.0 <= haircut <= 1.0:
                 raise SystemExit(
-                    f"{path}: scenario '{name}' fill_haircut={haircut} is outside "
+                    f"{where}: scenario '{name}' fill_haircut={haircut} is outside "
                     "[0, 1] (0 = mid, 1 = at the bid)"
                 )
         unknown = set(entry) - {'name', 'overrides', 'fill_haircut'}
         if unknown:
             raise SystemExit(
-                f"{path}: scenario '{name}' has unknown field(s) "
+                f"{where}: scenario '{name}' has unknown field(s) "
                 f"{sorted(unknown)}. A misspelled field would silently do nothing."
             )
         scenarios.append(Scenario(str(name), dict(overrides), haircut))
     return scenarios
 
 
+# The sweep spec's top-level fields (FC-060 D2). A misspelled field must fail
+# loudly rather than be silently dropped: a spec whose `holdout_start` was typed
+# `holdout` would run IN-SAMPLE ONLY and report itself as validated.
+SPEC_FIELDS = frozenset({
+    'symbols', 'start', 'end', 'holdout_start', 'starting_cash',
+    'run_sensitivity', 'scenarios',
+})
+
+# Cloud Run caps a container's whole environment at 32 KiB and the spec is one
+# variable among several, so it gets a conservative slice of that. The dashboard
+# enforces the same ceiling before it launches; this is the Job-side backstop for
+# a spec that arrived some other way.
+MAX_SPEC_BYTES = 24 * 1024
+
+
+def load_spec_from_env(var: str) -> dict:
+    """Parse the JSON sweep spec out of environment variable ``var`` (D2).
+
+    Job mode. The spec travels as a per-execution ``containerOverrides`` env
+    entry rather than as a file because the dashboard shares no writable
+    filesystem with the Job, and because the override is atomic with the
+    execution — there is no window in which a launched execution has no spec, or
+    somebody else's.
+    """
+    raw = os.environ.get(var)
+    if not raw or not raw.strip():
+        raise SystemExit(
+            f"--spec-env {var}: the environment variable is unset or empty. In "
+            f"Job mode the spec arrives as a per-execution override; an "
+            f"execution launched without one has nothing to replay."
+        )
+    if len(raw.encode('utf-8')) > MAX_SPEC_BYTES:
+        raise SystemExit(
+            f"--spec-env {var}: spec is {len(raw.encode('utf-8'))} bytes, over "
+            f"the {MAX_SPEC_BYTES}-byte limit."
+        )
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--spec-env {var}: not valid JSON ({exc})")
+    if not isinstance(spec, dict):
+        raise SystemExit(
+            f"--spec-env {var}: expected a JSON object, got {type(spec).__name__}"
+        )
+    unknown = set(spec) - SPEC_FIELDS
+    if unknown:
+        raise SystemExit(
+            f"--spec-env {var}: unknown field(s) {sorted(unknown)}. "
+            f"Known fields: {sorted(SPEC_FIELDS)}."
+        )
+    return spec
+
+
+def scenarios_from_spec(spec: dict):
+    """``Scenario`` objects from the JSON spec's ``scenarios`` list.
+
+    Deliberately routed through the same validator as the YAML path
+    (``_scenarios_from_entries``) so a spec the dashboard accepted and a file an
+    operator wrote are held to one standard. The alternative — two parsers — is
+    how an API ends up accepting an arm the Job then refuses, three minutes into
+    a container start.
+    """
+    raw = spec.get('scenarios')
+    if raw is None:
+        raise SystemExit("sweep spec: expected a 'scenarios' list")
+    return _scenarios_from_entries(raw, 'sweep spec')
+
+
+def _spec_date(spec: dict, field: str):
+    """One ISO date out of the spec, or None. Raises SystemExit on a bad one."""
+    from datetime import datetime as _dt
+
+    value = spec.get(field)
+    if value in (None, ''):
+        return None
+    try:
+        return _dt.strptime(str(value), '%Y-%m-%d').date()
+    except ValueError:
+        raise SystemExit(
+            f"sweep spec: '{field}' must be YYYY-MM-DD, got {value!r}"
+        )
+
+
 def run_sweep_cmd(args, config: Config, logger) -> int:
-    """Replay many scenarios over many symbols (FC-060 Layer 2). Returns an exit code."""
-    from datetime import date, datetime, timedelta
+    """Replay many scenarios over many symbols (FC-060 Layers 2/3).
 
+    Two entry shapes, one code path:
+
+    * ``--scenarios <yaml>`` — the operator CLI. Unchanged by Layer 3: it does
+      not persist unless ``--persist`` is passed, so the byte-identical-report
+      contract holds.
+    * ``--spec-env <VAR>`` — the ``backtest-sweep`` Cloud Run Job. The spec and
+      the run id arrive as per-execution env overrides, and persistence is
+      implied: an execution whose results nobody can read is an execution nobody
+      should have launched.
+
+    Returns an exit code.
+    """
+    import uuid
+    from datetime import date, datetime, timedelta, timezone
+
+    from src.backtesting.data.chain_store import ChainStore
+    from src.backtesting.reporting.bq_writer import config_hash
     from src.backtesting.scenarios import run_sweep
+    from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
     from src.backtesting.scenarios.report import render_json, render_markdown
-    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+    from src.backtesting.screen import (
+        DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION, accumulate_lake_summary,
+    )
 
-    if not args.scenarios:
-        raise SystemExit("sweep requires --scenarios <yaml>")
+    spec_env = getattr(args, 'spec_env', None)
+    if spec_env and args.scenarios:
+        raise SystemExit(
+            "sweep: pass either --scenarios <yaml> or --spec-env <VAR>, not "
+            "both — two sources of truth for one run is one too many."
+        )
 
-    scenarios = load_scenarios(args.scenarios)
-    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
-    start = (datetime.strptime(args.start, '%Y-%m-%d').date() if args.start
-             else end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    if spec_env:
+        spec = load_spec_from_env(spec_env)
+        scenarios = scenarios_from_spec(spec)
+        end = _spec_date(spec, 'end') or date.today()
+        start = (_spec_date(spec, 'start')
+                 or end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+        holdout_start = _spec_date(spec, 'holdout_start')
+        symbols = [str(x).strip().upper() for x in (spec.get('symbols') or [])
+                   if str(x).strip()]
+        starting_cash = float(spec.get('starting_cash') or args.starting_cash)
+        run_sensitivity = bool(spec.get('run_sensitivity', False))
+    else:
+        if not args.scenarios:
+            raise SystemExit("sweep requires --scenarios <yaml> or --spec-env <VAR>")
+        scenarios = load_scenarios(args.scenarios)
+        end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
+        start = (datetime.strptime(args.start, '%Y-%m-%d').date() if args.start
+                 else end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+        holdout_start = (datetime.strptime(args.holdout_start, '%Y-%m-%d').date()
+                         if args.holdout_start else None)
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
+        elif args.symbol:
+            symbols = [args.symbol.upper()]
+        else:
+            symbols = list(config.stock_symbols)
+        starting_cash = args.starting_cash
+        run_sensitivity = not args.no_sensitivity
+
     if end <= start:
         raise SystemExit(f"--end ({end}) must be after --start ({start})")
-    holdout_start = (datetime.strptime(args.holdout_start, '%Y-%m-%d').date()
-                     if args.holdout_start else None)
-
-    if args.symbols:
-        symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
-    elif args.symbol:
-        symbols = [args.symbol.upper()]
-    else:
-        symbols = list(config.stock_symbols)
     if not symbols:
         raise SystemExit("sweep has no symbols: pass --symbols or configure stocks.symbols")
+
+    # Validate every override BEFORE anything is written or launched.
+    # `run_sweep` validates too, but by then a `running` row exists and the
+    # operator has a failed sweep in the store for what is a typo. This costs
+    # microseconds and turns that into an immediate, explained refusal.
+    from src.backtesting.scenarios.overrides import validate_overrides
+
+    chain_reach = int(getattr(config, 'put_target_dte', 7))
+    for scenario in scenarios:
+        validate_overrides(scenario.overrides, chain_reach_dte=chain_reach)
 
     # `base` is implicit UNLESS the file already declares it, so the banner must
     # not blindly add one — a file with an explicit `base` would be announced as
@@ -500,12 +664,121 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         print("  NOTE: no --holdout-start, so this ranking will be IN-SAMPLE "
               "ONLY and unvalidated.\n")
 
-    result = run_sweep(
-        config, scenarios, symbols, start, end,
-        holdout_start=holdout_start,
-        starting_cash=args.starting_cash,
-        run_sensitivity=not args.no_sensitivity,
+    # ---------------------------------------------------------------- store --
+    # ONE canonical spec payload whichever entry shape was used, so a sweep run
+    # from a YAML file and the same sweep submitted from the dashboard produce
+    # the SAME `sweep_key` and dedup against each other. Building it from the
+    # RESOLVED values rather than from the raw input is what makes that true:
+    # defaults are already filled in on both paths.
+    spec_payload = {
+        'symbols': symbols,
+        'start': start.isoformat(),
+        'end': end.isoformat(),
+        'holdout_start': holdout_start.isoformat() if holdout_start else None,
+        'starting_cash': starting_cash,
+        'run_sensitivity': run_sensitivity,
+        'scenarios': [
+            {'name': s.name, 'overrides': dict(s.overrides),
+             'fill_haircut': s.fill_haircut}
+            for s in scenarios
+        ],
+    }
+
+    persist = bool(spec_env) or bool(getattr(args, 'persist', False))
+    run_id = os.environ.get('SWEEP_RUN_ID') or uuid.uuid4().hex[:16]
+    submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
+                    or datetime.now(timezone.utc).isoformat())
+    git_commit = os.environ.get('GIT_COMMIT') or None
+    key = compute_sweep_key(spec_payload, engine_version=ENGINE_VERSION,
+                            git_commit=git_commit)
+    provenance = dict(
+        run_id=run_id,
+        submitted_at=submitted_at,
+        sweep_key=key,
+        submitted_via=(os.environ.get('SWEEP_SUBMITTED_VIA')
+                       or ('dashboard' if spec_env else 'cli')),
+        engine_version=ENGINE_VERSION,
+        git_commit=git_commit,
+        # Cloud Run stamps this on every Job task. Stored for operator debugging
+        # only: D3 makes status BigQuery-based precisely because
+        # `run.executions.get` is unproven for the dashboard's service account.
+        execution_name=os.environ.get('CLOUD_RUN_EXECUTION'),
+        spec=spec_payload,
+        base_config=sweep_store.base_config_snapshot(config),
+        base_config_hash=config_hash(config),
     )
+
+    writer = None
+    if persist:
+        # Profile-derived, never hardcoded (the FC-075 DD-4 lesson): a
+        # covered-call profile running a sweep writes to its own dataset rather
+        # than into the wheel's store.
+        writer = sweep_store.ScenarioRunWriter(dataset_id=config.bigquery_dataset)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    if writer is not None:
+        # `running` FIRST, before the dedup query (D3). A `submitted` row with no
+        # `running` row after 10 minutes is the dashboard's "stuck — check the
+        # execution" signal, and a dedup lookup that hung would otherwise sit
+        # inside exactly that window and read as a dead container.
+        writer.write_status(sweep_store.status_row(
+            status=sweep_store.STATUS_RUNNING, started_at=started_at, **provenance))
+
+        prior = writer.find_done_sweep(key)
+        if prior is not None and prior.get('run_id') != run_id:
+            writer.write_status(sweep_store.status_row(
+                status=sweep_store.STATUS_DEDUPLICATED,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                deduplicated_to=prior['run_id'], **provenance))
+            print(f"\nDEDUPLICATED: sweep_key {key} already completed as run "
+                  f"{prior['run_id']}. Nothing was replayed; read that run's "
+                  f"rows instead.")
+            logger.info("Sweep deduplicated against a completed run",
+                        event_category="backtest", event_type="sweep_deduplicated",
+                        run_id=run_id, sweep_key=key,
+                        deduplicated_to=prior['run_id'])
+            return 0
+
+    # ONE chain store for the run, so its lake counters can be reported on the
+    # sweep row. This is exactly the object `run_sweep` builds for itself when
+    # none is injected (`ChainStore.from_env()`), so passing it changes nothing
+    # about the replay.
+    chain_store = ChainStore.from_env()
+
+    result = None
+    failure = None
+    try:
+        result = run_sweep(
+            config, scenarios, symbols, start, end,
+            holdout_start=holdout_start,
+            starting_cash=starting_cash,
+            run_sensitivity=run_sensitivity,
+            chain_store=chain_store,
+        )
+    except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
+        failure = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if writer is not None:
+            lake_totals: dict = {}
+            accumulate_lake_summary(lake_totals, chain_store.summary())
+            lake_summary = dict(chain_store.summary())
+            lake_summary.update(lake_totals)
+            # Cells BEFORE the terminal status row: a reader that sees `done`
+            # must be able to trust the rows are already there. The reverse order
+            # leaves a window in which a finished sweep has no results.
+            if result is not None:
+                writer.write_runs(sweep_store.rows_from_sweep(
+                    result, run_id=run_id, submitted_at=submitted_at,
+                    engine_version=ENGINE_VERSION, git_commit=git_commit))
+            writer.write_status(sweep_store.status_row(
+                status=(sweep_store.STATUS_DONE if failure is None
+                        else sweep_store.STATUS_FAILED),
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                result=result, error=failure, lake_summary=lake_summary,
+                **provenance))
 
     markdown = render_markdown(result)
     print(markdown)
@@ -517,6 +790,10 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         with open(args.json_out, 'w') as fh:
             fh.write(render_json(result))
         print(f"JSON report -> {args.json_out}")
+    if persist:
+        print(f"\nStored as run_id {run_id} (sweep_key {key}) in "
+              f"{config.bigquery_dataset}.{sweep_store.SWEEPS_TABLE} / "
+              f"{sweep_store.RUNS_TABLE}.")
 
     # Exit non-zero when any cell never produced a verdict. A sweep that
     # half-ran reads as a complete one, and a missing cell is exactly where a

@@ -1,0 +1,110 @@
+"""Verbatim copies of the sweep report's operator-facing prose (FC-060 D11).
+
+**This file is a COPY, and the copy is deliberate.** The dashboard renders the
+same bias footer, in-sample banner and holdout note the CLI report renders, so a
+reader of `/sims` and a reader of `sweep.md` are warned in the same words. The
+originals live in `src/backtesting/scenarios/report.py`, which the dashboard
+image cannot import: `report.py` imports `runner.py`, and `runner.py` imports the
+simulator, the Alpaca provider and pandas — none of which this image has, and
+none of which it should acquire to print a paragraph.
+
+D11 sanctions exactly this ("otherwise re-implement with a shared test fixture
+asserting equality"). The guard is
+`tests/test_dashboard_sweeps.py::TestTheReportProseIsNotAFork`, which compares
+every constant below against its original, byte for byte. That test runs as step
+1 of every Cloud Build, so prose drift fails the build rather than shipping a
+dashboard that quietly disagrees with the CLI about what a number means.
+
+Edit `report.py` FIRST, then copy the new value across here in the same
+commit. The test names the exact constant that diverged.
+"""
+
+BASE_SCENARIO_NAME = 'base'
+
+# The activity floor below which an annualised number rests on idle
+# capital. Copied from `src.backtesting.metrics.fitness`.
+MIN_DAYS_IN_POSITION = 0.25
+
+CROSS_SCENARIO_CAVEAT = ('**Comparisons between scenarios that differ in call-leg activity are '
+ 'biased against the call-heavier one until FC-056 is fixed.** The engine '
+ 'prices identical call contracts at **last measured 0.676** of the live '
+ "fill (a ~32% shortfall, ~5x the put leg's ~7% error) — **FC-056; that "
+ 'figure is stale, pending the FC-068/078 re-baseline**, so treat it as an '
+ 'order of magnitude rather than a coefficient. An arm that writes more '
+ 'calls is marked down for doing so. Rank arms that hold call activity '
+ 'roughly constant; treat a ranking across arms with very different '
+ '`calls_sold` as unproven.')
+
+IN_SAMPLE_BANNER = ('> ## IN-SAMPLE ONLY — this ranking has not been validated\n'
+ '>\n'
+ '> Every arm below was measured on the same window it would be chosen '
+ "from, over a **single volatility regime** (Alpaca's option history "
+ 'begins 2024-02-01). With 10 arms x 6 symbols there are 60 numbers here, '
+ 'and the best-looking arm is more often the luckiest one than the best '
+ 'one.\n'
+ '>\n'
+ '> **Re-run with `--holdout-start` and act on the sign-agreement column, '
+ 'not on this table.** A ranking that does not survive out of sample has '
+ 'been refuted, not merely unconfirmed.')
+
+HOLDOUT_SEMANTICS = ('**How the split is run.** The two windows are independent replays, not '
+ 'one run cut in half: each starts flat with the full `--starting-cash`, '
+ 'carries no position across the boundary, and derives its own strike '
+ 'anchors from its own bars. So a holdout does not inherit the fit '
+ "window's assigned shares — the wheel begins its cycle again — and the "
+ 'fit window ends the day BEFORE `--holdout-start`, so the two never '
+ 'overlap. **A short holdout inflates `insuf`**: a cycle needs a put to be '
+ 'written, held and resolved, so a window of a few weeks can end with '
+ 'nothing completed on symbols that traded perfectly well. Read the '
+ '`insuf` column before reading the medians.')
+
+TALLY_CAVEAT = ('**This report deliberately carries no `binding_constraint` column.** '
+ 'Only the FIRST replay in a process gets a working `RejectionTally`: '
+ '`setup_logging` sets `cache_logger_on_first_use=True`, a structlog lazy '
+ 'proxy caches its whole processor chain on first use, and '
+ '`structlog.configure()` — which is how the tally installs itself — does '
+ 'not invalidate that cache, so every strategy logger keeps delivering to '
+ "replay #1's tally for the life of the process. Replays 2..N would report "
+ 'an empty `blocked_days_by_reason`, i.e. "the strategy was never '
+ 'blocked". That is a pre-existing defect (it also empties 13 of every 14 '
+ 'rows the monthly screen writes to `backtest_runs`), and reporting a '
+ 'column that is NULL by artifact would launder it. Every other number '
+ 'here comes from the broker ledger and the equity curve and is '
+ 'unaffected.')
+
+SWEEP_BIASES = [('Every arm is measured by the same biased engine, so DIFFERENCES survive '
+  'better than LEVELS',
+  'Premium is understated on both legs — puts by ~7% against 204 real '
+  'decisions, calls far worse (see the call caveat above). Spreads come '
+  'from a parametric model measured ~2.5x wider than the real book '
+  '(FC-051). Greeks are Black-Scholes inversions, not published values. '
+  'None of that cancels perfectly between arms, but it cancels far better '
+  'than it does in absolute terms: read the ORDER of these rows, and do '
+  'not quote any single cell as a forecast of what the strategy would have '
+  'earned.'),
+ ('One decision per day, and the replay gets the price it saw',
+  'Production scans and executes ~15 minutes apart; the replay does both '
+  'on one snapshot, and holds every contract to expiry or assignment. '
+  'Early profit-taking closed 52% of real call positions before expiry and '
+  'is unmodelled. Arms that would have changed monitor-cycle churn cannot '
+  'be distinguished here at all — which is why the monitor knobs are '
+  'refused as overrides rather than swept.'),
+ ('Dividends come from a static table; ex-dividend early assignment has '
+  'never fired on real data',
+  'Both legs collect from the same committed table, so the two stay on one '
+  "footing, but a window running past the table's coverage credits nothing "
+  'after that point on either. The early-assignment path needs a dividend '
+  "payer holding an ITM short call, and this universe's payers are exactly "
+  'the symbols that cannot clear the premium floor to open a position — so '
+  'it is validated by unit tests only.'),
+ ('One vol regime',
+  "Alpaca's option history starts 2024-02-01, so every window here sits "
+  'inside a single regime. A shifted start date can flip a marginal '
+  'verdict, and it can reorder two arms that are close. This is the reason '
+  'the in-sample banner exists.'),
+ ('Splits are refused, not modelled; taxes are not modelled',
+  'A window spanning a split is refused outright '
+  '(`UnadjustedCorporateAction`) and shows as an errored cell. Wheel '
+  'income is short-term gains and buy-and-hold defers to long-term; '
+  'published estimates put that drag at ~1-2%/yr, which nothing here '
+  'deducts.')]

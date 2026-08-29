@@ -58,9 +58,18 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from ...utils.config import Config
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # STDLIB-ONLY AT RUNTIME, DELIBERATELY (FC-060 Layer 3, D7). This module is
+    # copied verbatim into the dashboard image so the API refuses exactly what
+    # the Job refuses, with the same reason strings — and the dashboard has
+    # neither PyYAML, nor structlog's config stack, nor a settings file. A
+    # runtime `from ...utils.config import Config` would drag all three in and,
+    # worse, would make the copy un-importable outside its package. `Config` is
+    # used here only as an annotation, and `from __future__ import annotations`
+    # already makes annotations strings, so nothing is lost.
+    from ...utils.config import Config
 
 
 class OverrideError(ValueError):

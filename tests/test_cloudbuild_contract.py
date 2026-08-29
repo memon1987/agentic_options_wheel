@@ -560,6 +560,142 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
     )
 
 
+# --------------------------------------------------------------------------
+# 5b. The scenario-sweep Cloud Run Job (FC-060 Layer 3, D9).
+# --------------------------------------------------------------------------
+SWEEP_JOB_STEP = "deploy-sweep-job"
+SWEEP_JOB_NAME = "backtest-sweep"
+
+
+def test_sweep_job_step_honours_the_superseded_marker_first(by_id):
+    """A superseded build must not push its image onto the sweep Job.
+
+    The step is deliberately NOT gated by `serialize-builds` (it deploys no
+    traffic and no revision, so two builds racing here leaves the newer image on
+    the job either way) — which makes the marker the ONLY thing stopping an
+    obsolete build from repointing the job at code the winning build already
+    replaced. Dropping this line is silent: the step still exits 0.
+    """
+    assert SWEEP_JOB_STEP in by_id, (
+        f"`{SWEEP_JOB_STEP}` is what creates and updates the `{SWEEP_JOB_NAME}` "
+        "Cloud Run Job. Without it the job either does not exist (the dashboard's "
+        "submit returns 404 forever) or sits on whatever image an operator last "
+        "pinned — which is exactly how `backtest-screen` ended up on a Layer-1 "
+        "image with no `sweep` command."
+    )
+    script = script_of(by_id[SWEEP_JOB_STEP])
+    assert script, f"{SWEEP_JOB_STEP} must be a `bash -c` step to carry the marker check"
+    first = next((ln.strip() for ln in script.splitlines() if ln.strip()), "")
+    assert first == MARKER_CHECK, (
+        f"{SWEEP_JOB_STEP} must begin with the marker check:\n  {MARKER_CHECK}\n"
+        f"got:\n  {first}"
+    )
+
+
+def test_sweep_job_step_deploys_this_builds_image_with_the_sweep_command(by_id):
+    """The job runs THIS build's image, in Job mode, on the wheel profile.
+
+    `:$COMMIT_SHA` rather than `:latest` is the load-bearing half. An ad-hoc
+    sweep exists to answer a question about the code as it is now, and its
+    `sweep_key` (D4) hashes `GIT_COMMIT` — a job pinned to a floating tag would
+    stamp one commit on results produced by another.
+    """
+    script = script_of(by_id[SWEEP_JOB_STEP])
+    assert f"gcloud run jobs deploy {SWEEP_JOB_NAME}" in script, (
+        f"{SWEEP_JOB_STEP} must `gcloud run jobs deploy {SWEEP_JOB_NAME}` — "
+        "`deploy` is create-or-update, which is what lets one step both create "
+        "the job and keep it current."
+    )
+    assert "options-wheel-strategy:$COMMIT_SHA" in script, (
+        f"{SWEEP_JOB_STEP} must deploy the strategy image at :$COMMIT_SHA."
+    )
+    assert "--command=python" in script and (
+        "--args=main.py,--command,sweep,--spec-env,SWEEP_SPEC_JSON" in script
+    ), (
+        f"{SWEEP_JOB_STEP} must run `python main.py --command sweep --spec-env "
+        "SWEEP_SPEC_JSON`. The spec arrives as a per-execution env override "
+        "(D2); a job whose args say otherwise ignores the submission entirely."
+    )
+    # `backtest-screen` is SHA-pinned on purpose and must stay untouched.
+    assert "backtest-screen" not in script, (
+        f"{SWEEP_JOB_STEP} must not touch `backtest-screen`: the monthly screen "
+        "is deliberately pinned so it stays reproducible."
+    )
+
+
+def test_sweep_job_step_carries_every_env_var_and_secret_the_sweep_needs(by_id):
+    """`--set-env-vars` REPLACES the whole set, so every var must be listed.
+
+    Each of these is a distinct silent failure if dropped:
+      GIT_COMMIT          -> every sweep keys as commit-less; dedup never hits.
+      CHAIN_LAKE_BUCKET   -> every execution materialises cold (~20 min, not 7).
+      GCP_PROJECT         -> the writer disables itself and the run is invisible.
+      the three secrets   -> `Config()` raises before a single day is replayed.
+    """
+    script = script_of(by_id[SWEEP_JOB_STEP])
+    for expected in ("ALPACA_PAPER_TRADING=true", "GCP_PROJECT=$PROJECT_ID",
+                     "CHAIN_LAKE_BUCKET=options-wheel-chain-lake",
+                     "GIT_COMMIT=$COMMIT_SHA"):
+        assert expected in script, f"{SWEEP_JOB_STEP} must set {expected}"
+    for secret in ("ALPACA_API_KEY=alpaca-api-key:latest",
+                   "ALPACA_SECRET_KEY=alpaca-secret-key:latest",
+                   "FINNHUB_API_KEY=finnhub-api-key:latest"):
+        assert secret in script, f"{SWEEP_JOB_STEP} must bind {secret}"
+    assert "--max-retries=0" in script, (
+        f"{SWEEP_JOB_STEP} must set --max-retries=0. A retried sweep would replay "
+        "under the SAME SWEEP_RUN_ID and write a second full set of "
+        "`scenario_runs` rows for one run_id — the results view would then render "
+        "each cell twice."
+    )
+    assert "--service-account=799970961417-compute@developer.gserviceaccount.com" in script
+
+
+def test_dashboard_service_knows_the_sweep_job_name(by_id):
+    """The API cannot launch a job it cannot name.
+
+    Pinned here rather than left to a code default because the default and the
+    deployed job name drifting apart produces a 404 from `jobs.run` that reads
+    like a permissions problem.
+    """
+    script = script_of(by_id[CHAINS["options-wheel-dashboard"]["deploy"]])
+    assert f"SWEEP_JOB_NAME={SWEEP_JOB_NAME}" in script
+
+
+def test_dashboard_image_ships_the_pure_scenario_modules():
+    """The sweep API must refuse exactly what the sweep Job refuses (D7).
+
+    Two halves, and both are needed:
+
+    1. The dashboard build context is the REPO ROOT — `dashboard/` alone cannot
+       reach `src/`, so a `dir: dashboard` build makes the COPY below impossible.
+    2. `dashboard/Dockerfile` copies the two stdlib-only modules to the FLAT
+       names `services/sweeps.py` falls back to.
+
+    Break either and the image builds a dashboard whose allowlist is whatever
+    `services/sweeps.py`'s fallback import happens to find — which, if someone
+    later adds a same-named module, is worse than an ImportError.
+    """
+    step = next(s for s in load_steps() if s["id"] == "build-dashboard-image")
+    assert "dir" not in step, (
+        "build-dashboard-image must build from the REPO ROOT (no `dir:`), so the "
+        "image can copy src/backtesting/scenarios/*.py. See dashboard/Dockerfile."
+    )
+    args = step.get("args") or []
+    assert args[:3] == ["build", "-f", "dashboard/Dockerfile"], args
+    assert args[-1] == ".", args
+
+    dockerfile = (REPO_ROOT / "dashboard" / "Dockerfile").read_text()
+    for src, dest in (
+        ("src/backtesting/scenarios/overrides.py", "./scenario_overrides.py"),
+        ("src/backtesting/scenarios/identity.py", "./scenario_identity.py"),
+    ):
+        assert f"COPY {src} {dest}" in dockerfile, (
+            f"dashboard/Dockerfile must `COPY {src} {dest}` — "
+            "dashboard/backend/services/sweeps.py imports the flat name as its "
+            "fallback, and tests/test_dashboard_sweeps.py pins that name."
+        )
+
+
 def test_gate_status_filter_covers_pending_builds(by_id):
     """A build sitting in PENDING is a real competitor and must be counted.
 

@@ -65,16 +65,21 @@ steps:
     id: 'build-bot-image'
     waitFor: ['run-tests']
 
-  # Step 3: Build the dashboard container image
+  # Step 3: Build the dashboard container image.
+  # Context is the REPO ROOT (no `dir:`), because the image ships two stdlib-only
+  # modules out of `src/backtesting/scenarios/` so the sweep API refuses exactly
+  # what the sweep Job refuses (FC-060 D7). Every COPY in dashboard/Dockerfile is
+  # therefore repo-relative.
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '-f'
+      - 'dashboard/Dockerfile'
       - '-t'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
       - '-t'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:latest'
       - '.'
-    dir: 'dashboard'
     id: 'build-dashboard-image'
     waitFor: ['run-tests']
 
@@ -320,6 +325,47 @@ steps:
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard'
     id: 'push-dashboard-image'
     waitFor: ['build-dashboard-image']
+
+  # Step 5b: Deploy the ad-hoc scenario-sweep Cloud Run JOB (FC-060 Layer 3, D9).
+  #
+  # `gcloud run jobs deploy` is create-or-update, so this step both creates the
+  # job on the merging build and keeps it on current `main` thereafter. That is
+  # the whole point: `backtest-screen` is deliberately SHA-pinned (a monthly
+  # screen must be reproducible), and nothing in this file used to update a Job
+  # at all — which is how that job sat on a Layer-1 image with no `sweep`
+  # command. An ad-hoc sweep has the opposite requirement: it answers a question
+  # about the code as it is now.
+  #
+  # NOT gated by `serialize-builds`: this deploys no traffic and no revision, so
+  # two builds racing here simply leaves the newer image on the job — which is
+  # what serialization would have produced anyway. It DOES honour the superseded
+  # marker, because a superseded build must not push its image onto the job that
+  # the winning build is about to point at current code.
+  #
+  # `--set-env-vars` REPLACES the whole env set on every deploy, so every
+  # persistent Job env var must be listed here. GIT_COMMIT is the FC-081 wiring:
+  # it is half of the sweep dedup key (D4), so a Job that ran without it would
+  # key every sweep as if it had no commit.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        gcloud run jobs deploy backtest-sweep \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+          --region=us-central1 \
+          --command=python \
+          --args=main.py,--command,sweep,--spec-env,SWEEP_SPEC_JSON \
+          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA \
+          --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
+          --memory=1Gi \
+          --cpu=1 \
+          --task-timeout=3600 \
+          --max-retries=0 \
+          --service-account=799970961417-compute@developer.gserviceaccount.com
+    id: 'deploy-sweep-job'
+    waitFor: ['push-bot-image']
 
   # Step 6: Deploy trading bot to Cloud Run (canary - no traffic)
   # The revision name is chosen here, before the deploy, via --revision-suffix, and
@@ -676,7 +722,7 @@ steps:
             --max-instances=2 \
             --min-instances=0 \
             --timeout=300 \
-            --set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA \
+            --set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA,SWEEP_JOB_NAME=backtest-sweep \
             --no-traffic \
             --tag=canary \
             --revision-suffix=$${SUFFIX} \

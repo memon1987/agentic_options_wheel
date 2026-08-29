@@ -1695,6 +1695,85 @@ class BigQueryService:
         result["uncovered"].sort(key=lambda r: r["uncovered_days"], reverse=True)
         return result
 
+    # ------------------------------------------------------------------
+    # FC-060 Layer 3 — the scenario store.
+    #
+    # The ONLY write this backend makes to BigQuery is the `submitted` row
+    # below. Everything else about a sweep is written by the Job. That
+    # boundary is the point: the dashboard has no Alpaca credentials, no
+    # engine and no business producing a result, and a backend that could
+    # write results could write them wrong.
+    #
+    # These read `scenario_sweeps` / `scenario_runs` and NEVER `backtest_runs`
+    # — the screen's table stays the screen's, so a hypothetical can never
+    # displace a real demotion candidate.
+    # ------------------------------------------------------------------
+
+    def get_recent_sweeps(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Latest status per run, newest submission first."""
+        from services.sweeps import recent_sweeps_sql
+
+        return self._run_query(
+            recent_sweeps_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("limit", "INT64", int(limit))],
+        )
+
+    def get_sweep(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The latest status row for one run, or None."""
+        from services.sweeps import one_sweep_sql
+
+        rows = self._run_query(
+            one_sweep_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
+        )
+        return rows[0] if rows else None
+
+    def get_sweep_rows(self, run_id: str) -> List[Dict[str, Any]]:
+        """Every cell of one run."""
+        from services.sweeps import sweep_rows_sql
+
+        return self._run_query(
+            sweep_rows_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("run_id", "STRING", run_id)],
+        )
+
+    def find_done_sweep(self, sweep_key: str) -> Optional[Dict[str, Any]]:
+        """The most recent COMPLETED run under ``sweep_key``, or None (D4).
+
+        Goal 5 — "revisit, not recompute" — at the API layer: an identical spec
+        on the same engine and commit returns the prior run instead of burning
+        another eight minutes of Job time to reproduce it.
+        """
+        from services.sweeps import done_by_key_sql
+
+        if not sweep_key:
+            return None
+        rows = self._run_query(
+            done_by_key_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key)],
+        )
+        return rows[0] if rows else None
+
+    def insert_sweep_status(self, row: Dict[str, Any]) -> None:
+        """Insert one ``scenario_sweeps`` row. Raises on failure, deliberately.
+
+        The caller writes the ``submitted`` row BEFORE it launches the Job and
+        must abort if this fails: an execution with no row is a sweep the
+        dashboard can never show, can never dedup against, and can never count
+        towards the one-at-a-time limit. A swallowed failure here would look
+        like a dashboard bug and be an invisible-sweep bug.
+
+        The table is created by the Job's writer, not here. That is deliberate
+        too — one schema owner, and it is the side that knows every column.
+        A submit before the first Job run therefore fails loudly rather than
+        creating a table with half a schema.
+        """
+        table = f"{self.dataset}.scenario_sweeps"
+        errors = self.client.insert_rows_json(table, [row])
+        if errors:
+            raise Exception(f"scenario_sweeps insert failed: {str(errors)[:400]}")
+
+
 # Singleton instance
 _bq_service: Optional[BigQueryService] = None
 
