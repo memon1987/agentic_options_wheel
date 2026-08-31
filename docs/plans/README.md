@@ -92,7 +92,7 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-060-chain-lake.md](fc-060-chain-lake.md) — FC-060 Layer 1 — the chain lake (GCS-backed, write-through `ChainStore`), status: Done
 - [fc-060-scenario-runner.md](fc-060-scenario-runner.md) — FC-060 Layer 2 — the scenario runner (materialise once, replay many), status: Done
 - [fc-060-scenario-store-ui.md](fc-060-scenario-store-ui.md) — FC-060 Layers 3+4 — scenario store, backtest-sweep Job, sweep API, /sims page, status: Done
-- [fc-096-a.md](fc-096-a.md) — FC-096 Phase A — data foundation: candidate universe, weekly backfill Job, DTE-21 lake, status: Draft
+- [fc-096-a.md](fc-096-a.md) — FC-096 Phase A — data foundation: candidate universe, weekly backfill Job, DTE-21 lake, status: Approved
 - [fc-065.md](fc-065.md) — One floor, one path, one decision record — the covered-call gating layer, status: Done
 - [fc-068.md](fc-068.md) — Delete the dead engine call path; repoint the backtest to the real pipeline, status: Done
 - [fc-069.md](fc-069.md) — FC-069 — the decommission sweep. 15 decision cards for operator sign-off, status: DONE
