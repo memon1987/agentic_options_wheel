@@ -50,6 +50,19 @@ COPY src/backtesting/scenarios/identity.py ./scenario_identity.py
 # Copy built frontend to static directory
 COPY --from=frontend-build /app/frontend/dist ./static
 
+# The engine identity (FC-096 Phase B), computed by cloudbuild.yaml's
+# `compute-engine-identity` step from the SAME checkout that builds this image
+# and passed in as a build-arg. This image ships no `src/` tree, so it cannot
+# hash one; baking the value is the only way the dashboard can compute the
+# `sweep_key` the Job computes.
+#
+# Deliberately DEFAULTS TO EMPTY. A `docker build` with no build-arg (a local
+# build, a future step that forgets it) produces an image whose sweep dedup HINT
+# disables itself and says so in the logs — never one that keys with a plausible
+# wrong value. See `services/sweeps.engine_identity_from_env`.
+ARG ENGINE_IDENTITY=""
+ENV ENGINE_IDENTITY=$ENGINE_IDENTITY
+
 # Set environment variables
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1

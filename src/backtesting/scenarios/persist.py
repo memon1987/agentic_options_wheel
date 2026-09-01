@@ -176,6 +176,16 @@ def _sweeps_schema():
         f("execution_name", "STRING"),     # CLOUD_RUN_EXECUTION, for debugging
         f("git_commit", "STRING"),
         f("engine_version", "STRING"),
+        # FC-096 Phase B: the content hash of `src/**` (`engine_identity.py`),
+        # and HALF THE DEDUP KEY since it replaced `git_commit` there. Additive
+        # and NULLABLE: `_ensure_table`'s reconcile adds it to the live table,
+        # and the rows that predate it stay NULL. That is the correct migration
+        # posture rather than a defect — a NULL row can never satisfy
+        # `engine_identity = @engine_identity`, so legacy results are readable
+        # by run_id and unreachable through the new key, which is exactly right:
+        # they were keyed by a commit, and nothing can prove which source tree
+        # produced them.
+        f("engine_identity", "STRING"),
         f("base_config_hash", "STRING"),
         # The PAYLOAD, not just the hash: a hash proves two runs used the same
         # config, and tells a reader nothing about what that config was.
@@ -277,6 +287,7 @@ def _runs_schema():
         # Provenance, repeated on every cell so one row is self-describing
         f("engine_version", "STRING"),
         f("git_commit", "STRING"),
+        f("engine_identity", "STRING"),
     ]
 
 
@@ -417,7 +428,8 @@ class ScenarioRunWriter:
         return self._enabled
 
     def find_done_sweep(self, sweep_key: str,
-                        base_config_hash: Optional[str] = None
+                        base_config_hash: Optional[str] = None,
+                        engine_identity: Optional[str] = None
                         ) -> Optional[Dict[str, Any]]:
         """The most recent run that COMPLETED under ``sweep_key``, or None.
 
@@ -435,11 +447,22 @@ class ScenarioRunWriter:
         * a run every cell of which errored — a page of ``err`` served as a
           result, and the operator never learns the sweep is worth re-running;
         * a run under a different EFFECTIVE base config. ``sweep_key`` covers
-          the spec, the engine version and the commit; it cannot see an operator
-          flipping ``EARNINGS_ENABLED`` on the Job between two otherwise
-          identical submissions, because that value is not in the yaml the key
-          hashes. ``base_config_hash`` is the hash of the effective snapshot and
-          closes exactly that hole.
+          the spec, the engine version and the engine identity; it cannot see an
+          operator flipping ``EARNINGS_ENABLED`` on the Job between two
+          otherwise identical submissions, because that value is not in the yaml
+          the key hashes. ``base_config_hash`` is the hash of the effective
+          snapshot and closes exactly that hole.
+
+        **Plus a fifth, from FC-096 Phase B: ``engine_identity`` equality.** The
+        key already carries it, so this predicate is redundant for any row
+        written after the re-key — and it is not redundant for the rows written
+        BEFORE it, whose ``engine_identity`` is NULL and whose ``sweep_key`` was
+        computed over a commit SHA. ``NULL = @engine_identity`` is never true, so
+        those rows can never be served as a hit. That is the intended migration:
+        a legacy row is readable by ``run_id`` for ever and is never a cache
+        answer for a key it was not keyed by. Belt and braces on the one
+        predicate whose failure mode is serving one engine's numbers as
+        another's.
 
         A duplicate replay costs eight minutes. A wrong dedup hit serves one
         experiment's numbers as another's, and nothing in the UI says so.
@@ -453,14 +476,14 @@ class ScenarioRunWriter:
         query = f"""
         WITH latest AS (
           SELECT run_id, status, submitted_at, finished_at, cell_count,
-                 rows_persisted, error_cells, base_config_hash,
+                 rows_persisted, error_cells, base_config_hash, engine_identity,
                  ROW_NUMBER() OVER (
                    PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
           FROM `{table}`
           WHERE sweep_key = @sweep_key
         )
         SELECT run_id, submitted_at, finished_at, cell_count, rows_persisted,
-               error_cells, base_config_hash
+               error_cells, base_config_hash, engine_identity
         FROM latest
         WHERE rn = 1
           AND status = '{STATUS_DONE}'
@@ -468,6 +491,7 @@ class ScenarioRunWriter:
           AND rows_persisted IS NOT NULL
           AND rows_persisted = cell_count
           AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)
+          AND engine_identity = @engine_identity
         ORDER BY submitted_at DESC
         LIMIT 1
         """
@@ -476,6 +500,8 @@ class ScenarioRunWriter:
                 bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
                 bigquery.ScalarQueryParameter("base_config_hash", "STRING",
                                               base_config_hash),
+                bigquery.ScalarQueryParameter("engine_identity", "STRING",
+                                              engine_identity),
             ])
             rows = list(self._client.query(query, job_config=job_config).result(
                 timeout=60))
@@ -538,6 +564,7 @@ def status_row(
     submitted_via: str = "cli",
     engine_version: Optional[str] = None,
     git_commit: Optional[str] = None,
+    engine_identity: Optional[str] = None,
     execution_name: Optional[str] = None,
     spec: Optional[Dict[str, Any]] = None,
     base_config: Optional[Dict[str, Any]] = None,
@@ -581,6 +608,7 @@ def status_row(
         "execution_name": execution_name,
         "git_commit": git_commit,
         "engine_version": engine_version,
+        "engine_identity": engine_identity,
         "base_config_hash": base_config_hash,
         "base_config_json": (json.dumps(base_config, sort_keys=True, default=str)
                              if base_config is not None else None),
@@ -661,6 +689,7 @@ def rows_from_sweep(
     submitted_at: str,
     engine_version: str,
     git_commit: Optional[str] = None,
+    engine_identity: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One ``scenario_runs`` row per cell of ``result``.
 
@@ -726,6 +755,7 @@ def rows_from_sweep(
 
             "engine_version": engine_version,
             "git_commit": git_commit,
+            "engine_identity": engine_identity,
         }))
     return out
 

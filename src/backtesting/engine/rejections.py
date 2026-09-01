@@ -16,11 +16,14 @@ live stages *already* emit and counts them.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 
 from ...utils import clock
+from ...utils.logger import active_tally, ensure_tally_dispatch
+
+logger = structlog.get_logger(__name__)
 
 # FC-069 item 12, review fix 1. This bucket is NOT a stand-down: it fires on
 # every day the wheel is doing exactly what it exists to do — holding a position
@@ -145,9 +148,29 @@ _SELECTION_DROP_REASONS = {
 class RejectionTally:
     """Counts blocking reasons emitted during a replay.
 
-    Installed as a structlog processor for the duration of the run and removed
-    afterwards. Never raises into the run: a diagnostic that can break the thing
-    it is diagnosing is not worth having.
+    Bound as the ACTIVE tally for the duration of the run and unbound afterwards.
+    Never raises into the run: a diagnostic that can break the thing it is
+    diagnosing is not worth having.
+
+    **How it reaches the loggers, and why not directly (FC-092 item 1).** This
+    object does not install itself into structlog's processor chain. A single
+    process-stable processor — ``utils.logger.tally_dispatch`` — sits at the
+    front of the chain and forwards to whichever tally is bound in a contextvar;
+    ``__enter__`` binds, ``__exit__`` unbinds.
+
+    Installing the instance itself was the pre-existing defect: `setup_logging`
+    sets ``cache_logger_on_first_use=True``, a ``BoundLoggerLazyProxy`` caches
+    its whole chain on first use, and ``structlog.configure()`` does not
+    invalidate that cache — so every strategy logger bound replay #1's tally and
+    delivered to it for the life of the process. Measured on `main` at 7087007,
+    two ``evaluate_symbol`` calls in one process: the first got a populated
+    ``blocked_days_by_reason``, the second ``{}``. The monthly screen replays 14
+    symbols in one process, so 13 of every 14 ``backtest_runs`` rows carried an
+    empty tally and a NULL ``binding_constraint``.
+
+    The indirection is what makes N sequential runs in one process each get a
+    complete tally: the cached chain holds the dispatch, which never changes,
+    and the dispatch reads the tally at call time.
     """
 
     def __init__(self) -> None:
@@ -160,6 +183,7 @@ class RejectionTally:
         self._seen: set = set()
         self._candidate_days: set = set()
         self._prev_config: Optional[dict] = None
+        self._binding = None
 
     # ------------------------------------------------------------------ #
     def processor(self, logger, name, event_dict):
@@ -197,20 +221,49 @@ class RejectionTally:
         return event_dict
 
     def __enter__(self) -> "RejectionTally":
+        self._binding = None
         try:
-            self._prev_config = structlog.get_config()
-            processors = list(self._prev_config.get("processors", []))
-            structlog.configure(processors=[self.processor] + processors)
-        except Exception:  # noqa: BLE001
+            # Idempotent: returns None (and reconfigures nothing) when
+            # `setup_logging` already put the dispatch at the front, which is
+            # every production path. It reconfigures only in a process that
+            # configured structlog some other way — a test, mostly — and hands
+            # back the previous config so `__exit__` can put it back.
+            self._prev_config = ensure_tally_dispatch()
+            self._binding = active_tally(self.processor)
+            self._binding.__enter__()
+        except Exception as exc:  # noqa: BLE001
             self._prev_config = None
+            self._binding = None
+            # A tally that fails to bind counts NOTHING, and every consumer of
+            # an empty tally reads it as "the strategy was never blocked" — the
+            # FC-057 dishonest-metric class, arrived at by silence. The swallow
+            # stays (a diagnostic must not break the run it is diagnosing), but
+            # it stops being invisible: this is exactly the state FC-092 spent
+            # a year in undetected.
+            try:
+                logger.warning(
+                    "Rejection tally could not bind — this replay will report "
+                    "no blocked days, which is an ARTIFACT and not a finding",
+                    event_category="backtest",
+                    event_type="rejection_tally_bind_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:300])
+            except Exception:  # noqa: BLE001 - logging is what just failed
+                pass
         return self
 
     def __exit__(self, *exc) -> None:
+        if self._binding is not None:
+            try:
+                self._binding.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._binding = None
         if self._prev_config is not None:
             try:
                 structlog.configure(**self._prev_config)
             except Exception:  # noqa: BLE001
                 pass
+            self._prev_config = None
         return None
 
     # ------------------------------------------------------------------ #
@@ -218,12 +271,33 @@ class RejectionTally:
     def candidate_days(self) -> int:
         return len(self._candidate_days)
 
-    def summary(self) -> Dict[str, int]:
-        """Distinct DAYS blocked, per reason, descending."""
+    def _ranked(self) -> List[Tuple[str, int]]:
+        """``(reason, days)`` most-blocked first, ties broken by reason name.
+
+        **Deterministic, and that is the whole point (FC-092 item 2).**
+        ``self._seen`` is a set, and ``Counter.most_common()`` preserves
+        insertion order among equal counts — so the order in which a set happens
+        to iterate, which depends on ``PYTHONHASHSEED``, decided which of two
+        equally-blocking reasons got reported as ``binding_constraint`` and
+        which led the "why the strategy stood down" table. The same replay could
+        produce two different answers in two processes; FC-060 Layer 2's identity
+        proof had to pin ``PYTHONHASHSEED=0`` to work around it.
+
+        The alphabetical tiebreak is arbitrary in substance and load-bearing in
+        form: what matters is that the same tally always answers the same way.
+        """
         per_reason: Counter = Counter(reason for _day, reason in self._seen)
-        return dict(per_reason.most_common())
+        return sorted(per_reason.items(), key=lambda item: (-item[1], item[0]))
+
+    def summary(self) -> Dict[str, int]:
+        """Distinct DAYS blocked, per reason, descending. Order is deterministic."""
+        return dict(self._ranked())
 
     def binding_constraint(self) -> Optional[str]:
-        """The reason that blocked the most days, if any."""
-        top = Counter(r for _d, r in self._seen).most_common(1)
-        return top[0][0] if top else None
+        """The reason that blocked the most days, if any.
+
+        Reads the same ranking ``summary()`` does, so the column and the table
+        can never disagree about which reason came first.
+        """
+        ranked = self._ranked()
+        return ranked[0][0] if ranked else None

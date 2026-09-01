@@ -29,9 +29,11 @@ anything a worker would own:
   1. ``ExecutionEngine._failed_symbols`` is a module-global set that the day loop
      clears every simulated day and the simulator snapshots/restores around a
      run. Two replays in one process would clear each other's.
-  2. ``RejectionTally.__enter__`` calls ``structlog.configure()``, which is
-     process-global. Two concurrent tallies would install each other's
-     processors and count each other's events.
+  2. The rejection tally binds itself into a process-wide structlog chain. Since
+     FC-092 that binding is a ``contextvars.ContextVar`` (``utils.logger``), so
+     two tallies on two threads would at least not overwrite each other — but
+     hazard 1 alone is disqualifying, and nothing here is designed for
+     concurrency.
 
 Multiprocessing would sidestep both, and is out of scope precisely because the
 measured cost does not justify the work: the sweep already fits inside a coffee
@@ -42,30 +44,27 @@ documented "current demotion candidates" query takes the latest ``run_kind='full
 row, so a persisted full-universe sweep would displace the production screen with
 a hypothetical. Layer 3 owns a store that cannot do that.
 
-**No ``binding_constraint`` column, and it is not an oversight.** A sweep runs
-many replays in one process, and only the FIRST of them gets a working
-``RejectionTally``. ``setup_logging`` configures structlog with
-``cache_logger_on_first_use=True``; a ``BoundLoggerLazyProxy`` caches its whole
-processor chain on first use, and ``structlog.configure()`` — which is how the
-tally installs itself — does not invalidate that cache. So every strategy logger
-binds during replay #1 and keeps delivering to replay #1's tally for the life of
-the process. Replays 2..N report an empty ``blocked_days_by_reason``, which reads
-as "the strategy was never blocked" for a strategy that was blocked constantly.
-
-Measured on ``origin/main`` at 7087007, two ``evaluate_symbol`` calls in one
-process::
+**No ``binding_constraint`` column — still, and still deliberately.** The reason
+Layer 2 shipped without one was that only the FIRST replay in a process got a
+working ``RejectionTally``: ``setup_logging`` sets
+``cache_logger_on_first_use=True``, a ``BoundLoggerLazyProxy`` caches its whole
+processor chain on first use, and ``structlog.configure()`` — which was how the
+tally installed itself — does not invalidate that cache. Measured on the
+pre-fix tree at 7087007, two ``evaluate_symbol`` calls in one process::
 
     call #1: blocked_days_by_reason={'already holds this underlying (scan, put)': 16,
                                      'selection: duplicate underlying': 4}
     call #2: blocked_days_by_reason={}
 
-This is a PRE-EXISTING defect, not one Layer 2 introduces, and it is not Layer
-2's to fix: the monthly screen runs 14 symbols in one process, so 13 of every 14
-``backtest_runs`` rows already carry an empty tally and a NULL
-``binding_constraint``, and correcting that changes what that table means. It
-needs its own FC. What Layer 2 will not do is *launder* it — reporting a column
-that is NULL by artifact as though it were a finding is the FC-057
-dishonest-metric class, so the sweep does not carry one at all.
+**That defect is FIXED** (FC-092, FC-096 Phase B PR-a): the tally now binds
+through ``utils.logger.tally_dispatch``, a process-stable processor that reads
+the active tally out of a contextvar, so N sequential replays in one process each
+get a complete tally, and the summary's ordering no longer depends on
+``PYTHONHASHSEED``. The column stays absent anyway — adding it is a schema
+change to ``scenario_runs`` with its own consumers and its own review, not a
+side effect of a logging fix. What Layer 2 will not do is *launder* a metric:
+reporting a column that is NULL by artifact as though it were a finding is the
+FC-057 dishonest-metric class.
 """
 
 from __future__ import annotations
@@ -105,9 +104,9 @@ BASE_SCENARIO_NAME = "base"
 # Strategy loggers whose INFO stream is silenced during replays (D11). ~1.8 MB
 # of `logs/options_wheel.log` per pass; 60 replays would be 100+ MB of noise that
 # nobody reads and that slows the sweep measurably. WARNING and above still land,
-# and the RejectionTally still counts everything: it installs its processor at
-# the FRONT of the structlog chain, ahead of `structlog.stdlib.filter_by_level`,
-# so it sees an event the stdlib level then drops.
+# and the RejectionTally still counts everything: its dispatch sits at the FRONT
+# of the structlog chain, ahead of `structlog.stdlib.filter_by_level`, so it sees
+# an event the stdlib level then drops.
 _QUIET_LOGGERS = ("src", "deploy")
 
 

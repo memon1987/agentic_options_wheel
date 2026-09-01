@@ -60,7 +60,7 @@ ORDER BY submitted_at DESC
 | column | type | notes |
 |---|---|---|
 | `run_id` | STRING REQ | 16 hex characters; shared by every row of one submission and by its `scenario_runs` cells |
-| `sweep_key` | STRING | sha256[:16] of the canonical spec + `engine_version` + `git_commit`. The dedup key — see below |
+| `sweep_key` | STRING | sha256[:16] of the canonical spec + `engine_version` + `engine_identity`. The dedup key — see below |
 | `status` | STRING REQ | `submitted` \| `running` \| `done` \| `failed` \| `deduplicated` |
 | `deduplicated_to` | STRING | the earlier `run_id` whose results answer this submission |
 | `submitted_at` | TIMESTAMP REQ | **partition key**; identical on every row of one run |
@@ -68,7 +68,9 @@ ORDER BY submitted_at DESC
 | `started_at` / `finished_at` | TIMESTAMP | the Job's own clock |
 | `submitted_via` | STRING | `dashboard` \| `cli` |
 | `execution_name` | STRING | `CLOUD_RUN_EXECUTION`. Stored for operator debugging only — status is BigQuery-based (D3), because `run.executions.get` is unproven for this service account and grantable only in the console |
-| `git_commit` / `engine_version` | STRING | provenance, and both are inputs to `sweep_key` |
+| `git_commit` | STRING | the commit the run was launched from. **Provenance only since FC-096 Phase B** — it used to be half of `sweep_key` and no longer is |
+| `engine_version` | STRING | `screen.ENGINE_VERSION`; an input to `sweep_key` |
+| `engine_identity` | STRING | sha256[:16] of the **contents of `src/**`** (`src/backtesting/scenarios/engine_identity.py`); the other input to `sweep_key`, and a dedup predicate in its own right. **NULL on every row written before 2026-09-01** — those rows were keyed by a commit SHA, so they are readable by `run_id` for ever and can never be served as a dedup hit |
 | `base_config_hash` | STRING | sha256[:16] of the **effective** snapshot below. This is the dedup's configuration guard, not the `backtest_runs` linkage — see *Effective, not as written* |
 | `base_config_json` | STRING | the `strategy`/`risk`/`earnings`/`rolling`/`universe` sections **plus an `effective` block read through `Config`'s accessors**. The payload, not just the hash — a hash proves two runs matched and tells a reader nothing about what they matched on. `alpaca:` is excluded: these tables are read by a public dashboard |
 | `spec_json` | STRING | the normalised submission (symbols, window, arms with their overrides and haircuts, cash, sensitivity) |
@@ -130,13 +132,16 @@ status = 'done'
 AND error_cells = 0
 AND rows_persisted IS NOT NULL AND rows_persisted = cell_count
 AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)
+AND engine_identity = @engine_identity
 ```
 
 Each clause exists because `status = 'done'` alone would return something that
 is not an answer: a run whose rows never landed (an empty grid), a run every arm
 of which errored (a page of `err`, and the operator never learns to re-run), or
 a run under a different effective base config (`sweep_key` covers the spec, the
-engine version and the commit — it cannot see a kill switch flipped on the Job).
+engine version and the engine identity — it cannot see a kill switch flipped on
+the Job), or a run whose `engine_identity` is NULL because it predates the
+FC-096 re-key.
 
 A duplicate replay costs eight minutes. A wrong dedup hit serves one
 experiment's numbers as another's, silently.
@@ -144,8 +149,8 @@ experiment's numbers as another's, silently.
 **Only the Job deduplicates.** The API never skips a launch on the strength of
 this query, and it binds no `base_config_hash`.
 
-It used to: it passed the last `base_config_hash` any run on the same
-`git_commit` had recorded. That was self-referential. After an operator flipped
+It used to: it passed the last `base_config_hash` any run on the same commit had
+recorded. That was self-referential. After an operator flipped
 `ROLLER_ENABLED` on the Job, a re-submitted spec matched the *pre-flip* run's own
 hash, deduplicated to it, and — because nothing was launched — the Job's exact
 check, the one that would have caught the flip, never ran. The dedup became
@@ -211,7 +216,7 @@ the summary row stops adding up.
 | activity | `puts_sold`, `calls_sold`, `cycles_completed`, `cycles_open`, `decision_days`, `days_in_position_fraction` |
 | fill sensitivity | `bid_fill_return`, `verdict_flips_on_fill` |
 | cost / failure | `replay_seconds`, `error` |
-| provenance | `engine_version`, `git_commit` |
+| provenance | `engine_version`, `git_commit`, `engine_identity` |
 
 **`scenario_hash` is the identity of the ARM; `config_hash` is not.**
 `config_hash` hashes nine strategy parameters plus the module scoring constants,
@@ -223,7 +228,7 @@ arms apart; use `config_hash` only to line a row up with a `backtest_runs` row.
 
 ## `sweep_key` — what "the same sweep" means
 
-`sha256(canonical spec + engine_version + git_commit)[:16]`, computed by
+`sha256(canonical spec + engine_version + engine_identity)[:16]`, computed by
 `src/backtesting/scenarios/identity.py` — one implementation, imported by the
 Job and copied verbatim into the dashboard image.
 
@@ -232,12 +237,80 @@ symbols are upper-cased and sorted, arms are sorted by `(name, arm hash)`,
 override key order inside an arm does not matter, and an explicitly-declared
 empty `base` arm is dropped (the runner prepends it anyway).
 
-`engine_version` and `git_commit` are **in** the key on purpose. The same arms
-replayed by a different engine build are a different experiment, and returning
-the old rows for them would be the worst kind of cache hit — one that looks like
-a result. A missing `git_commit` hashes as the empty string rather than raising:
-a locally-run sweep has no commit stamp, and the consequence of a mismatch is
-merely a missed cache, never a wrong answer.
+`engine_version` and `engine_identity` are **in** the key on purpose. The same
+arms replayed by a different engine build are a different experiment, and
+returning the old rows for them would be the worst kind of cache hit — one that
+looks like a result.
+
+### `engine_identity` — why the key is not the commit (FC-096 Phase B)
+
+The third component was `git_commit` until 2026-09-01. That was sound and far
+too coarse: **every** merge to `main` invalidated **every** stored result,
+including the merges that cannot possibly change a replay — a README edit, a
+dashboard CSS tweak, a `cloudbuild.yaml` flag. Under Phase B's weekly battery
+that is the difference between a cheap Saturday and an expensive one.
+
+`engine_identity` asks the narrower question: *did the code the replay executes
+change?* It is `sha256[:16]` over the sorted relative paths and the **contents**
+of every file under `src/`, of every type, plus the repo-root `requirements.txt`,
+plus `ENGINE_VERSION`:
+
+- **all of `src/`, not just the backtesting package** — the replay drives the
+  live strategy, so `src/strategy/**`, `src/api/**`, `src/data/**` and
+  `src/utils/**` are executed inside a simulated day;
+- **all file types, not just `*.py`** — `src/backtesting/data/earnings_dates.json`
+  and `dividend_history.json` are committed replay *inputs*; a table correction
+  changes results without changing a line of code;
+- **plus `requirements.txt`** — the replay's arithmetic runs inside pandas,
+  numpy and the Alpaca SDK, and this file says which of them the image installs.
+  Under `git_commit` a dependency edit invalidated the cache; a `src/**`-only
+  hash would have quietly stopped doing that, which is a regression the re-key
+  must not smuggle in;
+- **nothing else outside `src/`** — `docs/`, `dashboard/`, `deploy/`, `tests/`
+  and `cloudbuild.yaml` cannot change a replay's output;
+- **content, never metadata** — no mtime, no directory order (the walk is sorted
+  on the relative path, because the Job and the Cloud Build worker that stamps
+  the dashboard image are two different filesystems with two different readdir
+  orders); `__pycache__` and `*.pyc` are skipped, being derived; a **symlink
+  anywhere under `src/` is refused outright**, because a followed link reads
+  bytes from outside the boundary the hash is defined by.
+
+**Residual: rebuild-resolution drift is outside the key.** `requirements.txt` is
+fully unpinned today (`pandas`, not `pandas==2.1.4`), so two builds of the
+identical file can resolve different wheel versions and still hash the same. The
+key sees the file's *content*; it cannot see what pip decided on a given
+afternoon. The discipline that covers the gap is manual: **bump `ENGINE_VERSION`
+on any dependency change that could move replay numerics**, pinned or not.
+Pinning the file would fold resolution back into the key and is the real fix — a
+separate change with its own review.
+
+`git_commit` is still stamped on every row. It is provenance; it is simply no
+longer identity.
+
+**Where each side gets the value.** The Job and the CLI call
+`engine_identity.engine_identity()` on the tree they are running. The dashboard
+image ships two flat stdlib modules and **no `src/` tree**, so it cannot hash
+one: `cloudbuild.yaml`'s `compute-engine-identity` step runs the *same shared
+module* against the checkout that builds the image and bakes the answer in as the
+`ENGINE_IDENTITY` env var. If that env var is missing, the dashboard **disables
+its dedup hint and logs why** — it never keys over a fallback, because a key
+computed over `""` is a valid-looking 16-hex string that collides across
+genuinely different engines.
+
+**Migration.** The column is additive and NULLABLE. The engine's writer
+reconcile adds it on the Job's next run; the two live tables were also altered
+directly (`ALTER TABLE <dataset>.scenario_sweeps ADD COLUMN engine_identity
+STRING`, same for `scenario_runs`) so the dashboard did not have to wait for a
+Job. Until that column exists the dashboard **degrades rather than failing**: the
+dedup hint reports a miss and logs `sweep_dedup_hint_disabled`, and the
+`submitted` insert is retried once without the field, logging
+`engine_identity_column_missing`. Submissions keep working throughout.
+
+**One-time invalidation, on the record.** Every row written before the re-key has
+a NULL `engine_identity` and a `sweep_key` computed over a commit. The first
+re-submission of each old spec recomputes once and is stored under the new key;
+the old rows stay readable by `run_id` for ever. The first weekly battery after
+any engine change is the expensive one — that is the design, not a regression.
 
 ## Useful queries
 

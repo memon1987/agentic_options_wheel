@@ -1773,7 +1773,8 @@ class BigQueryService:
         )
 
     def find_done_sweep(self, sweep_key: str,
-                        base_config_hash: Optional[str] = None
+                        base_config_hash: Optional[str] = None,
+                        engine_identity: Optional[str] = None
                         ) -> Optional[Dict[str, Any]]:
         """The most recent COMPLETED run under ``sweep_key``, or None.
 
@@ -1788,17 +1789,43 @@ class BigQueryService:
         "Completed" still excludes a run whose cells never landed and a run every
         arm of which errored — those are exact, and a hint that pointed at an
         empty grid would be worse than none.
-        """
-        from services.sweeps import done_by_key_sql
 
-        if not sweep_key:
+        **A dataset without the ``engine_identity`` column degrades to a
+        hint-miss, not a 500.** See the body.
+
+        ``engine_identity`` (FC-096 Phase B) is REQUIRED for a hit: an absent one
+        short-circuits to None rather than binding NULL and querying for nothing.
+        The caller has already logged why it has no identity, and a hint that
+        silently returned None from a live query would look like "no prior run"
+        rather than "this image cannot tell".
+        """
+        from services.sweeps import (done_by_key_sql,
+                                     mentions_missing_identity_column,
+                                     note_identity_query_degraded)
+
+        if not sweep_key or not engine_identity:
             return None
-        rows = self._sweep_query(
-            done_by_key_sql(self.dataset),
-            [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
-             bigquery.ScalarQueryParameter("base_config_hash", "STRING",
-                                           base_config_hash)],
-        )
+        try:
+            rows = self._sweep_query(
+                done_by_key_sql(self.dataset),
+                [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+                 bigquery.ScalarQueryParameter("base_config_hash", "STRING",
+                                               base_config_hash),
+                 bigquery.ScalarQueryParameter("engine_identity", "STRING",
+                                               engine_identity)],
+            )
+        except Exception as exc:  # noqa: BLE001
+            # An UN-MIGRATED dataset answers `Unrecognized name:
+            # engine_identity`, and `_sweep_query` re-raises that as a generic
+            # Exception the router turns into a 500. A missing HINT must never
+            # take the submit endpoint down: the submission is the operation,
+            # the hint is a convenience. Degrade to hint-miss, say so once, and
+            # let every other error through — a query that failed for any other
+            # reason is a real failure the caller must still see.
+            if not mentions_missing_identity_column(exc):
+                raise
+            note_identity_query_degraded(exc)
+            return None
         return rows[0] if rows else None
 
     def insert_sweep_status(self, row: Dict[str, Any]) -> None:
@@ -1814,9 +1841,41 @@ class BigQueryService:
         too — one schema owner, and it is the side that knows every column.
         A submit before the first Job run therefore fails loudly rather than
         creating a table with half a schema.
+
+        **The one exception is the ``engine_identity`` column** (FC-096 Phase B):
+        a dataset that has not been migrated yet rejects the whole request over
+        one unknown key, which would make every submit fail — including a
+        ``force`` submit, which never touches the hint path. The insert is
+        retried once without that field, loudly. It is still not schema
+        ownership: the row simply lands without a stamp the table cannot hold.
         """
+        from services.sweeps import (mentions_missing_identity_column,
+                                     note_identity_insert_degraded)
+
         table = f"{self.dataset}.scenario_sweeps"
-        errors = self.client.insert_rows_json(table, [row])
+        try:
+            errors = self.client.insert_rows_json(table, [row])
+        except Exception as exc:  # noqa: BLE001
+            # `insert_rows_json` REPORTS per-row problems as a return value and
+            # RAISES request-level ones; an unknown field has been seen as both,
+            # so both shapes reach the same check below.
+            if not mentions_missing_identity_column(exc):
+                raise
+            errors = [{"errors": [{"message": str(exc)}]}]
+
+        if errors and mentions_missing_identity_column(errors):
+            # ONE retry, without the single field the table does not have yet.
+            # `insert_rows_json` rejects the WHOLE request on an unknown key, so
+            # the real choice is a complete row or NO row — and no row means an
+            # invisible sweep: the dashboard cannot show it, the dedup cannot
+            # find it, and the one-at-a-time gate never counts it. A row missing
+            # the stamp is strictly better; the Job's own rows carry the value
+            # once the column exists, and readers take the latest row per run.
+            note_identity_insert_degraded(errors)
+            retry = {k: v for k, v in row.items() if k != "engine_identity"}
+            if len(retry) != len(row):
+                errors = self.client.insert_rows_json(table, [retry])
+
         if errors:
             raise Exception(f"scenario_sweeps insert failed: {str(errors)[:400]}")
 

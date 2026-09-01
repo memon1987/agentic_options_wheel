@@ -912,9 +912,16 @@ def test_dashboard_image_ships_the_pure_scenario_modules():
         "build-dashboard-image must build from the REPO ROOT (no `dir:`), so the "
         "image can copy src/backtesting/scenarios/*.py. See dashboard/Dockerfile."
     )
-    args = step.get("args") or []
-    assert args[:3] == ["build", "-f", "dashboard/Dockerfile"], args
-    assert args[-1] == ".", args
+    # The step became a `bash -c` script in FC-096 Phase B (it has to read the
+    # ENGINE_IDENTITY build-arg out of /workspace), so the invocation is asserted
+    # on the script text rather than on the exec-form arg list.
+    script = script_of(step)
+    assert script, "build-dashboard-image must be a `bash -c` step"
+    assert "-f dashboard/Dockerfile" in script, script
+    assert re.search(r"^\s*\.\s*$", script, re.M), (
+        "the build context must be the repo root — the trailing `.` of the "
+        f"docker build is missing:\n{script}"
+    )
 
     dockerfile = (REPO_ROOT / "dashboard" / "Dockerfile").read_text()
     for src, dest in (
@@ -926,6 +933,110 @@ def test_dashboard_image_ships_the_pure_scenario_modules():
             "dashboard/backend/services/sweeps.py imports the flat name as its "
             "fallback, and tests/test_dashboard_sweeps.py pins that name."
         )
+
+
+# --------------------------------------------------------------------------
+# 5b. The engine identity reaches the dashboard image (FC-096 Phase B PR-a).
+# --------------------------------------------------------------------------
+IDENTITY_STEP = "compute-engine-identity"
+IDENTITY_MODULE = "src/backtesting/scenarios/engine_identity.py"
+IDENTITY_FILE = "/workspace/engine_identity.txt"
+
+
+def test_the_identity_step_invokes_the_shared_module_not_a_reimplementation():
+    """Parity by INVOCATION. A second hash implementation would drift silently.
+
+    The dashboard would then compute a `sweep_key` that matches nothing the Job
+    ever writes and the dedup would simply stop firing — no error, no log, just
+    a full replay on every repeat submission for ever. So the build is required
+    to execute the same file the engine imports.
+
+    It must execute the FILE, not `python -c "from src.backtesting.scenarios…"`:
+    that package's `__init__.py` imports the runner, which imports pandas and the
+    Alpaca SDK, so the import form needs the engine's whole dependency set and
+    this step deliberately has no pip install.
+    """
+    step = next(s for s in load_steps() if s["id"] == IDENTITY_STEP)
+    script = script_of(step)
+    assert script, f"{IDENTITY_STEP} must be a `bash -c` step"
+    assert f"python {IDENTITY_MODULE}" in script, (
+        f"{IDENTITY_STEP} must run the shared module as a file:\n{script}"
+    )
+    assert "hashlib" not in script and "sha256" not in script, (
+        f"{IDENTITY_STEP} must not compute the hash itself — invoke "
+        f"{IDENTITY_MODULE}. A yaml-side reimplementation drifts, and its drift "
+        f"is silent.\n{script}"
+    )
+    assert IDENTITY_FILE in script, (
+        f"{IDENTITY_STEP} must write its answer to {IDENTITY_FILE}, which is "
+        "where build-dashboard-image reads it."
+    )
+
+
+def test_the_shared_module_has_the_main_entry_point_the_build_calls():
+    """The build's invocation and the module's entry point are one contract.
+
+    Asserted on the source rather than by running it, because the interesting
+    failure is someone deleting the `__main__` block while the module still
+    imports fine everywhere else — at which point the step prints nothing, the
+    build-arg is empty and the dashboard build fails on a message about a
+    disabled dedup hint.
+    """
+    module = (REPO_ROOT / IDENTITY_MODULE).read_text()
+    assert 'if __name__ == "__main__":' in module, (
+        f"{IDENTITY_MODULE} must keep its `__main__` block: cloudbuild.yaml's "
+        f"`{IDENTITY_STEP}` runs the file directly."
+    )
+    assert "engine_identity()" in module.split('if __name__ == "__main__":')[1]
+
+
+def test_the_dashboard_build_bakes_the_identity_and_refuses_an_empty_one():
+    """An empty build-arg must fail the build, not ship a crippled dashboard.
+
+    A dashboard image with no `ENGINE_IDENTITY` cannot compute `sweep_key` at
+    all: it disables its dedup hint for the life of the revision and says so
+    once in the logs. That is the right runtime posture and the wrong build
+    posture — at build time the fix is trivial and the failure should be loud.
+    """
+    step = next(s for s in load_steps() if s["id"] == "build-dashboard-image")
+    script = script_of(step)
+    assert "--build-arg ENGINE_IDENTITY=" in script, script
+    assert IDENTITY_FILE in script, (
+        "build-dashboard-image must read the identity computed by "
+        f"{IDENTITY_STEP} out of {IDENTITY_FILE}"
+    )
+    assert "exit 1" in script, (
+        "build-dashboard-image must FAIL on an empty identity rather than "
+        f"baking one:\n{script}"
+    )
+    assert IDENTITY_STEP in (step.get("waitFor") or []), (
+        "build-dashboard-image must waitFor the step that writes the file it "
+        "reads; Cloud Build runs unrelated steps concurrently."
+    )
+
+    dockerfile = (REPO_ROOT / "dashboard" / "Dockerfile").read_text()
+    assert "ARG ENGINE_IDENTITY" in dockerfile, (
+        "dashboard/Dockerfile must declare the build-arg, or docker warns and "
+        "drops it and the ENV is never set."
+    )
+    assert "ENV ENGINE_IDENTITY=$ENGINE_IDENTITY" in dockerfile, (
+        "the build-arg must become an ENV: `services/sweeps.py` reads it out of "
+        "os.environ at request time, not at build time."
+    )
+
+
+def test_the_identity_file_is_not_committed_at_the_repo_root():
+    """Same hazard as the gate's runtime files: a tracked copy would be read.
+
+    Cloud Build checks the repo out into /workspace, so a committed
+    `engine_identity.txt` would be picked up by build-dashboard-image if the
+    compute step ever failed to overwrite it — baking a stale identity into the
+    image, which is the one outcome the empty check exists to prevent.
+    """
+    assert not (REPO_ROOT / "engine_identity.txt").exists(), (
+        "engine_identity.txt is written into /workspace at build time and must "
+        "never be a tracked file."
+    )
 
 
 def test_gate_status_filter_covers_pending_builds(by_id):
