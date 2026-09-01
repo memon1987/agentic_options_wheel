@@ -107,7 +107,7 @@ universe:
   # Inventory validator thresholds (Phase 2): a holding failing these is skipped
   # + logged, never traded.
   # SUSPENDED 2026-09-01 (was 500): the option-chain source
-  # (`AlpacaClient.get_option_chain` — snapshot endpoint) hardcodes
+  # (`AlpacaClient.get_options_chain` — snapshot endpoint) hardcodes
   # `open_interest: 0` for every contract, so any floor here rejects EVERY
   # strike that survives the other gates (prod 2026-08-28: ~114 GOOGL / ~86 UNH
   # per scan died here, unlogged). `null` skips the check (Config property →

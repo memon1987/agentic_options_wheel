@@ -67,7 +67,7 @@ class TestCoveredCallScreeningKeysPresent:
 
 
 class TestCoveredCallOpenInterestFloorSuspended:
-    """`AlpacaClient.get_option_chain` builds contracts from the snapshot
+    """`AlpacaClient.get_options_chain` builds contracts from the snapshot
     endpoint and hardcodes `open_interest: 0` (src/api/alpaca_client.py). Any
     `universe.min_open_interest` on this profile therefore rejects every strike
     that survives the other gates — which is exactly what happened in
