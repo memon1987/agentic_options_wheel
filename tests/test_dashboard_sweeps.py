@@ -14,6 +14,7 @@ Same import trick as `tests/test_dashboard_pause_alert.py`: put
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
@@ -26,7 +27,10 @@ import pytest
 # See tests/_dashboard_path.py: the backend is APPENDED and the repo root
 # kept ahead of it, so `import main` still resolves to the CLI rather than
 # to dashboard/backend/main.py for every module collected after this one.
-from tests._dashboard_path import add_dashboard_backend_to_path  # noqa: E402
+from tests._dashboard_path import (  # noqa: E402
+    BACKEND,
+    add_dashboard_backend_to_path,
+)
 
 add_dashboard_backend_to_path()
 
@@ -2309,18 +2313,42 @@ class TestTheAllowlistProseDoesNotCiteARetiredRefusal:
     """REVIEW: both allowlist docstrings taught the reader with
     `put_target_dte` / `universe_dte=8` — a refusal that no longer exists. A
     doc example that the code contradicts is worse than none: it is the first
-    thing a reader checks, and finding it false costs them trust in the rest."""
+    thing a reader checks, and finding it false costs them trust in the rest.
 
-    @pytest.mark.parametrize("obj", [
-        S.allowlist_payload,
-        pytest.param(None, id="router"),
+    **Read from SOURCE, never imported.** `routers/v2.py` imports FastAPI, which
+    the dashboard image has and the bot CI image — where this suite runs — does
+    not. Importing it here turned CI red on a pure prose assertion that needs no
+    running code at all.
+
+    And deliberately NOT `importorskip`/`skipif` (the guard the two endpoint
+    classes below legitimately use, because they exercise real handlers): a
+    skipped guard stops guarding in exactly the environment CI runs, so the
+    docstring could drift back to the retired example and every build would stay
+    green. `ast.get_docstring` over the file text asserts the same thing with no
+    import, so this runs everywhere.
+    """
+
+    @staticmethod
+    def _docstring(relative_path: str, function: str) -> str:
+        """One function's docstring, parsed out of the file — no import."""
+        source = (BACKEND / relative_path).read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == function):
+                return ast.get_docstring(node) or ""
+        raise AssertionError(
+            f"{relative_path} has no function named {function!r} — the prose "
+            f"guard is pointing at something that no longer exists"
+        )
+
+    @pytest.mark.parametrize("path,function", [
+        pytest.param("services/sweeps.py", "allowlist_payload", id="service"),
+        pytest.param("routers/v2.py", "sweeps_allowlist", id="router"),
     ])
-    def test_no_docstring_cites_the_pre_pr2_dte_refusal(self, obj):
-        if obj is None:
-            import routers.v2 as v2_mod
-            doc = v2_mod.sweeps_allowlist.__doc__ or ""
-        else:
-            doc = obj.__doc__ or ""
+    def test_no_docstring_cites_the_pre_pr2_dte_refusal(self, path, function):
+        doc = self._docstring(path, function)
+        assert doc, f"{path}::{function} lost its docstring"
         assert "universe_dte=8" not in doc
         assert "put_target_dte" not in doc
         # ...and it still teaches with a REAL refusal, not a generic one.
