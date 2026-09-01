@@ -463,6 +463,80 @@ class TestOverwriteIsCoverageMonotone:
             tmp_path / "wide" / "XYZ" / "2025-01-06.parquet"
         ).read_bytes()
 
+    def test_a_22_reach_replaces_an_8_and_an_8_can_never_replace_a_22(
+        self, tmp_path, captured_events
+    ):
+        """The FC-096 widening, in both directions.
+
+        This is the exact transition the backfill performs on every day the
+        lake already holds: the live reach is `universe_dte = 8`
+        (`put_target_dte` 7 plus `UNIVERSE_DTE_BUFFER`) and the backfill writes
+        22. The plan's behaviour contract promised this case as a test and it
+        was missing, so the property was resting on the generic
+        `narrower_dte` / wider-rebuild tests rather than on the numbers that
+        will actually be in the bucket.
+
+        The reverse direction matters at least as much and is easy to lose
+        sight of: once history is widened, an ordinary DTE-7 sweep running cold
+        over the same session rebuilds it at reach 8, and the guard is the only
+        thing stopping that from deleting the widening. On a 14-symbol year
+        that is thousands of objects, and nothing would report it — the sweep
+        would simply be a little slower next month.
+        """
+        eight = dict(universe_dte=8, strike_gte=75.0, strike_lte=125.0,
+                     model="m1")
+        twenty_two = dict(universe_dte=22, strike_gte=60.0, strike_lte=140.0,
+                          model="m1")
+
+        lake = FakeLake()
+        _seed_lake(tmp_path, lake, eight)
+        eight_gen = lake.generation_of("XYZ", AS_OF)
+
+        # 22 over 8: accepted, because it is a superset on BOTH axes.
+        widening = ChainStore(str(tmp_path / "widen"), lake=lake)
+        widening.put(_snapshot(strikes=(65.0, 100.0, 135.0)), **twenty_two)
+        assert widening.lake_puts == 1 and widening.lake_skipped == 0
+        assert lake.generation_of("XYZ", AS_OF) != eight_gen
+
+        stored = ChainStore(str(tmp_path / "read"), lake=lake).stored_window(
+            "XYZ", AS_OF)
+        assert stored["universe_dte"] == 22
+        assert (stored["strike_gte"], stored["strike_lte"]) == (60.0, 140.0)
+
+        # 8 over 22: refused. A DTE-7 sweep must not undo the widening.
+        widened_gen = lake.generation_of("XYZ", AS_OF)
+        sweep = ChainStore(str(tmp_path / "sweep"), lake=lake)
+        sweep.put(_snapshot(), **eight)
+        assert sweep.lake_puts == 0 and sweep.lake_skipped == 1
+        assert lake.generation_of("XYZ", AS_OF) == widened_gen, (
+            "the 22-reach object must survive untouched"
+        )
+        assert _events(captured_events, "chain_lake_overwrite_skipped")[-1][
+            "reason"] == "narrower_dte"
+
+    def test_a_22_reach_file_still_answers_a_dte_7_request(self, tmp_path):
+        """Widening must be invisible to the sweeps that read it.
+
+        The read path masks to the requested reach, which is what lets a
+        DTE-7 sweep run against a 22-reach lake and see the identical chain.
+        Pinned here beside the replacement rule because the two together are
+        the whole safety argument for widening shared files at all.
+        """
+        lake = FakeLake()
+        store = ChainStore(str(tmp_path / "w"), lake=lake)
+        snapshot = _snapshot(strikes=(65.0, 100.0, 135.0))
+        store.put(snapshot, universe_dte=22, strike_gte=60.0, strike_lte=140.0,
+                  model="m1")
+
+        got = ChainStore(str(tmp_path / "r"), lake=lake).get(
+            "XYZ", AS_OF, universe_dte=8, strike_gte=75.0, strike_lte=125.0,
+            underlying_price=100.0, model="m1")
+        assert got is not None, "a 22-reach file covers an 8-reach request"
+        assert [q.strike for q in got.puts] == [100.0], (
+            "and is narrowed to exactly what was asked for"
+        )
+        assert all(q.dte <= 8 for q in got.puts)
+
     def test_an_identical_window_uploads_idempotently(self, tmp_path):
         """Equal coverage is a superset of itself; a refresh must not be blocked."""
         lake = FakeLake()

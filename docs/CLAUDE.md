@@ -506,8 +506,13 @@ prefix scan per live symbol) and compares the newest stored chain-day against
 a paused scheduler, a deleted scheduler and a Job that fails every execution
 all leave a clean scheduler history. The Job-failure alert policy
 (`deploy/monitoring/job_failure_alert_policy.json`, which watches all three
-Jobs) catches an execution that runs and fails; this catches the one that never
-runs. One result per run:
+Jobs — the first policy here to match `cloud_run_job` at all; the others match
+`cloud_run_revision` or `build`) catches an execution that runs and fails; this
+catches the one that never runs. Both events have their own policy:
+`lake_freshness_alert_policy.json` on the `fail`, and
+`lake_freshness_degraded_alert_policy.json` as a 24h-rate-limited nag on the
+degraded event — without them a stale lake only fails an hourly report nobody
+reads. One result per run:
 
 | Condition | status | name / log event |
 |---|---|---|
@@ -711,16 +716,33 @@ not created by the build:
 ```bash
 gcloud scheduler jobs create http backfill-weekly \
   --location=us-central1 --schedule="0 8 * * 6" --time-zone="America/New_York" \
-  --uri="https://run.googleapis.com/v2/projects/$PROJECT/locations/us-central1/jobs/data-backfill:run" \
+  --uri="https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/gen-lang-client-0607444019/jobs/data-backfill:run" \
   --http-method=POST --max-retry-attempts=3 \
   --oauth-service-account-email=799970961417-compute@developer.gserviceaccount.com
 ```
 
+**The URI form is copied from the live `monthly-performance-review` job, not
+from the API reference** — regional host, `apis/run.googleapis.com/v1/namespaces/<PROJECT>`,
+job name, `:run`. Verified 2026-08-31 with
+`gcloud scheduler jobs describe monthly-performance-review --location=us-central1`.
+The `v2/projects/.../locations/.../jobs/<job>:run` shape that the Cloud Run docs
+show is *not* what the one scheduler in this project known to work actually
+uses, and a scheduler pointed at a URI that 404s still records success — see
+below — so this is exactly the wrong place to improvise.
+
 Saturday is deliberate (weekend cadence, an Alpaca-quota courtesy — FC-095), and
 `--max-retry-attempts=3` is too: the live `monthly-performance-review` recipe
-has retryCount 0, so a transient API error there silently skips a month. **Do
-not "fix" the small `attemptDeadline`**: `jobs:run` is asynchronous, so the
-deadline bounds the API call, not the multi-hour execution behind it.
+has no `retryCount` at all (verified: its `retryConfig` carries only the backoff
+bounds), so a transient API error there silently skips a month. **Do not "fix"
+the small `attemptDeadline`** (`monthly-performance-review` runs 180s):
+`jobs:run` is asynchronous, so the deadline bounds the API call, not the
+multi-hour execution behind it.
+
+After creating it, **test-fire it once** — `gcloud scheduler jobs run
+backfill-weekly --location=us-central1` — and then confirm an execution actually
+appeared with `gcloud run jobs executions list --job=data-backfill
+--region=us-central1`. The scheduler reporting success proves only that the API
+call returned.
 
 Three properties worth knowing before running it:
 
@@ -734,7 +756,14 @@ Three properties worth knowing before running it:
   silently, for ever. That is the live SPY/IWM/PFE `rejected=231 skipped=231`
   shape.)
 - **It exits non-zero if any symbol hit a genuine failure** — a vendor error, an
-  exception mid-build, bars that never arrived. A day skipped for an unmodelled
+  exception mid-build, bars that never arrived (a typo'd candidate ticker
+  answers exactly like that), an unusable close — **or if a configured chain
+  lake did not take everything it was given**. The lake clause matters because
+  `ChainStore` degrades to local-only on a lake failure, which is right for a
+  backtest and wrong here: this Job's filesystem is destroyed when the task
+  exits, so an exit-0 run reporting a widened lake with `lake_puts = 0` would
+  send the operator on to the next chunk. A run with **no** lake configured is a
+  legitimate local build and exits 0. A day skipped for an unmodelled
   **corporate action** is counted and logged
   (`backfill_day_skipped{reason=corporate_action}`,
   `days_skipped_corporate_action` in the summary) but deliberately does **not**

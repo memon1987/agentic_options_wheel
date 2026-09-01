@@ -840,6 +840,48 @@ def test_backfill_job_never_retries_and_gets_a_six_hour_task_timeout(by_id):
     )
 
 
+def test_the_wheel_service_carries_the_chain_lake_bucket(by_id):
+    """`/regression`'s lake_freshness check cannot watch a bucket it is not told about.
+
+    FC-096 Phase A. The check reads `CHAIN_LAKE_BUCKET`; without it every hourly
+    run reports `lake_freshness_unconfigured` — a `warn`, so the report stays
+    green, and the one control that notices a paused `backfill-weekly` scheduler
+    is silently doing nothing. That is the same failure shape as FC-081: not an
+    alarm that fired wrongly, but nothing watching at all.
+
+    It is pinned HERE, on the literal `--set-env-vars` string, because
+    `--set-env-vars` replaces the entire env set on every deploy. Setting it
+    out-of-band with `gcloud run services update` works right up until the next
+    merge silently removes it again.
+    """
+    script = script_of(by_id[CHAINS["options-wheel-strategy"]["deploy"]])
+    assert "CHAIN_LAKE_BUCKET=options-wheel-chain-lake" in script, (
+        "deploy-bot-canary must set CHAIN_LAKE_BUCKET; /regression's "
+        "lake_freshness check reads it and warns 'unconfigured' without it."
+    )
+
+
+def test_the_covered_call_service_deliberately_has_no_lake_bucket(by_id):
+    """The omission is a decision, so it is pinned like one.
+
+    `cc-regression-hourly` runs the same monitor code against the covered-call
+    profile, whose universe is holdings-derived — it has no `stocks.symbols` to
+    check the lake against, so the check degrades to a
+    `lake_freshness_no_universe` warn by design. The lake is the wheel's data
+    and the wheel's check is its watcher; a second watcher measuring a different
+    universe would only produce a second opinion nobody reconciles.
+
+    Without this test, "the CC service has no CHAIN_LAKE_BUCKET" is
+    indistinguishable from an oversight, and the obvious fix is to add it.
+    """
+    script = script_of(by_id[CHAINS["covered-call-engine"]["deploy"]])
+    assert "CHAIN_LAKE_BUCKET" not in script, (
+        "deploy-cc-canary must NOT set CHAIN_LAKE_BUCKET — see this test's "
+        "docstring and check_lake_freshness's. If this is being changed "
+        "deliberately, change the docstrings too."
+    )
+
+
 def test_dashboard_service_knows_the_sweep_job_name(by_id):
     """The API cannot launch a job it cannot name.
 

@@ -88,7 +88,7 @@ from .alpaca_provider import (
 )
 from .bar_store import BarStore, CachedBarProvider, last_settled_day
 from .chain_builder import STRIKE_WINDOW_PCT, UNIVERSE_DTE_BUFFER, ChainBuilder, strike_window
-from .chain_store import _BOUND_TOL, _PRICE_TOL, ChainStore
+from .chain_store import _BOUND_TOL, _close, ChainStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...utils.config import Config
@@ -154,12 +154,40 @@ class SymbolBackfill:
     days_written: int = 0        # an object was written for the day
     days_replaced_wider: int = 0  # ...over an existing object, as a superset
     days_skipped: int = 0        # the store DECLINED the write (any reason)
+    days_covered: int = 0        # already stored at or above this window
     # Days deliberately not built because the session carries an unmodelled
     # corporate action. Reported everywhere, and NOT a failure — see ``failed``.
     days_skipped_corporate_action: int = 0
     errors: int = 0              # days that produced no chain BY FAILURE
     error: Optional[str] = None  # symbol-level failure; the pass stopped here
     seconds: float = 0.0
+
+    #: The buckets every checked day lands in, exactly one each.
+    DAY_BUCKETS = (
+        "days_written", "days_skipped", "days_covered",
+        "days_skipped_corporate_action", "errors",
+    )
+
+    @property
+    def reconciles(self) -> bool:
+        """Whether every checked day is accounted for in exactly one bucket.
+
+        This is a real invariant, not a formality. Before it existed a lake
+        operation that failed *before* the circuit breaker tripped moved no
+        counter this module sampled, so the day fell into no bucket at all and
+        a five-day run reported "4 written" with the fifth day mentioned
+        nowhere — the run looked complete and was not. A hole in the lake that
+        nothing reports is precisely the failure this whole phase exists to
+        remove, so the arithmetic is asserted rather than assumed.
+
+        A symbol that failed at the SYMBOL level is exempt: its pass stopped
+        mid-window, so the days after it were never checked.
+        """
+        if self.error is not None:
+            return True
+        return self.days_checked == sum(
+            getattr(self, name) for name in self.DAY_BUCKETS
+        )
 
     @property
     def failed(self) -> bool:
@@ -175,9 +203,13 @@ class SymbolBackfill:
         instead, where it informs without paging.
 
         Genuine failures — a vendor error, an exception mid-build, a symbol
-        whose bars never arrived — keep the full fail posture.
+        whose bars never arrived, a lake operation that did not land — keep the
+        full fail posture. So does a pass whose day counters do not reconcile:
+        if this module cannot say what happened to every checked day, it cannot
+        claim the window is covered.
         """
-        return self.error is not None or self.errors > 0
+        return (self.error is not None or self.errors > 0
+                or not self.reconciles)
 
     def as_log(self) -> dict:
         return {
@@ -186,16 +218,18 @@ class SymbolBackfill:
             "days_written": self.days_written,
             "days_replaced_wider": self.days_replaced_wider,
             "days_skipped": self.days_skipped,
+            "days_covered": self.days_covered,
             "days_skipped_corporate_action": self.days_skipped_corporate_action,
             "errors": self.errors,
             "error": self.error,
+            "reconciles": self.reconciles,
             "seconds": round(self.seconds, 2),
         }
 
 
 @dataclass
 class BackfillSummary:
-    """The whole run. ``failed_symbols`` decides the process exit code."""
+    """The whole run. ``failed()`` decides the process exit code."""
 
     start: date
     end: date
@@ -207,8 +241,69 @@ class BackfillSummary:
     def failed_symbols(self) -> List[str]:
         return [s.symbol for s in self.symbols if s.failed]
 
+    @property
+    def lake_configured(self) -> bool:
+        """Whether this run was asked to write to a lake at all.
+
+        ``CHAIN_LAKE_BUCKET`` unset is a legitimate local run — a developer
+        building chains into their own cache — and must not fail. A lake that
+        was configured and then died is the opposite case; see ``lake_failed``.
+        """
+        return bool(self.lake.get("lake_enabled"))
+
+    @property
+    def lake_failed(self) -> bool:
+        """A configured lake that did not take everything it was given.
+
+        **This fails the run**, and the reason is worth stating plainly: the
+        entire purpose of an execution is to put objects in the lake. When a
+        lake operation fails, ``ChainStore`` degrades to local-only — correct
+        behaviour for a backtest, which still needs its chains, and exactly
+        wrong for a backfill, whose filesystem is destroyed when the task
+        exits. A green exit-0 run reporting "widened the lake" with
+        ``lake_puts = 0`` is the silent failure this phase exists to kill, and
+        it is worse than a loud one because the operator moves on to the next
+        chunk believing this one landed.
+
+        **Why this is not simply ``lake_disabled``.** ``ChainLake``'s circuit
+        breaker counts *consecutive* failures and is reset by
+        ``note_success()`` — and a successful read is a success, including a
+        miss, which is the RPC reaching GCS. The backfill interleaves a
+        provenance read and a write on every single day, so each day's read
+        resets the counter the write just incremented and the breaker **never
+        trips** for this workload. Measured: 12 consecutive failed uploads left
+        ``_consecutive_errors`` at 1 and ``disabled`` False. Keying this on
+        ``lake_disabled`` alone would therefore have reported "lake: ok" on a
+        run where 100% of the writes failed, which is the exact sentence this
+        property exists to prevent anyone from reading.
+
+        (That interleaving is not a bug to fix here: the breaker's job is to
+        stop a *backtest* paying for a dead lake 5,400 times, and the backfill
+        does want to keep trying — every day it does not upload is a day it
+        will have to redo. What it must not do is call the result a success.)
+        """
+        if not self.lake_configured:
+            return False
+        return (bool(self.lake.get("lake_disabled"))
+                or int(self.lake.get("lake_errors") or 0) > 0)
+
+    def failed(self) -> bool:
+        """The process exit code, as a predicate."""
+        return bool(self.failed_symbols()) or self.lake_failed
+
     def total(self, field_name: str) -> int:
         return sum(getattr(s, field_name) for s in self.symbols)
+
+    def lake_health(self) -> dict:
+        """The lake facts a reader needs to trust the write counts."""
+        return {
+            "lake_enabled": bool(self.lake.get("lake_enabled")),
+            "lake_disabled": bool(self.lake.get("lake_disabled")),
+            "lake_disabled_reason": self.lake.get("lake_disabled_reason"),
+            "lake_bucket": self.lake.get("lake_bucket"),
+            "lake_puts": int(self.lake.get("lake_puts") or 0),
+            "lake_errors": int(self.lake.get("lake_errors") or 0),
+        }
 
     def as_log(self) -> dict:
         return {
@@ -220,11 +315,14 @@ class BackfillSummary:
             "days_written": self.total("days_written"),
             "days_replaced_wider": self.total("days_replaced_wider"),
             "days_skipped": self.total("days_skipped"),
+            "days_covered": self.total("days_covered"),
             "days_skipped_corporate_action": self.total(
                 "days_skipped_corporate_action"),
             "errors": self.total("errors"),
             "failed_symbols": self.failed_symbols(),
+            "lake_failed": self.lake_failed,
             "seconds": round(self.seconds, 2),
+            **self.lake_health(),
         }
 
     def render(self) -> str:
@@ -235,18 +333,48 @@ class BackfillSummary:
             f"{self.seconds:.1f}s)",
             "",
             f"{'symbol':<8} {'checked':>8} {'written':>8} {'wider':>7} "
-            f"{'skipped':>8} {'corp_act':>9} {'errors':>7}  note",
+            f"{'skipped':>8} {'covered':>8} {'corp_act':>9} {'errors':>7}  note",
         ]
         for s in self.symbols:
             lines.append(
                 f"{s.symbol:<8} {s.days_checked:>8} {s.days_written:>8} "
                 f"{s.days_replaced_wider:>7} {s.days_skipped:>8} "
-                f"{s.days_skipped_corporate_action:>9} "
+                f"{s.days_covered:>8} {s.days_skipped_corporate_action:>9} "
                 f"{s.errors:>7}  {s.error or ''}"
             )
+        # Lake health sits beside the write counts, never below the fold: a
+        # "written" column is only meaningful if the lake was actually up.
+        health = self.lake_health()
+        if not health["lake_enabled"]:
+            lines += ["", "lake: NOT CONFIGURED (local-only run; "
+                          "no object left this machine)"]
+        elif health["lake_disabled"]:
+            lines += ["", f"lake: DISABLED mid-run "
+                          f"(reason={health['lake_disabled_reason']}, "
+                          f"bucket={health['lake_bucket']}, "
+                          f"lake_puts={health['lake_puts']}, "
+                          f"lake_errors={health['lake_errors']}) — every day "
+                          f"after that point was written to a container "
+                          f"filesystem that is about to be destroyed"]
+        elif health["lake_errors"]:
+            lines += ["", f"lake: ERRORS (bucket={health['lake_bucket']}, "
+                          f"lake_puts={health['lake_puts']}, "
+                          f"lake_errors={health['lake_errors']}) — operations "
+                          f"failed and the run continued local-only. The "
+                          f"breaker did NOT trip: the per-day provenance read "
+                          f"resets its consecutive-failure count, so a lake "
+                          f"refusing every write still reads as 'enabled'"]
+        else:
+            lines += ["", f"lake: ok (bucket={health['lake_bucket']}, "
+                          f"lake_puts={health['lake_puts']}, "
+                          f"lake_errors={health['lake_errors']})"]
         failed = self.failed_symbols()
         if failed:
             lines += ["", f"FAILED: {', '.join(failed)}"]
+        if self.lake_failed:
+            lines += ["FAILED: the chain lake was configured and did not take "
+                      "everything it was given; this execution did not do its "
+                      "job. Re-run this window."]
         return "\n".join(lines)
 
 
@@ -338,7 +466,11 @@ def covers(stored: Optional[dict], *, strike_gte: float, strike_lte: float,
     if float(lo) > strike_gte + _BOUND_TOL or float(hi) < strike_lte - _BOUND_TOL:
         return False
     price = stored.get("underlying_price")
-    if price is None or abs(float(price) - underlying_price) > _PRICE_TOL:
+    # `_close`, not an absolute epsilon: the store's tolerance is RELATIVE
+    # (`_PRICE_TOL * max(1, |a|, |b|)`), so an absolute 1e-9 would predict "not
+    # covered" on a $900 underlying where the store says covered — and the
+    # accounting would report a rebuild that never happened.
+    if price is None or not _close(float(price), underlying_price):
         # A file built against a different close for the same session prices
         # every delta in it against that close; `get` refuses it and rebuilds.
         return False
@@ -484,10 +616,24 @@ def _backfill_symbol(
         )
         splits = split_days(bars)
         model = builder._model_fingerprint(symbol)
-        for bar in bars:
+        in_window = [b for b in bars if start <= b.bar_date <= end]
+        if not in_window:
+            # A symbol with no settled session in a non-empty window did not
+            # "complete with nothing to do" — something is wrong with the
+            # symbol. The case this is written for is the one the onboarding
+            # checklist creates: a typo'd ticker in `stocks.candidates`, which
+            # Alpaca answers with an empty bar list rather than an error. As a
+            # silent zero-day pass it would report success for ever, and the
+            # first symptom would be a sweep on a symbol with no data at all.
+            # Delisting and a window of pure market holidays land here too, and
+            # both deserve the same "look at this" as the typo.
+            raise ValueError(
+                f"no settled sessions for {symbol} in {start}..{end} — the "
+                f"provider returned no bars in the window. A typo'd ticker "
+                f"answers exactly like this."
+            )
+        for bar in in_window:
             day = bar.bar_date
-            if not (start <= day <= end):
-                continue
             row.days_checked += 1
             try:
                 _backfill_day(
@@ -549,9 +695,10 @@ def _backfill_day(
         # of separating the two counters is that this one still fails the run.
         row.errors += 1
         logger.warning(
-            "Backfill skipped a day: no usable underlying close",
-            event_category="backtest_data", event_type="backfill_day_skipped",
+            "Backfill FAILED a day: no usable underlying close",
+            event_category="backtest_data", event_type="backfill_day_failed",
             reason="no_underlying_price", symbol=symbol, as_of=day.isoformat(),
+            close=None if close is None else float(close),
         )
         return
 
@@ -578,32 +725,67 @@ def _backfill_day(
     )
     after = _write_counters(chain_store)
 
+    bucket = _classify_day(chain_store, before, after, already=already)
+    if bucket == "errors":
+        logger.warning(
+            "Backfill FAILED a day: the chain lake did not take it",
+            event_category="backtest_data", event_type="backfill_day_failed",
+            reason="lake_write_failed", symbol=symbol, as_of=day.isoformat(),
+            lake_errors=after["lake_errors"] - before["lake_errors"],
+            lake_merge_gaps=after["lake_merge_gaps"] - before["lake_merge_gaps"],
+            lake_live=after["lake_live"],
+        )
+    setattr(row, bucket, getattr(row, bucket) + 1)
+    if bucket == "days_written" and stored is not None:
+        row.days_replaced_wider += 1
+
+
+def _classify_day(store: ChainStore, before: Dict[str, int],
+                  after: Dict[str, int], *, already: bool) -> str:
+    """Which single bucket this day belongs in. Exactly one, always.
+
+    Reads the store's public counter deltas — ``summary()`` is its own
+    aggregate view, so nothing here reaches into store internals. The order is
+    a priority, not a preference:
+
+    1. **A failed lake operation wins.** ``lake_errors`` moves when an RPC
+       raised and the run continued local-only; ``lake_merge_gaps`` moves when
+       two windows did not overlap so the merge published *nothing at all*.
+       Either way the day is not in the lake. Before these two were sampled the
+       day landed in no bucket whatsoever — a five-day run reporting four
+       written and saying nothing about the fifth.
+    2. **A declined upload** (``lake_skipped``) is the guard working: a wider
+       object is already there, or a generation race was lost. Not a failure.
+    3. **A write**: ``lake_puts`` for the ordinary path, ``lake_merged`` for an
+       FC-091 union.
+    4. **A dead lake makes everything after it an error, not a write.** When a
+       CONFIGURED lake is switched off, ``_mirror_to_lake`` returns before
+       touching a counter, so a local write moves nothing — and counting it as
+       ``days_written`` would report a widened lake to an operator whose
+       objects went to a container filesystem that is about to be destroyed.
+    5. **No lake configured at all** is a legitimate local run: fall back to
+       what the coverage check said, because ``lake_puts`` cannot move and the
+       local file genuinely is the deliverable.
+    6. Otherwise the stored object already covered the request — a hit.
+    """
+    if (after["lake_errors"] > before["lake_errors"]
+            or after["lake_merge_gaps"] > before["lake_merge_gaps"]):
+        return "errors"
     if after["lake_skipped"] > before["lake_skipped"]:
-        # The store declined the upload — a wider object already there, an
-        # unreadable remote, or a lost generation race. Each one logged its own
-        # WARNING with the reason; the count is what makes it show up in the
-        # run summary too.
-        row.days_skipped += 1
-        return
-    wrote = (
-        after["lake_puts"] > before["lake_puts"]
-        or after["lake_merged"] > before["lake_merged"]
-    )
-    if not wrote and not _lake_accounting(chain_store):
-        # No lake (a local-only run, or one whose lake tripped its breaker), so
-        # `lake_puts` cannot move. Fall back to what the coverage check said:
-        # a day the stored file did not already cover was rebuilt and written
-        # to disk. In the Job — where a lake is always configured — this branch
-        # is not taken.
-        wrote = not already
-    if wrote:
-        row.days_written += 1
-        if stored is not None:
-            row.days_replaced_wider += 1
+        return "days_skipped"
+    if (after["lake_puts"] > before["lake_puts"]
+            or after["lake_merged"] > before["lake_merged"]):
+        return "days_written"
+    if after["lake_configured"]:
+        # Configured. If it is still live, no counter moving means the stored
+        # object covered the request; if it is dead, this day never left the
+        # machine.
+        return "days_covered" if after["lake_live"] else "errors"
+    return "days_written" if not already else "days_covered"
 
 
 def _write_counters(store: ChainStore) -> Dict[str, int]:
-    """The store's public write counters. Sampled, never reached into.
+    """The store's public write counters, plus its health. Sampled, not probed.
 
     ``summary()`` is the store's own aggregate view; taking deltas of it keeps
     this module out of ``ChainStore``'s internals entirely, which is what lets
@@ -615,13 +797,12 @@ def _write_counters(store: ChainStore) -> Dict[str, int]:
         "lake_puts": int(snapshot.get("lake_puts") or 0),
         "lake_skipped": int(snapshot.get("lake_skipped") or 0),
         "lake_merged": int(snapshot.get("lake_merged") or 0),
+        "lake_errors": int(snapshot.get("lake_errors") or 0),
+        "lake_merge_gaps": int(snapshot.get("lake_merge_gaps") or 0),
+        "lake_configured": bool(snapshot.get("lake_enabled")),
+        "lake_live": bool(snapshot.get("lake_enabled"))
+        and not snapshot.get("lake_disabled"),
     }
-
-
-def _lake_accounting(store: ChainStore) -> bool:
-    """Whether the store's counters can see writes at all this run."""
-    snapshot = store.summary()
-    return bool(snapshot.get("lake_enabled")) and not snapshot.get("lake_disabled")
 
 
 def resolve_window(

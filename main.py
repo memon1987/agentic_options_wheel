@@ -442,9 +442,11 @@ def run_backfill_cmd(args, config: Config, logger) -> int:
     Writes nothing to BigQuery — the output is parquet objects in the shared
     chain lake and the bars cache, plus the summary below.
 
-    Returns an exit code: non-zero if any symbol failed, because a run that
-    half-happened looks exactly like one that worked (the FC-081 lesson) and
-    the Job-failure alert policy is what turns that into a page.
+    Returns an exit code: non-zero if any symbol failed, or if a CONFIGURED
+    chain lake died mid-run, because a run that half-happened looks exactly
+    like one that worked (the FC-081 lesson) and the Job-failure alert policy
+    is what turns that into a page. A run with no lake configured at all is a
+    legitimate local build and exits 0.
     """
     from src.backtesting.data.backfill import (
         DEFAULT_HISTORY_DAYS,
@@ -534,8 +536,23 @@ def run_backfill_cmd(args, config: Config, logger) -> int:
             f"\nWARNING: {len(failed)} symbol(s) did not complete cleanly: "
             f"{', '.join(failed)}"
         )
-        return 1
-    return 0
+    if summary.lake_failed:
+        # A CONFIGURED lake that died mid-run fails the execution even if every
+        # symbol looks clean. The store degrades to local-only on purpose — the
+        # right answer for a backtest, which still needs its chains — but this
+        # process exists to put objects in a bucket, and its filesystem is
+        # destroyed when the task exits. Exiting 0 here would report a widened
+        # lake to an operator who would move on to the next chunk.
+        health = summary.lake_health()
+        print(
+            f"\nWARNING: the chain lake was configured "
+            f"({health['lake_bucket']}) and was DISABLED mid-run "
+            f"(reason={health['lake_disabled_reason']}, "
+            f"lake_puts={health['lake_puts']}, "
+            f"lake_errors={health['lake_errors']}). Days built after that "
+            f"point never left this container. Re-run this window."
+        )
+    return 1 if summary.failed() else 0
 
 
 def run_screen_cmd(args, config: Config, logger) -> int:

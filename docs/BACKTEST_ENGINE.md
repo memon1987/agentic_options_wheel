@@ -399,7 +399,7 @@ data at all. `python main.py --command backfill` is the deliberate version, and 
 | Default universe | `stocks.symbols` + `stocks.candidates` |
 | Default window | the trailing **30 calendar days** through the last settled session |
 | Job overrides (all optional, per EXECUTION) | `BACKFILL_SYMBOLS`, `BACKFILL_HISTORY_DAYS`, `BACKFILL_START`, `BACKFILL_END` |
-| Exit code | non-zero if any symbol hit a genuine **failure** (vendor error, exception, missing bars). A day skipped for an unmodelled **corporate action** is counted (`days_skipped_corporate_action`) and logged, but does *not* fail the run — a split recurs and the window slides, so paging weekly for a month is how the alert gets muted |
+| Exit code | non-zero if any symbol hit a genuine **failure** (vendor error, exception, missing bars, unusable close) **or if a configured lake did not take everything it was given** (`lake_puts = 0` on a run that claims to have widened the lake is the silent failure this phase kills). A day skipped for an unmodelled **corporate action** is counted (`days_skipped_corporate_action`) and logged, but does *not* fail the run — a split recurs and the window slides, so paging weekly for a month is how the alert gets muted |
 
 **The window rule is the whole design.** Each `(symbol, day)` is built at the **union** of
 a fresh spot ±40% window and whatever the stored object already covers, so the file that
@@ -428,12 +428,23 @@ dividend yields in here would look like an improvement and would fork the lake i
 second, invisible model whose files no sweep can read. A model change is its own PR, across
 every writer, with a `CHAIN_LAKE_PREFIX` bump.
 
-**Watching it.** `deploy/monitoring/job_failure_alert_policy.json` alerts on a failed
-execution of any of the three Jobs; the `/regression` `lake_freshness` check catches the
-other half — a `backfill-weekly` scheduler that was paused or deleted, which is invisible
-to the scheduler's own history because `jobs:run` is asynchronous. Per-symbol
-`backfill_symbol_complete` log lines are emitted as they complete, so a run killed at the
-task timeout is still reconstructable.
+**Every checked day lands in exactly one bucket**, and the summary asserts it:
+`days_checked == days_written + days_skipped + days_covered +
+days_skipped_corporate_action + errors`. A pass whose arithmetic does not close is a
+failure, because a module that cannot say what happened to every day it looked at cannot
+claim the window is covered. (The counters are read from `ChainStore.summary()` deltas, so
+they describe what the store *did*, not what the backfill asked for.)
+
+**Watching it.** Three policies and one check, and they cover different failures:
+`deploy/monitoring/job_failure_alert_policy.json` alerts on an execution that runs and
+fails; `lake_freshness_alert_policy.json` alerts on the `/regression` `lake_freshness`
+check's `fail`, which is the only signal for an execution that **never ran** — a
+`backfill-weekly` scheduler that was paused or deleted is invisible to the scheduler's own
+history, because `jobs:run` is asynchronous and records success when the API call returns;
+and `lake_freshness_degraded_alert_policy.json` nags once a day if that check is itself
+impaired, since a control reporting `warn` for ever looks exactly like one that is working.
+Per-symbol `backfill_symbol_complete` log lines are emitted as each symbol finishes, so a
+run killed at the task timeout is still reconstructable.
 
 ### Candidate onboarding
 

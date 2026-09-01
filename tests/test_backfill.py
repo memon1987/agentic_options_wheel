@@ -42,7 +42,10 @@ from src.backtesting.data.chain_builder import (
     UNIVERSE_DTE_BUFFER,
     ChainBuilder,
 )
-from src.backtesting.data.chain_store import ChainStore
+from src.backtesting.data.chain_store import (
+    MAX_CONSECUTIVE_LAKE_ERRORS,
+    ChainStore,
+)
 from src.backtesting.data.provider import OptionBar, OptionContract, StockBar
 from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
 from tests.test_chain_store_lake import FakeLake
@@ -704,6 +707,87 @@ class TestSummaryAccounting:
         row = summary.symbols[0]
         assert row.days_written == 0
         assert store.summary()["lake_errors"] > 0
+        assert row.reconciles
+        assert summary.failed()
+
+    def test_every_checked_day_lands_in_exactly_one_bucket(self, tmp_path,
+                                                            provider, days):
+        """The reconciliation invariant, on the run that broke it.
+
+        A lake operation that fails *before* the circuit breaker trips moves
+        `lake_errors` and nothing else — and `lake_errors` was not sampled, so
+        the day fell into no bucket at all. The observed shape was a five-day
+        run reporting "4 written" with the fifth day mentioned nowhere: a hole
+        in the lake that the summary, the logs and the exit code all agreed did
+        not exist.
+        """
+        fail_on = {days[2], days[5]}
+
+        class Flaky(FakeLake):
+            def upload(self, local_path, underlying, as_of, **kw):
+                self._record("upload", underlying, as_of)
+                if as_of in fail_on:
+                    raise Exception("503 backend error")
+                return super().upload(local_path, underlying, as_of, **kw)
+
+        store = _store(tmp_path, lake=Flaky())
+        summary = _run(provider, store, ["XYZ"], days[0], days[-1])
+        row = summary.symbols[0]
+
+        assert row.days_checked == len(days)
+        assert row.errors == 2
+        assert row.days_written == len(days) - 2
+        assert row.reconciles, (
+            f"{row.days_checked} checked != "
+            f"{[getattr(row, b) for b in row.DAY_BUCKETS]}"
+        )
+        assert sum(getattr(row, b) for b in row.DAY_BUCKETS) == row.days_checked
+        assert summary.failed_symbols() == ["XYZ"], (
+            "a day the lake refused to take is a failure, not a footnote"
+        )
+
+    @pytest.mark.parametrize("scenario", ["clean", "covered", "split", "declined"])
+    def test_the_buckets_reconcile_on_every_shape(self, tmp_path, provider,
+                                                  days, prices, scenario):
+        lake = FakeLake()
+        symbols = ["XYZ"]
+        if scenario == "split":
+            prices = {d: 100.0 for d in days}
+            for d in days[4:]:
+                prices[d] = 10.0
+            provider = LadderProvider(prices)
+        if scenario == "declined":
+            day, price = days[0], prices[days[0]]
+            seed = ChainStore(str(tmp_path / "seed"))
+            ChainBuilder(provider, store=seed).build(
+                "XYZ", day, 60, underlying_price=price * 1.01,
+                cost_basis=price * 3.0, low_anchor=price * 0.1)
+            lake.put_object("XYZ", day,
+                            Path(seed._path("XYZ", day)).read_bytes())
+
+        store = _store(tmp_path, lake=lake, name="run-1")
+        summary = _run(provider, store, symbols, days[0], days[-1])
+        if scenario == "covered":
+            summary = _run(provider, _store(tmp_path, lake=lake, name="run-2"),
+                           symbols, days[0], days[-1])
+            assert summary.symbols[0].days_covered == len(days)
+
+        for row in summary.symbols:
+            assert row.reconciles, (row.symbol, row.as_log())
+        assert summary.as_log()["days_checked"] == sum(
+            summary.total(b) for b in bf.SymbolBackfill.DAY_BUCKETS)
+
+    def test_a_pass_that_cannot_account_for_its_days_is_a_failure(self):
+        """If the arithmetic does not close, the window is not covered.
+
+        Constructed directly rather than provoked: the point is the posture, not
+        the mechanism that would produce it. A future counter added to
+        `_classify_day` and forgotten in `DAY_BUCKETS` lands exactly here.
+        """
+        row = bf.SymbolBackfill(symbol="XYZ", days_checked=5, days_written=4)
+        assert not row.reconciles
+        assert row.failed
+        assert row.as_log()["reconciles"] is False
 
     def test_a_lakeless_run_still_reports_writes(self, tmp_path, provider, days):
         """No lake means `lake_puts` cannot move; local writes still count.
@@ -719,6 +803,227 @@ class TestSummaryAccounting:
         assert _run(provider, store, ["XYZ"], days[0], days[-1]) \
             .symbols[0].days_written == 0
 
+class TestDeadLake:
+    """A configured lake that dies mid-run is the run failing, not degrading.
+
+    `ChainStore` degrades to local-only by design — the right answer for a
+    backtest, which still needs its chains. It is exactly wrong here: this
+    process exists to put objects in a bucket, and the container filesystem it
+    would fall back to is destroyed when the task exits. The failure mode being
+    closed off is a green exit-0 execution reporting a widened lake with
+    `lake_puts = 0`, after which the operator moves on to the next chunk.
+    """
+
+    class _DeadOnUpload(FakeLake):
+        def upload(self, *a, **kw):
+            self._record("upload", a[1], a[2])
+            raise Exception("permission denied")
+
+    def _run_until_dead(self, tmp_path, provider, days):
+        store = _store(tmp_path, lake=self._DeadOnUpload())
+        summary = _run(provider, store, ["XYZ"], days[0], days[-1])
+        assert store.summary()["lake_errors"] == len(days)
+        assert store.summary()["lake_puts"] == 0
+        return summary, store
+
+    def test_the_breaker_does_not_trip_under_this_workload(self, tmp_path,
+                                                           provider, days):
+        """The finding that shaped `lake_failed`, pinned so it cannot regress.
+
+        `ChainLake`'s breaker counts CONSECUTIVE failures and `note_success()`
+        resets it — and a read is a success, a miss included (the RPC reached
+        GCS). The backfill interleaves a provenance read and a write on every
+        day, so each read resets the counter the write just incremented.
+
+        A `lake_failed` keyed on `lake_disabled` alone would therefore have
+        reported "lake: ok" on a run where every single upload failed. This
+        test is the reason it is not keyed that way.
+        """
+        summary, store = self._run_until_dead(tmp_path, provider, days)
+        assert not store.lake.disabled, (
+            "if the breaker starts tripping here, re-read `lake_failed` — its "
+            "second clause exists precisely because it does not"
+        )
+        assert store.lake._consecutive_errors < MAX_CONSECUTIVE_LAKE_ERRORS
+        assert summary.lake_failed, (
+            "and the run must still be a failure despite the healthy-looking "
+            "lake state"
+        )
+
+    def test_local_only_fallback_writes_are_not_counted_as_written(
+            self, tmp_path, provider, days):
+        summary, _ = self._run_until_dead(tmp_path, provider, days)
+        row = summary.symbols[0]
+        assert row.days_written == 0, (
+            "every day after the breaker tripped was written to a container "
+            "filesystem that is about to be destroyed; calling that 'written' "
+            "is the silent failure this phase exists to kill"
+        )
+        assert row.days_checked == len(days)
+        assert row.errors == len(days)
+        assert row.reconciles
+
+    def test_the_run_exits_non_zero(self, tmp_path, provider, days):
+        summary, _ = self._run_until_dead(tmp_path, provider, days)
+        assert summary.lake_configured
+        assert summary.lake_failed
+        assert summary.failed()
+
+    def test_a_tripped_breaker_is_also_a_failure(self, tmp_path, provider, days):
+        """The other half: a lake switched off before the run even starts.
+
+        `ChainStore` refuses every operation without an RPC once the lake is
+        disabled, so no counter moves at all — no errors, no puts, nothing.
+        Only the health flag distinguishes this from a run where every day was
+        already covered.
+        """
+        lake = FakeLake()
+        lake.disable("bucket_missing")
+        store = _store(tmp_path, lake=lake)
+        summary = _run(provider, store, ["XYZ"], days[0], days[-1])
+
+        assert summary.lake_configured and summary.lake_failed
+        assert summary.failed()
+        assert summary.symbols[0].days_written == 0
+        assert summary.symbols[0].errors == len(days)
+        assert summary.symbols[0].reconciles
+        assert "DISABLED mid-run" in summary.render()
+
+    def test_a_dead_lake_fails_the_run_even_with_no_failed_symbol(self):
+        """The two conditions are independent, and the summary carries both."""
+        summary = bf.BackfillSummary(
+            start=date(2026, 1, 1), end=date(2026, 1, 31), universe_dte=22,
+            lake={"lake_enabled": True, "lake_disabled": True,
+                  "lake_disabled_reason": "consecutive_errors",
+                  "lake_bucket": "b", "lake_puts": 0, "lake_errors": 5},
+        )
+        summary.symbols.append(bf.SymbolBackfill(
+            symbol="XYZ", days_checked=3, days_covered=3))
+        assert summary.failed_symbols() == []
+        assert summary.failed()
+
+    def test_lake_health_is_in_the_log_and_the_render(self, tmp_path, provider,
+                                                      days):
+        summary, _ = self._run_until_dead(tmp_path, provider, days)
+        log = summary.as_log()
+        assert log["lake_enabled"] is True
+        assert log["lake_disabled"] is False, (
+            "the breaker does not trip under this workload — see "
+            "test_the_breaker_does_not_trip_under_this_workload"
+        )
+        assert log["lake_failed"] is True
+        assert log["lake_puts"] == 0
+        assert log["lake_errors"] > 0
+        rendered = summary.render()
+        assert "lake: ERRORS" in rendered
+        assert "breaker did NOT trip" in rendered
+        assert "did not do its job" in rendered
+
+    def test_a_lakeless_by_config_run_is_healthy_and_exits_zero(
+            self, tmp_path, provider, days):
+        """No bucket configured is a developer build, not a broken Job.
+
+        The distinction is the whole reason `lake_failed` asks whether the lake
+        was CONFIGURED rather than whether it is usable.
+        """
+        store = _store(tmp_path)
+        summary = _run(provider, store, ["XYZ"], days[0], days[-1])
+        assert store.lake is None
+        assert not summary.lake_configured
+        assert not summary.lake_failed
+        assert not summary.failed()
+        assert summary.symbols[0].days_written == len(days)
+        assert "NOT CONFIGURED" in summary.render()
+
+    def test_a_healthy_lake_says_so(self, tmp_path, provider, days):
+        summary = _run(provider, _store(tmp_path, lake=FakeLake()), ["XYZ"],
+                       days[0], days[-1])
+        assert summary.lake_configured and not summary.lake_failed
+        assert "lake: ok" in summary.render()
+        assert summary.as_log()["lake_puts"] == len(days)
+
+
+class TestDayLevelFailures:
+    def test_a_non_positive_close_is_an_error_not_a_skip(
+            self, tmp_path, days, captured_backfill_events):
+        """Broken vendor data must not hide in the corporate-action counter.
+
+        Note the shape needed to reach this branch at all, which is itself the
+        interesting part: a lone zero close is a >40% move, so the split
+        detector claims it first. The second consecutive zero is what lands
+        here — `split_days` skips a pair whose predecessor close is already
+        non-positive. So one run exercises both branches and proves they are
+        counted apart, which is the property under test.
+
+        A skip query ("which days is the lake missing, and why") must not sweep
+        in failures, so this logs under `backfill_day_failed`, not
+        `backfill_day_skipped`.
+        """
+        prices = {d: 100.0 for d in days}
+        prices[days[3]] = 0.0   # reads as a corporate action (100 -> 0)
+        prices[days[4]] = 0.0   # no usable close, and no ratio to judge it by
+        summary = _run(LadderProvider(prices),
+                       _store(tmp_path, lake=FakeLake()), ["XYZ"],
+                       days[0], days[-1])
+        row = summary.symbols[0]
+
+        assert row.errors == 1
+        assert row.days_skipped_corporate_action == 1
+        assert row.days_written == len(days) - 2
+        assert row.reconciles
+        assert summary.failed(), "an unusable close fails the run"
+
+        failures = [e for e in captured_backfill_events
+                    if e.get("event_type") == "backfill_day_failed"]
+        assert [e["reason"] for e in failures] == ["no_underlying_price"]
+        assert failures[0]["as_of"] == days[4].isoformat()
+
+        skips = [e for e in captured_backfill_events
+                 if e.get("event_type") == "backfill_day_skipped"]
+        assert [e["reason"] for e in skips] == ["corporate_action"], (
+            "the failure must NOT appear in a skip query"
+        )
+        assert skips[0]["as_of"] == days[3].isoformat()
+
+    def test_a_symbol_with_no_bars_in_the_window_fails(self, tmp_path, days):
+        """The typo'd-candidate case, which three documents already promise.
+
+        Alpaca answers an unknown ticker with an empty bar list, not an error.
+        As a silent zero-day pass it would report success for ever, and the
+        first symptom would be a sweep against a symbol that has no data at all.
+        """
+        provider = LadderProvider({d: 100.0 for d in days})
+        provider.per_symbol["TYPO"] = {}
+        summary = bf.run_backfill(
+            None, ["XYZ", "TYPO"], days[0], days[-1],
+            chain_store=_store(tmp_path, lake=FakeLake()), bar_provider=provider,
+        )
+        by_symbol = {s.symbol: s for s in summary.symbols}
+
+        assert by_symbol["TYPO"].error is not None
+        assert "no settled sessions" in by_symbol["TYPO"].error
+        assert summary.failed_symbols() == ["TYPO"]
+        assert summary.failed()
+        assert by_symbol["XYZ"].days_written == len(days), (
+            "and the good symbol still completes"
+        )
+
+    def test_an_empty_window_is_still_not_a_symbol_failure(self, tmp_path,
+                                                           provider):
+        """A window with no sessions is refused BEFORE any symbol is walked.
+
+        The zero-bars rule is about a symbol with no data, not about a caller
+        asking for a window that contains no sessions at all — that is caught
+        once, up front, rather than reported as fourteen broken symbols.
+        """
+        summary = _run(provider, _store(tmp_path, lake=FakeLake()), ["XYZ"],
+                       date.today() + timedelta(days=3),
+                       date.today() + timedelta(days=9))
+        assert summary.symbols == []
+        assert not summary.failed()
+
+
+class TestSummaryAccountingExtra:
     def test_totals_and_render(self, tmp_path, provider, days, prices):
         summary = bf.run_backfill(
             None, ["AAA", "ZZZ"], days[0], days[-1],
@@ -851,6 +1156,41 @@ class TestCoveragePrediction:
     def test_nothing_stored_never_covers(self):
         assert not bf.covers(None, strike_gte=1.0, strike_lte=2.0, model="m",
                              underlying_price=1.0)
+
+    def test_the_price_tolerance_is_the_stores_relative_one(self):
+        """A float wobble on an expensive underlying is not a rebuild.
+
+        `ChainStore._close` scales its tolerance with the price
+        (`_PRICE_TOL * max(1, |a|, |b|)`). An absolute 1e-9 here would predict
+        "not covered" for a $900 name where the store says covered — the
+        accounting would then report a write the store never made, on the one
+        symbol class (SPY, QQQ, high-priced tech) the widening cares most
+        about.
+
+        Verified against the store's own comparator rather than a hand-picked
+        epsilon, so the two cannot drift apart.
+        """
+        from src.backtesting.data.chain_store import _close
+
+        for price in (5.0, 100.0, 925.25, 6120.0):
+            wobble = price * 5e-10          # inside the relative tolerance
+            stored = {"universe_dte": 22, "strike_gte": price * 0.5,
+                      "strike_lte": price * 1.5, "model": "m1",
+                      "underlying_price": price + wobble}
+            assert _close(price + wobble, price), "premise: the store agrees"
+            assert bf.covers(stored, strike_gte=price * 0.6,
+                             strike_lte=price * 1.4, model="m1",
+                             underlying_price=price), price
+
+    def test_a_genuinely_different_close_still_does_not_cover(self):
+        """The tolerance must not become a licence to ignore a restated bar."""
+        from src.backtesting.data.chain_store import _close
+
+        stored = {"universe_dte": 22, "strike_gte": 500.0, "strike_lte": 1500.0,
+                  "model": "m1", "underlying_price": 925.25}
+        assert not _close(925.26, 925.25), "premise: the store disagrees"
+        assert not bf.covers(stored, strike_gte=555.0, strike_lte=1295.0,
+                             model="m1", underlying_price=925.26)
 
 
 # --------------------------------------------------------------------------- #

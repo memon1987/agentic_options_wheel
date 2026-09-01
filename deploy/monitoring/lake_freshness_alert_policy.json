@@ -1,0 +1,26 @@
+{
+  "displayName": "Chain lake freshness — the weekly backfill has stopped landing data",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "The newest stored chain-day is older than the freshness window",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=(\"options-wheel-strategy\" OR \"covered-call-engine\") AND (jsonPayload.event_type=\"lake_freshness_stale\" OR textPayload:\"lake_freshness_stale\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The scheduled `/regression` chain-lake freshness check found that the newest chain-day stored for the live universe is more than `LAKE_FRESHNESS_MAX_DAYS` (10) old — or that the lake holds nothing for the live universe at all.\n\n**What this actually detects, and why the Job-failure alert cannot.** The `data-backfill` Cloud Run Job is fired by the `backfill-weekly` Cloud Scheduler job, and **`jobs:run` is asynchronous**: the scheduler records success the moment the API call returns, whether the execution then succeeded, failed, or never existed. So a paused scheduler, a deleted scheduler, and a Job whose name no longer matches all leave a clean scheduler history and produce **no logs at all** — nothing for a Job-failure policy to match on. The absence of data is the only signal, and this is what reads it.\n\nThe companion policy (`job_failure_alert_policy.json`) covers the other half: an execution that runs and fails. Both are needed. FC-081's lesson is that the dangerous state is not \"an alarm fired and was wrong\" — it is \"nothing fired, and nothing was watching.\"\n\n**Ten days is one entirely missed Saturday plus the weekend either side.** The Job covers through the last settled session, so the newest chain-day is normally 1-3 days old on a weekday. A single skipped run does not fire; two consecutive misses do.\n\nDETECTION LATENCY — this is not real-time. The check runs on the `/regression` schedulers: `:45`, 10:45-15:45 ET, **weekdays only**. A scheduler that dies on a Friday is first reported the following Monday at the earliest, and the 10-day window means a genuinely stopped backfill takes up to two weeks to surface. Do not read silence as health.\n\nTriage:\n\n```\n# is the scheduler still there, and enabled?\ngcloud scheduler jobs describe backfill-weekly --location=us-central1\n\n# did the executions actually run, and did they succeed?\ngcloud run jobs executions list --job=data-backfill --region=us-central1 --limit=5\n\n# what does the lake actually hold for one symbol?\ngsutil ls gs://options-wheel-chain-lake/chains/v1/AAPL/ | tail -5\n```\n\nThe check's own message names the newest day it found and the per-symbol detail is on the `CheckResult`, so a single lagging symbol is distinguishable from a dead Job: **the verdict is the newest day ACROSS the universe**, so one stale symbol cannot fire this — only the whole universe going quiet can.\n\nKNOWN NON-CAUSES — do not chase these:\n\n1. A read error is never this event. GCS unavailable, a missing credential, an image without `google-cloud-storage`: all report `warn` and fire the *degraded* policy instead, never this one. `fail` is reserved for \"the data really is stale\", because `fail` returns HTTP 500 from `/regression`.\n2. The covered-call service does not participate. It has no `stocks.symbols`, so its copy of the check reports `lake_freshness_no_universe` (a degraded warn) by design — the lake is the wheel's data and the wheel's check is its watcher.\n3. A stale lake is not caused by a *failed* backfill execution. That fires the Job-failure policy, loudly and immediately. This one is for the executions that never happened.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    },
+    "autoClose": "86400s"
+  }
+}

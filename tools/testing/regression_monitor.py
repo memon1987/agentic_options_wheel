@@ -1700,9 +1700,20 @@ class RegressionMonitor:
         `lake_freshness_degraded` event with a `reason`, because a check that
         reports `warn` for ever is indistinguishable from one that is working.
 
-        The covered-call profile has no `stocks` section, so its universe is
-        empty and this degrades rather than inventing one — the lake is the
-        wheel's data, and `cc-regression-hourly` runs the same code.
+        **The wheel service is the lake's watcher; the covered-call service is
+        deliberately not.** `CHAIN_LAKE_BUCKET` is set on
+        `options-wheel-strategy` by `cloudbuild.yaml`'s `deploy-bot-canary`
+        step (pinned by a contract test, because `--set-env-vars` replaces the
+        whole env set and an out-of-band addition survives exactly one deploy).
+        It is **not** set on `covered-call-engine`, and that omission is a
+        decision rather than an oversight: `cc-regression-hourly` runs this same
+        code against a profile whose universe is holdings-derived, so it has no
+        `stocks.symbols` to measure the lake against. That service therefore
+        reports a steady `lake_freshness_no_universe` **warn** — visible on its
+        report and on the degraded nag policy, never a `fail`. Two watchers
+        measuring different universes would only produce a second opinion
+        nobody reconciles; one that says plainly "I am not watching this" is
+        better than one that guesses.
         """
         bucket = (os.environ.get("CHAIN_LAKE_BUCKET") or "").strip()
         prefix = (os.environ.get("CHAIN_LAKE_PREFIX") or "").strip().strip("/") or "chains/v1"
