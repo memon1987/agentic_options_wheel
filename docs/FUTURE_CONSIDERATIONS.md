@@ -906,6 +906,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 **Links:** PR #100 reviews (data/perf persona), PR #101 reviews, `src/backtesting/data/bar_store.py`, `src/backtesting/data/chain_store.py`, FC-091 (merge-on-put, same file), `docs/plans/fc-060-scenario-runner.md`.
 
+**Rider (2026-08-31, from the FC-096 PR-1 build):** the lake circuit breaker (`MAX_CONSECUTIVE_LAKE_ERRORS=5`) can never trip under a read-then-write-per-day workload — each day's successful provenance read calls `note_success()` and resets the consecutive count the failed upload just incremented (measured: 12 consecutive failed uploads left the count at 1, breaker never opened). The backfill compensates by keying its own failure verdict on `lake_errors > 0` rather than the breaker (`test_the_breaker_does_not_trip_under_this_workload` pins it), but the breaker's semantics — consecutive-anything vs consecutive-per-operation-class — deserve a deliberate revisit for every lake consumer.
 ---
 
 ### FC-094: the dashboard is publicly reachable — decide: keep it read-only-public, or put it behind IAM/IAP
