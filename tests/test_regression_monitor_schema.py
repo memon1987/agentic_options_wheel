@@ -226,6 +226,7 @@ EXPECTED_CHECK_GROUPS = [
     "performance_baseline",
     "risk_parameters",
     "deploy_freshness",
+    "lake_freshness",
 ]
 
 _GROUP_METHODS = {
@@ -236,6 +237,7 @@ _GROUP_METHODS = {
     "performance_baseline": "check_performance_baseline",
     "risk_parameters": "check_risk_parameters",
     "deploy_freshness": "check_deploy_freshness",
+    "lake_freshness": "check_lake_freshness",
 }
 
 
@@ -265,3 +267,15 @@ def test_deploy_freshness_group_is_registered():
 
     source = __import__("inspect").getsource(RegressionMonitor.run_all_checks)
     assert '"deploy_freshness": self.check_deploy_freshness' in source
+
+
+def test_lake_freshness_group_is_registered():
+    """FC-096 Phase A: the chain-lake freshness check must actually be wired.
+
+    It is the only control that sees a `backfill-weekly` scheduler that was
+    paused or deleted — `jobs:run` is async, so the scheduler's own history
+    reports success whether the execution happened, failed, or never existed.
+    A check written but not registered would leave that silence intact.
+    """
+    source = __import__("inspect").getsource(RegressionMonitor.run_all_checks)
+    assert '"lake_freshness": self.check_lake_freshness' in source

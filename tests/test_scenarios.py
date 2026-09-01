@@ -17,6 +17,8 @@ it produce a number that means something other than what it says":
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import uuid
 from contextlib import contextmanager
@@ -163,6 +165,64 @@ class TestApplyOverrides:
         message = str(exc.value)
         assert "universe_dte=8" in message
         assert "re-materialisation" in message
+
+    def test_the_dte_knob_is_still_closed_in_pr_1(self, sweep_config):
+        """FC-096 Phase A PR-1 adds a CONSTANT, and nothing else.
+
+        `MAX_SWEEPABLE_DTE = 21` lands with the backfill machinery so both
+        halves of the system read one number — but the allowlist does not move
+        until the data exists (PR-2, gated on the rollout's measurement). This
+        is the test that catches a PR-1 that accidentally opened the knob:
+        flipping it early re-creates the FC-095 quota exposure, a dashboard
+        submit materialising a 22-reach window cold on the live key for hours.
+        """
+        from src.backtesting.scenarios.overrides import (
+            ALLOWED_OVERRIDES,
+            MAX_SWEEPABLE_DTE,
+        )
+
+        assert MAX_SWEEPABLE_DTE == 21
+        assert "strategy.put_target_dte" not in ALLOWED_OVERRIDES
+        with pytest.raises(OverrideError):
+            apply_overrides(sweep_config, {"strategy.put_target_dte": 21})
+
+    def test_the_backfill_reads_the_constant_rather_than_restating_it(self):
+        """One number, two consumers (the Job and the dashboard's flat copy).
+
+        `overrides.py` is copied verbatim into the dashboard image
+        (`dashboard/Dockerfile`, pinned by tests/test_cloudbuild_contract.py),
+        so a constant defined there is by construction the same on both sides.
+        What is NOT structural is the backfill agreeing with it — hence this.
+        The import direction is fixed: `overrides.py` is stdlib-only and cannot
+        import the data layer.
+        """
+        from src.backtesting.data import backfill
+        from src.backtesting.scenarios import overrides
+
+        assert backfill.BACKFILL_MAX_DTE is overrides.MAX_SWEEPABLE_DTE
+        # Structural, not textual: the module's own comments name `backfill.py`
+        # (they explain the import direction), so what is checked is the set of
+        # modules it actually imports AT RUNTIME.
+        tree = ast.parse(inspect.getsource(overrides))
+        runtime_imports = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                # `if TYPE_CHECKING:` - annotation-only, never executed.
+                if getattr(node.test, "id", None) == "TYPE_CHECKING":
+                    continue
+            if isinstance(node, ast.Import):
+                runtime_imports.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                runtime_imports.add(node.module.split(".")[0])
+        forbidden = runtime_imports & {
+            "pandas", "structlog", "yaml", "numpy", "google", "requests",
+        }
+        assert not forbidden, (
+            f"overrides.py imports {sorted(forbidden)} - it is flat-copied "
+            "into a dashboard image that has none of them, and an ImportError "
+            "there takes the sweep API down"
+        )
+        assert not any(name.endswith("backfill") for name in runtime_imports)
 
     def test_a_longer_call_target_dte_is_refused_but_a_shorter_one_is_not(
             self, sweep_config):

@@ -52,7 +52,7 @@ cp .env.example .env
 ## Commands
 
 **CLI** (`main.py` — `--command` accepts exactly `scan`, `status`, `report`,
-`backtest`, `screen`, `sweep`):
+`backtest`, `screen`, `sweep`, `backfill`):
 ```bash
 python main.py --command scan    # Scan for opportunities (same OptionsScanner as production)
 python main.py --command status  # Portfolio status  (PortfolioTracker — CLI only)
@@ -460,7 +460,7 @@ Check groups: `endpoint_health`, `trade_execution`, `log_analysis`,
 `position_reconciliation`, `performance_baseline` (**KNOWN DEAD — validates
 nothing: it queries columns/tables that never existed; do not trust its
 "pass". FC-085 owns the fix-or-delete decision**), `risk_parameters`,
-`deploy_freshness`.
+`deploy_freshness`, `lake_freshness`.
 Since FC-082 (2026-08-27) the monitor's dataset is profile-derived
 (`BQ_DATASET` env survives as explicit override only), and
 `cc-regression-hourly` runs the same checks against the covered-call service.
@@ -497,6 +497,30 @@ The two `fail` rows are emitted through `log_error_event` (which sets
 `deploy/monitoring/deploy_freshness_alert_policy.json` matches on. Everything
 else is a `warn` on purpose: `fail` returns HTTP 500 from `/regression`, so a
 GitHub outage must never trip it.
+
+`lake_freshness` (FC-096 Phase A) is the same detective shape aimed at a Cloud
+Run **Job**: it lists the chain lake (`CHAIN_LAKE_BUCKET`, one `list_blobs`
+prefix scan per live symbol) and compares the newest stored chain-day against
+`LAKE_FRESHNESS_MAX_DAYS = 10`. It exists because **Cloud Scheduler's
+`jobs:run` is asynchronous** — it records success when the API call returns, so
+a paused scheduler, a deleted scheduler and a Job that fails every execution
+all leave a clean scheduler history. The Job-failure alert policy
+(`deploy/monitoring/job_failure_alert_policy.json`, which watches all three
+Jobs) catches an execution that runs and fails; this catches the one that never
+runs. One result per run:
+
+| Condition | status | name / log event |
+|---|---|---|
+| newest chain-day older than `LAKE_FRESHNESS_MAX_DAYS` (10) | `fail` | `lake_freshness_stale` |
+| no chain-day at all for the live universe | `fail` | `lake_freshness_stale` |
+| `CHAIN_LAKE_BUCKET` unset | `warn` | `lake_freshness_unconfigured` |
+| the profile configures no `stocks.symbols` (the covered-call service) | `warn` | `lake_freshness_no_universe` |
+| GCS client unavailable, or a listing raised | `warn` | `lake_freshness_read_error` |
+| fresh | `pass` | `lake_freshness` |
+
+Its degraded events are `lake_freshness_degraded` with a `reason`
+(`no_bucket`, `no_universe`, `bad_profile`, `no_client`, `list_failed`), on the
+same "no warn is silent" rule as below.
 
 **No `warn` is silent.** Every degraded path also emits a
 `deploy_freshness_degraded` log event carrying a `reason`
@@ -669,7 +693,58 @@ python main.py --command sweep --scenarios examples/scenarios_example.yaml \
     --symbols AAPL,AMZN,GOOGL,IWM,NVDA,UNH --start 2025-08-01 --end 2026-07-31
 python main.py --command sweep --scenarios s.yaml --persist   # -> scenario_sweeps/runs
 python main.py --command sweep --spec-env SWEEP_SPEC_JSON      # the backtest-sweep Job
+python main.py --command backfill                              # the data-backfill Job
+python main.py --command backfill --symbols GOOGL --start 2024-09-01 --end 2025-09-01
 ```
+
+**`--command backfill` writes data, never results (FC-096 Phase A).** It keeps
+the bars cache and the chain lake current for `stocks.symbols` +
+`stocks.candidates` at `universe_dte = 22` (a 21-DTE target plus the universe
+buffer) — one file per day, not one per reach. It touches no BigQuery table.
+Deployed as the **`data-backfill` Cloud Run Job** by `cloudbuild.yaml`; the
+four per-execution overrides `BACKFILL_SYMBOLS` / `BACKFILL_HISTORY_DAYS` /
+`BACKFILL_START` / `BACKFILL_END` are all optional, and a bare execution means
+"the trailing 30 days of live + candidate symbols". The weekly
+**`backfill-weekly` scheduler is an operator step** (FC-096 Phase A rollout §3),
+not created by the build:
+
+```bash
+gcloud scheduler jobs create http backfill-weekly \
+  --location=us-central1 --schedule="0 8 * * 6" --time-zone="America/New_York" \
+  --uri="https://run.googleapis.com/v2/projects/$PROJECT/locations/us-central1/jobs/data-backfill:run" \
+  --http-method=POST --max-retry-attempts=3 \
+  --oauth-service-account-email=799970961417-compute@developer.gserviceaccount.com
+```
+
+Saturday is deliberate (weekend cadence, an Alpaca-quota courtesy — FC-095), and
+`--max-retry-attempts=3` is too: the live `monthly-performance-review` recipe
+has retryCount 0, so a transient API error there silently skips a month. **Do
+not "fix" the small `attemptDeadline`**: `jobs:run` is asynchronous, so the
+deadline bounds the API call, not the multi-hour execution behind it.
+
+Three properties worth knowing before running it:
+
+- **It is idempotent, and the window rule is what makes it so.** Each day is
+  built at the UNION of a spot ±40% window and whatever the stored object
+  already covers, so the file that replaces an existing one is a strict
+  superset on both axes and `ChainStore`'s coverage-monotone guard accepts it.
+  A second run over a covered window writes nothing and reaches no provider.
+  (A spot-centred rebuild would be *narrower on one bound* for any day whose
+  window had been pushed out by a position anchor or an FC-091 merge — refused,
+  silently, for ever. That is the live SPY/IWM/PFE `rejected=231 skipped=231`
+  shape.)
+- **It exits non-zero if any symbol did not complete cleanly**, and a genuine
+  stock split inside the window counts (the day is skipped and reported). That
+  is deliberate: an operator should hear about a split once.
+- **The DTE knob is still closed.** `MAX_SWEEPABLE_DTE = 21` exists in
+  `scenarios/overrides.py` and the backfill imports it, but
+  `strategy.put_target_dte` stays allowlist-refused until the historical
+  widening has actually run (FC-096 Phase A, PR-2).
+
+Deep history is a **chunked, operator-supervised** job — explicit
+`BACKFILL_SYMBOLS` plus `--start/--end`, one symbol-year per execution
+(fourteen symbols × ~275 days at 22-reach is ~7.5 h and does not fit one 6 h
+execution). See `docs/BACKTEST_ENGINE.md` §"Candidate onboarding".
 
 **Scenario sweeps have their OWN store, and it is never `backtest_runs`
 (FC-060 Layers 2-3).** `--command sweep` replays many config variants over many
@@ -887,18 +962,20 @@ deploy/smoke/promote step begins with**
 build still validates and pushes its image, which is what makes rollback-by-SHA
 possible.
 
-**Timing budget.** Measured single-build runtime is **max 798 s, p95 662 s**
-(queue time sits on top and does not count against the build timeout: ≤110 s).
-When one build waits for an older one:
+**Timing budget.** Measured single-build runtime is **max 827 s** (2026-08-31;
+the earlier max-798 s figure predates the sweep-Job step), p95 662 s (queue time
+sits on top and does not count against the build timeout: ≤110 s). When one
+build waits for an older one:
 
 ```
-waiting build total = wait for the older build to finish (≤798 s)
+waiting build total = wait for the older build to finish (≤827 s)
                     + this build's own deploy chain (~360 s)
-                    ≈ 1158 s
+                    ≈ 1187 s
 ```
 
-Under the old 1200 s timeout that left **~42 s** of headroom, so `timeout:` is
-raised to **1500 s** (~342 s of headroom). Both adversarial reviews called the
+Under the old 1200 s timeout that left **~42 s** of headroom at the 798 s
+figure — and ~13 s at the measured 827 s — so `timeout:` is raised to **1500 s**
+(~313 s of headroom). Both adversarial reviews called the
 original "don't touch 1200 s" a plan defect. The gate derives its own deadline
 from that number — `BUILD_TIMEOUT_SECONDS` in `serialize-builds`, asserted equal
 to `timeout:` by a contract test — and gives up **90 s early** so its explanation

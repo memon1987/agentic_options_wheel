@@ -664,6 +664,29 @@ class Config:
         safe on a non-wheel profile.
         """
         return self._config.get("stocks", {}).get("symbols", [])
+
+    @property
+    def candidate_symbols(self) -> List[str]:
+        """Symbols under EVALUATION only — never traded, never scanned.
+
+        FC-096 Phase A (A1). ``stocks.candidates`` is a second universe beside
+        ``stocks.symbols``: the backtest data layer keeps bars and chains
+        current for it so a candidate can be simulated the moment someone asks,
+        and nothing in the live path reads it. That separation is the whole
+        point of a separate key rather than a flag on the existing list — a
+        symbol cannot be "a candidate" and accidentally tradeable, because the
+        scanner never looks here.
+
+        ``[]`` when the section or the key is absent, exactly as
+        ``stock_symbols`` behaves: the covered-call profile has no ``stocks``
+        section at all, and an absent key is a default, not a typo.
+
+        The one consumer today is ``main.py --command backfill`` (the
+        ``data-backfill`` Job's default universe).
+        ``tests/test_candidate_universe.py`` asserts, structurally, that
+        nothing in the live trading path reads it.
+        """
+        return self._config.get("stocks", {}).get("candidates", [])
     
     # FC-069 S1 deleted the `monitoring:` accessor (card 17) and the whole
     # gap-risk accessor block (item 5) together with

@@ -384,6 +384,88 @@ cache, and `ChainStore` uses it write-through:
   guarantee.
 
 
+### Feeding the lake — `--command backfill` (FC-096 Phase A)
+
+Before FC-096 the lake grew **by accident**: a chain-day existed because a screen or a
+sweep happened to run cold over it. Freshness was a side effect of the monthly screen, the
+stored reach was capped at `universe_dte = 8`, and a symbol nobody had backtested had no
+data at all. `python main.py --command backfill` is the deliberate version, and the
+`data-backfill` Cloud Run Job runs it weekly.
+
+| | |
+|---|---|
+| What it writes | chain-lake objects at `universe_dte = 22` (21-DTE target + `UNIVERSE_DTE_BUFFER`) — **one file per day, not one per reach** — and the `BarStore` parquet each symbol's bars come from |
+| What it never writes | BigQuery. Nothing in `backtest_runs`, `scenario_*`, or anywhere else results live |
+| Default universe | `stocks.symbols` + `stocks.candidates` |
+| Default window | the trailing **30 calendar days** through the last settled session |
+| Job overrides (all optional, per EXECUTION) | `BACKFILL_SYMBOLS`, `BACKFILL_HISTORY_DAYS`, `BACKFILL_START`, `BACKFILL_END` |
+| Exit code | non-zero if any symbol did not complete cleanly (a stock split inside the window counts — the day is skipped and reported) |
+
+**The window rule is the whole design.** Each `(symbol, day)` is built at the **union** of
+a fresh spot ±40% window and whatever the stored object already covers, so the file that
+replaces an existing one is a strict superset on both axes and the coverage-monotone guard
+accepts it by construction. Two things follow, and both matter:
+
+- A spot-centred rebuild would be *narrower on one bound* for every day whose window had
+  been pushed out by a position anchor or an FC-091 merge — refused, logged as
+  `chain_lake_overwrite_skipped`, for ever. That is the live SPY/IWM/PFE
+  `rejected=231 skipped=231` pattern, and a weekly scheduler would have made it permanent.
+- A second run over a covered window writes **nothing** and reaches no provider. The
+  weekly run re-walks the same trailing month every Saturday; if that were not free it
+  would re-fetch a symbol-month from Alpaca every week.
+
+Why ±40% rather than the `STRIKE_WINDOW_PCT = 0.25` used at 7 DTE: that constant was
+measured on the 0.10-0.20 delta band **at 7 DTE**. At 21 DTE and 90% IV the 0.10-delta put
+sits near K/S ≈ 0.78, outside a 25% window — and the failure mode is not a slow build, it
+is a *silently different* chain, with a nearer strike substituted into a file every later
+run reads. `STRIKE_WINDOW_PCT` itself is untouched (it is the live reach's window, shared
+with every other caller); the backfill widens through the builder's `cost_basis` /
+`low_anchor` anchor parameters instead.
+
+The model is **frozen equal to the sweep runner's** (`risk_free_rate=0.04`, no dividend
+map, default `SpreadModel`) because the model fingerprint is part of the cache key. Wiring
+dividend yields in here would look like an improvement and would fork the lake into a
+second, invisible model whose files no sweep can read. A model change is its own PR, across
+every writer, with a `CHAIN_LAKE_PREFIX` bump.
+
+**Watching it.** `deploy/monitoring/job_failure_alert_policy.json` alerts on a failed
+execution of any of the three Jobs; the `/regression` `lake_freshness` check catches the
+other half — a `backfill-weekly` scheduler that was paused or deleted, which is invisible
+to the scheduler's own history because `jobs:run` is asynchronous. Per-symbol
+`backfill_symbol_complete` log lines are emitted as they complete, so a run killed at the
+task timeout is still reconstructable.
+
+### Candidate onboarding
+
+`stocks.candidates` (FC-096 A1) is an **evaluation-only** universe beside `stocks.symbols`:
+the backfill keeps its data current, and nothing on the live path reads it — enforced
+structurally by `tests/test_candidate_universe.py`, not by a comment.
+
+To onboard a symbol, in this order:
+
+1. **Refresh the committed earnings table for it — REQUIRED, and first.** A symbol absent
+   from `src/backtesting/data/earnings_dates.json` replays with the FC-013 earnings gate
+   *silently passing everything through*: the candidate is then measured under a rule the
+   live bot does not follow, and it will look better than it is. This is a required step,
+   not a caveat.
+2. Add the symbol to `stocks.candidates` in a config PR.
+3. Execute the Job once for it — `gcloud run jobs execute data-backfill --region=us-central1
+   --update-env-vars=BACKFILL_SYMBOLS=<SYM>,BACKFILL_START=<YYYY-MM-DD>,BACKFILL_END=<YYYY-MM-DD>`
+   — or wait for Saturday if the trailing 30 days is enough. Chunk deep history at roughly
+   one symbol-year per execution; the Job's task timeout is 6 h and fourteen symbols ×
+   ~275 days at 22-reach measures ~7.5 h, so a whole-universe widening does **not** fit one
+   execution.
+4. Re-run it as often as you like: the backfill is idempotent, so a repeat over a covered
+   window is free.
+
+**Promotion to live trading is a separate, deliberate move** of the symbol from
+`candidates` into `symbols` — and it is a trading decision, not a data one.
+
+**Cross-reference, FC-086.** A console-driven conclusion of the form "this symbol wants
+DTE 14" cannot be applied to *live* config as a one-line change: the live early-close
+profit-taking bands are keyed by DTE, and they break under a target-DTE change. Route any
+such recommendation through FC-086 first.
+
 ### The bars cache (FC-060 Layer 2)
 
 Chains have had a parquet cache since FC-042 Track A; **underlying bars never did**. Every

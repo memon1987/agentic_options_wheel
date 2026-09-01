@@ -16,6 +16,8 @@ Checks performed:
        naked calls, cost-basis floor) — see `check_risk_parameters`
     7. Deploy freshness (what is serving vs. what is on GitHub `main`) —
        see `check_deploy_freshness` (FC-081 follow-up)
+    8. Chain-lake freshness (is the weekly backfill Job still running?) —
+       see `check_lake_freshness` (FC-096 Phase A)
 """
 
 import os
@@ -86,6 +88,30 @@ GITHUB_REDIRECT_STATUSES = (301, 302, 307, 308)
 DEPLOY_FRESHNESS_MAX_HOURS_DEFAULT = 2.0
 
 GITHUB_API_TIMEOUT_SECONDS = 10
+
+# ---------------------------------------------------------------------------
+# Chain-lake freshness (FC-096 Phase A)
+# ---------------------------------------------------------------------------
+# How stale the newest stored chain-day may get before this is a `fail`.
+#
+# The weekly `data-backfill` Job runs Saturdays and covers through the last
+# settled session, so the newest chain-day is normally 1-3 days old on a
+# weekday. Ten days is one entirely missed Saturday plus the weekend either
+# side — enough that a single skipped run does not page, and short enough that
+# two consecutive misses do.
+LAKE_FRESHNESS_MAX_DAYS = 10
+
+# Object names are `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` (ChainStore's
+# layout). Parsed rather than inferred: an object that does not match is
+# ignored, so a stray file in the bucket cannot be read as a fresh chain-day.
+LAKE_OBJECT_DATE_PATTERN = re.compile(r"/(\d{4}-\d{2}-\d{2})\.parquet$")
+
+# Upper bound on objects walked per symbol. The listing is ordered
+# lexicographically, which for this layout is chronological, so the LAST name
+# is the newest day — but a pathological prefix must not turn an hourly check
+# into an unbounded scan.
+LAKE_LIST_MAX_OBJECTS = 20_000
+LAKE_LIST_TIMEOUT_SECONDS = 30
 
 # Thresholds
 ERROR_WARNING_THRESHOLD = 5
@@ -1591,6 +1617,241 @@ class RegressionMonitor:
             f"{head_sha[:7]} is newer than the deployed {git_commit[:7]}",
         )
 
+    # ------------------------------------------------------------------
+    # 8. Chain-lake freshness (FC-096 Phase A)
+    # ------------------------------------------------------------------
+    def _lake_storage_client(self):
+        """The GCS client this check lists with. A seam, so tests never need one.
+
+        Imported inside the method for the same reason `ChainLake` builds its
+        client lazily: `/regression` must keep working on a machine, or in an
+        image, where `google-cloud-storage` is unavailable or no credential is
+        configured — that is a degraded check, not a failed monitor.
+        """
+        from google.cloud import storage
+
+        return storage.Client()
+
+    def _lake_latest_day(self, client, bucket: str, prefix: str, symbol: str):
+        """The newest stored chain-day for one symbol, or None.
+
+        A `list_blobs` prefix scan, because **neither `ChainStore` nor the lake
+        exposes an index**: the store answers "do you have this exact day", and
+        asking it that for every plausible date is a hundred round-trips to
+        learn one number. Listing is ordered lexicographically and this layout
+        makes lexicographic order chronological, so the last matching name is
+        the answer — but every name is still parsed rather than assumed,
+        because an unparseable object must be ignored, not read as fresh.
+        """
+        latest = None
+        seen = 0
+        for blob in client.list_blobs(
+            bucket,
+            prefix=f"{prefix}/{symbol.upper()}/",
+            timeout=LAKE_LIST_TIMEOUT_SECONDS,
+        ):
+            seen += 1
+            if seen > LAKE_LIST_MAX_OBJECTS:
+                break
+            match = LAKE_OBJECT_DATE_PATTERN.search(getattr(blob, "name", "") or "")
+            if not match:
+                continue
+            try:
+                day = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if latest is None or day > latest:
+                latest = day
+        return latest
+
+    def check_lake_freshness(self) -> List[CheckResult]:
+        """Is the chain lake still being fed — i.e. is the weekly Job alive?
+
+        FC-096 Phase A. The `data-backfill` Cloud Run Job keeps the chain lake
+        current for the live universe every Saturday. **Nothing else would
+        notice if it stopped.** Cloud Scheduler's `jobs:run` is asynchronous —
+        it records success when the API call returns, so a paused scheduler, a
+        deleted scheduler, or a Job that fails on every execution all leave a
+        clean scheduler history. The Job-failure alert policy
+        (`deploy/monitoring/job_failure_alert_policy.json`) catches an execution
+        that *runs and fails*; this catches the one that never runs at all,
+        which is the FC-081 failure shape transplanted onto a Job.
+
+        Exactly one ``CheckResult`` per run, following
+        ``check_deploy_freshness``'s posture exactly:
+
+        ==============================================  ======  ==========================
+        Condition                                       status  name
+        ==============================================  ======  ==========================
+        newest chain-day older than the window          fail    lake_freshness_stale
+        no chain-day at all for the live universe       fail    lake_freshness_stale
+        ``CHAIN_LAKE_BUCKET`` unset                     warn    lake_freshness_unconfigured
+        no live universe on this profile                warn    lake_freshness_no_universe
+        GCS unavailable / listing raised                warn    lake_freshness_read_error
+        fresh                                           pass    lake_freshness
+        ==============================================  ======  ==========================
+
+        **A read error is never a `fail`.** `fail` returns HTTP 500 from
+        `/regression`, and a GCS hiccup, a missing credential or an image
+        without `google-cloud-storage` says nothing whatsoever about whether the
+        backfill ran. Same rule the GitHub half of `deploy_freshness` follows.
+
+        **And no `warn` is silent**: every degraded path emits a
+        `lake_freshness_degraded` event with a `reason`, because a check that
+        reports `warn` for ever is indistinguishable from one that is working.
+
+        The covered-call profile has no `stocks` section, so its universe is
+        empty and this degrades rather than inventing one — the lake is the
+        wheel's data, and `cc-regression-hourly` runs the same code.
+        """
+        bucket = (os.environ.get("CHAIN_LAKE_BUCKET") or "").strip()
+        prefix = (os.environ.get("CHAIN_LAKE_PREFIX") or "").strip().strip("/") or "chains/v1"
+
+        details: Dict[str, Any] = {
+            "bucket": bucket or None,
+            "prefix": prefix,
+            "max_days": LAKE_FRESHNESS_MAX_DAYS,
+            "latest_chain_day": None,
+            "age_days": None,
+            "symbols_checked": 0,
+        }
+
+        def _degraded(reason: str, check: str) -> None:
+            logger.warning(
+                "Lake freshness check degraded",
+                event_category="system",
+                event_type="lake_freshness_degraded",
+                reason=reason,
+                check=check,
+                bucket=bucket or None,
+            )
+
+        def _one(name: str, status: str, message: str) -> List[CheckResult]:
+            result = CheckResult(name, status, message, dict(details))
+            self.results.append(result)
+            return [result]
+
+        def _warn(name: str, message: str, reason: str) -> List[CheckResult]:
+            _degraded(reason, name)
+            return _one(name, "warn", message)
+
+        if not bucket:
+            return _warn(
+                "lake_freshness_unconfigured",
+                "CHAIN_LAKE_BUCKET is not set on this service — chain-lake "
+                "freshness cannot be checked, so a stopped data-backfill Job "
+                "would be invisible here.",
+                "no_bucket",
+            )
+
+        try:
+            from src.utils.config import Config
+
+            symbols = list(
+                Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
+                .stock_symbols
+            )
+        except Exception as exc:
+            return _warn(
+                "lake_freshness_read_error",
+                f"Could not resolve the live universe ({type(exc).__name__})",
+                "bad_profile",
+            )
+
+        if not symbols:
+            # The covered-call profile's universe is holdings-derived, so there
+            # is no configured list to check the lake against. Not a failure of
+            # the lake; a check that cannot run.
+            return _warn(
+                "lake_freshness_no_universe",
+                "This profile configures no stocks.symbols, so there is no "
+                "universe to check chain-lake freshness against.",
+                "no_universe",
+            )
+
+        try:
+            client = self._lake_storage_client()
+        except Exception as exc:
+            return _warn(
+                "lake_freshness_read_error",
+                f"Could not build a GCS client ({type(exc).__name__})",
+                "no_client",
+            )
+
+        latest = None
+        per_symbol: Dict[str, Optional[str]] = {}
+        for symbol in symbols:
+            try:
+                day = self._lake_latest_day(client, bucket, prefix, symbol)
+            except Exception as exc:
+                # One symbol's listing failing is still a read error for the
+                # whole check: the newest day across the universe cannot be
+                # established, and reporting the max of the symbols that DID
+                # answer would understate staleness.
+                return _warn(
+                    "lake_freshness_read_error",
+                    f"Listing gs://{bucket}/{prefix}/{symbol}/ failed "
+                    f"({type(exc).__name__})",
+                    "list_failed",
+                )
+            per_symbol[symbol] = day.isoformat() if day else None
+            if day is not None and (latest is None or day > latest):
+                latest = day
+
+        details["symbols_checked"] = len(symbols)
+        details["per_symbol_latest"] = per_symbol
+        details["latest_chain_day"] = latest.isoformat() if latest else None
+
+        if latest is None:
+            message = (
+                f"gs://{bucket}/{prefix} holds no chain-day for any of the "
+                f"{len(symbols)} live symbols. Either the lake is empty or the "
+                f"prefix is wrong; nothing has ever been backfilled here."
+            )
+            log_error_event(
+                logger,
+                error_type="lake_freshness_stale",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                bucket=bucket,
+                prefix=prefix,
+                symbols=len(symbols),
+            )
+            return _one("lake_freshness_stale", "fail", message)
+
+        age_days = (_utcnow().date() - latest).days
+        details["age_days"] = age_days
+
+        if age_days > LAKE_FRESHNESS_MAX_DAYS:
+            message = (
+                f"The newest chain-day in gs://{bucket}/{prefix} is {latest} "
+                f"({age_days}d old, limit {LAKE_FRESHNESS_MAX_DAYS}d). The "
+                f"weekly data-backfill Job has not landed data — check the "
+                f"`backfill-weekly` scheduler is enabled and its executions "
+                f"succeeded (`jobs:run` is async, so the scheduler reports "
+                f"success either way)."
+            )
+            log_error_event(
+                logger,
+                error_type="lake_freshness_stale",
+                error_message=message,
+                component="regression_monitor",
+                recoverable=False,
+                bucket=bucket,
+                prefix=prefix,
+                latest_chain_day=latest.isoformat(),
+                age_days=age_days,
+                max_days=LAKE_FRESHNESS_MAX_DAYS,
+            )
+            return _one("lake_freshness_stale", "fail", message)
+
+        return _one(
+            "lake_freshness", "pass",
+            f"Chain lake is current: newest day {latest} ({age_days}d old) "
+            f"across {len(symbols)} live symbols",
+        )
+
     def run_all_checks(self) -> Dict[str, Any]:
         """Execute all regression checks and return a consolidated report."""
         self.results = []
@@ -1604,6 +1865,7 @@ class RegressionMonitor:
             "performance_baseline": self.check_performance_baseline,
             "risk_parameters": self.check_risk_parameters,
             "deploy_freshness": self.check_deploy_freshness,
+            "lake_freshness": self.check_lake_freshness,
         }
 
         group_results: Dict[str, List[Dict]] = {}

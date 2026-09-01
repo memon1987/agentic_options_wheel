@@ -255,6 +255,22 @@ def _reject_reason(key: str) -> Optional[str]:
 # Config should pass it rather than rely on this.
 DEFAULT_CHAIN_REACH_DTE = 7
 
+# The longest DTE target the stored lake is being built to reach (FC-096 D1a,
+# Phase A). **A CONSTANT ONLY IN PR-1** — no allowlist entry and no value rule
+# reads it yet, deliberately: the knob does not open until the data exists
+# (FC-096 Phase A, PR-2, gated on the rollout §5 measurement). Opening it here
+# would let a dashboard submit materialise a 22-reach window cold on the live
+# key for hours, which is the FC-095 quota exposure this sequencing exists to
+# avoid.
+#
+# It lives HERE, in the stdlib-only module that is flat-copied into the
+# dashboard image, and ``src/backtesting/data/backfill.py`` imports it — not the
+# other way round. Backfill can import this file; this file cannot import
+# backfill (that would drag pandas, structlog and the whole data layer into the
+# dashboard). One number, two consumers, no drift: a parity test pins the Job's
+# reach and the dashboard's copy to the same value.
+MAX_SWEEPABLE_DTE = 21
+
 
 def validate_override_key(
     key: str, value: Any = None, *, chain_reach_dte: int = DEFAULT_CHAIN_REACH_DTE
