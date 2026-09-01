@@ -18,10 +18,22 @@ Two hashes live here and they answer different questions:
   the module scoring constants, so 12 of the 19 allowlisted override keys and
   the per-scenario fill haircut are outside it entirely.
 * ``sweep_key(spec, ...)`` — identity of a WHOLE SUBMISSION: the canonical spec
-  plus ``engine_version`` plus ``git_commit``. The last two are in the key on
-  purpose. The same arms replayed by a different engine build are a different
+  plus ``engine_version`` plus ``engine_identity``. The last two are in the key
+  on purpose. The same arms replayed by a different engine build are a different
   experiment, and returning the old rows for them would be the worst kind of
   cache hit — one that looks like a result.
+
+  **``engine_identity`` replaced ``git_commit`` in FC-096 Phase B.** The commit
+  was sound and far too coarse: every merge to ``main`` invalidated every stored
+  result, including the merges that cannot change a replay (a README edit, a
+  dashboard tweak, a build flag). ``engine_identity`` is the content hash of
+  ``src/**`` — see ``engine_identity.py`` — so it moves when, and only when, the
+  code a replay executes moves. ``git_commit`` is still STORED on every row: it
+  is provenance, it is just no longer identity. Callers pass the value in (this
+  module stays stdlib-only and importable without walking a tree); the Job and
+  the CLI compute it from ``engine_identity.engine_identity()``, and the
+  dashboard image reads it out of the ``ENGINE_IDENTITY`` env baked in at build
+  time.
 
 **Canonicalisation is what makes the key mean "the same question", not "the
 same JSON".** Symbols are upper-cased and sorted; scenarios are sorted by
@@ -205,21 +217,31 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def sweep_key(
-    spec: Mapping[str, Any], *, engine_version: str, git_commit: Optional[str]
+    spec: Mapping[str, Any], *, engine_version: str,
+    engine_identity: Optional[str]
 ) -> str:
-    """sha256[:16] over the canonical spec, the engine version and the commit.
+    """sha256[:16] over the canonical spec, the engine version and the engine hash.
 
-    A missing ``git_commit`` hashes as the empty string rather than raising: a
-    locally-run sweep has no commit stamp, and refusing to key it would mean
-    refusing to persist it. The consequence is stated in D4 — a dashboard and a
-    Job on different commits simply miss each other's cache, which costs a
-    replay and never returns a wrong answer.
+    ``engine_identity`` is ``engine_identity.engine_identity()`` — the content
+    hash of ``src/**``. It is a PARAMETER rather than a call, exactly as
+    ``git_commit`` was before it, because this module is copied into the
+    dashboard image, which ships no ``src/`` tree to hash: the dashboard reads
+    the value from an env var baked in at image-build time from the same
+    checkout, and the Job/CLI compute it directly.
+
+    A missing ``engine_identity`` hashes as the empty string rather than
+    raising: refusing to key a sweep would mean refusing to persist it. The
+    consequence is the same one D4 states for a missing commit — two sides that
+    disagree simply miss each other's cache, which costs a replay and never
+    returns a wrong answer. The dashboard nonetheless refuses to *use* an empty
+    value (it disables its dedup hint loudly instead), because a key computed
+    over "" would collide across genuinely different engines.
     """
     payload = json.dumps(
         {
             "spec": canonical_spec(spec),
             "engine_version": engine_version,
-            "git_commit": git_commit or "",
+            "engine_identity": engine_identity or "",
         },
         sort_keys=True,
         default=str,

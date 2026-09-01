@@ -1773,7 +1773,8 @@ class BigQueryService:
         )
 
     def find_done_sweep(self, sweep_key: str,
-                        base_config_hash: Optional[str] = None
+                        base_config_hash: Optional[str] = None,
+                        engine_identity: Optional[str] = None
                         ) -> Optional[Dict[str, Any]]:
         """The most recent COMPLETED run under ``sweep_key``, or None.
 
@@ -1788,16 +1789,24 @@ class BigQueryService:
         "Completed" still excludes a run whose cells never landed and a run every
         arm of which errored — those are exact, and a hint that pointed at an
         empty grid would be worse than none.
+
+        ``engine_identity`` (FC-096 Phase B) is REQUIRED for a hit: an absent one
+        short-circuits to None rather than binding NULL and querying for nothing.
+        The caller has already logged why it has no identity, and a hint that
+        silently returned None from a live query would look like "no prior run"
+        rather than "this image cannot tell".
         """
         from services.sweeps import done_by_key_sql
 
-        if not sweep_key:
+        if not sweep_key or not engine_identity:
             return None
         rows = self._sweep_query(
             done_by_key_sql(self.dataset),
             [bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
              bigquery.ScalarQueryParameter("base_config_hash", "STRING",
-                                           base_config_hash)],
+                                           base_config_hash),
+             bigquery.ScalarQueryParameter("engine_identity", "STRING",
+                                           engine_identity)],
         )
         return rows[0] if rows else None
 

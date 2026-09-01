@@ -42,6 +42,14 @@ from src.backtesting.scenarios.runner import ScenarioResult, SweepResult  # noqa
 from src.backtesting.screen import ENGINE_VERSION  # noqa: E402
 
 
+# A stand-in for what `cloudbuild.yaml`'s `compute-engine-identity` step bakes
+# into the dashboard image. Deliberately NOT the repo's real identity: a test
+# that happened to compute the same value both sides would pass on a dashboard
+# that computed the hash itself, which is precisely what it must not do (it
+# ships no `src/` tree).
+BAKED_IDENTITY = "0123456789abcdef"
+
+
 def spec(**overrides):
     base = {
         "symbols": ["AAPL", "NVDA"],
@@ -98,6 +106,126 @@ class TestTheEngineVersionIsNotAFork:
         disagreed would compute a key nothing ever matches, so the dedup would
         never fire — silently, at the cost of a full replay every time."""
         assert S.ENGINE_VERSION == ENGINE_VERSION
+
+
+class TestTheEngineIdentityIsReadNeverComputed:
+    """FC-096 Phase B B1: where the dashboard's half of `sweep_key` comes from.
+
+    The image ships two flat stdlib modules and no `src/` tree, so it cannot
+    hash one. `cloudbuild.yaml` runs the SHARED module against the checkout that
+    builds the image and bakes the answer in as `ENGINE_IDENTITY`. Two failure
+    modes are worth tests: computing it here (drift), and falling back to a
+    plausible wrong value when it is absent (a silent wrong dedup).
+    """
+
+    def test_it_reads_the_baked_in_env_var(self, monkeypatch):
+        monkeypatch.setenv("ENGINE_IDENTITY", BAKED_IDENTITY)
+        S._reset_engine_identity_warning()
+        assert S.engine_identity_from_env() == BAKED_IDENTITY
+
+    def test_whitespace_is_stripped(self, monkeypatch):
+        """A build-arg read out of a file arrives with the trailing newline the
+        module's `print` put there. A key over `"abc\n"` is a different key."""
+        monkeypatch.setenv("ENGINE_IDENTITY", f"  {BAKED_IDENTITY}\n")
+        S._reset_engine_identity_warning()
+        assert S.engine_identity_from_env() == BAKED_IDENTITY
+
+    def test_an_absent_env_disables_the_hint_loudly(self, monkeypatch, caplog):
+        """It must return None and SAY SO — never key over the empty string.
+
+        `sweep_key(..., engine_identity="")` is a perfectly valid-looking 16-hex
+        string that is identical across genuinely different engine builds. A
+        dashboard that fell back to it would eventually point an operator at
+        another engine's numbers, with nothing in the UI to say so. Losing the
+        hint costs one container start; guessing costs correctness.
+        """
+        import logging
+
+        monkeypatch.delenv("ENGINE_IDENTITY", raising=False)
+        S._reset_engine_identity_warning()
+        with caplog.at_level(logging.ERROR, logger=S.__name__):
+            assert S.engine_identity_from_env() is None
+        assert any(r.levelno >= logging.ERROR
+                   and "sweep_dedup_hint_disabled" in r.getMessage()
+                   for r in caplog.records), caplog.text
+
+    def test_an_empty_env_is_treated_as_absent(self, monkeypatch):
+        """`ARG ENGINE_IDENTITY=""` with no `--build-arg` sets it to empty, not
+        unset. The two must not behave differently."""
+        monkeypatch.setenv("ENGINE_IDENTITY", "")
+        S._reset_engine_identity_warning()
+        assert S.engine_identity_from_env() is None
+
+    def test_the_absence_is_logged_once_per_process(self, monkeypatch, caplog):
+        """One line per process, not one per submit: an ERROR that repeats a
+        thousand times a day is an ERROR nobody reads."""
+        import logging
+
+        monkeypatch.delenv("ENGINE_IDENTITY", raising=False)
+        S._reset_engine_identity_warning()
+        with caplog.at_level(logging.ERROR, logger=S.__name__):
+            for _ in range(5):
+                S.engine_identity_from_env()
+        hits = [r for r in caplog.records
+                if "sweep_dedup_hint_disabled" in r.getMessage()]
+        assert len(hits) == 1, f"{len(hits)} log lines for one absent env"
+
+    def test_this_module_does_not_reimplement_the_hash(self):
+        """Parity is by shared-module INVOCATION at build time. A second
+        implementation would drift, and its drift is silent: the dashboard would
+        compute a key nothing ever writes and the dedup would just stop firing.
+        """
+        import inspect
+
+        source = inspect.getsource(S)
+        assert "hashlib" not in source, (
+            "services/sweeps.py must not hash anything itself — the engine "
+            "identity is computed by cloudbuild and read from the env"
+        )
+        assert "os.walk" not in source and "rglob" not in source
+
+    def test_the_key_the_dashboard_computes_is_the_key_the_job_computes(self):
+        """One identity in, one key out, on both sides. This is the property the
+        whole build-arg exists to provide: a divergence here means the dedup
+        never fires across the dashboard/Job pair and nothing says so."""
+        from src.backtesting.scenarios.identity import sweep_key as engine_key
+
+        normalised = S.validate_spec(spec())
+        assert S.compute_sweep_key(normalised, BAKED_IDENTITY) == engine_key(
+            normalised, engine_version=ENGINE_VERSION,
+            engine_identity=BAKED_IDENTITY)
+
+    def test_a_different_identity_is_a_different_key(self):
+        normalised = S.validate_spec(spec())
+        assert (S.compute_sweep_key(normalised, BAKED_IDENTITY)
+                != S.compute_sweep_key(normalised, "fedcba9876543210"))
+
+    def test_the_submitted_row_carries_the_identity(self):
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec()), sweep_key_value="k",
+            submitted_at="2026-09-01T12:00:00+00:00", git_commit="abc",
+            engine_identity=BAKED_IDENTITY)
+        assert row["engine_identity"] == BAKED_IDENTITY
+        # ...and the commit is still stored. It stopped being identity; it did
+        # not stop being provenance.
+        assert row["git_commit"] == "abc"
+
+    def test_the_submitted_row_tolerates_a_missing_identity(self):
+        """The degraded image still writes a row. The Job's own `running`/`done`
+        rows carry the correct identity, and readers take the latest row — so
+        the run is still dedup-reachable once it finishes."""
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec()), sweep_key_value=None,
+            submitted_at="2026-09-01T12:00:00+00:00", git_commit="abc")
+        assert row["engine_identity"] is None
+        assert row["sweep_key"] is None
+
+    def test_the_allowlist_payload_exposes_the_identity(self, monkeypatch):
+        """So the UI can explain a missing `prior_done_run_id` instead of
+        looking broken."""
+        monkeypatch.setenv("ENGINE_IDENTITY", BAKED_IDENTITY)
+        S._reset_engine_identity_warning()
+        assert S.allowlist_payload()["engine_identity"] == BAKED_IDENTITY
 
 
 class TestTheStatusOrderingIsNotAFork:
@@ -1190,7 +1318,8 @@ class FakeBQ:
         if self.raises is not None:
             raise self.raises
 
-    def find_done_sweep(self, key, base_config_hash=None):
+    def find_done_sweep(self, key, base_config_hash=None,
+                        engine_identity=None):
         self._maybe_raise()
         return self.prior
 
@@ -1233,6 +1362,11 @@ class TestTheSubmitEndpoint:
 
         monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
         monkeypatch.setenv("GIT_COMMIT", "cafebabe")
+        # What cloudbuild's `compute-engine-identity` step bakes in. Set here
+        # rather than per test because EVERY submit path reads it now: an image
+        # without it is the degraded case, and it has its own tests below.
+        monkeypatch.setenv("ENGINE_IDENTITY", BAKED_IDENTITY)
+        S._reset_engine_identity_warning()
         bq = FakeBQ()
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: bq)
         return v2, bq
@@ -1535,8 +1669,10 @@ class TestTheSubmitEndpoint:
         recorded = []
 
         class Recording(FakeBQ):
-            def find_done_sweep(self, key, base_config_hash=None):
-                recorded.append({"key": key, "hash": base_config_hash})
+            def find_done_sweep(self, key, base_config_hash=None,
+                                engine_identity=None):
+                recorded.append({"key": key, "hash": base_config_hash,
+                                 "identity": engine_identity})
                 return None
 
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: Recording())
@@ -1550,6 +1686,84 @@ class TestTheSubmitEndpoint:
 
         assert len(recorded) == 1
         assert recorded[0]["hash"] is None
+        # ...but the engine identity IS bound. It is not a configuration guess:
+        # it is the image's own baked-in value, and binding it is what keeps a
+        # pre-migration row (NULL column, commit-keyed) out of the hint.
+        assert recorded[0]["identity"] == BAKED_IDENTITY
+
+    def test_the_submit_carries_the_baked_identity_end_to_end(
+            self, wired, monkeypatch):
+        """The value reaches BOTH the response key and the stored row.
+
+        A `sweep_key` on the row that the Job's own key does not match would
+        make the run invisible to the dedup for ever, which is the failure the
+        whole build-arg exists to prevent.
+        """
+        import httpx
+
+        v2, bq = wired
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        async def ok(*_a, **_k):
+            return httpx.Response(200, json={"metadata": {"name": "e"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+        out = self.submit(v2)
+
+        expected = S.compute_sweep_key(S.validate_spec(spec()), BAKED_IDENTITY)
+        assert out["sweep_key"] == expected
+        assert bq.rows[0]["sweep_key"] == expected
+        assert bq.rows[0]["engine_identity"] == BAKED_IDENTITY
+
+    def test_an_image_without_the_identity_still_launches_but_skips_the_hint(
+            self, wired, monkeypatch):
+        """The degraded posture, end to end.
+
+        An image built without the build-arg cannot compute `sweep_key` at all.
+        It must NOT key over a fallback — that key is a valid-looking 16 hex
+        characters shared by every engine build, and a hit on it would point an
+        operator at another engine's numbers. So: no hint lookup, a NULL
+        `sweep_key` on the `submitted` row, and the submission still launches.
+        The Job computes the real key from the tree it is running and does the
+        dedup that decides anything.
+        """
+        import httpx
+
+        v2, _bq = wired
+        monkeypatch.delenv("ENGINE_IDENTITY", raising=False)
+        S._reset_engine_identity_warning()
+
+        looked_up = []
+
+        class Recording(FakeBQ):
+            def find_done_sweep(self, key, base_config_hash=None,
+                                engine_identity=None):
+                looked_up.append(key)
+                return {"run_id": "earlierrun000001"}
+
+        recording = Recording()
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: recording)
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+
+        launched = []
+
+        async def ok(self, url, **kwargs):
+            launched.append(kwargs.get("json"))
+            return httpx.Response(200, json={"metadata": {"name": "e"}})
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+        out = self.submit(v2)
+
+        assert looked_up == [], (
+            "the hint must not be looked up without an identity to bind — a "
+            "query on a key computed over the empty string can HIT, and the hit "
+            "would be another engine's run"
+        )
+        assert out["launched"] is True and len(launched) == 1
+        assert out["sweep_key"] is None
+        assert out["prior_done_run_id"] is None
+        assert recording.rows[0]["sweep_key"] is None
+        assert recording.rows[0]["engine_identity"] is None
 
     def test_the_self_referential_lookup_is_gone_entirely(self):
         """Dead code that encodes a rejected design is worse than none: the next

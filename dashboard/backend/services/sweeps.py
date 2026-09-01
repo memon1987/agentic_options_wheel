@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -83,6 +85,68 @@ except ImportError:  # dashboard image: the same files, copied flat
 # matches and the dedup would never fire — costing a full replay every time,
 # silently. Pinned by TestTheEngineVersionIsNotAFork.
 ENGINE_VERSION = "fc-069-scanner-rewire"
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================ #
+# Engine identity (FC-096 Phase B) — read, never computed, on this side.
+# ============================================================================ #
+
+# `sweep_key`'s third component since FC-096 Phase B: the sha256 of `src/**`
+# (`src/backtesting/scenarios/engine_identity.py`). It replaced `git_commit`,
+# whose failure mode was over-invalidation — every merge to `main` threw away
+# every stored sweep result, including the merges that cannot change a replay.
+#
+# **The dashboard image cannot compute it.** It ships two flat stdlib modules out
+# of the engine package and no `src/` tree at all, so there is nothing to hash.
+# `cloudbuild.yaml` runs the SHARED module against the same checkout that builds
+# this image and bakes the answer in as this env var (Dockerfile ARG -> ENV).
+# Parity is by shared-module invocation; a second implementation here is exactly
+# the silent-drift class the whole file exists to avoid.
+ENGINE_IDENTITY_ENV = "ENGINE_IDENTITY"
+
+# One log line per process, not one per request: an image built without the
+# build-arg would otherwise emit this on every submit for the life of the
+# revision, and a log that repeats a thousand times a day is a log nobody reads.
+_identity_absence_logged = False
+
+
+def engine_identity_from_env() -> Optional[str]:
+    """The baked-in engine identity, or ``None`` — loudly — when it is absent.
+
+    **Absent means the dedup hint disables itself, never that it keys with a
+    wrong value.** A key computed over an empty identity is a real, valid-looking
+    16-hex string that collides across genuinely different engine builds, so a
+    dashboard that fell back to `""` would eventually point an operator at
+    another engine's numbers. Returning None costs a hint; guessing costs
+    correctness.
+
+    The Job is unaffected either way — it computes the identity from the tree it
+    is actually running and does the dedup that decides anything.
+    """
+    global _identity_absence_logged
+    value = (os.environ.get(ENGINE_IDENTITY_ENV) or "").strip()
+    if value:
+        return value
+    if not _identity_absence_logged:
+        _identity_absence_logged = True
+        logger.error(
+            "sweep_dedup_hint_disabled: %s is not set on this image, so the "
+            "dashboard cannot compute sweep_key. Submissions still launch and "
+            "the Job still deduplicates; only the `prior_done_run_id` hint and "
+            "the submitted row's sweep_key are unavailable. Fix: the "
+            "`compute-engine-identity` step in cloudbuild.yaml must run and its "
+            "value must reach dashboard/Dockerfile's ENGINE_IDENTITY build-arg.",
+            ENGINE_IDENTITY_ENV,
+        )
+    return None
+
+
+def _reset_engine_identity_warning() -> None:
+    """Test seam: re-arm the one-shot log. Never called in production."""
+    global _identity_absence_logged
+    _identity_absence_logged = False
+
 
 SWEEPS_TABLE = "scenario_sweeps"
 RUNS_TABLE = "scenario_runs"
@@ -607,12 +671,23 @@ def new_run_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
-def compute_sweep_key(spec: Dict[str, Any], git_commit: Optional[str]) -> str:
-    return sweep_key(spec, engine_version=ENGINE_VERSION, git_commit=git_commit)
+def compute_sweep_key(spec: Dict[str, Any],
+                      engine_identity: Optional[str]) -> str:
+    """The Job's key, computed from the identity baked into this image.
+
+    The second argument was ``git_commit`` until FC-096 Phase B. Callers that
+    have no identity should not call this at all — see
+    ``engine_identity_from_env`` for why an absent identity disables the hint
+    instead of keying over ``""``.
+    """
+    return sweep_key(spec, engine_version=ENGINE_VERSION,
+                     engine_identity=engine_identity)
 
 
-def submitted_row(*, run_id: str, spec: Dict[str, Any], sweep_key_value: str,
+def submitted_row(*, run_id: str, spec: Dict[str, Any],
+                  sweep_key_value: Optional[str],
                   submitted_at: str, git_commit: Optional[str],
+                  engine_identity: Optional[str] = None,
                   execution_name: Optional[str] = None,
                   status: str = STATUS_SUBMITTED,
                   deduplicated_to: Optional[str] = None) -> Dict[str, Any]:
@@ -641,6 +716,11 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any], sweep_key_value: str,
         "execution_name": execution_name,
         "git_commit": git_commit,
         "engine_version": ENGINE_VERSION,
+        # Stamped from the image's baked-in value. NULL when the build-arg never
+        # arrived — the same state that disables the hint — and the Job's own
+        # `running`/`done` rows carry the correct value regardless, so the run is
+        # still dedup-reachable once it finishes.
+        "engine_identity": engine_identity,
         "base_config_hash": None,
         "base_config_json": None,
         "spec_json": json.dumps(spec, sort_keys=True),
@@ -882,11 +962,17 @@ def done_by_key_sql(dataset: str) -> str:
     * ``rows_persisted = cell_count`` — a run whose ``scenario_runs`` insert did
       not land has an EMPTY grid; the cached answer would be nothing at all;
     * ``base_config_hash`` equality — ``sweep_key`` covers the spec, the engine
-      version and the commit, and cannot see an operator flipping
+      version and the engine identity, and cannot see an operator flipping
       ``EARNINGS_ENABLED`` on the Job between two otherwise identical
       submissions. That value is not in the yaml the key hashes. **Only the Job
       binds this parameter**; the API passes NULL, which is why its answer is a
-      hint and not a decision.
+      hint and not a decision;
+    * ``engine_identity`` equality (FC-096 Phase B) — redundant against the key
+      for every row written since the re-key, and NOT redundant for the rows
+      written before it, whose column is NULL and whose ``sweep_key`` was
+      computed over a commit SHA. ``NULL = @engine_identity`` is never true, so a
+      pre-migration row can never be served as a hit. Both callers bind it, and
+      a caller with no identity does not call this at all.
 
     A duplicate replay costs eight minutes. A wrong dedup hit serves one
     experiment's numbers as another's, silently — so the side that cannot check
@@ -898,6 +984,7 @@ def done_by_key_sql(dataset: str) -> str:
         " AND rows_persisted IS NOT NULL"
         " AND rows_persisted = cell_count"
         " AND (@base_config_hash IS NULL OR base_config_hash = @base_config_hash)"
+        " AND engine_identity = @engine_identity"
         " ORDER BY submitted_at DESC LIMIT 1"
     )
 
@@ -1313,5 +1400,8 @@ def allowlist_payload() -> Dict[str, Any]:
         },
         "base_scenario_name": BASE_SCENARIO_NAME,
         "engine_version": ENGINE_VERSION,
+        # None on an image built without the build-arg; the UI can then say why
+        # `prior_done_run_id` never appears instead of looking broken.
+        "engine_identity": engine_identity_from_env(),
         "min_days_in_position": MIN_DAYS_IN_POSITION,
     }

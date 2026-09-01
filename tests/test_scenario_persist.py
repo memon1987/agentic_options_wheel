@@ -147,11 +147,17 @@ class TestRowsFromSweep:
     def test_provenance_and_arm_metadata_are_on_every_row(self, sweep):
         rows = store.rows_from_sweep(
             sweep, run_id="abc123", submitted_at="2026-08-29T12:00:00+00:00",
-            engine_version=ENGINE_VERSION, git_commit="deadbeef")
+            engine_version=ENGINE_VERSION, git_commit="deadbeef",
+            engine_identity="0123456789abcdef")
         tighter = next(r for r in rows if r["scenario_name"] == "tighter")
         assert tighter["run_id"] == "abc123"
         assert tighter["engine_version"] == ENGINE_VERSION
         assert tighter["git_commit"] == "deadbeef"
+        # FC-096 Phase B: the identity that keyed the sweep is stamped on every
+        # cell, so one row still says which engine produced it without a join
+        # back to the sweep row. `git_commit` stays beside it as provenance.
+        assert tighter["engine_identity"] == "0123456789abcdef"
+        assert all(r["engine_identity"] == "0123456789abcdef" for r in rows)
         # Overrides travel WITH the cell, so one row is self-describing without
         # a join back to the sweep row.
         assert json.loads(tighter["overrides_json"]) == {
@@ -172,6 +178,22 @@ class TestRowsFromSweep:
                 sweep, run_id="r", submitted_at="2026-08-29T12:00:00+00:00",
                 engine_version=ENGINE_VERSION):
             assert set(row) <= declared, set(row) - declared
+
+    def test_the_status_row_carries_the_engine_identity(self):
+        """Both tables stamp it, and NULL is a legal value.
+
+        The Job passes what it computed; a row written before FC-096 has NULL,
+        and that NULL is what keeps a commit-keyed run out of the new dedup.
+        """
+        stamped = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00",
+            engine_identity="0123456789abcdef")
+        assert stamped["engine_identity"] == "0123456789abcdef"
+        unstamped = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00")
+        assert unstamped["engine_identity"] is None
 
     def test_status_row_keys_are_declared_columns(self):
         pytest.importorskip("google.cloud.bigquery")
@@ -535,8 +557,11 @@ class TestTheLatestStatusOrderBy:
 # (3) Dedup identity
 # --------------------------------------------------------------------------
 class TestSweepKey:
-    def key(self, spec, commit="abc123", engine=ENGINE_VERSION):
-        return sweep_key(spec, engine_version=engine, git_commit=commit)
+    # `identity` was `commit` until FC-096 Phase B re-keyed the dedup off the
+    # content hash of `src/**`. Every canonicalisation property below is
+    # unchanged by that — they are properties of the SPEC half of the key.
+    def key(self, spec, identity="abc123", engine=ENGINE_VERSION):
+        return sweep_key(spec, engine_version=engine, engine_identity=identity)
 
     def test_symbol_and_scenario_order_do_not_matter(self):
         a = dict(SPEC, symbols=["AAPL", "NVDA"], scenarios=[
@@ -643,14 +668,29 @@ class TestSweepKey:
         reproduces, or the two are never comparable."""
         assert self.key(dict(SPEC, force=True)) == self.key(SPEC)
 
-    def test_engine_version_and_commit_are_in_the_key(self):
+    def test_engine_version_and_identity_are_in_the_key(self):
+        """Both non-spec components move the key. Since FC-096 Phase B the
+        second one is the content hash of `src/**`, not the commit: a merge
+        that cannot change a replay no longer invalidates a stored result, and
+        a one-byte strategy change still does."""
         assert self.key(SPEC, engine="fc-999-other") != self.key(SPEC)
-        assert self.key(SPEC, commit="feedface") != self.key(SPEC)
+        assert self.key(SPEC, identity="feedface") != self.key(SPEC)
 
-    def test_a_missing_commit_hashes_rather_than_raises(self):
-        """A local sweep has no commit stamp; refusing to key it would mean
-        refusing to persist it."""
-        assert len(self.key(SPEC, commit=None)) == 16
+    def test_a_missing_identity_hashes_rather_than_raises(self):
+        """Refusing to key would mean refusing to persist. The dashboard
+        separately refuses to USE an absent identity — it disables its dedup
+        hint rather than keying over the empty string."""
+        assert len(self.key(SPEC, identity=None)) == 16
+
+    def test_the_old_git_commit_keyword_is_gone(self):
+        """A caller left on the old signature must FAIL rather than key wrong.
+
+        This is the migration's one silent failure mode: a `git_commit=` call
+        that still worked would compute a key no other side computes, and the
+        dedup would quietly stop firing on that path for ever.
+        """
+        with pytest.raises(TypeError):
+            sweep_key(SPEC, engine_version=ENGINE_VERSION, git_commit="abc123")
 
     def test_arm_hash_is_the_runners_scenario_hash(self):
         """One definition of "the same arm", used by both sides."""
@@ -687,8 +727,9 @@ class FakeWriter:
         self.runs.extend(rows)
         return True
 
-    def find_done_sweep(self, key, base_config_hash=None):
-        self.dedup_calls.append((key, base_config_hash))
+    def find_done_sweep(self, key, base_config_hash=None,
+                        engine_identity=None):
+        self.dedup_calls.append((key, base_config_hash, engine_identity))
         return self.prior
 
 
@@ -891,7 +932,8 @@ class TestTerminationIsRecorded:
 
         main_mod, writer = wired
 
-        def cancelled_during_lookup(key, base_config_hash=None):
+        def cancelled_during_lookup(key, base_config_hash=None,
+                                    engine_identity=None):
             # A real signal, delivered to this process, not a hand-called
             # handler: that is what proves the handler is INSTALLED by now.
             os.kill(os.getpid(), signal.SIGTERM)
@@ -1061,12 +1103,17 @@ class TestForceSkipsTheDedup:
         main_mod, writer = wired
         main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
         assert len(writer.dedup_calls) == 1
-        key, cfg_hash = writer.dedup_calls[0]
+        key, cfg_hash, identity = writer.dedup_calls[0]
         assert cfg_hash and len(cfg_hash) == 16
         # ...and it is the hash of the EFFECTIVE snapshot, not config_hash.
         from src.backtesting.scenarios import persist as store_mod
         assert cfg_hash == store_mod.base_config_hash(
             store_mod.base_config_snapshot(_config()))
+        # The Job binds the engine identity it is actually running (FC-096
+        # Phase B): a NULL column on a pre-migration row can then never satisfy
+        # the predicate, which is what keeps commit-keyed rows out of the dedup.
+        from src.backtesting.scenarios.engine_identity import engine_identity
+        assert identity == engine_identity()
 
 
 class TestTheEffectiveConfigSnapshot:

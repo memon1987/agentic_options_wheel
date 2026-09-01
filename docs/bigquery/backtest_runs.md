@@ -60,7 +60,31 @@ at mid or at the bid, which means it is not a verdict.
 | `verdict` | STRING | `fit` / `marginal` / `unfit`; NULL when the symbol errored |
 | `demote` | BOOL | `verdict == 'unfit'`. Recommendation only |
 | `verdict_reasons` | STRING[] | Ordered, prefixed `BLOCK:` / `WARN:` / `OK:` |
-| `binding_constraint` | STRING | Which filter blocked the most days |
+| `binding_constraint` | STRING | Which filter blocked the most days. **NULL by artifact on every row written before 2026-09-01 except the first symbol of each run** — see below |
+
+#### `binding_constraint` is NULL by artifact on historical rows (FC-092)
+
+Until 2026-09-01 the `RejectionTally` only counted the FIRST replay in a
+process. `setup_logging` sets structlog's `cache_logger_on_first_use=True`; a
+`BoundLoggerLazyProxy` caches its whole processor chain on first use, and the
+`structlog.configure()` the tally used to install itself does not invalidate
+that cache — so every strategy logger bound replay #1's tally and delivered to
+it for the life of the process.
+
+The monthly screen evaluates 14 symbols in one process. **13 of every 14 rows
+therefore carry an empty `blocked_days_by_reason`, `candidate_days = 0` and a
+NULL `binding_constraint`** — not because the strategy was never blocked, but
+because nothing counted it. Separately, `summary()` iterated a set, so the
+reported constraint could differ between two runs of the same replay depending
+on `PYTHONHASHSEED`.
+
+Both are fixed (FC-096 Phase B PR-a): the tally binds through
+`utils.logger.tally_dispatch`, a process-stable processor that reads the active
+tally from a contextvar, and the ranking is sorted with an explicit tiebreak.
+**Nothing was backfilled** — the honest repair is to re-run the screen, not to
+invent counts for replays whose events are gone. When reading rows older than
+2026-09-01, treat a NULL `binding_constraint` as "not measured", never as "never
+blocked".
 
 ### Performance
 `starting_cash`, `final_equity`, `total_return`, `annualized_return`,

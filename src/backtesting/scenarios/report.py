@@ -92,18 +92,22 @@ HOLDOUT_SEMANTICS = (
 # single-symbol report has one. Stated in the report rather than only in the
 # code, because its absence would otherwise read as an omission.
 TALLY_CAVEAT = (
-    "**This report deliberately carries no `binding_constraint` column.** Only "
-    "the FIRST replay in a process gets a working `RejectionTally`: "
-    "`setup_logging` sets `cache_logger_on_first_use=True`, a structlog lazy "
-    "proxy caches its whole processor chain on first use, and "
-    "`structlog.configure()` — which is how the tally installs itself — does not "
-    "invalidate that cache, so every strategy logger keeps delivering to replay "
-    "#1's tally for the life of the process. Replays 2..N would report an empty "
-    "`blocked_days_by_reason`, i.e. \"the strategy was never blocked\". That is a "
-    "pre-existing defect (it also empties 13 of every 14 rows the monthly screen "
-    "writes to `backtest_runs`), and reporting a column that is NULL by artifact "
-    "would launder it. Every other number here comes from the broker ledger and "
-    "the equity curve and is unaffected."
+    "**This report carries no `binding_constraint` column.** It shipped without "
+    "one because only the FIRST replay in a process got a working "
+    "`RejectionTally`: `setup_logging` sets `cache_logger_on_first_use=True`, a "
+    "structlog lazy proxy caches its whole processor chain on first use, and the "
+    "`structlog.configure()` the tally used to install itself does not "
+    "invalidate that cache — so every strategy logger kept delivering to replay "
+    "#1's tally for the life of the process, and replays 2..N reported an empty "
+    "`blocked_days_by_reason`, i.e. \"the strategy was never blocked\". **That "
+    "defect is fixed** (FC-092, shipped with FC-096 Phase B): the tally binds "
+    "through a process-stable dispatch, so every replay in a sweep now gets a "
+    "complete, deterministically-ordered tally. Adding the column is a schema "
+    "change with its own review and is not part of that fix — so this report "
+    "still does not carry one. Rows the monthly screen wrote to `backtest_runs` "
+    "before the fix keep their NULL `binding_constraint`; read it as \"not "
+    "measured\", never as \"never blocked\". Every other number here comes from "
+    "the broker ledger and the equity curve and was never affected."
 )
 
 # The engine's biases, rewritten FOR THIS REPORT. `reporting.report.KNOWN_BIASES`

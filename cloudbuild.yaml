@@ -65,23 +65,73 @@ steps:
     id: 'build-bot-image'
     waitFor: ['run-tests']
 
+  # Step 2b: Compute the ENGINE IDENTITY of this checkout (FC-096 Phase B).
+  #
+  # `sweep_key` is half engine-identity — the sha256 of `src/**` — since the
+  # dedup was re-keyed off `git_commit`. The dashboard image ships two flat
+  # stdlib modules out of the engine package and NO `src/` tree, so it cannot
+  # hash one at runtime; this step hashes the same checkout the dashboard image
+  # is built from and hands the value to the build as an arg.
+  #
+  # It runs the SHARED MODULE — `src/backtesting/scenarios/engine_identity.py` —
+  # rather than reimplementing the hash in yaml. A second implementation would
+  # drift, and its drift would be silent: the dashboard would compute a key that
+  # matches nothing the Job ever writes, and the dedup would simply stop firing.
+  # `tests/test_engine_identity.py` pins the parity.
+  #
+  # The FILE is executed, not imported: `src.backtesting.scenarios.__init__`
+  # imports the runner (pandas, the Alpaca SDK, the simulator), so
+  # `python -c "from src...engine_identity import ..."` would need the engine's
+  # whole dependency set installed. Running it as `__main__` needs only the
+  # standard library, which is what lets this be a bare `python:3.11-slim` with
+  # no pip step. The module's `if __name__ == "__main__"` block is that entry
+  # point and is pinned by the contract test.
+  #
+  # `waitFor: ['-']` so it starts immediately and overlaps `run-tests`: it costs
+  # ~1.3 MB of reads and must never sit on the critical path.
+  - name: 'python:3.11-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        python src/backtesting/scenarios/engine_identity.py \
+          > /workspace/engine_identity.txt
+        echo "engine identity: $(cat /workspace/engine_identity.txt)"
+    id: 'compute-engine-identity'
+    waitFor: ['-']
+
   # Step 3: Build the dashboard container image.
   # Context is the REPO ROOT (no `dir:`), because the image ships two stdlib-only
   # modules out of `src/backtesting/scenarios/` so the sweep API refuses exactly
   # what the sweep Job refuses (FC-060 D7). Every COPY in dashboard/Dockerfile is
   # therefore repo-relative.
+  #
+  # A `bash -c` step rather than the exec form because the ENGINE_IDENTITY
+  # build-arg's value is produced by the previous step and has to be read out of
+  # /workspace. The empty check is the point: an empty build-arg would silently
+  # produce a dashboard whose sweep dedup hint is disabled for the life of the
+  # revision, and a build failure is the cheaper way to find that out.
   - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
     args:
-      - 'build'
-      - '-f'
-      - 'dashboard/Dockerfile'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
-      - '-t'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:latest'
-      - '.'
+      - '-c'
+      - |
+        set -euo pipefail
+        ENGINE_IDENTITY="$(cat /workspace/engine_identity.txt)"
+        if [ -z "$${ENGINE_IDENTITY}" ]; then
+          echo "compute-engine-identity produced no value; refusing to build a" \
+               "dashboard whose sweep dedup hint would be permanently disabled"
+          exit 1
+        fi
+        docker build \
+          -f dashboard/Dockerfile \
+          --build-arg ENGINE_IDENTITY="$${ENGINE_IDENTITY}" \
+          -t us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA \
+          -t us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:latest \
+          .
     id: 'build-dashboard-image'
-    waitFor: ['run-tests']
+    waitFor: ['run-tests', 'compute-engine-identity']
 
   # Step 4: Push the trading bot container image
   - name: 'gcr.io/cloud-builders/docker'

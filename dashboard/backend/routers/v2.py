@@ -667,7 +667,16 @@ async def submit_sweep(
 
     bq = get_bigquery_service()
     git_commit = os.getenv("GIT_COMMIT") or None
-    key = sweeps.compute_sweep_key(normalised, git_commit)
+    # FC-096 Phase B: the key is now half engine-identity — the content hash of
+    # `src/**`, baked into this image at build time because the image ships no
+    # `src/` tree to hash. Absent (an image built without the build-arg) it is
+    # None, `key` is None, the hint is skipped and the `submitted` row carries a
+    # NULL `sweep_key`. Submissions still launch and the Job still dedups
+    # against the tree it is actually running; only the hint is lost. Keying
+    # over a fallback would be worse than losing it — see
+    # `sweeps.engine_identity_from_env`.
+    identity = sweeps.engine_identity_from_env()
+    key = sweeps.compute_sweep_key(normalised, identity) if identity else None
     submitted_at = datetime.now(timezone.utc).isoformat()
     force = bool(normalised.get("force"))
 
@@ -675,7 +684,8 @@ async def submit_sweep(
         # A HINT, never a decision — no `base_config_hash` is bound, so this
         # cannot see a kill switch flipped on the Job. `force` suppresses even
         # the hint, since the operator has already said they do not want one.
-        prior = None if force else bq.find_done_sweep(key)
+        prior = (None if (force or not key)
+                 else bq.find_done_sweep(key, engine_identity=identity))
         history = bq.get_recent_sweeps(limit=25)
     except Exception as exc:  # noqa: BLE001
         if _sweep_store_missing(exc):
@@ -710,7 +720,8 @@ async def submit_sweep(
     run_id = sweeps.new_run_id()
     row = sweeps.submitted_row(
         run_id=run_id, spec=normalised, sweep_key_value=key,
-        submitted_at=submitted_at, git_commit=git_commit)
+        submitted_at=submitted_at, git_commit=git_commit,
+        engine_identity=identity)
     bq.insert_sweep_status(row)
 
     try:

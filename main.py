@@ -913,6 +913,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     from src.backtesting.reporting.bq_writer import config_hash
     from src.backtesting.scenarios import run_sweep
     from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.scenarios.engine_identity import engine_identity
     from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
     from src.backtesting.scenarios.report import render_json, render_markdown
     from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION
@@ -1017,8 +1018,13 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
                     or datetime.now(timezone.utc).isoformat())
     git_commit = os.environ.get('GIT_COMMIT') or None
+    # FC-096 Phase B: the dedup key is the CONTENT of `src/**`, not the commit.
+    # A merge that cannot change a replay (docs, dashboard, build config) leaves
+    # every stored result valid; a one-byte change to `put_seller.py` invalidates
+    # them all. `git_commit` is still stamped on every row as provenance.
+    identity = engine_identity()
     key = compute_sweep_key(spec_payload, engine_version=ENGINE_VERSION,
-                            git_commit=git_commit)
+                            engine_identity=identity)
     snapshot = sweep_store.base_config_snapshot(config)
     effective_hash = sweep_store.base_config_hash(snapshot)
     provenance = dict(
@@ -1029,6 +1035,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                        or ('dashboard' if spec_env else 'cli')),
         engine_version=ENGINE_VERSION,
         git_commit=git_commit,
+        engine_identity=identity,
         # Cloud Run stamps this on every Job task. Stored for operator debugging
         # only: D3 makes status BigQuery-based precisely because
         # `run.executions.get` is unproven for the dashboard's service account.
@@ -1103,8 +1110,9 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                 # the decision is actually made, against the config this process
                 # is holding.
                 prior = (None if force else
-                         writer.find_done_sweep(key,
-                                                base_config_hash=effective_hash))
+                         writer.find_done_sweep(
+                             key, base_config_hash=effective_hash,
+                             engine_identity=identity))
                 if prior is not None and prior.get('run_id') != run_id:
                     deduplicated_to = prior['run_id']
 
@@ -1130,6 +1138,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                 chain_store=chain_store, started_at=started_at,
                 run_id=run_id, submitted_at=submitted_at,
                 engine_version=ENGINE_VERSION, git_commit=git_commit,
+                engine_identity=identity,
                 provenance=provenance, deduplicated_to=deduplicated_to,
             )
 
@@ -1182,7 +1191,8 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
 
 def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
                            started_at, run_id, submitted_at, engine_version,
-                           git_commit, provenance, deduplicated_to=None):
+                           git_commit, provenance, deduplicated_to=None,
+                           engine_identity=None):
     """Write the cells and the terminal status row. Returns rows persisted, or None.
 
     Extracted from the `finally` because **every step in here can itself raise**,
@@ -1212,7 +1222,8 @@ def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
             writer=writer, logger=logger, result=result, failure=failure,
             chain_store=chain_store, started_at=started_at, run_id=run_id,
             submitted_at=submitted_at, engine_version=engine_version,
-            git_commit=git_commit, provenance=provenance,
+            git_commit=git_commit, engine_identity=engine_identity,
+            provenance=provenance,
             deduplicated_to=deduplicated_to,
             sweep_store=sweep_store,
             accumulate_lake_summary=accumulate_lake_summary,
@@ -1223,7 +1234,8 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
                                  started_at, run_id, submitted_at,
                                  engine_version, git_commit, provenance,
                                  deduplicated_to, sweep_store,
-                                 accumulate_lake_summary, datetime, timezone):
+                                 accumulate_lake_summary, datetime, timezone,
+                                 engine_identity=None):
     """The body of `_finalise_sweep_status`, run with SIGTERM ignored."""
     lake_summary = None
     try:
@@ -1247,7 +1259,8 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
         try:
             rows = sweep_store.rows_from_sweep(
                 result, run_id=run_id, submitted_at=submitted_at,
-                engine_version=engine_version, git_commit=git_commit)
+                engine_version=engine_version, git_commit=git_commit,
+                engine_identity=engine_identity)
             rows_ok = writer.write_runs(rows)
             rows_written = len(rows) if rows_ok else 0
         except Exception as exc:  # noqa: BLE001
