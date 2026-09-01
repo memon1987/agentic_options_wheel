@@ -65,7 +65,30 @@ BASE_SCENARIO_NAME = "base"
 # refused rather than rendered. The pattern keeps names to things that are safe
 # as a grid key, a report cell and an env-var payload.
 MAX_SCENARIO_NAME_CHARS = 40
-SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+# `\Z`, not `$`. In Python `$` also matches immediately BEFORE a trailing
+# newline, so `"tighter\n"` satisfied this pattern end to end: the API accepted
+# the arm, the CLI accepted the YAML entry, and the name then travelled into an
+# env var, a grid column header and — since FC-096 Phase B — a GCS object name,
+# where the newline is a header-splitting character the client library rejects at
+# serve time. A name is a single line by construction; `\Z` is how that is
+# actually spelled.
+SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*\Z")
+
+# The separator FC-096 Phase B's detail-artifact object names are built from:
+# ``<run_id>/<scenario>__<symbol>__<split>.json.gz``, parsed back with
+# ``rsplit("__", 2)``. A scenario name containing ``__`` would make that parse
+# ambiguous — ``a__b__AAPL__all`` splits into ``("a__b", "AAPL", "all")`` only by
+# luck of the rsplit direction, and ``a__b__c`` with a one-token symbol parses to
+# a scenario nobody named. So the name rule forbids it, in the ONE place both
+# sides read (this module is copied flat into the dashboard image), and the
+# artifact writer never has to sanitise a name the validator already refused.
+ARTIFACT_NAME_SEPARATOR = "__"
+
+# Object-name prefix inside the artifacts bucket. Versioned like the chain
+# lake's (``chain_store.DEFAULT_LAKE_PREFIX``): bump it when the artifact JSON
+# schema changes incompatibly, so two generations of object can never be read as
+# each other.
+ARTIFACT_PREFIX = "sim-artifacts/v1"
 
 
 def validate_scenario_name(name: str, where: str) -> None:
@@ -84,6 +107,82 @@ def validate_scenario_name(name: str, where: str) -> None:
             f"{where}: scenario name {name!r} must start alphanumeric and "
             f"contain only letters, digits, '_', '.' or '-' "
             f"(pattern {SCENARIO_NAME_RE.pattern})")
+    if ARTIFACT_NAME_SEPARATOR in name:
+        raise ValueError(
+            f"{where}: scenario name {name!r} may not contain "
+            f"{ARTIFACT_NAME_SEPARATOR!r}. It is the field separator in the "
+            f"detail-artifact object name "
+            f"(<run_id>/<scenario>__<symbol>__<split>.json.gz), which is parsed "
+            f"back with rsplit('__', 2); a name carrying it would make that "
+            f"parse silently wrong. A single underscore is fine.")
+
+
+# What an UNDERLYING may be, for the same reason a scenario name is bounded: it
+# becomes a field in the artifact object name. Real tickers carry dots and
+# dashes (BRK.B, RDS-A); nothing legitimate carries `__`, a slash, a space or a
+# newline. The dashboard's serve-side check (`services/artifacts.SYMBOL_RE`)
+# is this rule, and the CLI applies it too — a hand-typed `--symbols` value
+# reaching the writer is the one path that could otherwise create an object no
+# reader can address.
+SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,15}\Z")
+
+
+def validate_symbol(symbol: str, where: str) -> None:
+    """Raise ``ValueError`` unless ``symbol`` can key an artifact object."""
+    if not SYMBOL_RE.match(symbol or ""):
+        raise ValueError(
+            f"{where}: symbol {str(symbol)[:32]!r} must be an uppercase ticker "
+            f"of at most 16 characters from [A-Z0-9.-] "
+            f"(pattern {SYMBOL_RE.pattern}). Symbols key the per-cell detail "
+            f"artifact's object name, so one carrying '__', a slash or "
+            f"whitespace would write an object nothing can address.")
+
+
+def artifact_object_name(run_id: str, scenario: str, symbol: str,
+                         split: str) -> str:
+    """The GCS object name for one cell's detail artifact (FC-096 Phase B B2).
+
+    ``<prefix>/<run_id>/<scenario>__<symbol>__<split>.json.gz``. Here rather
+    than in the engine's ``reporting/artifact.py`` for the reason the whole
+    module exists: the dashboard serves these objects and ships no engine, so
+    the writer and the reader have to agree bit-for-bit on the name. One
+    function, imported by both — a second implementation would drift and its
+    drift would present as a 404 on an artifact that exists.
+
+    ``scenario`` is NOT sanitised: ``validate_scenario_name`` already refuses
+    every character that could break the name, ``__`` included. Sanitising here
+    would silently map two distinct arms onto one object.
+    """
+    return (f"{ARTIFACT_PREFIX}/{run_id}/{scenario}"
+            f"{ARTIFACT_NAME_SEPARATOR}{symbol}"
+            f"{ARTIFACT_NAME_SEPARATOR}{split}.json.gz")
+
+
+def parse_artifact_object_name(name: str) -> Dict[str, str]:
+    """``{run_id, scenario, symbol, split}`` from an artifact object name.
+
+    The inverse of ``artifact_object_name``, and the only parser anything is
+    allowed to use: ``rsplit(ARTIFACT_NAME_SEPARATOR, 2)`` from the RIGHT, so a
+    scenario name is whatever is left over. That direction is what makes the
+    ``__``-in-a-name rule sufficient rather than merely helpful.
+
+    Raises ``ValueError`` on anything that is not one of these names.
+    """
+    stem = name
+    if stem.endswith(".json.gz"):
+        stem = stem[: -len(".json.gz")]
+    else:
+        raise ValueError(f"not an artifact object name (no .json.gz): {name!r}")
+    head, _, tail = stem.rpartition("/")
+    run_id = head.rsplit("/", 1)[-1] if head else ""
+    parts = tail.rsplit(ARTIFACT_NAME_SEPARATOR, 2)
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(
+            f"not an artifact object name (expected "
+            f"<scenario>__<symbol>__<split>.json.gz): {name!r}")
+    scenario, symbol, split = parts
+    return {"run_id": run_id, "scenario": scenario,
+            "symbol": symbol, "split": split}
 
 
 # The per-symbol notional a spec that does not say otherwise is run at. Same

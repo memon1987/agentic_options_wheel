@@ -923,14 +923,35 @@ regression; do not treat those columns as data.
 ### The sweep API — the one write path this backend has (FC-060 Layer 3)
 
 `/api/v2/sweeps*` is the dashboard's only endpoint family that *causes* anything.
-Four routes, and the asymmetry between them is deliberate:
+Five routes, and the asymmetry between them is deliberate:
 
 | route | auth | what it does |
 |---|---|---|
 | `GET /api/v2/sweeps/allowlist` | none | the override keys, the refusals **and their reasons**, presets, caps. Static — no BigQuery |
 | `GET /api/v2/sweeps` | none | recent runs, latest status per `run_id`, `stuck` label |
 | `GET /api/v2/sweeps/{run_id}` | none | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
+| `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` | none | one cell's **detail artifact** — equity curve, full ledger, cycles, rolls, rejection tally (FC-096 Phase B) |
 | `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → 409 gate → write `submitted` → launch the Job → **202** |
+
+- **The artifact route reads GCS, not BigQuery.** The engine gzips one JSON
+  object per non-errored cell to
+  `gs://<bucket>/sim-artifacts/v1/<run_id>/<scenario>__<symbol>__<split>.json.gz`
+  as it replays; this route decompresses one and serves it as
+  `application/json`. Decompressing SERVER-SIDE rather than passing the gzip
+  through is deliberate: an object whose metadata declares
+  `Content-Encoding: gzip` gets *decompressive transcoding* from GCS (so the
+  "gzip" body is already plain), and an intermediary that re-encodes an
+  already-encoded body double-wraps it. The stored object stays gzipped — this
+  is a transport decision only.
+- **404 is a normal answer**, not an error: an errored cell has no replay to
+  serialise, and neither does a run that predates FC-096 Phase B or one an
+  operator ran from the CLI without `--persist`. 502 is reserved for a read that
+  FAILED (a missing bucket grant), because "absent" and "unreadable" send an
+  operator to different places.
+- **The object name is `scenario_identity.artifact_object_name`**, the same
+  function the writer calls — not a second implementation. `__` is the field
+  separator and `validate_scenario_name` forbids it in a name, which is what
+  makes the `rsplit('__', 2)` parser sound.
 
 - **The GETs are public because everything on this dashboard is** (it is reachable
   by `allUsers` — FC-094 owns that decision). Sweep results are hypotheticals over

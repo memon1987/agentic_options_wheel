@@ -215,6 +215,19 @@ def _sweeps_schema():
         # result. See `find_done_sweep`.
         f("rows_persisted", "INTEGER"),
         f("error_cells", "INTEGER"),
+        # FC-096 Phase B B2. Whether EVERY non-errored cell of this run also
+        # landed its detail artifact in GCS. Additive and NULLABLE, and the
+        # three states are genuinely different: TRUE = the console can open any
+        # cell of this run; FALSE = some cells have no evidence and the operator
+        # should not read an empty ledger as "nothing happened"; NULL = this run
+        # wrote no artifacts at all (a CLI run without `--persist`, or a row
+        # written before the column existed), which is not a defect.
+        #
+        # An ERRORED cell is excluded from both sides of the comparison on
+        # purpose: it produced no replay, so it has nothing to serialise, and
+        # counting it would make every partially-failed sweep report incomplete
+        # artifacts as well — two different problems reported as one.
+        f("artifacts_complete", "BOOL"),
         # FC-096 A4. Symbols the FC-013 earnings gate could not gate because
         # they are absent from the committed table — JSON array text, NULLABLE,
         # NULL on every non-terminal row and on runs written before the column
@@ -577,6 +590,7 @@ def status_row(
     error: Optional[str] = None,
     rows_persisted: Optional[int] = None,
     engine_config_hash: Optional[str] = None,
+    artifacts_complete: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """One ``scenario_sweeps`` row.
 
@@ -646,6 +660,12 @@ def status_row(
         "bar_cache_hits": None,
         "rows_persisted": rows_persisted,
         "error_cells": None,
+        # FC-096 Phase B B2. NULL on every non-terminal row and on every run
+        # that wrote no artifacts; the terminal row of an artifact-writing run
+        # carries the answer. Present on EVERY row for the reason the block
+        # above gives: one column set per run, whichever writer produced it.
+        "artifacts_complete": (None if artifacts_complete is None
+                               else bool(artifacts_complete)),
         "engine_config_hash": engine_config_hash,
         "earnings_symbols_without_data": None,
     }

@@ -910,6 +910,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     from datetime import date, datetime, timedelta, timezone
 
     from src.backtesting.data.chain_store import ChainStore
+    from src.backtesting.reporting.artifact_store import ArtifactWriter
     from src.backtesting.reporting.bq_writer import config_hash
     from src.backtesting.scenarios import run_sweep
     from src.backtesting.scenarios import persist as sweep_store
@@ -952,6 +953,20 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
             symbols = [args.symbol.upper()]
         else:
             symbols = list(config.stock_symbols)
+        # The SAME rule the artifact endpoint applies at serve time
+        # (identity.validate_symbol / services/artifacts.SYMBOL_RE). Hand-typed
+        # `--symbols` is the one path by which a symbol containing `__`, a
+        # slash or whitespace could reach the artifact writer and land an object
+        # whose name nothing can parse or request back. Checked here, before
+        # anything is materialised, so it is an immediate refusal rather than a
+        # sweep that completes and produces unreadable evidence.
+        from src.backtesting.scenarios.identity import validate_symbol
+
+        for symbol in symbols:
+            try:
+                validate_symbol(symbol, '--symbols')
+            except ValueError as exc:
+                raise SystemExit(str(exc))
         starting_cash = args.starting_cash
         run_sensitivity = not args.no_sensitivity
 
@@ -1053,6 +1068,23 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         engine_config_hash=config_hash(config),
     )
 
+    # FC-096 Phase B B2. Detail artifacts ride the SAME gate as BigQuery
+    # persistence, which gives the two contracts the plan asks for without a
+    # second flag: the Job always persists (`persist` is implied by `--spec-env`)
+    # so it always writes artifacts, and a CLI sweep without `--persist` writes
+    # NOTHING ANYWHERE — no rows, no objects, and no GCS client is even
+    # constructed, because `ArtifactWriter` is never built.
+    artifact_writer = ArtifactWriter(run_id) if persist else None
+    if artifact_writer is not None and not artifact_writer.enabled:
+        # The explicit off switch (`SIM_ARTIFACT_BUCKET=""`). Said once, because
+        # a run whose evidence is silently not being stored is exactly the
+        # "silence reads as all-clear" failure this project keeps relearning.
+        logger.warning(
+            "Detail artifacts are switched off for this run (no artifact "
+            "bucket configured); results are unaffected",
+            event_category="backtest", event_type="sim_artifacts_disabled",
+            run_id=run_id)
+
     writer = None
     if persist:
         # Profile-derived, never hardcoded (the FC-075 DD-4 lesson): a
@@ -1127,6 +1159,11 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                     starting_cash=starting_cash,
                     run_sensitivity=run_sensitivity,
                     chain_store=chain_store,
+                    artifact_sink=(artifact_writer.write
+                                   if artifact_writer is not None
+                                   and artifact_writer.enabled else None),
+                    run_id=run_id,
+                    engine_identity=identity,
                 )
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
         failure = f"{type(exc).__name__}: {exc}"
@@ -1140,6 +1177,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
                 engine_version=ENGINE_VERSION, git_commit=git_commit,
                 engine_identity=identity,
                 provenance=provenance, deduplicated_to=deduplicated_to,
+                artifact_writer=artifact_writer,
             )
 
     if deduplicated_to is not None:
@@ -1192,7 +1230,7 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
 def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
                            started_at, run_id, submitted_at, engine_version,
                            git_commit, provenance, deduplicated_to=None,
-                           engine_identity=None):
+                           engine_identity=None, artifact_writer=None):
     """Write the cells and the terminal status row. Returns rows persisted, or None.
 
     Extracted from the `finally` because **every step in here can itself raise**,
@@ -1225,6 +1263,7 @@ def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
             git_commit=git_commit, engine_identity=engine_identity,
             provenance=provenance,
             deduplicated_to=deduplicated_to,
+            artifact_writer=artifact_writer,
             sweep_store=sweep_store,
             accumulate_lake_summary=accumulate_lake_summary,
             datetime=datetime, timezone=timezone)
@@ -1235,8 +1274,10 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
                                  engine_version, git_commit, provenance,
                                  deduplicated_to, sweep_store,
                                  accumulate_lake_summary, datetime, timezone,
-                                 engine_identity=None):
+                                 engine_identity=None, artifact_writer=None):
     """The body of `_finalise_sweep_status`, run with SIGTERM ignored."""
+    artifacts_complete = _artifacts_complete(artifact_writer, result, logger,
+                                             run_id=run_id)
     lake_summary = None
     try:
         if chain_store is not None:
@@ -1290,6 +1331,7 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
             finished_at=datetime.now(timezone.utc).isoformat(),
             result=result, error=failure, lake_summary=lake_summary,
             rows_persisted=(rows_written if rows_ok else None),
+            artifacts_complete=artifacts_complete,
             deduplicated_to=(deduplicated_to
                              if status == sweep_store.STATUS_DEDUPLICATED
                              else None),
@@ -1302,6 +1344,65 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
                      run_id=run_id, status=status, exc_info=True)
         return None
     return rows_written if status == sweep_store.STATUS_DONE else None
+
+
+def _artifacts_complete(artifact_writer, result, logger, *, run_id):
+    """Whether every NON-ERRORED cell of this run also stored its artifact.
+
+    Three values, and the difference between them is the whole point:
+
+    * ``True``  — every non-errored cell has an artifact; the console can open
+      any cell of this run.
+    * ``False`` — some do not; an empty ledger in the console is a STORAGE
+      failure, not a replay that did nothing.
+    * ``None``  — the question does not apply. No writer, artifacts switched
+      off, a dedup hit with no result, **a run with no non-errored cell at all**
+      (nothing was ever supposed to be written, so "complete" is vacuous), or a
+      run that CRASHED before producing a result while having written nothing.
+
+    ``None`` is not a soft ``False``. "This run stored no evidence and was never
+    meant to" and "this run's evidence is incomplete" send an operator to
+    different places, and the vacuous case is the one that used to answer
+    ``0 == 0`` -> ``True``: a sweep whose every arm errored would have claimed a
+    complete artifact set it does not have a single object of.
+
+    **The crashed path is the subtle one.** When the replay raises there is no
+    ``result``, so the arithmetic has no denominator — but the writer may
+    already have stored objects for the cells that finished before the crash.
+    Stamping ``None`` there would say "this run wrote nothing" while orphaned
+    objects sit in the bucket, so a crashed run that wrote at least one artifact
+    is ``False``: incomplete, which is exactly what it is.
+
+    Errored cells are excluded from BOTH sides of the comparison: an errored
+    cell has no replay to serialise, so ``_replay_one`` never calls the sink for
+    it. Counting it would make every sweep with one bad arm also report missing
+    artifacts, folding two unrelated problems into one flag.
+    """
+    if artifact_writer is None or not getattr(artifact_writer, "enabled", False):
+        return None
+    written = int(getattr(artifact_writer, "written", 0))
+    if result is None:
+        # Crashed, or deduplicated away without replaying. Objects already in
+        # the bucket are orphans of a run that has no cell rows to pair them
+        # with — incomplete, never "wrote nothing".
+        return False if written > 0 else None
+    cells = getattr(result, "rows", []) or []
+    expected = sum(1 for cell in cells if not getattr(cell, "error", None))
+    if expected == 0:
+        # Nothing was ever supposed to be written. `0 == 0` is True and would be
+        # a lie about a run with no evidence in it at all.
+        return None
+    complete = written == expected
+    if not complete:
+        logger.warning(
+            "Detail artifacts are INCOMPLETE for this run — some cells have "
+            "results but no evidence",
+            event_category="backtest",
+            event_type="sim_artifacts_incomplete",
+            run_id=run_id, expected=expected, written=written,
+            failed=int(getattr(artifact_writer, "failed", 0)),
+            last_error=getattr(artifact_writer, "last_error", None))
+    return complete
 
 
 def _sensitivity_section(s: dict) -> str:

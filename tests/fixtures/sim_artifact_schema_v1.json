@@ -1,0 +1,145 @@
+{
+  "counters": [
+    "candidate_days",
+    "decision_days",
+    "dividends_credited",
+    "early_assignments",
+    "final_equity",
+    "ledger_events",
+    "rolls_evaluated",
+    "rolls_executed",
+    "total_return",
+    "unpriced_ex_div_calls"
+  ],
+  "cycles": [
+    "annualized_return",
+    "assigned",
+    "called_away",
+    "calls_sold",
+    "capital_at_risk",
+    "contracts_closed",
+    "cost_basis",
+    "days",
+    "dividends",
+    "end",
+    "event_count",
+    "exit_price",
+    "fees",
+    "is_open",
+    "max_collateral",
+    "option_pnl",
+    "outcome",
+    "puts_sold",
+    "return_on_capital",
+    "rolls",
+    "shares_acquired",
+    "start",
+    "stock_pnl",
+    "total_pnl",
+    "underlying"
+  ],
+  "daily": [
+    "cash",
+    "date",
+    "equity",
+    "open_options",
+    "reserved_collateral",
+    "shares_held"
+  ],
+  "earnings_coverage": [
+    "symbols_past_horizon",
+    "symbols_without_data"
+  ],
+  "ledger": [
+    "cash_delta",
+    "contracts",
+    "date",
+    "detail",
+    "fees",
+    "kind",
+    "price",
+    "shares",
+    "symbol",
+    "underlying"
+  ],
+  "ledger_detail_by_kind": {
+    "buy_to_close": [
+      "collateral_released"
+    ],
+    "call_assignment": [
+      "reason"
+    ],
+    "dividend": [],
+    "expire_worthless": [
+      "collateral_released"
+    ],
+    "put_assignment": [
+      "basis",
+      "collateral_released",
+      "strike"
+    ],
+    "sell_call_open": [],
+    "sell_put_open": [
+      "collateral"
+    ]
+  },
+  "provenance": [
+    "config_hash",
+    "engine_identity",
+    "fill",
+    "generated_at",
+    "git_commit",
+    "masked_reach",
+    "run_id",
+    "scenario",
+    "scenario_hash",
+    "split",
+    "starting_cash",
+    "symbol",
+    "window"
+  ],
+  "provenance.fill": [
+    "basis",
+    "fill_haircut"
+  ],
+  "provenance.masked_reach": [
+    "dte_buffer",
+    "dte_cutoff",
+    "max_dte",
+    "sweep_max_dte"
+  ],
+  "provenance.window": [
+    "end",
+    "first_decision_day",
+    "last_decision_day",
+    "start"
+  ],
+  "rejections": [
+    "days",
+    "reason"
+  ],
+  "roll_records": [
+    "btc_order_id",
+    "contracts",
+    "day",
+    "net_credit",
+    "new_strike",
+    "old_strike",
+    "stc_order_id",
+    "success",
+    "underlying"
+  ],
+  "schema": 1,
+  "top_level": [
+    "binding_constraint",
+    "counters",
+    "cycles",
+    "daily",
+    "earnings_coverage",
+    "ledger",
+    "provenance",
+    "rejections",
+    "roll_records",
+    "schema"
+  ]
+}

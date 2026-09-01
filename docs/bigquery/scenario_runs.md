@@ -85,6 +85,7 @@ ORDER BY submitted_at DESC
 | `error` | STRING | on a `failed` row |
 | `rows_persisted` | INTEGER | how many `scenario_runs` rows actually landed. NULL unless the insert succeeded |
 | `error_cells` | INTEGER | cells whose `error IS NOT NULL`. Counted from the cells, not inferred from the exit code |
+| `artifacts_complete` | BOOL | FC-096 Phase B. TRUE when every **non-errored** cell also stored its detail artifact in GCS; FALSE when some did not (the console will show empty ledgers, and that is a storage failure rather than a quiet replay) — **including a run that crashed mid-replay having already written some objects**, which is incomplete rather than empty; **NULL** when the question does not apply: the run wrote no artifacts at all (a CLI run without `--persist`, a row written before the column existed), or it had **no non-errored cell to write one for** (every arm errored — `0 == 0` would claim a complete set the run has not one object of). NULL is not a defect |
 | `engine_config_hash` | STRING | `bq_writer.config_hash` — nine strategy keys plus the scoring constants. This is the column that lines a sweep row up with a `backtest_runs` row; `base_config_hash` is a different hash answering a different question (below) |
 
 ### Effective, not as written
@@ -374,6 +375,69 @@ Job and the caller polls the detail route. Its body carries `run_id`,
 `sweep_key`, `execution_name`, `cell_count`, `forced`, `deduplicated_to` (always
 `null` from this endpoint) and `prior_done_run_id` (the hint described above,
 `null` when there is none or when `force` was set).
+
+## Detail artifacts (FC-096 Phase B)
+
+A `scenario_runs` row is ~30 numbers. The replay behind it held a daily equity
+curve, a complete money/position ledger, the wheel cycles those events
+reconstruct into, the roller's records and the rejection tally — all of which
+used to be discarded after aggregation. Since FC-096 Phase B every non-errored
+cell of a **persisting** run also writes one gzipped JSON object:
+
+```
+gs://gen-lang-client-0607444019-options-data/sim-artifacts/v1/<run_id>/<scenario>__<symbol>__<split>.json.gz
+```
+
+Read one with
+`GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` (served
+decompressed as `application/json`).
+
+Four things on the object exist so a correct artifact cannot tell a reader
+something false, and all four are worth knowing before querying one:
+
+- **`provenance.fill`** — the fill assumption of the SERIALISED replay, always
+  `{"basis": "mid", "fill_haircut": <arm's haircut>}`. The row's
+  `bid_fill_return` comes from a SECOND replay at the bid that deliberately gets
+  no artifact; without this stamp, comparing the two would be comparing two
+  different runs.
+- **`provenance.masked_reach`** — this ARM's DTE reach and the chain cutoff it
+  implies (`max_dte + UNIVERSE_DTE_BUFFER`, carried alongside as `dte_buffer` so
+  a reader never has to know the constant's current value), never the sweep-wide
+  materialisation reach (carried separately as `sweep_max_dte`, for context
+  only). Since FC-096 Phase A PR-2
+  each arm replays against a chain view masked to its own reach, so stamping the
+  parent's number would describe a chain the cell never saw.
+- **`rejections`** — an ORDERED list (`[{reason, days}, ...]`), ranked as
+  `RejectionTally.summary()` ranked it, plus `binding_constraint`. A list rather
+  than an object because the ranking is the answer and JSON objects have no
+  guaranteed order. Post-FC-092 an EMPTY tally now means "nothing was blocked"
+  rather than "the logger cached the first run's tally".
+- **`daily[].shares_held`** — per-symbol share counts on every curve row. Equity
+  alone cannot distinguish a cash account from an assigned one holding the same
+  dollars, which is the first thing a reader needs from a wheel drawdown.
+
+`"schema": 1` is in the JSON and mirrored by the `v1` in the object prefix; a
+frozen-fixture test (`tests/test_sim_artifacts.py`) pins the full key set,
+including the per-`kind` `LedgerEvent.detail` keys and the roll record's — which
+is `CallRoller.execute_roll`'s success dict (`success`, `underlying`,
+`old_strike`, `new_strike`, `contracts`, `net_credit`, `btc_order_id`,
+`stc_order_id`) plus the ISO `day` the replay stamps on at capture, because
+production's record carries no date at all (the log line's timestamp is the
+date). Adding a field is additive; removing or renaming one bumps both.
+
+**What the artifact deliberately does NOT carry: any price series.** There is no
+underlying bar history and no buy-and-hold benchmark curve on the object — only
+what the replay itself produced (trades, the equity curve, cycles, rolls, the
+tally). Phase E's price-overlay and vs-benchmark components read bars through
+their own path, defined in Phase E's plan; duplicating a bar series into every
+cell's artifact would multiply one shared series by `arms x symbols x splits` and
+create a second, staler copy of data the lake already owns.
+
+**Storage is best-effort and accounted for.** Artifacts are evidence, not
+results: a GCS failure logs `sim_artifact_write_failed`, is counted, and never
+fails a cell. `artifacts_complete` on the terminal `scenario_sweeps` row is what
+tells an operator whether the set is whole, without listing the bucket. There is
+no lifecycle rule on the prefix today; revisit at ~1 GB.
 
 ## Operational notes
 
