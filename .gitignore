@@ -69,3 +69,7 @@ htmlcov/
 dmypy.json
 # Agent worktrees (transient)
 .claude/worktrees/
+
+# Cloud Build writes this into /workspace, which IS the repo root there
+# (cloudbuild.yaml `compute-engine-identity`). Never a tracked file.
+engine_identity.txt
