@@ -733,9 +733,14 @@ Three properties worth knowing before running it:
   window had been pushed out by a position anchor or an FC-091 merge — refused,
   silently, for ever. That is the live SPY/IWM/PFE `rejected=231 skipped=231`
   shape.)
-- **It exits non-zero if any symbol did not complete cleanly**, and a genuine
-  stock split inside the window counts (the day is skipped and reported). That
-  is deliberate: an operator should hear about a split once.
+- **It exits non-zero if any symbol hit a genuine failure** — a vendor error, an
+  exception mid-build, bars that never arrived. A day skipped for an unmodelled
+  **corporate action** is counted and logged
+  (`backfill_day_skipped{reason=corporate_action}`,
+  `days_skipped_corporate_action` in the summary) but deliberately does **not**
+  fail the run: a split recurs across the universe and the trailing window
+  slides, so paging weekly for the month it takes to age out is how the
+  Job-failure alert gets muted.
 - **The DTE knob is still closed.** `MAX_SWEEPABLE_DTE = 21` exists in
   `scenarios/overrides.py` and the backfill imports it, but
   `strategy.put_target_dte` stays allowlist-refused until the historical

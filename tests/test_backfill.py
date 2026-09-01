@@ -149,6 +149,26 @@ def provider(prices):
     return LadderProvider(prices)
 
 
+@pytest.fixture
+def captured_backfill_events():
+    """Every structlog event the backfill emits during one test."""
+    import structlog
+
+    seen = []
+
+    def capture(_logger, _name, event_dict):
+        seen.append(dict(event_dict))
+        return event_dict
+
+    previous = structlog.get_config()
+    structlog.configure(
+        processors=[capture] + list(previous.get("processors", [])))
+    try:
+        yield seen
+    finally:
+        structlog.configure(**previous)
+
+
 def _store(tmp_path, lake=None, name="cache"):
     return ChainStore(str(tmp_path / name), lake=lake)
 
@@ -511,13 +531,42 @@ class TestSplits:
         row = summary.symbols[0]
 
         assert row.days_checked == len(days)
-        assert row.errors == 1, "the split day, and only it"
+        assert row.days_skipped_corporate_action == 1, "the split day, and only it"
+        assert row.errors == 0, (
+            "a split is market data, not a fault — it must not reach the "
+            "counter the exit code reads"
+        )
         assert row.days_written == len(days) - 1, (
             "every other session must still be backfilled — a split must not "
             "cost a symbol its whole month"
         )
         assert store.stored_window("XYZ", days[4]) is None
         assert store.stored_window("XYZ", days[5]) is not None
+
+    def test_the_skip_is_visible_in_the_summary_and_the_logs(
+            self, tmp_path, days, captured_backfill_events):
+        """Not failing must not mean not saying. A silent hole is the worse bug.
+
+        The skip has to be legible in three places, because each is read by a
+        different person at a different time: the terminal summary an operator
+        reads after a manual run, the structured per-symbol log line that
+        survives a killed container, and the per-day event that names the date.
+        """
+        prices = {d: 100.0 for d in days}
+        for d in days[4:]:
+            prices[d] = 10.0
+        summary = _run(LadderProvider(prices), _store(tmp_path, lake=FakeLake()),
+                       ["XYZ"], days[0], days[-1])
+
+        assert summary.as_log()["days_skipped_corporate_action"] == 1
+        assert "corp_act" in summary.render()
+        assert summary.symbols[0].as_log()["days_skipped_corporate_action"] == 1
+
+        skips = [e for e in captured_backfill_events
+                 if e.get("event_type") == "backfill_day_skipped"]
+        assert len(skips) == 1
+        assert skips[0]["reason"] == "corporate_action"
+        assert skips[0]["as_of"] == days[4].isoformat()
 
     def test_a_split_on_the_windows_first_day_is_still_seen(
             self, tmp_path, provider, days):
@@ -534,16 +583,45 @@ class TestSplits:
 
         store = _store(tmp_path, lake=FakeLake())
         summary = _run(provider, store, ["XYZ"], days[0], days[-1])
-        assert summary.symbols[0].errors == 1
+        assert summary.symbols[0].days_skipped_corporate_action == 1
+        assert summary.symbols[0].errors == 0
         assert store.stored_window("XYZ", days[0]) is None
 
-    def test_a_symbol_with_a_split_fails_the_run(self, tmp_path, days):
-        """Intended: an operator hears about a split once, not never."""
+    def test_a_split_does_not_fail_the_run(self, tmp_path, days):
+        """The alert-fatigue decision, pinned.
+
+        A stock split recurs across a 14-symbol universe and the trailing window
+        slides, so failing here would page the Job-failure alert every Saturday
+        for the month it takes the split to age out — on a condition nobody can
+        act on. An alarm layer that cries wolf gets muted, and then it is not
+        watching the failures that matter either.
+        """
         prices = {d: 100.0 for d in days}
         for d in days[4:]:
             prices[d] = 10.0
         summary = _run(LadderProvider(prices), _store(tmp_path, lake=FakeLake()),
                        ["XYZ"], days[0], days[-1])
+        assert summary.failed_symbols() == []
+        assert summary.total("days_skipped_corporate_action") == 1
+
+    def test_a_split_and_a_real_error_on_one_symbol_still_fails(
+            self, tmp_path, days):
+        """The split must not MASK a genuine failure on the same symbol."""
+        prices = {d: 100.0 for d in days}
+        for d in days[4:]:
+            prices[d] = 10.0
+        bad_day = days[7]
+
+        class Flaky(LadderProvider):
+            def get_contract_universe(self, underlying, as_of, *a, **kw):
+                if as_of == bad_day:
+                    raise RuntimeError("truncated response")
+                return super().get_contract_universe(underlying, as_of, *a, **kw)
+
+        summary = _run(Flaky(prices), _store(tmp_path, lake=FakeLake()),
+                       ["XYZ"], days[0], days[-1])
+        assert summary.symbols[0].days_skipped_corporate_action == 1
+        assert summary.symbols[0].errors == 1
         assert summary.failed_symbols() == ["XYZ"]
 
 
@@ -895,6 +973,29 @@ class TestBackfillCommand:
         monkeypatch.setenv("BACKFILL_END", "2024-03-01")
         with pytest.raises(SystemExit):
             main_module.run_backfill_cmd(_Args(), _StubConfig(), _NullLogger())
+
+    def test_a_run_whose_only_gap_is_a_split_exits_zero(self, monkeypatch,
+                                                        clean_env):
+        """The exit code is what the Job-failure alert policy reads.
+
+        This is the end of the chain the alert-fatigue decision is about: skip
+        -> counter -> `failed` -> exit code -> alert. A split must not travel
+        down it.
+        """
+        import main as main_module
+
+        summary = bf.BackfillSummary(
+            start=date(2026, 1, 1), end=date(2026, 1, 31), universe_dte=22)
+        summary.symbols.append(bf.SymbolBackfill(
+            symbol="NVDA", days_checked=20, days_written=19,
+            days_skipped_corporate_action=1))
+        monkeypatch.setattr(bf, "run_backfill", lambda *a, **kw: summary)
+        monkeypatch.setattr(
+            "src.backtesting.data.chain_store.ChainStore.from_env",
+            classmethod(lambda cls, cache_dir=None: None))
+
+        assert main_module.run_backfill_cmd(
+            _Args(), _StubConfig(), _NullLogger()) == 0
 
     def test_a_failed_symbol_exits_non_zero(self, monkeypatch, clean_env):
         """The Job-failure alert is downstream of this exit code."""

@@ -399,7 +399,7 @@ data at all. `python main.py --command backfill` is the deliberate version, and 
 | Default universe | `stocks.symbols` + `stocks.candidates` |
 | Default window | the trailing **30 calendar days** through the last settled session |
 | Job overrides (all optional, per EXECUTION) | `BACKFILL_SYMBOLS`, `BACKFILL_HISTORY_DAYS`, `BACKFILL_START`, `BACKFILL_END` |
-| Exit code | non-zero if any symbol did not complete cleanly (a stock split inside the window counts — the day is skipped and reported) |
+| Exit code | non-zero if any symbol hit a genuine **failure** (vendor error, exception, missing bars). A day skipped for an unmodelled **corporate action** is counted (`days_skipped_corporate_action`) and logged, but does *not* fail the run — a split recurs and the window slides, so paging weekly for a month is how the alert gets muted |
 
 **The window rule is the whole design.** Each `(symbol, day)` is built at the **union** of
 a fresh spot ±40% window and whatever the stored object already covers, so the file that

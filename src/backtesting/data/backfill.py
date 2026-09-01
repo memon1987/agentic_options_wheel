@@ -53,7 +53,9 @@ have shipped:
    correct for a replay that may hold a position across it — and wrong here: a
    split inside the window would set the ceiling ~7x too high and turn the
    strike filter into a no-op. Each day is built from its own close, and a day
-   whose bars carry a split-sized move is skipped and reported.
+   whose bars carry a split-sized move is skipped and reported — reported, but
+   not counted as a failure: a split is market data, and paging weekly for the
+   month it takes to leave the trailing window is how an alert gets muted.
 
 Everything degrades rather than dies: one symbol's failure does not stop the
 others, one day's failure does not stop the symbol, and a half-finished run is
@@ -133,12 +135,18 @@ _SPLIT_CONTEXT = timedelta(days=7)
 class SymbolBackfill:
     """What one symbol's pass did.
 
-    The four "days_*" counters are derived from ``ChainStore``'s own public
-    counters, sampled before and after each day — not from anything this module
-    believes should have happened. The distinction is the point: the store is
-    allowed to decline a write (a wider object already there, a lost generation
-    race, an unreadable remote), and a summary that reported intent rather than
-    outcome would call those days written.
+    The write counters are derived from ``ChainStore``'s own public counters,
+    sampled before and after each day — not from anything this module believes
+    should have happened. The distinction is the point: the store is allowed to
+    decline a write (a wider object already there, a lost generation race, an
+    unreadable remote), and a summary that reported intent rather than outcome
+    would call those days written.
+
+    **Two different kinds of "this day has no chain", counted apart.** A
+    corporate action is expected market data — the engine does not model an
+    adjusted deliverable, so the session is skipped by design. A fetch failure
+    is not. Merging them would make a stock split indistinguishable from a
+    broken vendor response in the one number the exit code reads.
     """
 
     symbol: str
@@ -146,7 +154,10 @@ class SymbolBackfill:
     days_written: int = 0        # an object was written for the day
     days_replaced_wider: int = 0  # ...over an existing object, as a superset
     days_skipped: int = 0        # the store DECLINED the write (any reason)
-    errors: int = 0              # days that produced no chain (incl. splits)
+    # Days deliberately not built because the session carries an unmodelled
+    # corporate action. Reported everywhere, and NOT a failure — see ``failed``.
+    days_skipped_corporate_action: int = 0
+    errors: int = 0              # days that produced no chain BY FAILURE
     error: Optional[str] = None  # symbol-level failure; the pass stopped here
     seconds: float = 0.0
 
@@ -154,11 +165,17 @@ class SymbolBackfill:
     def failed(self) -> bool:
         """Whether this symbol's pass is trustworthy as "done".
 
-        A corporate-action skip counts in ``errors`` (it is a day the lake will
-        not have, and that must never be invisible), so a real split inside the
-        window makes the run exit non-zero until the split ages out of it. That
-        is intended: an operator should hear about a split once, not discover it
-        as a hole months later.
+        **A corporate-action skip is NOT a failure.** A split is ordinary market
+        data that recurs across the universe, and the trailing window slides —
+        so counting it here would page the Job-failure alert every week for the
+        month it takes to age out, on a condition nobody can act on. An alarm
+        layer that cries wolf gets muted, and then it is not watching the
+        failures that matter either (the FC-069 principle). The skip is loud in
+        the summary, the progress log and the `backfill_day_skipped` event
+        instead, where it informs without paging.
+
+        Genuine failures — a vendor error, an exception mid-build, a symbol
+        whose bars never arrived — keep the full fail posture.
         """
         return self.error is not None or self.errors > 0
 
@@ -169,6 +186,7 @@ class SymbolBackfill:
             "days_written": self.days_written,
             "days_replaced_wider": self.days_replaced_wider,
             "days_skipped": self.days_skipped,
+            "days_skipped_corporate_action": self.days_skipped_corporate_action,
             "errors": self.errors,
             "error": self.error,
             "seconds": round(self.seconds, 2),
@@ -202,6 +220,8 @@ class BackfillSummary:
             "days_written": self.total("days_written"),
             "days_replaced_wider": self.total("days_replaced_wider"),
             "days_skipped": self.total("days_skipped"),
+            "days_skipped_corporate_action": self.total(
+                "days_skipped_corporate_action"),
             "errors": self.total("errors"),
             "failed_symbols": self.failed_symbols(),
             "seconds": round(self.seconds, 2),
@@ -215,12 +235,13 @@ class BackfillSummary:
             f"{self.seconds:.1f}s)",
             "",
             f"{'symbol':<8} {'checked':>8} {'written':>8} {'wider':>7} "
-            f"{'skipped':>8} {'errors':>7}  note",
+            f"{'skipped':>8} {'corp_act':>9} {'errors':>7}  note",
         ]
         for s in self.symbols:
             lines.append(
                 f"{s.symbol:<8} {s.days_checked:>8} {s.days_written:>8} "
                 f"{s.days_replaced_wider:>7} {s.days_skipped:>8} "
+                f"{s.days_skipped_corporate_action:>9} "
                 f"{s.errors:>7}  {s.error or ''}"
             )
         failed = self.failed_symbols()
@@ -508,11 +529,13 @@ def _backfill_day(
 ) -> None:
     """Ensure one (symbol, day) is stored at the backfill window."""
     if day in splits:
-        # Skip-and-report. Raw bars are the correct input for point-in-time
-        # chain work (strikes are as-listed and never retroactively adjusted),
-        # but the session a split lands on carries adjusted contracts whose
-        # deliverable this engine does not model.
-        row.errors += 1
+        # Skip-and-report, NOT skip-and-fail. Raw bars are the correct input for
+        # point-in-time chain work (strikes are as-listed and never
+        # retroactively adjusted), but the session a split lands on carries
+        # adjusted contracts whose deliverable this engine does not model. That
+        # is a property of the market, not a fault in the run — see
+        # ``SymbolBackfill.failed`` for why it must not reach the exit code.
+        row.days_skipped_corporate_action += 1
         logger.warning(
             "Backfill skipped a day: unmodelled corporate action",
             event_category="backtest_data", event_type="backfill_day_skipped",
@@ -521,6 +544,9 @@ def _backfill_day(
         )
         return
     if close is None or close <= 0:
+        # An error, NOT a corporate-action skip: a settled session whose close
+        # is missing or non-positive is broken vendor data, and the whole point
+        # of separating the two counters is that this one still fails the run.
         row.errors += 1
         logger.warning(
             "Backfill skipped a day: no usable underlying close",
