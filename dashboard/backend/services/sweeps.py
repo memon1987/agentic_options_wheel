@@ -205,7 +205,14 @@ def missing_optional_column(error: Any) -> Optional[str]:
     if not any(marker in text for marker in _MISSING_COLUMN_MARKERS):
         return None
     for column, _type in ADDITIVE_OPTIONAL_COLUMNS:
-        if column in text:
+        # A WORD-BOUNDED match, not a substring one. `engine_identity` is a
+        # prefix of any future `engine_identity_hash`, and a message naming the
+        # longer column would silently make us drop the shorter — writing a row
+        # that is missing a field the table actually has, and leaving the real
+        # unknown key in place so the retry fails anyway. `\b` does not help
+        # here (`_` is a word character to `re`), so the boundary is spelled
+        # explicitly as "not preceded or followed by a name character".
+        if re.search(rf"(?<![0-9a-z_]){re.escape(column)}(?![0-9a-z_])", text):
             return column
     return None
 
@@ -338,7 +345,19 @@ STALE_GRACE_MINUTES = 10
 # be worse than saying so (D3).
 STUCK_AFTER_MINUTES = 10
 
-SYMBOL_RE = re.compile(r"^[A-Z.]{1,6}$")
+# `\Z`, not `$` — Python's `$` also matches before a trailing newline. The
+# value is stripped before it reaches here, so this is defence in depth
+# rather than a live hole; the anchor is spelled correctly in all four
+# places (here, `identity.SCENARIO_NAME_RE`, `identity.SYMBOL_RE`,
+# `services/artifacts.RUN_ID_RE`) so none of them is the one that rots.
+# Leading character is a LETTER, not `[A-Z.]`. The old `^[A-Z.]{1,6}$`
+# accepted `"."` and `".AB"` — symbols no exchange lists, and (since
+# FC-096 Phase B) symbols the artifact endpoint cannot address, so a
+# sweep submitted under one would write evidence that is permanently
+# unreachable. Caught by the subset test in tests/
+# test_dashboard_artifacts.py, which pins this rule as strictly narrower
+# than `identity.SYMBOL_RE`.
+SYMBOL_RE = re.compile(r"^[A-Z][A-Z.]{0,5}\Z")
 
 SPEC_FIELDS = frozenset({
     "symbols", "start", "end", "holdout_start", "starting_cash",

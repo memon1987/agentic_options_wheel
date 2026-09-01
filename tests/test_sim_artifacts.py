@@ -22,6 +22,7 @@ from __future__ import annotations
 import gzip
 import json
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,9 +53,44 @@ from src.backtesting.scenarios.identity import (
 from src.utils.config import Config
 
 from .test_scenarios import _MultiSymbolProvider  # noqa: F401 - fixture plumbing
-from .test_backtest_simulator import ScriptedProvider, _weekdays
+from .test_backtest_simulator import (
+    ScriptedProvider,
+    _simulator as _golden_simulator,
+    _weekdays,
+    dip_then_recovering_window,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sim_artifact_schema_v1.json"
+
+
+# --------------------------------------------------------------------------- #
+# Roll records come from a REAL replay, never from this file's imagination.
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1)
+def _real_roll_records():
+    """Executed-roll records from an actual replay of the golden window.
+
+    **This exists because the first cut of this file invented them.** It hand-
+    wrote `{"date", "from_symbol", "to_symbol", "strike_change", ...}` and the
+    frozen fixture duly froze the invention: `from_symbol` appears nowhere in
+    `src/`, and a real record carries no date at all. A schema pin taken over a
+    shape the producer never emits is WORSE than no pin — it passes for ever
+    while describing nothing, and Phase E would have been built against it.
+
+    So the shape comes from the producer: `CallRoller.execute_roll`'s success
+    dict, as `WheelEngine.run_rolling_cycle` collects it and the simulator
+    captures it, plus the `day` the simulator stamps on (FC-096 Phase B).
+    `dip_then_recovering_window` is the one window in this suite whose replay
+    actually executes a roll; it is imported rather than re-derived.
+
+    Cached for the session — one replay, not one per test.
+    """
+    days, closes, expirations = dip_then_recovering_window()
+    result = _golden_simulator("XYZ", closes, expirations, days).run()
+    assert result.roll_records, (
+        "the golden window executed no roll, so this pin would freeze an empty "
+        "list and assert nothing — fix the window, do not hand-write a record")
+    return tuple(dict(record) for record in result.roll_records)
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +153,12 @@ def _hand_built_result() -> SimulationResult:
         unpriced_ex_div_calls=1,
         rolls_evaluated=3,
         rolls_executed=1,
-        roll_records=[{
-            "date": date(2024, 6, 24), "underlying": "AAA",
-            "from_symbol": call_a, "to_symbol": call_b,
-            "net_credit": 0.35, "strike_change": -1.0,
-        }],
+        # REAL records from a real replay (see `_real_roll_records`), never a
+        # hand-written shape. The ledger and curve above are hand-built because
+        # no short replay reliably produces all seven ledger kinds; the roll
+        # records are not, because the producer's shape is exactly what the
+        # frozen fixture has to pin.
+        roll_records=[dict(record) for record in _real_roll_records()],
         earnings_symbols_without_data=["AAA"],
         earnings_symbols_past_horizon=[],
     )
@@ -273,6 +310,56 @@ class TestTheSchemaIsFrozen:
             "dividend", "expire_worthless", "call_assignment",
         }
 
+    def test_the_roll_record_shape_is_the_ROLLERS_shape(self):
+        """The pin that the first cut of this file got wrong.
+
+        `CallRoller.execute_roll`'s success dict is the producer, and the
+        artifact must carry its keys — not a plausible-looking invention. This
+        asserts against the roller's own source rather than against a literal,
+        so a field added there fails HERE rather than silently never reaching
+        Phase E.
+        """
+        records = _real_roll_records()
+        for record in records:
+            assert record["success"] is True
+            # Every key `execute_roll` returns on the success path.
+            assert {"success", "underlying", "old_strike", "new_strike",
+                    "contracts", "net_credit", "btc_order_id",
+                    "stc_order_id"} <= set(record), record
+            # ...and NOT the invention the first cut froze.
+            assert "from_symbol" not in record
+            assert "to_symbol" not in record
+            assert "strike_change" not in record
+            assert "date" not in record
+
+    def test_the_replay_stamps_the_decision_day_onto_each_roll(self):
+        """Production's record has no date — the log line's timestamp is the
+        date. An artifact read months later has no such context, and "which day
+        did this roll happen" is the first question a chart marker asks. The
+        capture point is the only place that knows the day.
+
+        MUTATION CHECK: drop the `{'day': ...}` merge in `simulator.py` and this
+        fails, as does the frozen fixture.
+        """
+        from datetime import date as _date
+
+        for record in _real_roll_records():
+            assert "day" in record, record
+            # A real ISO date, not a repr of something else.
+            assert _date.fromisoformat(record["day"])
+
+    def test_the_stamp_cannot_clobber_a_future_roller_field(self):
+        """`{'day': ..., **record}` — ours first, the roller's second — so a
+        roller that one day emits its own `day` wins rather than being silently
+        overwritten by the replay's."""
+        import inspect
+
+        from src.backtesting.engine import simulator as sim
+
+        source = inspect.getsource(sim.Simulator.replay)
+        assert "{'day': day.isoformat(), **r}" in source, (
+            "the merge order is load-bearing: `**r` must come SECOND")
+
     def test_shares_held_is_on_every_daily_row(self):
         """M9's item: equity alone cannot tell a cash account from an assigned
         one holding the same dollars, which is the first thing a reader needs
@@ -363,9 +450,59 @@ class TestTheObjectName:
         with pytest.raises(ValueError, match="__"):
             validate_scenario_name(name, "test")
 
+    @pytest.mark.parametrize("name", ["tighter\n", "\ntighter", "a\nb"])
+    def test_a_newline_in_a_name_is_refused(self, name):
+        """`SCENARIO_NAME_RE` is anchored with `\\Z`, not `$`. Python's `$` ALSO
+        matches immediately before a trailing newline, so `"tighter\\n"` used to
+        satisfy this pattern end to end — accepted by the CLI, carried into an
+        env var and a grid header, and (since this PR) into a GCS object name,
+        where a newline is a header-splitting character the client rejects at
+        serve time.
+
+        MUTATION CHECK: put `$` back and the trailing-newline case passes
+        validation.
+        """
+        with pytest.raises(ValueError):
+            validate_scenario_name(name, "test")
+
     def test_a_single_underscore_is_still_fine(self):
         validate_scenario_name("long_dte", "test")
         validate_scenario_name("a_b_c", "test")
+
+    def test_a_symbol_that_could_not_address_an_object_is_refused(self):
+        """The CLI's `--symbols` is hand-typed and reaches the artifact writer
+        directly. A symbol carrying `__`, a slash or whitespace would land an
+        object whose name nothing can parse or request back — so it is refused
+        by the SAME rule the endpoint applies at serve time."""
+        from src.backtesting.scenarios.identity import validate_symbol
+
+        for bad in ("A__B", "A/B", "A B", "aapl\n", "", "1AAPL",
+                    "TOOLONGSYMBOL1234"):
+            with pytest.raises(ValueError, match="symbol"):
+                validate_symbol(bad, "--symbols")
+        for good in ("AAPL", "BRK.B", "RDS-A", "F"):
+            validate_symbol(good, "--symbols")
+
+    def test_the_cli_refuses_an_unaddressable_symbol_before_replaying(
+            self, tmp_path, one_symbol):
+        """Before anything is materialised — an immediate refusal beats a sweep
+        that completes and produces unreadable evidence."""
+        import main as main_module
+
+        days, _p = one_symbol
+        yaml_path = tmp_path / "s.yaml"
+        yaml_path.write_text("scenarios:\n  - name: a\n    overrides: {}\n")
+        with patch("sys.argv", [
+            "main.py", "--command", "sweep", "--scenarios", str(yaml_path),
+            "--symbols", "AAA__B", "--start", days[0].isoformat(),
+            "--end", days[-1].isoformat(),
+        ]), patch.object(main_module, "setup_logging", lambda *a, **kw: None):
+            with pytest.raises(SystemExit) as exc:
+                main_module.main()
+        # `SystemExit(str)` — the repo's refusal idiom: Python prints the string
+        # and exits 1. The message is the assertion, not the numeric code.
+        assert "AAA__B" in str(exc.value)
+        assert "object nothing can address" in str(exc.value)
 
     def test_the_cli_yaml_path_applies_the_same_rule(self):
         """`main._scenarios_from_entries` shares the validator, so a `--persist`
@@ -652,6 +789,34 @@ class TestTheSink:
                             [Scenario("a", {})], artifact_sink=lambda _a: None)
         assert not result.errors
 
+    def test_an_UNIMPORTABLE_serialiser_is_swallowed_too(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """The import lives INSIDE the guard, not above it.
+
+        A syntax error in `artifact.py`, or a dependency missing from some
+        future build, raises `ImportError` — and outside the guard that would
+        propagate into `_replay_one`'s handler and turn every successfully
+        replayed cell into an error row. Losing a run's results to a defect in
+        its evidence writer is precisely backwards.
+
+        MUTATION CHECK: hoist the import above the `try` in `_emit_artifact` and
+        this run comes back with two error rows.
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def refuse(name, *args, **kwargs):
+            if "reporting.artifact" in name or name.endswith("artifact"):
+                raise ImportError("no module named artifact (simulated)")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", refuse):
+            result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                            [Scenario("a", {})], artifact_sink=lambda _a: None)
+        assert not result.errors, [r.error for r in result.errors]
+        assert all(row.total_return is not None for row in result.rows)
+
     def test_the_dte_7_arm_stamps_its_own_reach_not_the_sweeps(
             self, tmp_path, one_symbol, one_symbol_config):
         """The headline masked-reach test, end to end through a MIXED sweep.
@@ -754,6 +919,30 @@ class TestArtifactsCompleteAccounting:
         incomplete"."""
         assert self._call(None, _Result([_Cell()])) is None
         assert self._call(_Writer(0, enabled=False), _Result([_Cell()])) is None
+        assert self._call(_Writer(0), None) is None
+
+    def test_a_run_with_no_measured_cell_at_all_is_none_not_true(self):
+        """The vacuous case. `0 == 0` is True, and it would be a LIE: a sweep
+        whose every arm errored has not one artifact object, and a `done` row
+        claiming a complete set is exactly the kind of absence-as-result this
+        column exists to prevent.
+
+        MUTATION CHECK: delete the `expected == 0` guard and this returns True.
+        """
+        assert self._call(_Writer(0), _Result([_Cell("boom"), _Cell("boom")])) is None
+        assert self._call(_Writer(0), _Result([])) is None
+
+    def test_a_crashed_run_that_wrote_objects_is_false_not_none(self):
+        """The subtle one. A replay that raises leaves no `result`, so there is
+        no denominator — but the writer may already have stored objects for the
+        cells that finished. `None` there would say "this run wrote nothing"
+        while orphaned objects sit in the bucket.
+
+        MUTATION CHECK: return `None` unconditionally when `result is None` and
+        this fails.
+        """
+        assert self._call(_Writer(3), None) is False
+        # ...and a crash before ANY artifact landed is still the vacuous None.
         assert self._call(_Writer(0), None) is None
 
     def test_the_status_row_carries_the_flag_and_defaults_to_null(self):

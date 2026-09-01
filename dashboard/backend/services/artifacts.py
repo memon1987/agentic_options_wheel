@@ -43,11 +43,11 @@ from typing import Any, Dict, Optional, Tuple
 
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
-        artifact_object_name, validate_scenario_name,
+        SYMBOL_RE, artifact_object_name, validate_scenario_name, validate_symbol,
     )
 except ImportError:  # dashboard image: the same file, copied flat
     from scenario_identity import (  # type: ignore
-        artifact_object_name, validate_scenario_name,
+        SYMBOL_RE, artifact_object_name, validate_scenario_name, validate_symbol,
     )
 
 logger = logging.getLogger(__name__)
@@ -65,11 +65,22 @@ DEFAULT_ARTIFACT_BUCKET = "gen-lang-client-0607444019-options-data"
 # check, not just a length check, because this value becomes a path segment in
 # an object name. `_` and `-` are allowed for hand-made ids; `/`, `.` and `..`
 # are not, which is what stops a request escaping the prefix.
-RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#
+# **`\Z`, never `$`** — here, in `SYMBOL_RE`, and in
+# `identity.SCENARIO_NAME_RE`. Python's `$` also matches immediately
+# BEFORE a trailing newline, so `"r1\n"` satisfied every one of these
+# checks end to end and only failed deep inside the GCS client, where a
+# newline in an object name is a header-splitting character. Every segment
+# here becomes part of an object name, and an object name is a single line
+# by construction.
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
-# Underlyings, as the engine upper-cases them (`run_sweep` does `s.upper()`).
-# Dots and dashes appear in real tickers (BRK.B, RDS-A).
-SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,15}$")
+# `SYMBOL_RE` / `validate_symbol` are IMPORTED, not restated — one addressing
+# rule, in the module the dashboard image copies flat, enforced by the CLI
+# (`main.py --symbols`), by the writer and here. Note this is a different
+# question from `services/sweeps.SYMBOL_RE`, which is what may be SUBMITTED: that
+# one is deliberately narrower, and a test pins it as a strict subset so the API
+# can never accept a symbol this endpoint could not then address.
 
 # `runner._windows` produces exactly these three. A closed set rather than a
 # pattern: there is no fourth split, and accepting one would build a name that
@@ -79,6 +90,19 @@ SPLITS = ("all", "fit", "holdout")
 
 class ArtifactPathError(ValueError):
     """A path segment that cannot address an artifact. Carries its own reason."""
+
+
+class ArtifactBucketError(RuntimeError):
+    """The bucket itself could not be resolved — configuration or IAM.
+
+    Its own type because it must never be confused with a missing object: GCS
+    raises ``NotFound`` for a missing bucket and a missing object alike, and the
+    two are a 502 and a 404 respectively.
+    """
+
+
+class ArtifactReadError(RuntimeError):
+    """The object exists but could not be served as an artifact (e.g. empty)."""
 
 
 def artifact_bucket() -> Optional[str]:
@@ -150,26 +174,67 @@ class ArtifactStore:
     def __init__(self, bucket: Optional[str] = None, client: Any = None) -> None:
         self.bucket_name = bucket if bucket is not None else artifact_bucket()
         self._client = client
+        self._bucket_handle = None
 
     @property
     def enabled(self) -> bool:
         return bool(self.bucket_name)
 
     def _bucket(self):
+        """The bucket handle, RESOLVED once per process on first use.
+
+        **Resolution is the whole point, not caching.** ``client.bucket(name)``
+        is a local constructor that talks to nobody, so a bucket that does not
+        exist — or that this service account cannot see — produces a perfectly
+        ordinary handle whose first download raises ``NotFound``: **the same
+        exception class a missing OBJECT raises**. Catching ``NotFound`` around
+        the download alone therefore reports a misconfigured or ungranted bucket
+        as "no artifact for this cell", on every cell, for ever. That is the
+        exact failure this whole module is written to avoid, arriving through
+        the one door that looks benign.
+
+        So the bucket is resolved with ``get_bucket`` — a real RPC — the first
+        time it is needed, and a failure there propagates as
+        ``ArtifactBucketError``. Once per process, not once per request: the
+        answer cannot change without a redeploy, and paying an RPC per artifact
+        read would be a tax on the healthy path to detect a startup condition.
+        """
+        if self._bucket_handle is not None:
+            return self._bucket_handle
         if self._client is None:
             from google.cloud import storage  # imported lazily; see docstring
 
             self._client = storage.Client()
-        return self._client.bucket(self.bucket_name)
+        try:
+            self._bucket_handle = self._client.get_bucket(self.bucket_name)
+        except Exception as exc:  # noqa: BLE001 - re-raised as our own type
+            raise ArtifactBucketError(
+                f"the artifact bucket {self.bucket_name!r} could not be "
+                f"resolved ({type(exc).__name__}: {exc}). This is a "
+                f"configuration or IAM failure, NOT a missing artifact — check "
+                f"the bucket name and that this service account has "
+                f"storage.buckets.get / storage.objects.get on it."
+            ) from exc
+        return self._bucket_handle
 
     def fetch(self, run_id: str, scenario: str, symbol: str,
               split: str) -> Optional[bytes]:
-        """The artifact's JSON bytes, or ``None`` when the object is absent.
+        """The artifact's JSON bytes, or ``None`` when the OBJECT is absent.
 
-        ``None`` is reserved for absence. Every other failure (permissions, a
-        dead bucket, a corrupt object) raises, because "we could not read it"
-        and "it is not there" lead an operator to different places, and a
-        blanket ``None`` would send every one of them to the wrong one.
+        ``None`` is reserved for one fact: this cell has no artifact. Every
+        other failure raises, because "we could not read it" and "it is not
+        there" lead an operator to different places, and a blanket ``None``
+        would send every one of them to the wrong one.
+
+        The bucket is resolved first (see ``_bucket``) precisely so a missing or
+        ungranted BUCKET cannot borrow the benign answer — GCS raises the same
+        ``NotFound`` for both, and only the order of the two calls tells them
+        apart.
+
+        A zero-byte object also raises rather than returning empty bytes: an
+        object that exists but holds nothing is a truncated or failed write, and
+        serving it as an empty 200 would put "this cell did nothing" in front of
+        a reader when the truth is "this cell's evidence was lost".
         """
         from google.cloud.exceptions import NotFound
 
@@ -179,6 +244,10 @@ class ArtifactStore:
             raw = blob.download_as_bytes(timeout=30.0)
         except NotFound:
             return None
+        if not raw:
+            raise ArtifactReadError(
+                f"the artifact object {name!r} exists but is EMPTY — a "
+                f"truncated or failed write, not a cell that did nothing")
         return decode(raw)
 
 

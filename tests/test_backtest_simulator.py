@@ -140,6 +140,11 @@ def falling_then_flat():
 
 @pytest.fixture
 def dip_then_recovering():
+    """The fixture form of ``dip_then_recovering_window``. See that function."""
+    return dip_then_recovering_window()
+
+
+def dip_then_recovering_window():
     """Assigns a put, then RECOVERS so the call leg can actually run.
 
     `falling_then_flat` cannot test the call side and never could: it assigns
@@ -154,6 +159,13 @@ def dip_then_recovering():
       * spot >= basis, so strikes above the floor exist at all, and
       * strikes just above basis sit inside call_delta_range [0.15, 0.25], and
       * a later expiry finishes above the sold strike, so the call assigns.
+
+    A plain function with a fixture wrapper, because this is the only window in
+    the suite whose replay actually EXECUTES a roll, and `tests/
+    test_sim_artifacts.py` needs the real records to pin the artifact's
+    `roll_records` shape against the producer rather than against an invention.
+    A second copy of the price path would be the drift this split exists to
+    prevent.
     """
     warmup = _weekdays(date(2024, 3, 25), 45)
     days = _weekdays(date(2024, 6, 3), 45)

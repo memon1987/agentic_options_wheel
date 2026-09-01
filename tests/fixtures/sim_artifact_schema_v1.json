@@ -119,11 +119,14 @@
     "reason"
   ],
   "roll_records": [
-    "date",
-    "from_symbol",
+    "btc_order_id",
+    "contracts",
+    "day",
     "net_credit",
-    "strike_change",
-    "to_symbol",
+    "new_strike",
+    "old_strike",
+    "stc_order_id",
+    "success",
     "underlying"
   ],
   "schema": 1,

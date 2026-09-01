@@ -259,6 +259,13 @@ class SimulationResult:
     # `roll_records` carries the executed rolls so the golden replay can assert
     # what actually matters now — every executed roll netted a credit and
     # increased the strike — instead of "the roller never fires".
+    #
+    # Each record is `CallRoller.execute_roll`'s SUCCESS dict — `success`,
+    # `underlying`, `old_strike`, `new_strike`, `contracts`, `net_credit`,
+    # `btc_order_id`, `stc_order_id` — with one field added by the replay:
+    # `day`, the ISO decision date (FC-096 Phase B). Production does not carry a
+    # date on the record because the log line's timestamp is the date; a stored
+    # artifact read months later has no such context.
     rolls_evaluated: int = 0
     rolls_executed: int = 0
     roll_records: List[Dict[str, Any]] = field(default_factory=list)
@@ -728,8 +735,19 @@ class Simulator:
                     rolls = engine.run_rolling_cycle() or {}
                     self._rolls_evaluated += int(rolls.get('rolls_evaluated', 0) or 0)
                     self._rolls_executed += int(rolls.get('rolls_executed', 0) or 0)
+                    # The decision DAY is stamped here because here is the
+                    # only place that knows it: `execute_roll`'s record carries
+                    # `underlying`, the two strikes, contracts, the net credit
+                    # and the two order ids — and no date at all, because in
+                    # production the timestamp is the log line's. A replay's
+                    # records are read months later off a stored artifact, where
+                    # "which day did this roll happen" is the first question a
+                    # chart marker asks. `**record` second so a future roller
+                    # field named `day` wins rather than being silently
+                    # overwritten by ours.
                     self._roll_records.extend(
-                        r for r in (rolls.get('roll_details') or [])
+                        {'day': day.isoformat(), **r}
+                        for r in (rolls.get('roll_details') or [])
                         if r.get('success'))
                 except Exception:
                     logger.exception(

@@ -602,12 +602,18 @@ async def get_sweep(run_id: str) -> Dict[str, Any]:
     shaped["stuck"] = sweeps.is_stuck(row)
     shaped["status"] = row.get("status")
     shaped["run_id"] = run_id
+    # FC-096 Phase B. Whether every non-errored cell of this run also stored its
+    # detail artifact — surfaced HERE because this is the payload the console
+    # opens a cell from, and a cell that 404s needs to be explicable as "the
+    # evidence was not stored" rather than as a broken link. `None` on runs that
+    # wrote no artifacts at all, and on rows written before the column existed.
+    shaped["artifacts_complete"] = row.get("artifacts_complete")
     return shaped
 
 
 @router.get("/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}")
-async def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
-                              split: str) -> Response:
+def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
+                        split: str) -> Response:
     """One replayed cell's detail artifact: curve, ledger, cycles, rolls, tally.
 
     FC-096 Phase B B2. The engine gzips one of these per non-errored cell as it
@@ -625,6 +631,14 @@ async def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
     * **503** when no artifact bucket is configured for this deployment.
     * **200** with the DECOMPRESSED JSON. See `services/artifacts.py` for why
       the gzip is not passed through.
+
+    **A sync `def` on purpose, unlike every other route in this file.** The GCS
+    client is blocking, so an `async def` would run `download_as_bytes` ON the
+    event loop and one stalled read (a 30 s timeout on a degraded bucket) would
+    freeze every other request the worker is serving. FastAPI dispatches a sync
+    handler to its threadpool instead, which is exactly the right shape for one
+    blocking I/O call. The other routes here are `async` because they await
+    `httpx` or call BigQuery through a service that is already offloaded.
 
     Exposure: this sits on the public dashboard until IAP lands. Same class as
     the rest of `/api/v2` (FC-094 / Phase D), called out in the plan's open
@@ -644,6 +658,18 @@ async def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
         payload = store.fetch(run_id, scenario, symbol, split)
     except HTTPException:
         raise
+    except artifacts.ArtifactReadError as exc:
+        # The object exists but is unusable (empty). Not a 404: serving an empty
+        # 200 would put "this cell did nothing" in front of a reader whose cell
+        # actually lost its evidence to a truncated write.
+        logger.error("Artifact object unusable: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except artifacts.ArtifactBucketError as exc:
+        # The bucket, not the object. Named separately because GCS raises the
+        # same NotFound for both and only this distinction keeps a missing IAM
+        # grant from reading as "no artifacts exist" on every cell for ever.
+        logger.error("Artifact bucket unreachable: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         logger.exception("Artifact read failed for %s", name)
         raise HTTPException(

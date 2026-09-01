@@ -1009,17 +1009,21 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
     The import is LOCAL on purpose: ``reporting.artifact`` pulls in the cycle
     builder, and a sweep run with no sink (every test that is not about
     artifacts, and every CLI run without ``--persist``) must not pay for a module
-    it never calls.
+    it never calls. It is also INSIDE the ``try``: an ImportError — a syntax
+    error in the serialiser, a missing dependency in some future build — is
+    exactly the class of defect that must cost the run its evidence and nothing
+    else. Outside the guard it would raise into ``_replay_one``'s handler and
+    turn every successfully replayed cell into an error row.
 
     ``arm_max_dte`` is the reach ``narrow_to_dte`` was called with for THIS arm,
     which is the whole point of stamping it: the shared window may reach much
     further because a different arm asked for it, and an artifact that reported
     the parent's reach would describe a chain this cell never saw.
     """
-    from ..reporting.artifact import ArtifactMeta, cell_artifact
-
     split, w_start, w_end = window
     try:
+        from ..reporting.artifact import ArtifactMeta, cell_artifact
+
         sink(cell_artifact(result, ArtifactMeta(
             run_id=run_id, scenario=scenario, symbol=symbol, split=split,
             scenario_hash=scenario_hash, config_hash=cfg_hash,

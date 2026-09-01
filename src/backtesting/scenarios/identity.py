@@ -65,7 +65,14 @@ BASE_SCENARIO_NAME = "base"
 # refused rather than rendered. The pattern keeps names to things that are safe
 # as a grid key, a report cell and an env-var payload.
 MAX_SCENARIO_NAME_CHARS = 40
-SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+# `\Z`, not `$`. In Python `$` also matches immediately BEFORE a trailing
+# newline, so `"tighter\n"` satisfied this pattern end to end: the API accepted
+# the arm, the CLI accepted the YAML entry, and the name then travelled into an
+# env var, a grid column header and — since FC-096 Phase B — a GCS object name,
+# where the newline is a header-splitting character the client library rejects at
+# serve time. A name is a single line by construction; `\Z` is how that is
+# actually spelled.
+SCENARIO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*\Z")
 
 # The separator FC-096 Phase B's detail-artifact object names are built from:
 # ``<run_id>/<scenario>__<symbol>__<split>.json.gz``, parsed back with
@@ -108,6 +115,27 @@ def validate_scenario_name(name: str, where: str) -> None:
             f"(<run_id>/<scenario>__<symbol>__<split>.json.gz), which is parsed "
             f"back with rsplit('__', 2); a name carrying it would make that "
             f"parse silently wrong. A single underscore is fine.")
+
+
+# What an UNDERLYING may be, for the same reason a scenario name is bounded: it
+# becomes a field in the artifact object name. Real tickers carry dots and
+# dashes (BRK.B, RDS-A); nothing legitimate carries `__`, a slash, a space or a
+# newline. The dashboard's serve-side check (`services/artifacts.SYMBOL_RE`)
+# is this rule, and the CLI applies it too — a hand-typed `--symbols` value
+# reaching the writer is the one path that could otherwise create an object no
+# reader can address.
+SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,15}\Z")
+
+
+def validate_symbol(symbol: str, where: str) -> None:
+    """Raise ``ValueError`` unless ``symbol`` can key an artifact object."""
+    if not SYMBOL_RE.match(symbol or ""):
+        raise ValueError(
+            f"{where}: symbol {str(symbol)[:32]!r} must be an uppercase ticker "
+            f"of at most 16 characters from [A-Z0-9.-] "
+            f"(pattern {SYMBOL_RE.pattern}). Symbols key the per-cell detail "
+            f"artifact's object name, so one carrying '__', a slash or "
+            f"whitespace would write an object nothing can address.")
 
 
 def artifact_object_name(run_id: str, scenario: str, symbol: str,

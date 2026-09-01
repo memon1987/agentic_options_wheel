@@ -92,17 +92,33 @@ class FakeBucket:
 
 
 class FakeGCS:
-    def __init__(self, objects=None, raises=None):
+    """A GCS client stand-in.
+
+    ``get_bucket`` is the RESOLVING call and can be made to fail — which is the
+    whole point of the split: ``client.bucket(name)`` talks to nobody, so a
+    missing bucket is indistinguishable from a missing object until something
+    actually resolves it.
+    """
+
+    def __init__(self, objects=None, raises=None, bucket_raises=None):
         self.bucket_obj = FakeBucket(objects or {}, raises=raises)
         self.asked_for = []
+        self.resolved = []
+        self.bucket_raises = bucket_raises
 
     def bucket(self, name):
         self.asked_for.append(name)
         return self.bucket_obj
 
+    def get_bucket(self, name):
+        self.resolved.append(name)
+        if self.bucket_raises is not None:
+            raise self.bucket_raises
+        return self.bucket_obj
 
-def _store(objects=None, raises=None, bucket="test-bucket"):
-    gcs = FakeGCS(objects, raises=raises)
+
+def _store(objects=None, raises=None, bucket="test-bucket", bucket_raises=None):
+    gcs = FakeGCS(objects, raises=raises, bucket_raises=bucket_raises)
     return A.ArtifactStore(bucket=bucket, client=gcs), gcs
 
 
@@ -192,6 +208,74 @@ class TestPathValidation:
             S.validate_spec(spec)
         assert "__" in str(exc.value)
 
+    @pytest.mark.parametrize("segment",
+                             ["run_id", "scenario", "symbol", "split"])
+    def test_a_trailing_newline_is_refused_on_every_segment(self, segment):
+        """Python's `$` ALSO matches immediately before a trailing newline, so
+        `"r1\n"` satisfied every one of these checks end to end: the value was
+        accepted at submit and only failed deep inside the GCS client, where a
+        newline in an object name is a header-splitting character.
+
+        MUTATION CHECK: put `$` back in `RUN_ID_RE`, `SYMBOL_RE` or
+        `SCENARIO_NAME_RE` and the matching case here fails.
+
+        `split` is in the sweep to PROVE it has no anchor to get wrong (it is a
+        closed set), not because it shared the defect.
+        """
+        good = {"run_id": "r1", "scenario": "base", "symbol": "AAPL",
+                "split": "all"}
+        bad = dict(good, **{segment: good[segment] + "\n"})
+        with pytest.raises(A.ArtifactPathError):
+            A.validate_path(**bad)
+
+    def test_no_newline_can_reach_a_stored_name_from_EITHER_entry(self):
+        """The property that matters, asserted where each path actually enforces
+        it — the two paths do it differently and both are correct.
+
+        * The **API** strips before it validates, so a submitted `"tighter\n"`
+          is STORED as `"tighter"`. Normalisation, not refusal: the operator
+          pasted a newline, not a different experiment, and a stored name is
+          clean either way.
+        * The **CLI/YAML** path does not strip, so the same value is REFUSED
+          outright by `validate_scenario_name`.
+
+        Either way nothing carrying a newline can reach an object name — which
+        is the whole reason `SCENARIO_NAME_RE` is anchored with `\Z`. A name the
+        API accepted verbatim and the serve side refused would be an arm whose
+        evidence is unreachable for ever.
+        """
+        import main as main_module
+
+        spec = {
+            "symbols": ["AAPL"], "start": "2025-08-01", "end": "2026-07-31",
+            "scenarios": [{"name": "tighter\n", "overrides": {}}],
+        }
+        stored = S.validate_spec(spec)["scenarios"][0]["name"]
+        assert stored == "tighter", "the API must normalise, not store a newline"
+        A.validate_path("r1", stored, "AAPL", "all")   # and it addresses fine
+
+        with pytest.raises(SystemExit, match="scenario name"):
+            main_module._scenarios_from_entries(
+                [{"name": "tighter\n", "overrides": {}}], "scenarios.yaml")
+
+    def test_the_submit_symbol_rule_is_a_subset_of_the_addressing_rule(self):
+        """`services/sweeps.SYMBOL_RE` (what may be SUBMITTED) is deliberately
+        narrower than the addressing rule; the direction is what matters. If the
+        API ever accepted a symbol this endpoint could not address, that sweep's
+        artifacts would be written and permanently unreachable.
+
+        Checked by construction over the alphabet the submit rule allows.
+        """
+        import itertools
+        import string
+
+        alphabet = string.ascii_uppercase[:4] + "."
+        for length in (1, 2, 6):
+            for tup in itertools.product(alphabet, repeat=length):
+                candidate = "".join(tup)
+                if S.SYMBOL_RE.match(candidate):
+                    assert A.SYMBOL_RE.match(candidate), candidate
+
     def test_a_single_underscore_still_submits_and_still_addresses(self):
         spec = {
             "symbols": ["AAPL"], "start": "2025-08-01", "end": "2026-07-31",
@@ -250,6 +334,51 @@ class TestTheStore:
         assert A.get_artifact_store() is store
         A._reset_for_tests()
 
+    def test_a_missing_BUCKET_is_not_the_benign_absence(self):
+        """The trap this split exists for.
+
+        `client.bucket(name)` is a local constructor that talks to nobody, so a
+        bucket that does not exist — or that this service account cannot see —
+        yields an ordinary handle whose first download raises `NotFound`: the
+        SAME class a missing OBJECT raises. Catching NotFound around the
+        download alone therefore reports a misconfigured or ungranted bucket as
+        "no artifact for this cell", on every cell, for ever.
+
+        MUTATION CHECK: use `bucket` instead of `get_bucket` in `_bucket` and
+        this returns None instead of raising.
+        """
+        from google.cloud.exceptions import NotFound
+
+        store, gcs = _store({}, bucket_raises=NotFound("bucket does not exist"))
+        with pytest.raises(A.ArtifactBucketError) as exc:
+            store.fetch("r1", "base", "AAPL", "all")
+        assert "could not be resolved" in str(exc.value)
+        assert "IAM" in str(exc.value)
+        assert gcs.resolved == ["test-bucket"]
+
+    def test_a_permissions_failure_on_the_bucket_is_also_ours(self):
+        store, _ = _store({}, bucket_raises=RuntimeError("403 Forbidden"))
+        with pytest.raises(A.ArtifactBucketError):
+            store.fetch("r1", "base", "AAPL", "all")
+
+    def test_the_bucket_is_resolved_ONCE_per_process(self):
+        """Once, not per request: the answer cannot change without a redeploy,
+        and an RPC per artifact read would tax the healthy path to detect a
+        startup condition."""
+        name = _object()
+        store, gcs = _store({name: gzip.compress(json.dumps(PAYLOAD).encode())})
+        for _ in range(3):
+            store.fetch("r1", "base", "AAPL", "all")
+        assert gcs.resolved == ["test-bucket"], gcs.resolved
+
+    def test_a_zero_byte_object_raises_rather_than_serving_empty(self):
+        """An object that exists but holds nothing is a truncated or failed
+        write. Serving it as an empty 200 would put "this cell did nothing" in
+        front of a reader whose cell actually lost its evidence."""
+        store, _ = _store({_object(): b""})
+        with pytest.raises(A.ArtifactReadError, match="EMPTY"):
+            store.fetch("r1", "base", "AAPL", "all")
+
     def test_the_decoder_recognises_gzip_by_its_magic_number(self):
         assert A.decode(gzip.compress(b"{}")) == b"{}"
         assert A.decode(b"{}") == b"{}"
@@ -303,6 +432,26 @@ class TestTheAdditiveColumnDegrade:
         assert S.missing_optional_column(
             Exception("400 Unrecognized name: engine_identity at [3:1]")
         ) == "engine_identity"
+
+    def test_the_column_match_is_word_bounded_not_a_substring(self):
+        """`engine_identity` is a PREFIX of any future `engine_identity_hash`.
+        A substring match would drop the shorter column on a message naming the
+        longer one — writing a row missing a field the table actually has, and
+        leaving the real unknown key in place so the retry fails anyway.
+
+        MUTATION CHECK: revert to `if column in text` and the first two
+        assertions return a column name instead of None.
+        """
+        assert S.missing_optional_column(
+            Exception("400 no such field: engine_identity_hash.")) is None
+        assert S.missing_optional_column(
+            Exception("400 no such field: run_artifacts_complete.")) is None
+        # ...and the real names still match, surrounding punctuation included.
+        assert S.missing_optional_column(
+            Exception("no such field: engine_identity.")) == "engine_identity"
+        assert S.missing_optional_column(
+            Exception("Unrecognized name: artifacts_complete at [3:1]")
+        ) == "artifacts_complete"
 
     def test_the_predicate_stays_narrow(self):
         """A degrade that caught everything would turn a permissions failure, a
@@ -443,7 +592,10 @@ class TestTheArtifactEndpoint:
         return asyncio.new_event_loop().run_until_complete(coro)
 
     def _get(self, v2, run_id="r1", scenario="base", symbol="AAPL", split="all"):
-        return self._run(v2.sweep_cell_artifact(run_id, scenario, symbol, split))
+        # Called DIRECTLY, not through an event loop: this handler is a sync
+        # `def` on purpose (see `test_the_handler_is_SYNC_...`), so awaiting it
+        # would be a type error rather than a test.
+        return v2.sweep_cell_artifact(run_id, scenario, symbol, split)
 
     @pytest.fixture
     def wired(self, monkeypatch):
@@ -519,6 +671,66 @@ class TestTheArtifactEndpoint:
             self._get(wired)
         assert exc.value.status_code == 502
         assert "403" in exc.value.detail
+
+    def test_502_when_the_BUCKET_cannot_be_resolved(self, wired, monkeypatch):
+        """A missing bucket or a missing IAM grant is a 502 with a remedy, never
+        the 404 that says "this cell has no evidence"."""
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        store, _ = _store({}, bucket_raises=NotFound("no such bucket"))
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 502
+        assert "could not be resolved" in exc.value.detail
+
+    def test_502_on_a_zero_byte_object(self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        store, _ = _store({_object(): b""})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 502
+        assert "EMPTY" in exc.value.detail
+
+    def test_400_on_a_trailing_newline_before_any_gcs_call(self, wired,
+                                                           monkeypatch):
+        from fastapi import HTTPException
+
+        store, gcs = _store({})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired, run_id="r1\n")
+        assert exc.value.status_code == 400
+        assert gcs.resolved == [] and gcs.bucket_obj.requested == []
+
+    def test_the_handler_is_SYNC_so_a_stalled_read_uses_the_threadpool(self, wired):
+        """Every other route in `v2.py` is `async`; this one must not be. The
+        GCS client is blocking, so an `async def` would run a 30 s stalled
+        download ON the event loop and freeze every other request the worker is
+        serving. FastAPI dispatches a sync handler to its threadpool instead."""
+        import inspect
+
+        assert not inspect.iscoroutinefunction(wired.sweep_cell_artifact)
+
+    def test_the_run_row_surfaces_artifacts_complete(self, wired, monkeypatch):
+        """The console opens a cell from this payload, so a 404 there has to be
+        explicable as "the evidence was not stored" rather than a broken link."""
+        class BQ:
+            def get_sweep(self, run_id):
+                return {"run_id": run_id, "status": "done",
+                        "artifacts_complete": False,
+                        "written_at": "2026-09-01T12:00:00+00:00",
+                        "submitted_at": "2026-09-01T12:00:00+00:00"}
+
+            def get_sweep_rows(self, run_id):
+                return []
+
+        monkeypatch.setattr(wired, "get_bigquery_service", lambda: BQ())
+        shaped = self._run(wired.get_sweep("r1"))
+        assert shaped["artifacts_complete"] is False
 
     def test_the_route_is_registered_where_the_plan_says(self, wired):
         paths = {r.path for r in wired.router.routes}

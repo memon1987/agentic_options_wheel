@@ -953,6 +953,20 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
             symbols = [args.symbol.upper()]
         else:
             symbols = list(config.stock_symbols)
+        # The SAME rule the artifact endpoint applies at serve time
+        # (identity.validate_symbol / services/artifacts.SYMBOL_RE). Hand-typed
+        # `--symbols` is the one path by which a symbol containing `__`, a
+        # slash or whitespace could reach the artifact writer and land an object
+        # whose name nothing can parse or request back. Checked here, before
+        # anything is materialised, so it is an immediate refusal rather than a
+        # sweep that completes and produces unreadable evidence.
+        from src.backtesting.scenarios.identity import validate_symbol
+
+        for symbol in symbols:
+            try:
+                validate_symbol(symbol, '--symbols')
+            except ValueError as exc:
+                raise SystemExit(str(exc))
         starting_cash = args.starting_cash
         run_sensitivity = not args.no_sensitivity
 
@@ -1335,22 +1349,49 @@ def _finalise_sweep_status_inner(*, writer, logger, result, failure, chain_store
 def _artifacts_complete(artifact_writer, result, logger, *, run_id):
     """Whether every NON-ERRORED cell of this run also stored its artifact.
 
-    ``None`` — not ``False`` — when nothing was supposed to be written (no
-    writer, artifacts switched off, or a dedup hit with no result). "This run
-    stored no evidence and was never meant to" and "this run's evidence is
-    incomplete" are different facts and must not share a value.
+    Three values, and the difference between them is the whole point:
 
-    Errored cells are excluded from BOTH sides: an errored cell has no replay to
-    serialise, so `_replay_one` never calls the sink for it. Counting it would
-    make every sweep with one bad arm also report missing artifacts, folding two
-    unrelated problems into one flag.
+    * ``True``  — every non-errored cell has an artifact; the console can open
+      any cell of this run.
+    * ``False`` — some do not; an empty ledger in the console is a STORAGE
+      failure, not a replay that did nothing.
+    * ``None``  — the question does not apply. No writer, artifacts switched
+      off, a dedup hit with no result, **a run with no non-errored cell at all**
+      (nothing was ever supposed to be written, so "complete" is vacuous), or a
+      run that CRASHED before producing a result while having written nothing.
+
+    ``None`` is not a soft ``False``. "This run stored no evidence and was never
+    meant to" and "this run's evidence is incomplete" send an operator to
+    different places, and the vacuous case is the one that used to answer
+    ``0 == 0`` -> ``True``: a sweep whose every arm errored would have claimed a
+    complete artifact set it does not have a single object of.
+
+    **The crashed path is the subtle one.** When the replay raises there is no
+    ``result``, so the arithmetic has no denominator — but the writer may
+    already have stored objects for the cells that finished before the crash.
+    Stamping ``None`` there would say "this run wrote nothing" while orphaned
+    objects sit in the bucket, so a crashed run that wrote at least one artifact
+    is ``False``: incomplete, which is exactly what it is.
+
+    Errored cells are excluded from BOTH sides of the comparison: an errored
+    cell has no replay to serialise, so ``_replay_one`` never calls the sink for
+    it. Counting it would make every sweep with one bad arm also report missing
+    artifacts, folding two unrelated problems into one flag.
     """
-    if (artifact_writer is None or not getattr(artifact_writer, "enabled", False)
-            or result is None):
+    if artifact_writer is None or not getattr(artifact_writer, "enabled", False):
         return None
+    written = int(getattr(artifact_writer, "written", 0))
+    if result is None:
+        # Crashed, or deduplicated away without replaying. Objects already in
+        # the bucket are orphans of a run that has no cell rows to pair them
+        # with — incomplete, never "wrote nothing".
+        return False if written > 0 else None
     cells = getattr(result, "rows", []) or []
     expected = sum(1 for cell in cells if not getattr(cell, "error", None))
-    written = int(getattr(artifact_writer, "written", 0))
+    if expected == 0:
+        # Nothing was ever supposed to be written. `0 == 0` is True and would be
+        # a lie about a run with no evidence in it at all.
+        return None
     complete = written == expected
     if not complete:
         logger.warning(
