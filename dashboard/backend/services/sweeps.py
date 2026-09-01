@@ -142,10 +142,91 @@ def engine_identity_from_env() -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------- #
+# Surviving a dataset that has not been migrated yet.
+# ---------------------------------------------------------------------------- #
+#
+# `engine_identity` is an ADDITIVE column, and the engine's writer reconcile
+# adds it — but the DASHBOARD has no writer and does not own the schema
+# (`insert_sweep_status` says so: one schema owner, and it is the side that
+# knows every column). So there is a window, and there are environments, in
+# which this image is new and the tables are old:
+#
+#   * between the dashboard deploy and the ALTER TABLE / first Job run;
+#   * a fresh project, or any dataset restored from before the migration.
+#
+# In that state the hint query fails with `Unrecognized name: engine_identity`
+# and the `submitted` insert fails with `no such field: engine_identity` — and
+# BOTH are on the submit path, so every submission would 502/500. The dedup hint
+# is a convenience; the SUBMISSION is not. Neither may take the endpoint down,
+# and `force` (which skips the hint) must not die at the insert either.
+#
+# The two predicates below recognise that specific failure so the callers can
+# degrade — hint-miss, and insert-without-the-column — instead of raising. They
+# are deliberately NARROW: anything that does not name this column is a real
+# error and still propagates.
+_MISSING_COLUMN_MARKERS = (
+    "unrecognized name",     # query: SELECT/WHERE on a column that is not there
+    "no such field",         # streaming insert: unknown key in the row
+    "unknown field",
+    "invalid field name",
+)
+
+_identity_query_degraded_logged = False
+_identity_insert_degraded_logged = False
+
+
+def mentions_missing_identity_column(error: Any) -> bool:
+    """Does ``error`` say the ``engine_identity`` column does not exist?
+
+    Takes anything stringifiable — an exception, or the list of per-row error
+    dicts ``insert_rows_json`` RETURNS rather than raises. Both spellings of the
+    same fact have to be recognised, and neither is a typed exception.
+    """
+    text = str(error).lower()
+    if "engine_identity" not in text:
+        return False
+    return any(marker in text for marker in _MISSING_COLUMN_MARKERS)
+
+
+def note_identity_query_degraded(error: Any) -> None:
+    """One log per process: the dedup hint is off until the column exists."""
+    global _identity_query_degraded_logged
+    if _identity_query_degraded_logged:
+        return
+    _identity_query_degraded_logged = True
+    logger.error(
+        "sweep_dedup_hint_disabled: the %s column does not exist on "
+        "scenario_sweeps yet, so the dedup hint is unavailable. Submissions "
+        "still launch and the Job still deduplicates. Fix: ALTER TABLE "
+        "<dataset>.scenario_sweeps ADD COLUMN engine_identity STRING (the "
+        "Job's writer reconcile adds it too, on its next run). Underlying "
+        "error: %s", ENGINE_IDENTITY_ENV, str(error)[:300])
+
+
+def note_identity_insert_degraded(error: Any) -> None:
+    """One log per process: rows are landing without their identity stamp."""
+    global _identity_insert_degraded_logged
+    if _identity_insert_degraded_logged:
+        return
+    _identity_insert_degraded_logged = True
+    logger.error(
+        "engine_identity_column_missing: scenario_sweeps has no "
+        "engine_identity column, so this `submitted` row was written WITHOUT "
+        "it. The row is otherwise complete and the sweep runs normally; the "
+        "Job's own rows will carry the value once the column exists. Fix: "
+        "ALTER TABLE <dataset>.scenario_sweeps ADD COLUMN engine_identity "
+        "STRING. Underlying error: %s", str(error)[:300])
+
+
 def _reset_engine_identity_warning() -> None:
-    """Test seam: re-arm the one-shot log. Never called in production."""
+    """Test seam: re-arm every one-shot log. Never called in production."""
     global _identity_absence_logged
+    global _identity_query_degraded_logged
+    global _identity_insert_degraded_logged
     _identity_absence_logged = False
+    _identity_query_degraded_logged = False
+    _identity_insert_degraded_logged = False
 
 
 SWEEPS_TABLE = "scenario_sweeps"

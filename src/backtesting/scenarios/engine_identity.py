@@ -33,9 +33,24 @@ the backtesting package:
   a line of code, and a ``*.py``-only hash would serve the pre-correction
   numbers for ever.
 
-**Nothing outside ``src/``.** ``docs/``, ``dashboard/``, ``deploy/``,
-``tests/``, ``cloudbuild.yaml`` cannot change a replay's output, and including
-them would reintroduce exactly the over-invalidation the commit SHA had.
+**Plus the repo-root ``requirements.txt``, and nothing else outside ``src/``.**
+``docs/``, ``dashboard/``, ``deploy/``, ``tests/`` and ``cloudbuild.yaml`` cannot
+change a replay's output, and including them would reintroduce exactly the
+over-invalidation the commit SHA had. ``requirements.txt`` is the exception
+because it is not documentation: it names pandas, numpy and the Alpaca SDK, and
+the replay's arithmetic runs inside them. Under ``git_commit`` a dependency edit
+invalidated the cache; a ``src/**``-only hash would have quietly stopped doing
+that, which is a REGRESSION the re-key must not smuggle in.
+
+**Residual, stated rather than papered over: rebuild-resolution drift is outside
+the key.** ``requirements.txt`` is fully unpinned today (``pandas``, not
+``pandas==2.1.4``), so two builds of the identical file can resolve different
+wheel versions and hash the same. The file's CONTENT is what the key can see;
+what pip decided on a given afternoon is not. The discipline that covers the gap
+is manual and belongs here: **bump ``ENGINE_VERSION`` on any dependency change
+that could move replay numerics**, pinned or not. Pinning the file would fold
+resolution back into the key and is the real fix — a separate change with its own
+review. Recorded in ``docs/bigquery/scenario_runs.md`` §``engine_identity`` too.
 
 **Content, never metadata.** No mtime, no inode, no directory listing order:
 the Job's checkout and a dashboard build's checkout are different files on
@@ -82,21 +97,59 @@ SKIP_DIR_NAMES = frozenset({"__pycache__"})
 SKIP_SUFFIXES = frozenset({".pyc", ".pyo", ".pyd"})
 SKIP_FILE_NAMES = frozenset({".DS_Store"})
 
+# Files OUTSIDE ``src/`` that are nonetheless behaviour-bearing, hashed by their
+# repo-root-relative path. Exactly one today, and the bar for a second is high:
+# it must be able to change what a replay COMPUTES.
+#
+# ``requirements.txt`` clears it. The replay's arithmetic runs inside pandas,
+# numpy and the Alpaca SDK, and this file is what says which of them the image
+# installs. Under the old ``git_commit`` key a dependency edit invalidated every
+# stored result; dropping it from the content hash would have silently ended
+# that. See the module docstring for the resolution-drift residual and the
+# ENGINE_VERSION discipline that covers it.
+EXTRA_ROOT_FILES = ("requirements.txt",)
+
 # ``<repo>/src`` — this file is ``<repo>/src/backtesting/scenarios/engine_identity.py``.
 SRC_DIR = Path(__file__).resolve().parents[2]
 
 _CACHED: Optional[str] = None
 
 
-def _walk(src_dir: Path) -> List[Tuple[str, Path]]:
+class EngineTreeError(RuntimeError):
+    """The source tree cannot be hashed honestly. Never caught internally."""
+
+
+def _walk(src_dir: Path, root: Optional[Path] = None) -> List[Tuple[str, Path]]:
     """``(relative posix path, absolute path)`` for every hashed file, sorted.
 
-    Sorted on the RELATIVE path so the ordering is a property of the tree's
-    contents rather than of the filesystem's directory order, which differs
-    between machines and between ext4 and APFS.
+    **The final sort is load-bearing, not tidiness.** ``os.walk`` yields
+    directory entries in whatever order the filesystem hands back, and that
+    order differs between ext4 and APFS, between two checkouts on one machine,
+    and after any file is rewritten. Without the sort the digest would depend on
+    readdir order — and the two environments that MUST agree (the Cloud Run Job
+    and the Cloud Build worker that stamps the dashboard image) are two different
+    filesystems. A test that shuffles the walk order pins this; a single-machine
+    test cannot, because one filesystem is self-consistent.
+
+    **Symlinks are refused, not followed.** A followed link reads bytes from
+    outside the boundary this hash is defined by, and a link to a directory can
+    add an entire invisible subtree (or a cycle). Neither is a state a checkout
+    of this repo produces, so refusing costs nothing and closes a quiet hole:
+    the alternative — skipping them silently — would let someone move a real
+    source file behind a link and watch the identity stop noticing it.
     """
+    root = root or src_dir.parent
     entries: List[Tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(src_dir):
+        for name in list(dirnames):
+            if name in SKIP_DIR_NAMES:
+                continue
+            if os.path.islink(os.path.join(dirpath, name)):
+                raise EngineTreeError(
+                    f"{os.path.join(dirpath, name)} is a symlink. The engine "
+                    f"identity is defined over the CONTENTS of src/**; a linked "
+                    f"directory can add an invisible subtree or a cycle. Replace "
+                    f"it with a real directory.")
         # Pruned in place — `os.walk` reads this list back, so removing a name
         # skips the whole subtree rather than just the directory entry.
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
@@ -106,18 +159,42 @@ def _walk(src_dir: Path) -> List[Tuple[str, Path]]:
             path = Path(dirpath) / name
             if path.suffix in SKIP_SUFFIXES:
                 continue
+            if path.is_symlink():
+                raise EngineTreeError(
+                    f"{path} is a symlink. The engine identity is defined over "
+                    f"the CONTENTS of src/**; following it would hash bytes from "
+                    f"outside that boundary. Replace it with a real file.")
             rel = path.relative_to(src_dir).as_posix()
             entries.append((f"src/{rel}", path))
+
+    for name in EXTRA_ROOT_FILES:
+        path = root / name
+        if not path.is_file():
+            raise EngineTreeError(
+                f"{path} is missing. It is part of the engine identity (the "
+                f"replay's arithmetic runs inside the packages it names), and "
+                f"hashing a tree without it would produce a digest that "
+                f"silently means something else.")
+        if path.is_symlink():
+            raise EngineTreeError(f"{path} is a symlink; see src/** above.")
+        entries.append((name, path))
+
     entries.sort(key=lambda pair: pair[0])
     return entries
 
 
-def compute_identity(src_dir: Path, engine_version: str = ENGINE_VERSION) -> str:
+def compute_identity(src_dir: Path, engine_version: str = ENGINE_VERSION,
+                     root: Optional[Path] = None) -> str:
     """The 16-hex digest of one ``src`` tree. Pure — no cache, no globals.
 
     Separated from :func:`engine_identity` so the sensitivity tests can hash a
     COPY of the tree with one byte changed. Nothing in production calls it with
     a directory other than :data:`SRC_DIR`.
+
+    ``root`` is where :data:`EXTRA_ROOT_FILES` are resolved from; it defaults to
+    ``src_dir.parent``, which is the repo root in every real layout (the bot
+    image is ``/app/src`` beside ``/app/requirements.txt``). A test hashing a
+    copied tree passes the copy's parent.
 
     The path, the byte length and the contents are all fed in, each
     NUL-separated: length-prefixing is what stops two files whose contents run
@@ -128,7 +205,7 @@ def compute_identity(src_dir: Path, engine_version: str = ENGINE_VERSION) -> str
     digest = hashlib.sha256()
     digest.update(DIGEST_SCHEME.encode("utf-8") + b"\0")
     digest.update(engine_version.encode("utf-8") + b"\0")
-    for rel, path in _walk(src_dir):
+    for rel, path in _walk(src_dir, root):
         data = path.read_bytes()
         digest.update(rel.encode("utf-8") + b"\0")
         digest.update(str(len(data)).encode("ascii") + b"\0")
@@ -161,6 +238,7 @@ def identity_manifest(src_dir: Optional[Path] = None) -> Dict[str, int]:
     file differs?", and answering it by hand means re-deriving the walk rules.
     """
     return {rel: path.stat().st_size for rel, path in _walk(src_dir or SRC_DIR)}
+
 
 
 if __name__ == "__main__":

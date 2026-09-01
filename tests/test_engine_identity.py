@@ -44,10 +44,16 @@ def tree(tmp_path_factory):
     Module-scoped and copied ONCE: the tests mutate a file, hash, and restore it
     in a finally, so they share the copy without leaking into each other. 1.3 MB
     and 69 files — copying it per test would be waste, not isolation.
+
+    `EXTRA_ROOT_FILES` are resolved from the tree's PARENT, so the copy is a
+    miniature repo root: `src/` beside `requirements.txt`, exactly the layout
+    `deploy/Dockerfile` produces at `/app`.
     """
-    dest = tmp_path_factory.mktemp("src_copy") / "src"
-    shutil.copytree(REPO_ROOT / "src", dest)
-    return dest
+    root = tmp_path_factory.mktemp("repo_copy")
+    shutil.copytree(REPO_ROOT / "src", root / "src")
+    for name in EI.EXTRA_ROOT_FILES:
+        shutil.copy(REPO_ROOT / name, root / name)
+    return root / "src"
 
 
 def _mutate(path: Path, extra: bytes = b"\n# fc-096 identity probe\n"):
@@ -100,6 +106,42 @@ class TestWhatTheIdentityIsSensitiveTo:
             )
         finally:
             restore()
+
+    def test_a_requirements_txt_byte_changes_it(self, tree):
+        """The replay's arithmetic runs inside pandas, numpy and the Alpaca SDK.
+
+        Under the old `git_commit` key a dependency edit invalidated every
+        stored result. A `src/**`-only hash would have quietly stopped doing
+        that — a REGRESSION hidden inside an improvement, which is the kind that
+        survives review. `requirements.txt` is in the digest so it does not.
+        """
+        before = EI.compute_identity(tree)
+        restore = _mutate(tree.parent / "requirements.txt", b"\nfaker\n")
+        try:
+            assert EI.compute_identity(tree) != before, (
+                "a dependency edit no longer invalidates the dedup key; a "
+                "different pandas would serve the old numbers as the new ones"
+            )
+        finally:
+            restore()
+        assert EI.compute_identity(tree) == before
+
+    def test_the_real_requirements_txt_is_in_the_manifest(self):
+        """Path-framed at the repo root, not under `src/`."""
+        manifest = EI.identity_manifest()
+        assert "requirements.txt" in manifest
+        assert manifest["requirements.txt"] > 0
+
+    def test_a_missing_extra_file_is_refused_not_ignored(self, tmp_path):
+        """Hashing a tree without it would produce a digest that silently means
+        something else — the same value a complete tree could legitimately
+        produce. Refusing is the only honest answer."""
+        lonely = tmp_path / "src"
+        lonely.mkdir()
+        (lonely / "mod.py").write_text("x = 1\n")
+        with pytest.raises(EI.EngineTreeError) as exc:
+            EI.compute_identity(lonely)
+        assert "requirements.txt" in str(exc.value)
 
     def test_a_new_file_changes_it(self, tree):
         """Adding a module is a change even if nothing imports it yet."""
@@ -159,7 +201,11 @@ class TestWhatTheIdentityIsBlindTo:
         assert (REPO_ROOT / relative).exists(), f"{relative} moved; fix the test"
         manifest = EI.identity_manifest()
         assert relative not in manifest
-        assert all(key.startswith("src/") for key in manifest)
+        # The manifest IS the input set: `src/**` plus the named extras and
+        # nothing else. Spelling the extras out here rather than allowing any
+        # repo-root file keeps a future addition from slipping in unreviewed.
+        assert all(key.startswith("src/") or key in EI.EXTRA_ROOT_FILES
+                   for key in manifest)
 
     def test_bytecode_and_pycache_are_skipped(self, tree):
         """mtime-immune and `__pycache__`-immune, both required by B1.
@@ -187,6 +233,130 @@ class TestWhatTheIdentityIsBlindTo:
         assert EI.compute_identity(tree) == before
 
 
+class TestTheWalkOrderCannotMoveTheDigest:
+    """The `entries.sort()` in `_walk` is load-bearing, and a single-filesystem
+    test cannot prove it.
+
+    A reviewer deleted the sort and all 28 tests still passed: one filesystem
+    returns one readdir order, consistently, so every hash in the suite agreed
+    with every other. Production does not have that luxury — the Cloud Run Job
+    and the Cloud Build worker that stamps the dashboard image are two different
+    filesystems, and a digest that depended on readdir order would simply never
+    match across them. The dedup would stop firing, silently, and the symptom
+    would be "sweeps got slow".
+
+    So the walk order is varied deliberately and the digest must not move.
+    """
+
+    # Bound at class-definition time: the tests monkeypatch `EI.os.walk`, and
+    # `EI.os` IS the stdlib module, so a harness that called `os.walk` by name
+    # would call itself. This reference is captured before any patch exists.
+    _REAL_WALK = staticmethod(os.walk)
+
+    @classmethod
+    def _shuffled_walk(cls, reverse_dirs, reverse_files):
+        """A stand-in for `os.walk` that yields the same tree in another order.
+
+        The real walk is materialised FIRST (with `__pycache__` pruning applied
+        here, since `_walk`'s own in-place pruning is meaningless once the
+        results are a list), then re-ordered. That is what a different
+        filesystem does: same files, different sequence.
+        """
+        real = cls._REAL_WALK
+
+        def walker(top, *args, **kwargs):
+            triples = [
+                (dirpath, dirnames, filenames)
+                for dirpath, dirnames, filenames in real(top)
+                if not any(part in EI.SKIP_DIR_NAMES
+                           for part in Path(dirpath).parts)
+            ]
+            if reverse_dirs:
+                triples.reverse()
+            for dirpath, dirnames, filenames in triples:
+                names = list(filenames)
+                if reverse_files:
+                    names.reverse()
+                yield dirpath, list(dirnames), names
+        return walker
+
+    @pytest.mark.parametrize("reverse_dirs,reverse_files", [
+        (False, True), (True, False), (True, True),
+    ])
+    def test_reordering_the_walk_does_not_move_the_digest(
+            self, tree, monkeypatch, reverse_dirs, reverse_files):
+        baseline = EI.compute_identity(tree)
+        monkeypatch.setattr(
+            EI.os, "walk",
+            self._shuffled_walk(reverse_dirs, reverse_files))
+        assert EI.compute_identity(tree) == baseline, (
+            "the digest depends on the order os.walk happens to return — the "
+            "Job and the dashboard build run on different filesystems and "
+            "would compute different keys for the identical tree"
+        )
+
+    def test_the_reordering_harness_actually_reorders(self, tree, monkeypatch):
+        """A harness that silently did nothing would make the test above vacuous
+        — it would pass against a deleted sort, which is exactly the mutant it
+        exists to kill."""
+        plain = [rel for rel, _ in EI._walk(tree)]
+        harness = self._shuffled_walk(True, True)
+
+        # The RAW sequence the harness hands `_walk`, before `_walk` sorts it.
+        raw = []
+        for dirpath, _dirs, files in harness(tree):
+            raw.extend(str(Path(dirpath) / f) for f in files)
+        assert len(raw) > 1
+        assert raw != sorted(raw), (
+            "the harness returned an already-sorted order; it proves nothing, "
+            "and the invariance tests above would pass against a deleted sort"
+        )
+
+        # ...and `_walk` still produces the identical, sorted list.
+        monkeypatch.setattr(EI.os, "walk", harness)
+        assert [rel for rel, _ in EI._walk(tree)] == plain
+
+
+class TestSymlinksAreRefused:
+    """A followed link reads bytes from outside the boundary the hash is defined
+    by, and a linked DIRECTORY can add an invisible subtree or a cycle.
+
+    Skipping them silently would be worse than either: a real source file moved
+    behind a link would stop being noticed, and the identity would keep looking
+    healthy. `find src -type l` is empty today, so refusing costs nothing.
+    """
+
+    def test_a_symlinked_file_under_src_raises(self, tree):
+        link = tree / "strategy" / "_linked.py"
+        link.symlink_to(tree / "strategy" / "put_seller.py")
+        try:
+            with pytest.raises(EI.EngineTreeError) as exc:
+                EI.compute_identity(tree)
+            assert "symlink" in str(exc.value)
+        finally:
+            link.unlink()
+        assert EI.compute_identity(tree)   # and the tree hashes again after
+
+    def test_a_symlinked_directory_under_src_raises(self, tree, tmp_path):
+        outside = tmp_path / "outside_tree"
+        outside.mkdir(exist_ok=True)
+        (outside / "smuggled.py").write_text("# not part of the engine\n")
+        link = tree / "strategy" / "_linked_dir"
+        link.symlink_to(outside, target_is_directory=True)
+        try:
+            with pytest.raises(EI.EngineTreeError) as exc:
+                EI.compute_identity(tree)
+            assert "symlink" in str(exc.value)
+        finally:
+            link.unlink()
+
+    def test_the_repo_has_no_symlinks_under_src(self):
+        """States the precondition the refusal relies on, so a future commit
+        that adds one fails here with an explanation rather than in a build."""
+        links = [p for p in (REPO_ROOT / "src").rglob("*") if p.is_symlink()]
+        assert links == [], f"symlinks under src/: {links}"
+
+
 # ==========================================================================
 # (2) Determinism, and the standalone entry point the build depends on
 # ==========================================================================
@@ -201,9 +371,13 @@ class TestTheIdentityIsDeterministic:
         of the same commit on two machines must produce the same 16 hex
         characters or the dedup never fires across them.
         """
-        clone = tmp_path / "src"
-        shutil.copytree(tree, clone)
-        assert EI.compute_identity(clone) == EI.compute_identity(tree)
+        clone_root = tmp_path / "clone"
+        clone_root.mkdir()
+        shutil.copytree(tree, clone_root / "src")
+        for name in EI.EXTRA_ROOT_FILES:
+            shutil.copy(tree.parent / name, clone_root / name)
+        assert (EI.compute_identity(clone_root / "src")
+                == EI.compute_identity(tree))
 
     def test_the_module_run_as_a_script_prints_the_same_value(self):
         """`python src/backtesting/scenarios/engine_identity.py` — the form

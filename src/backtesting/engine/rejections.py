@@ -23,6 +23,8 @@ import structlog
 from ...utils import clock
 from ...utils.logger import active_tally, ensure_tally_dispatch
 
+logger = structlog.get_logger(__name__)
+
 # FC-069 item 12, review fix 1. This bucket is NOT a stand-down: it fires on
 # every day the wheel is doing exactly what it exists to do — holding a position
 # on the underlying it already sold a put against. On a healthy deployment it is
@@ -229,9 +231,24 @@ class RejectionTally:
             self._prev_config = ensure_tally_dispatch()
             self._binding = active_tally(self.processor)
             self._binding.__enter__()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._prev_config = None
             self._binding = None
+            # A tally that fails to bind counts NOTHING, and every consumer of
+            # an empty tally reads it as "the strategy was never blocked" — the
+            # FC-057 dishonest-metric class, arrived at by silence. The swallow
+            # stays (a diagnostic must not break the run it is diagnosing), but
+            # it stops being invisible: this is exactly the state FC-092 spent
+            # a year in undetected.
+            try:
+                logger.warning(
+                    "Rejection tally could not bind — this replay will report "
+                    "no blocked days, which is an ARTIFACT and not a finding",
+                    event_category="backtest",
+                    event_type="rejection_tally_bind_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:300])
+            except Exception:  # noqa: BLE001 - logging is what just failed
+                pass
         return self
 
     def __exit__(self, *exc) -> None:

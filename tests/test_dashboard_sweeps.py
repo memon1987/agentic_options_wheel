@@ -228,6 +228,194 @@ class TestTheEngineIdentityIsReadNeverComputed:
         assert S.allowlist_payload()["engine_identity"] == BAKED_IDENTITY
 
 
+class TestAnUnmigratedDatasetDegradesInsteadOfFailing:
+    """The window between deploying this image and the column existing.
+
+    `engine_identity` is additive, and the ENGINE's writer reconcile adds it —
+    but the dashboard does not own the schema and does not create columns. So
+    there is a real state in which this image is new and the tables are old: the
+    minutes between a dashboard deploy and the ALTER TABLE, a fresh project, a
+    dataset restored from a pre-migration backup.
+
+    Both halves of the submit path touch the column, so in that state EVERY
+    submission would fail — the hint query with `Unrecognized name:
+    engine_identity` (which `_sweep_query` re-raises as a generic Exception the
+    router turns into a 500), and the `submitted` insert with `no such field`
+    (which `insert_rows_json` rejects the WHOLE request over, so `force` — which
+    skips the hint entirely — dies there too).
+
+    The dedup hint is a convenience. The SUBMISSION is not. Neither failure may
+    take the endpoint down.
+    """
+
+    QUERY_ERROR = ("Database query failed: 400 Unrecognized name: "
+                   "engine_identity at [8:5]")
+    INSERT_ERROR = [{"index": 0, "errors": [
+        {"reason": "invalid", "message": "no such field: engine_identity."}]}]
+
+    @staticmethod
+    def _service(client=None):
+        """A `BigQueryService` with no constructor run — no credentials, no
+        client build, just the two attributes these paths read."""
+        from services import bigquery as bq_mod
+
+        service = bq_mod.BigQueryService.__new__(bq_mod.BigQueryService)
+        service.dataset = "p.d"
+        service.client = client
+        return service
+
+    # -- the predicate ----------------------------------------------------
+    def test_it_recognises_both_wire_spellings(self):
+        """One is an exception message, the other a returned per-row error dict.
+        Neither is a typed exception, so both are matched on text."""
+        assert S.mentions_missing_identity_column(Exception(self.QUERY_ERROR))
+        assert S.mentions_missing_identity_column(self.INSERT_ERROR)
+
+    def test_it_does_not_swallow_unrelated_failures(self):
+        """Deliberately NARROW. A degrade path that caught everything would turn
+        a permissions failure, a missing table and a typo'd column into a silent
+        "no prior run" — three real outages reported as a cache miss."""
+        for other in (
+            Exception("403 Access Denied: Table scenario_sweeps"),
+            Exception("404 Not found: Table x.y.scenario_sweeps"),
+            Exception("400 Unrecognized name: sweep_ky at [3:1]"),
+            [{"index": 0, "errors": [{"message": "no such field: sweep_ky."}]}],
+            Exception("engine_identity is fine but the network died"),
+        ):
+            assert not S.mentions_missing_identity_column(other), other
+
+    # -- the hint path ----------------------------------------------------
+    def test_the_hint_degrades_to_a_miss_and_says_so_once(self, caplog):
+        """A missing hint costs one container start. A 500 costs the feature."""
+        import logging
+
+        service = self._service()
+        seen = []
+
+        def unmigrated(sql, params):
+            seen.append(sql)
+            raise Exception(self.QUERY_ERROR)
+
+        service._sweep_query = unmigrated
+        S._reset_engine_identity_warning()
+        with caplog.at_level(logging.ERROR, logger=S.__name__):
+            for _ in range(3):
+                assert service.find_done_sweep(
+                    "key0123456789ab", engine_identity=BAKED_IDENTITY) is None
+
+        assert len(seen) == 3
+        assert "engine_identity = @engine_identity" in seen[0]
+        hits = [r for r in caplog.records
+                if "sweep_dedup_hint_disabled" in r.getMessage()]
+        assert len(hits) == 1, f"{len(hits)} log lines for one process"
+
+    def test_a_real_query_failure_still_propagates(self):
+        """The degrade covers ONE known schema state, not every error. A
+        permissions failure must still surface as a failure."""
+        service = self._service()
+
+        def denied(sql, params):
+            raise Exception("403 Access Denied: BigQuery: Permission denied")
+
+        service._sweep_query = denied
+        with pytest.raises(Exception, match="Access Denied"):
+            service.find_done_sweep("key0123456789ab",
+                                    engine_identity=BAKED_IDENTITY)
+
+    # -- the insert path --------------------------------------------------
+    @pytest.mark.parametrize("raise_instead", [False, True])
+    def test_the_insert_retries_once_without_the_column(
+            self, caplog, raise_instead):
+        """A row missing the stamp beats NO row.
+
+        No row means an invisible sweep: the dashboard cannot show it, the dedup
+        cannot find it, and the one-at-a-time gate never counts it. The Job's own
+        rows carry the value once the column exists, and readers take the latest
+        row per run — so nothing is permanently lost.
+
+        Parametrised over both shapes: `insert_rows_json` REPORTS per-row
+        problems and RAISES request-level ones, and an unknown field has been
+        seen as each.
+        """
+        import logging
+
+        calls = []
+
+        class Unmigrated:
+            def insert_rows_json(self, table, rows):
+                calls.append(rows[0])
+                if any("engine_identity" in r for r in rows):
+                    if raise_instead:
+                        raise Exception("400 no such field: engine_identity.")
+                    return [{"index": 0, "errors": [
+                        {"reason": "invalid",
+                         "message": "no such field: engine_identity."}]}]
+                return []
+
+        service = self._service(Unmigrated())
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec()), sweep_key_value="k",
+            submitted_at="2026-09-01T12:00:00+00:00", git_commit="abc",
+            engine_identity=BAKED_IDENTITY)
+
+        S._reset_engine_identity_warning()
+        with caplog.at_level(logging.ERROR, logger=S.__name__):
+            service.insert_sweep_status(row)   # must NOT raise
+
+        assert len(calls) == 2, "expected one failed insert then one retry"
+        assert "engine_identity" in calls[0]
+        assert "engine_identity" not in calls[1]
+        # ...and nothing ELSE was dropped. A retry that shed more than the one
+        # unsupported field would write a row the results view renders blank.
+        assert set(calls[1]) == set(row) - {"engine_identity"}
+        assert calls[1]["sweep_key"] == "k"
+        assert any("engine_identity_column_missing" in r.getMessage()
+                   for r in caplog.records), caplog.text
+
+    def test_the_retry_is_attempted_exactly_once(self):
+        """One retry. A table that rejects the row for a second reason must
+        surface, not spin."""
+        calls = []
+
+        class AlwaysBroken:
+            def insert_rows_json(self, table, rows):
+                calls.append(rows[0])
+                return [{"index": 0, "errors": [
+                    {"message": "no such field: engine_identity."}]}]
+
+        service = self._service(AlwaysBroken())
+        S._reset_engine_identity_warning()
+        with pytest.raises(Exception, match="insert failed"):
+            service.insert_sweep_status({"run_id": "r",
+                                         "engine_identity": BAKED_IDENTITY})
+        assert len(calls) == 2
+
+    def test_an_unrelated_insert_error_still_raises(self):
+        class Denied:
+            def insert_rows_json(self, table, rows):
+                return [{"index": 0, "errors": [
+                    {"message": "no such field: sweep_ky."}]}]
+
+        service = self._service(Denied())
+        with pytest.raises(Exception, match="insert failed"):
+            service.insert_sweep_status({"run_id": "r"})
+
+    def test_a_migrated_dataset_takes_neither_path(self):
+        """The happy path is untouched: one insert, the column intact."""
+        calls = []
+
+        class Fine:
+            def insert_rows_json(self, table, rows):
+                calls.append(rows[0])
+                return []
+
+        service = self._service(Fine())
+        service.insert_sweep_status({"run_id": "r",
+                                     "engine_identity": BAKED_IDENTITY})
+        assert len(calls) == 1
+        assert calls[0]["engine_identity"] == BAKED_IDENTITY
+
+
 class TestTheStatusOrderingIsNotAFork:
     def test_order_by_matches_the_writers(self):
         assert S.LATEST_STATUS_ORDER_BY == store.LATEST_STATUS_ORDER_BY

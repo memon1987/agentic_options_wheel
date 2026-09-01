@@ -60,7 +60,7 @@ at mid or at the bid, which means it is not a verdict.
 | `verdict` | STRING | `fit` / `marginal` / `unfit`; NULL when the symbol errored |
 | `demote` | BOOL | `verdict == 'unfit'`. Recommendation only |
 | `verdict_reasons` | STRING[] | Ordered, prefixed `BLOCK:` / `WARN:` / `OK:` |
-| `binding_constraint` | STRING | Which filter blocked the most days. **NULL by artifact on every row written before 2026-09-01 except the first symbol of each run** — see below |
+| `binding_constraint` | STRING | Which filter blocked the most days. **NULL by artifact on every row written before the FC-096 Phase B PR-a deploy (PR #109, `f18d0c5`, 2026-09-01), except the first symbol of each run** — see below |
 
 #### `binding_constraint` is NULL by artifact on historical rows (FC-092)
 
@@ -78,7 +78,10 @@ because nothing counted it. Separately, `summary()` iterated a set, so the
 reported constraint could differ between two runs of the same replay depending
 on `PYTHONHASHSEED`.
 
-Both are fixed (FC-096 Phase B PR-a): the tally binds through
+Both are fixed by **FC-096 Phase B PR-a (PR #109, commit `f18d0c5`, merged
+2026-09-01)** — cite the commit rather than only the date when auditing a row,
+because the deploy that carried it is what actually moves the boundary: the
+tally binds through
 `utils.logger.tally_dispatch`, a process-stable processor that reads the active
 tally from a contextvar, and the ranking is sorted with an explicit tiebreak.
 **Nothing was backfilled** — the honest repair is to re-run the screen, not to

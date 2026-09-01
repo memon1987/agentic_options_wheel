@@ -252,7 +252,8 @@ that is the difference between a cheap Saturday and an expensive one.
 
 `engine_identity` asks the narrower question: *did the code the replay executes
 change?* It is `sha256[:16]` over the sorted relative paths and the **contents**
-of every file under `src/`, of every type, plus `ENGINE_VERSION`:
+of every file under `src/`, of every type, plus the repo-root `requirements.txt`,
+plus `ENGINE_VERSION`:
 
 - **all of `src/`, not just the backtesting package** — the replay drives the
   live strategy, so `src/strategy/**`, `src/api/**`, `src/data/**` and
@@ -260,11 +261,28 @@ of every file under `src/`, of every type, plus `ENGINE_VERSION`:
 - **all file types, not just `*.py`** — `src/backtesting/data/earnings_dates.json`
   and `dividend_history.json` are committed replay *inputs*; a table correction
   changes results without changing a line of code;
-- **nothing outside `src/`** — `docs/`, `dashboard/`, `deploy/`, `tests/` and
-  `cloudbuild.yaml` cannot change a replay's output;
-- **content, never metadata** — no mtime, no directory order; `__pycache__` and
-  `*.pyc` are skipped, because they are derived and their presence depends on
-  whether something happened to import the tree first.
+- **plus `requirements.txt`** — the replay's arithmetic runs inside pandas,
+  numpy and the Alpaca SDK, and this file says which of them the image installs.
+  Under `git_commit` a dependency edit invalidated the cache; a `src/**`-only
+  hash would have quietly stopped doing that, which is a regression the re-key
+  must not smuggle in;
+- **nothing else outside `src/`** — `docs/`, `dashboard/`, `deploy/`, `tests/`
+  and `cloudbuild.yaml` cannot change a replay's output;
+- **content, never metadata** — no mtime, no directory order (the walk is sorted
+  on the relative path, because the Job and the Cloud Build worker that stamps
+  the dashboard image are two different filesystems with two different readdir
+  orders); `__pycache__` and `*.pyc` are skipped, being derived; a **symlink
+  anywhere under `src/` is refused outright**, because a followed link reads
+  bytes from outside the boundary the hash is defined by.
+
+**Residual: rebuild-resolution drift is outside the key.** `requirements.txt` is
+fully unpinned today (`pandas`, not `pandas==2.1.4`), so two builds of the
+identical file can resolve different wheel versions and still hash the same. The
+key sees the file's *content*; it cannot see what pip decided on a given
+afternoon. The discipline that covers the gap is manual: **bump `ENGINE_VERSION`
+on any dependency change that could move replay numerics**, pinned or not.
+Pinning the file would fold resolution back into the key and is the real fix — a
+separate change with its own review.
 
 `git_commit` is still stamped on every row. It is provenance; it is simply no
 longer identity.
@@ -278,6 +296,15 @@ module* against the checkout that builds the image and bakes the answer in as th
 its dedup hint and logs why** — it never keys over a fallback, because a key
 computed over `""` is a valid-looking 16-hex string that collides across
 genuinely different engines.
+
+**Migration.** The column is additive and NULLABLE. The engine's writer
+reconcile adds it on the Job's next run; the two live tables were also altered
+directly (`ALTER TABLE <dataset>.scenario_sweeps ADD COLUMN engine_identity
+STRING`, same for `scenario_runs`) so the dashboard did not have to wait for a
+Job. Until that column exists the dashboard **degrades rather than failing**: the
+dedup hint reports a miss and logs `sweep_dedup_hint_disabled`, and the
+`submitted` insert is retried once without the field, logging
+`engine_identity_column_missing`. Submissions keep working throughout.
 
 **One-time invalidation, on the record.** Every row written before the re-key has
 a NULL `engine_identity` and a `sweep_key` computed over a commit. The first
