@@ -248,10 +248,32 @@ class Config:
                     "test can see every candidate's expiry"
                 )
 
-        # Put parameters and universe price-screening are wheel-only. The
-        # covered-call profile has no put phase and derives its universe from
-        # holdings, so these are not required (and not present) for it. Gating
-        # on strategy_id keeps the wheel's validation path byte-identical.
+        # Price/volume screening keys are required on EVERY profile, not just
+        # the wheel: `MarketDataManager.get_stock_metrics` hard-indexes
+        # `min_stock_price` / `max_stock_price` / `min_avg_volume` on every
+        # symbol it prices, and the covered-call profile reaches it on every
+        # chain fetch. Shipping a profile without them raised KeyError inside a
+        # broad except and silently priced every symbol as {} for a week
+        # (covered-call-engine, 2026-08-24..31). Fail at load instead.
+        for key in ('min_stock_price', 'max_stock_price', 'min_avg_volume'):
+            if key not in strategy:
+                errors.append(f"strategy.{key} is required on every profile "
+                              "(read by MarketDataManager.get_stock_metrics)")
+        min_price = strategy.get('min_stock_price', 0)
+        max_price = strategy.get('max_stock_price', 0)
+        if min_price < 0:
+            errors.append(f"min_stock_price must be non-negative (got {min_price})")
+        if max_price <= 0:
+            errors.append(f"max_stock_price must be positive (got {max_price})")
+        if min_price >= max_price:
+            errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
+        min_vol = strategy.get('min_avg_volume', 0)
+        if not isinstance(min_vol, (int, float)) or isinstance(min_vol, bool) or min_vol < 0:
+            errors.append(f"min_avg_volume must be a non-negative number (got {min_vol!r})")
+
+        # Put parameters are wheel-only. The covered-call profile has no put
+        # phase, so these are not required (and not present) for it. Gating on
+        # strategy_id keeps the wheel's put validation path byte-identical.
         if strategy_id == 'wheel':
             put_dte = strategy.get('put_target_dte', 0)
             if put_dte <= 0:
@@ -260,15 +282,6 @@ class Config:
             put_delta = strategy.get('put_delta_range', [])
             if len(put_delta) != 2 or not (0 <= put_delta[0] <= put_delta[1] <= 1):
                 errors.append(f"put_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {put_delta})")
-
-            min_price = strategy.get('min_stock_price', 0)
-            max_price = strategy.get('max_stock_price', 0)
-            if min_price < 0:
-                errors.append(f"min_stock_price must be non-negative (got {min_price})")
-            if max_price <= 0:
-                errors.append(f"max_stock_price must be positive (got {max_price})")
-            if min_price >= max_price:
-                errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
 
         # FC-069 S1 removed the validation of `max_total_positions`,
         # `max_positions_per_stock`, `max_exposure_per_ticker`,

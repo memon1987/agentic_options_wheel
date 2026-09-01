@@ -201,7 +201,9 @@ class TestConfigSurface:
         assert c.strategy_id == "covered_call"
         assert c.bigquery_dataset == "covered_call"   # live-wired by Seam 4
         assert c.sizing_basis == "equity"
-        assert c.min_open_interest == 500
+        # OI floor SUSPENDED (null) since PR #107: the chain source hardcodes
+        # open_interest=0, so any floor rejects every strike. Restore with FC-097.
+        assert c.min_open_interest is None
         assert c.max_spread_pct == 0.10
         assert c.earnings_enabled is True
         assert c.excluded_symbols == set()          # empty but normalized
@@ -220,7 +222,9 @@ class TestConfigSurface:
             "strategy_id": "covered_call",
             "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
                        "expected_account_number": "PA_CC"},
-            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25]},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
+                         "min_stock_price": 1, "max_stock_price": 100000,
+                         "min_avg_volume": 0},
             "risk": {"sizing_basis": "equity", "max_position_size": 0.35},
             "gcs": {"opportunity_bucket": "cc"},
             "bigquery": {"dataset": "covered_call"},

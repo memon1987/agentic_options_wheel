@@ -1000,6 +1000,41 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-060 (Completed — substrate), FC-094 (resolved by D3), FC-095 (dedup-granularity item moves here; the rest stands), FC-055 (ceiling question = an early console use-case), FC-075 (covered-call profile), `docs/plans/fc-060-scenario-store-ui.md` §Review addendum.
 
+### FC-097: source real option open interest — the chain reports `open_interest: 0` for every contract, so any OI floor rejects everything
+
+**Scope:** shared (`src/api/alpaca_client.py`, `src/api/market_data.py`, `config/covered_call.yaml`)
+**Status:** Filed 2026-09-01 (found by PR #107 review; CC OI floor SUSPENDED in that PR)
+**Size estimate:** S-M
+**Owner:** zeshan
+
+**Problem:** `AlpacaClient.get_options_chain` builds contracts from the snapshot endpoint and hardcodes `'open_interest': 0  # Not available in snapshot data`. The FC-075 DD-3 inventory validator set `universe.min_open_interest: 500` on the covered-call profile, and `_check_call_criteria_detailed` runs that gate LAST — so on covered-call-engine every strike that survived cost-basis / DTE / premium / delta / liquidity was rejected as `open_interest_too_low` (2026-08-28: ~114 GOOGL / ~86 UNH per scan, and the bucket was not even emitted on the STAGE 8 line until PR #107). The wheel was unaffected only because `settings.yaml` sets no floor. The basic `no_liquidity` check (`volume == 0 and open_interest < 10`) is also reasoning about a constant, and `volume` there is the last trade's size, not session volume.
+
+**Resolution (PR #107, config-only, reversible):** `min_open_interest: null` on the CC profile — the OI half of DD-3 is suspended, the spread half (`max_spread_pct: 0.10`) stays active. `tests/test_cc_stock_metrics_keys.py::TestCoveredCallOpenInterestFloorSuspended` pins the suspension to the hardcode: restoring the floor without sourcing OI fails CI, and sourcing OI without restoring the floor makes the test skip loudly.
+
+**Fix:** populate OI from `/v2/options/contracts` (carries `open_interest` + `open_interest_date`; one paged call per underlying, cacheable per day) and merge into the chain by OCC symbol; then restore `min_open_interest` on the CC profile (500 was a DD-3 starting value, never validated against real OI — re-derive from a day of real numbers), and give `no_liquidity` a real definition. Plan-driven: touches the chain contract both profiles read.
+
+### FC-098: `stock_metrics_error` ran on 100% of covered-call scans for a week with no alert — map structlog `level` to LogEntry severity, alert on CC scan-zero streaks
+
+**Scope:** shared (logging config, GCP alert policies, `covered-call-engine`)
+**Status:** Filed 2026-09-01 (PR #107 review)
+**Size estimate:** S
+**Owner:** zeshan
+
+**Problem:** the CC service logged `level=error` `stock_metrics_error` on every symbol-scan from 2026-08-24 to 08-31 (52/52). LogEntry `severity` was DEFAULT for all 52 (plain-text stdout; the FC-030 gotcha), so `severity>=ERROR` alerting saw nothing, and no policy matches `stock_metrics_error` or a `stage_8_complete_not_found` streak. A service that is *supposed* to trade and produces zero candidates for N consecutive scans is not distinguishable from a quiet day. Separately, `get_stock_metrics`'s broad `except Exception` files a config KeyError and a vendor outage under the same event, so even a reader of the logs could not tell "our config is wrong" from "Alpaca is down".
+
+**Fix:** (1) emit structured severity (the Cloud Run structured-log contract: a `severity` JSON field, or the logging agent's `jsonPayload.level` mapping) so `level=error` becomes `severity=ERROR`; (2) a log-match alert on `stock_metrics_error` (both services) and a CC-specific "N consecutive scans with `call_opportunities=0` while `positions_with_100_shares>0`" condition; (3) narrow the except in `get_stock_metrics` — let `KeyError`/`AttributeError` propagate (code/config defects) and keep the vendor-error path for API/network exceptions, with distinct `event_type`s.
+
+### FC-099: put-side STAGE 7 log line has the same unaccounted validation-failure bucket PR #107 fixed on the call side
+
+**Scope:** wheel (`src/api/market_data.py` `find_suitable_puts`)
+**Status:** Filed 2026-09-01 (PR #107 review)
+**Size estimate:** XS
+**Owner:** zeshan
+
+**Problem:** `find_suitable_puts` increments only `total_rejected` when `_validate_option_data` fails; its `rejection_stats` has no `data_validation_failed` bucket and the two STAGE 7 log lines under-sum `rejected=` by that amount, exactly the call-side defect that hid the covered-call OI problem. Masked today because the wheel's chains rarely fail validation.
+
+**Fix:** mirror the call-side change — add the bucket, increment it at the validation site, emit it on both STAGE 7 lines, and add a sum-invariant test (`sum(rejected_*) == rejected`) over the closed set of emitted put buckets.
+
 ---
 
 ## Completed

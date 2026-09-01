@@ -459,3 +459,164 @@ class TestTheRollProfile(_RollProfileFixture):
         with pytest.raises(ValueError, match='criteria_profile'):
             self.market_data.find_suitable_calls(
                 'NVDA', min_strike_price=100.0, criteria_profile='rol')
+
+
+# =========================================================================== #
+# STAGE 8 rejection-bucket completeness.
+#
+# The named buckets on the two STAGE 8 COMPLETE log lines are supposed to
+# account for `rejected=`. Three did not reach the log line:
+# `open_interest_too_low` and `spread_too_wide` (the covered-call inventory
+# criteria, which run LAST and so kill exactly the strikes that qualified on
+# everything else), and contracts dropped by `_validate_option_data`, which
+# incremented `total_rejected` under no named bucket at all. On 2026-08-28 the
+# emitted buckets summed ~114 (GOOGL) / ~86 (UNH) short of `rejected=` and the
+# shortfall was unattributable.
+#
+# The load-bearing assertion here is the SUM invariant.
+# =========================================================================== #
+
+class TestStage8RejectionBucketsAccountForRejected:
+    # `rejected_*` kwargs on the not-found line that are descriptive stats,
+    # not counts, and must be excluded from the sum.
+    NON_COUNT_KWARGS = {
+        'rejected_avg_premium',
+        'rejected_avg_delta',
+        'rejected_max_premium',
+        'rejected_dte_range',
+    }
+    EXPECTED_COUNT_KWARGS = {
+        'rejected_below_cost_basis',
+        'rejected_dte_too_high',
+        'rejected_premium_too_low',
+        'rejected_delta_out_of_range',
+        'rejected_no_liquidity',
+        'rejected_expires_into_earnings',
+        'rejected_expiry_beyond_horizon',
+        'rejected_open_interest_too_low',
+        'rejected_spread_too_wide',
+        'rejected_data_validation_failed',
+    }
+
+    def _cc_config(self):
+        config = Mock(spec=Config)
+        config.min_open_interest = 500        # universe.min_open_interest
+        config.max_spread_pct = 0.10          # universe.max_spread_pct
+        config.call_target_dte = 14
+        config.call_delta_range = [0.15, 0.25]
+        config.min_call_premium = 0.30
+        return config
+
+    def _chain(self):
+        expiry = TODAY + timedelta(days=7)
+
+        # Clears cost basis, DTE, premium, delta and the basic liquidity check;
+        # dies on the covered-call OI floor.
+        thin_oi = _call('NVDA260810C00200000', expiry, strike=200.0,
+                        delta=0.20, mid=1.00, dte=7)
+        thin_oi['volume'] = 100
+        thin_oi['open_interest'] = 100
+
+        # Same, but dies on the spread ceiling: 0.30 wide on a 1.00 mid = 30%.
+        wide_spread = _call('NVDA260810C00205000', expiry, strike=205.0,
+                            delta=0.20, mid=1.00, dte=7)
+        wide_spread['bid'] = 0.85
+        wide_spread['ask'] = 1.15
+
+        # Never reaches any criterion: `_validate_option_data` drops it.
+        no_delta = _call('NVDA260810C00210000', expiry, strike=210.0,
+                         delta=0.20, mid=1.00, dte=7)
+        del no_delta['delta']
+
+        return [thin_oi, wide_spread, no_delta]
+
+    def _stage8_kwargs(self, monkeypatch, event_type):
+        config = self._cc_config()
+        market_data = MarketDataManager(Mock(), config)
+        market_data.get_option_chain_with_analysis = Mock(
+            return_value={'puts': [], 'calls': self._chain()})
+
+        calls = []
+        fake_logger = Mock()
+        fake_logger.info.side_effect = lambda *a, **kw: calls.append(kw)
+        monkeypatch.setattr('src.api.market_data.logger', fake_logger)
+
+        results = market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+        assert results == []
+
+        matches = [kw for kw in calls if kw.get('event_type') == event_type]
+        assert len(matches) == 1, f"expected one {event_type} log line, got {len(matches)}"
+        return matches[0]
+
+    def test_not_found_line_carries_the_three_missing_buckets(self, monkeypatch):
+        kwargs = self._stage8_kwargs(monkeypatch, 'stage_8_complete_not_found')
+
+        assert kwargs['rejected_open_interest_too_low'] >= 1
+        assert kwargs['rejected_spread_too_wide'] >= 1
+        assert kwargs['rejected_data_validation_failed'] >= 1
+
+    def test_named_buckets_sum_to_rejected(self, monkeypatch):
+        """The invariant that was broken in production."""
+        kwargs = self._stage8_kwargs(monkeypatch, 'stage_8_complete_not_found')
+
+        count_keys = {
+            key for key in kwargs
+            if key.startswith('rejected_') and key not in self.NON_COUNT_KWARGS
+        }
+        # The closed set of buckets the STAGE 8 line must emit. A bucket added
+        # to `rejection_stats` but not emitted here would silently re-open the
+        # production gap this test exists for.
+        assert count_keys == self.EXPECTED_COUNT_KWARGS
+        bucket_total = sum(kwargs[key] for key in count_keys)
+        assert bucket_total == kwargs['rejected'] == 3
+
+    def test_validation_failure_reaches_the_decision_record_side_channel(self, monkeypatch):
+        """`OptionsScanner._call_rejection_counts` copies every non-zero,
+        non-`total_rejected` key, so the new bucket propagates automatically."""
+        config = self._cc_config()
+        market_data = MarketDataManager(Mock(), config)
+        market_data.get_option_chain_with_analysis = Mock(
+            return_value={'puts': [], 'calls': self._chain()})
+        market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+
+        stats = market_data.last_call_rejection_stats['NVDA']
+        assert stats['data_validation_failed'] == 1
+        assert stats['open_interest_too_low'] == 1
+        assert stats['spread_too_wide'] == 1
+        assert stats['total_rejected'] == 3
+
+    def test_found_line_carries_the_same_buckets(self, monkeypatch):
+        """Both STAGE 8 COMPLETE lines were missing them; both must carry them."""
+        config = self._cc_config()
+        market_data = MarketDataManager(Mock(), config)
+        # mid 2.00 keeps the helper's +/-0.05 quote inside the 10% spread
+        # ceiling (0.10/2.00 = 5%); at mid 1.00 it lands exactly on it and
+        # float error tips it over.
+        qualifying = _call('NVDA260810C00215000', TODAY + timedelta(days=7),
+                           strike=215.0, delta=0.20, mid=2.00, dte=7)
+        market_data.get_option_chain_with_analysis = Mock(
+            return_value={'puts': [], 'calls': self._chain() + [qualifying]})
+
+        calls = []
+        fake_logger = Mock()
+        fake_logger.info.side_effect = lambda *a, **kw: calls.append(kw)
+        monkeypatch.setattr('src.api.market_data.logger', fake_logger)
+
+        results = market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+        assert len(results) == 1
+
+        kwargs = next(kw for kw in calls
+                      if kw.get('event_type') == 'stage_8_complete_found')
+        assert kwargs['rejected_open_interest_too_low'] == 1
+        assert kwargs['rejected_spread_too_wide'] == 1
+        assert kwargs['rejected_data_validation_failed'] == 1
+        count_keys = {
+            key for key in kwargs
+            if key.startswith('rejected_') and key not in self.NON_COUNT_KWARGS
+        }
+        # The closed set of buckets the STAGE 8 line must emit. A bucket added
+        # to `rejection_stats` but not emitted here would silently re-open the
+        # production gap this test exists for.
+        assert count_keys == self.EXPECTED_COUNT_KWARGS
+        bucket_total = sum(kwargs[key] for key in count_keys)
+        assert bucket_total == kwargs['rejected'] == 3
