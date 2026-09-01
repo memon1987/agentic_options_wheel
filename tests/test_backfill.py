@@ -42,6 +42,7 @@ from src.backtesting.data.chain_builder import (
     UNIVERSE_DTE_BUFFER,
     ChainBuilder,
 )
+from src.backtesting.data.bar_store import last_settled_day
 from src.backtesting.data.chain_store import (
     MAX_CONSECUTIVE_LAKE_ERRORS,
     ChainStore,
@@ -136,10 +137,43 @@ def _weekdays(first: date, count: int):
     return out
 
 
+# The window every test in this file runs over. A FIXED anchor, not
+# `date.today() - N`, and that is load-bearing rather than tidiness.
+#
+# It was relative, and it broke the build. `test_a_split_on_the_windows_first_
+# day_is_still_seen` places its predecessor bars 8-10 days before `days[0]`, so
+# whether any of them fell inside the backfill's lookback depended on where the
+# weekend landed relative to `today`. It passed on 2026-08-31 (one predecessor
+# visible) and failed on 2026-09-01 (none) — same code, same test, different
+# day of the week. A test whose verdict is a function of the calendar tells you
+# nothing on the day it fails and, worse, nothing on the days it passes.
+#
+# 2026-03-02 is a Monday, so `days` is two clean Mon-Fri weeks with no holiday
+# in them, and it is permanently in the past — which the backfill requires
+# (`_is_cacheable` refuses to persist a session that is not settled, and
+# `run_backfill` clamps `end` to the last settled day). Tests about the clamp
+# itself still use `date.today()`, because there "today" is the subject.
+WINDOW_START = date(2026, 3, 2)
+
+
 @pytest.fixture
 def days():
-    """Ten settled weekday sessions, all safely in the past."""
-    return _weekdays(date.today() - timedelta(days=40), 10)
+    """Ten settled weekday sessions, fixed and safely in the past."""
+    return _weekdays(WINDOW_START, 10)
+
+
+def _future_window():
+    """A window entirely after the last settled session, `(start, end)`.
+
+    Derived from `last_settled_day()` — the seam `run_backfill` actually clamps
+    to — rather than from a second `date.today()` call. A test that reads the
+    clock and then relies on production reading the *same* clock is coupled to
+    the two reads landing on one calendar day, which is the coupling that took
+    the build down in the first place. The 30-day offset puts it beyond any
+    midnight rollover between the two calls as well.
+    """
+    settled = last_settled_day()
+    return settled + timedelta(days=30), settled + timedelta(days=36)
 
 
 @pytest.fixture
@@ -578,8 +612,19 @@ class TestSplits:
         Without the lookback the first day of every window is a blind spot, and
         the weekly window slides — so a split would be caught for three runs and
         missed on the fourth.
+
+        The predecessor sessions here sit **10-12 days** before the window on
+        purpose: outside the original 7-day lookback and inside the current
+        14-day one, so this test fails if the lookback is narrowed back. It is
+        also the shape that broke the build — under the 7-day fetch, whether any
+        predecessor was visible depended on the weekday `date.today()` happened
+        to be (it passed on a Monday run and failed on the Tuesday CI run).
         """
-        earlier = _weekdays(days[0] - timedelta(days=10), 4)[:3]
+        earlier = [days[0] - timedelta(days=n) for n in (12, 11, 10)]
+        assert all(d.weekday() < 5 for d in earlier), "premise: all sessions"
+        assert all(d < days[0] - timedelta(days=7) for d in earlier), (
+            "premise: every predecessor is outside the OLD 7-day lookback"
+        )
         prices = {d: 100.0 for d in earlier}
         prices.update({d: 10.0 for d in days})
         provider = LadderProvider(prices)
@@ -589,6 +634,51 @@ class TestSplits:
         assert summary.symbols[0].days_skipped_corporate_action == 1
         assert summary.symbols[0].errors == 0
         assert store.stored_window("XYZ", days[0]) is None
+
+    def test_only_the_last_session_before_the_window_is_the_predecessor(
+            self, tmp_path, days):
+        """Not "whatever bars the lookback happened to catch".
+
+        Two pre-window sessions, and the price moves ONLY between them — a
+        split that happened entirely before the window. The window's own first
+        day continues from the later of the two, so nothing inside the window
+        is a split and nothing is skipped. Comparing against the earlier bar
+        instead, or computing ratios across the whole fetched series, would
+        report a corporate action on a day the window does not contain.
+        """
+        prices = {days[0] - timedelta(days=11): 100.0,   # Thu
+                  days[0] - timedelta(days=10): 10.0}     # Fri, 10:1 overnight
+        prices.update({d: 10.0 for d in days})
+
+        summary = _run(LadderProvider(prices), _store(tmp_path, lake=FakeLake()),
+                       ["XYZ"], days[0], days[-1])
+        row = summary.symbols[0]
+        assert row.days_skipped_corporate_action == 0, (
+            "the split is before the window; no day inside it is affected"
+        )
+        assert row.days_written == len(days)
+        assert row.reconciles
+
+    def test_no_predecessor_at_all_is_reported_not_silent(
+            self, tmp_path, days, captured_backfill_events):
+        """The residual blind spot, at the very start of a symbol's history.
+
+        With no earlier session in the fetch there is nothing to compare the
+        first day against. The run proceeds — refusing would make the first
+        chunk of every widening unrunnable — but it says so, because an
+        undetectable split is exactly the kind of hole that is only ever found
+        months later.
+        """
+        summary = _run(LadderProvider({d: 100.0 for d in days}),
+                       _store(tmp_path, lake=FakeLake()), ["XYZ"],
+                       days[0], days[-1])
+        assert not summary.failed()
+
+        warned = [e for e in captured_backfill_events
+                  if e.get("event_type") == "backfill_no_split_predecessor"]
+        assert len(warned) == 1
+        assert warned[0]["as_of"] == days[0].isoformat()
+        assert warned[0]["lookback_days"] == 14
 
     def test_a_split_does_not_fail_the_run(self, tmp_path, days):
         """The alert-fatigue decision, pinned.
@@ -1017,8 +1107,7 @@ class TestDayLevelFailures:
         once, up front, rather than reported as fourteen broken symbols.
         """
         summary = _run(provider, _store(tmp_path, lake=FakeLake()), ["XYZ"],
-                       date.today() + timedelta(days=3),
-                       date.today() + timedelta(days=9))
+                       *_future_window())
         assert summary.symbols == []
         assert not summary.failed()
 
@@ -1052,16 +1141,23 @@ class TestWindowResolution:
 
     def test_end_is_clamped_to_the_last_settled_session(self, tmp_path, provider,
                                                         days):
-        """Today's chain is still forming; a run may not persist it."""
+        """Today's chain is still forming; a run may not persist it.
+
+        Asserted against `last_settled_day()` — the seam production actually
+        clamps to — rather than against a second `date.today()` call. Reading
+        the clock twice makes the test's verdict depend on the two reads
+        landing on the same calendar day, which is a race at midnight and, more
+        practically, the kind of coupling that makes a green suite a statement
+        about when it ran.
+        """
         summary = _run(provider, _store(tmp_path, lake=FakeLake()),
-                       ["XYZ"], days[0], date.today() + timedelta(days=5))
-        assert summary.end < date.today()
+                       ["XYZ"], days[0], last_settled_day() + timedelta(days=5))
+        assert summary.end == last_settled_day()
 
     def test_an_empty_window_does_nothing_rather_than_raising(self, tmp_path,
                                                               provider):
         summary = _run(provider, _store(tmp_path, lake=FakeLake()), ["XYZ"],
-                       date.today() + timedelta(days=3),
-                       date.today() + timedelta(days=9))
+                       *_future_window())
         assert summary.symbols == []
         assert summary.failed_symbols() == []
 

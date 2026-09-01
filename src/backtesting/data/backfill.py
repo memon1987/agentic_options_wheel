@@ -125,7 +125,17 @@ DEFAULT_HISTORY_DAYS = 30
 
 # Extra history fetched per symbol purely so a split on the window's first day
 # has a predecessor bar to be compared against. See `_backfill_symbol`.
-_SPLIT_CONTEXT = timedelta(days=7)
+#
+# Fourteen calendar days, not seven, and the reason is a guarantee rather than a
+# margin: seven days spans at most five sessions and can span as few as two
+# either side of a holiday-lengthened weekend, so "there will be a bar in there"
+# was a probabilistic claim about the calendar. Fourteen days contains a full
+# week of sessions even around Thanksgiving, Christmas/New Year and Independence
+# Day — the three stretches where the US market closes on a weekday adjacent to
+# a weekend. What is actually used is the LAST session before the window (see
+# `_backfill_symbol`); the extra span exists only so that session is reliably
+# inside the fetch.
+_SPLIT_CONTEXT = timedelta(days=14)
 
 
 # --------------------------------------------------------------------------- #
@@ -603,20 +613,41 @@ def _backfill_symbol(
     row = SymbolBackfill(symbol=symbol)
     t0 = time.perf_counter()
     try:
-        # One week of extra history, used ONLY for split detection: a
-        # split-sized move is a comparison between two adjacent sessions, so a
-        # split landing on the window's first day is invisible without a
-        # predecessor bar. The extra bars are never built into chains — the
-        # loop below skips anything outside [start, end] — and cost nothing:
-        # `CachedBarProvider` fetches the union of the request and what it
-        # already holds in one call either way.
+        # Extra history fetched ONLY for split detection: a split-sized move is
+        # a comparison between two adjacent sessions, so a split landing on the
+        # window's first day is invisible without a predecessor bar. The extra
+        # bars are never built into chains — only `in_window` is walked — and
+        # they cost nothing: `CachedBarProvider` fetches the union of the
+        # request and what it already holds in one call either way.
         bars = sorted(
             provider.get_stock_bars(symbol, start - _SPLIT_CONTEXT, end),
             key=lambda b: b.bar_date,
         )
-        splits = split_days(bars)
-        model = builder._model_fingerprint(symbol)
         in_window = [b for b in bars if start <= b.bar_date <= end]
+        preceding = [b for b in bars if b.bar_date < start]
+        # Exactly ONE predecessor: the last settled session before the window.
+        # Taking "whatever bars happen to fall in the lookback" made the
+        # comparison depend on how many sessions the preceding fortnight
+        # contained, which is a property of the calendar rather than of the
+        # data. It also computed ratios BETWEEN pre-window bars, whose split
+        # days are outside the window and can never be acted on.
+        split_series = (preceding[-1:] + in_window)
+        splits = split_days(split_series)
+        if not preceding and in_window:
+            # The residual blind spot, said out loud rather than left implicit:
+            # with no earlier session in the fetch there is nothing to compare
+            # the first day against, so a split exactly there would be missed.
+            # Reachable only at the very start of the vendor's history for a
+            # symbol; a widening chunk that begins mid-history always has one.
+            logger.warning(
+                "Backfill has no session before the window to detect a split "
+                "on its first day",
+                event_category="backtest_data",
+                event_type="backfill_no_split_predecessor",
+                symbol=symbol, as_of=in_window[0].bar_date.isoformat(),
+                lookback_days=_SPLIT_CONTEXT.days,
+            )
+        model = builder._model_fingerprint(symbol)
         if not in_window:
             # A symbol with no settled session in a non-empty window did not
             # "complete with nothing to do" — something is wrong with the
