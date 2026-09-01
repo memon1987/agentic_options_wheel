@@ -205,6 +205,14 @@ def _sweeps_schema():
         # result. See `find_done_sweep`.
         f("rows_persisted", "INTEGER"),
         f("error_cells", "INTEGER"),
+        # FC-096 A4. Symbols the FC-013 earnings gate could not gate because
+        # they are absent from the committed table — JSON array text, NULLABLE,
+        # NULL on every non-terminal row and on runs written before the column
+        # existed. Stored rather than re-derived because it is a property of the
+        # RUN's table snapshot, not of the spec: a symbol onboarded today and
+        # refreshed tomorrow would have the same spec and a different answer.
+        # Additive; `ensure_tables`' reconcile adds it to an existing table.
+        f("earnings_symbols_without_data", "STRING"),
         # `bq_writer.config_hash` — nine strategy keys plus the scoring
         # constants. Kept SEPARATE from `base_config_hash` (which is the hash of
         # the whole EFFECTIVE snapshot) because the two answer different
@@ -611,6 +619,7 @@ def status_row(
         "rows_persisted": rows_persisted,
         "error_cells": None,
         "engine_config_hash": engine_config_hash,
+        "earnings_symbols_without_data": None,
     }
 
     if result is not None:
@@ -636,6 +645,12 @@ def status_row(
                 1 for cell in (getattr(result, "rows", []) or [])
                 if getattr(cell, "error", None)),
         })
+        # FC-096 A4. `None` when the list is empty, not `"[]"`: "no gaps" and
+        # "this run predates the column" must not read alike, and a JSON `[]`
+        # in the column would claim the run checked and found nothing.
+        gaps = list(getattr(result, "earnings_symbols_without_data", None) or [])
+        row["earnings_symbols_without_data"] = (
+            json.dumps(gaps) if gaps else None)
     return row
 
 

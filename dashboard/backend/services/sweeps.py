@@ -665,6 +665,12 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any], sweep_key_value: str,
         "error_cells": None,
         # The API has no Config, so it cannot compute the engine hash either.
         "engine_config_hash": None,
+        # FC-096 A4. Only a replay knows which symbols the earnings table was
+        # missing; the API has run nothing. NULL here, filled by the Job's
+        # terminal row — but PRESENT, because every status row of a run must
+        # carry the same column set or the two writers diverge by whichever one
+        # happened to know a field.
+        "earnings_symbols_without_data": None,
     }
 
 
@@ -775,6 +781,24 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if status != STATUS_SUBMITTED:
         return False
     return now - stamp > timedelta(minutes=STUCK_AFTER_MINUTES)
+
+
+def _json_list(value: Any) -> List[str]:
+    """A stored JSON array of strings, or ``[]`` for anything unreadable.
+
+    Never raises and never 500s the results page: the column is NULL on every
+    run written before it existed, and a page that cannot render an old sweep is
+    worse than one that renders it without a caveat it never recorded.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return [str(v) for v in parsed] if isinstance(parsed, list) else []
 
 
 def _as_date_str(value: Any) -> Optional[str]:
@@ -1174,6 +1198,14 @@ def shape_results(sweep_row: Dict[str, Any],
     if effective_max_dte > DTE_REACH_BIAS_THRESHOLD:
         known_biases.append(DTE_REACH_BIAS)
 
+    # FC-096 A4. Read off the PERSISTED row, never re-derived: this is a
+    # property of the earnings table as it stood when the run replayed, and a
+    # symbol onboarded today and refreshed tomorrow has the same spec and a
+    # different answer. `[]` for a run that found no gaps AND for one written
+    # before the column existed — the two are indistinguishable downstream, so
+    # the page must not present an empty list as "checked, all clear".
+    earnings_gaps = _json_list(sweep_row.get("earnings_symbols_without_data"))
+
     return {
         "run": dict(sweep_row),
         "spec": spec,
@@ -1198,6 +1230,10 @@ def shape_results(sweep_row: Dict[str, Any],
         # Served so a reader can check the footer against its own input — the
         # CLI report carries the same field.
         "effective_max_dte": effective_max_dte,
+        # FC-096 A4. Symbols the FC-013 gate could not gate, because they are
+        # absent from the committed earnings table. Rendering it on `/sims` is
+        # Phase E; serving it now means the number exists to render.
+        "earnings_symbols_without_data": earnings_gaps,
         "cross_scenario_caveat": CROSS_SCENARIO_CAVEAT,
         "rejection_tally_caveat": TALLY_CAVEAT,
         "in_sample_banner": IN_SAMPLE_BANNER if in_sample_only else None,
@@ -1242,8 +1278,9 @@ def allowlist_payload() -> Dict[str, Any]:
 
     Rejections are served alongside the allowed keys, with their reasons. A form
     that only listed what is allowed teaches nothing; the reasons are the whole
-    value — "put_target_dte is not in the allowlist" tells an operator nothing,
-    "the cached chains store universe_dte=8" tells them what to do next.
+    value — "universe.min_open_interest is not in the allowlist" tells an
+    operator nothing, "the engine hardcodes open_interest to 0, so any floor
+    rejects every call" tells them what to do next.
     """
     return {
         "allowed": [{"key": key, "description": why}

@@ -27,9 +27,12 @@ const ALLOWLIST: SweepAllowlist = {
   ],
   rejected: [
     {
-      key: 'strategy.put_target_dte',
+      // A REAL rejection, kept real on purpose: DTE became sweepable in FC-096
+      // Phase A, and a fixture that goes on teaching the retired refusal is the
+      // first thing a reader checks and the first thing they find false.
+      key: 'universe.min_open_interest',
       reason:
-        'cached chains store universe_dte=8; a scenario needs a re-materialisation with a wider reach.',
+        'the engine has no open-interest data: get_options_chain hardcodes open_interest: 0, so any floor >= 1 rejects EVERY call.',
     },
   ],
   presets: [{ name: 'price_ceiling_800', overrides: { 'strategy.max_stock_price': 800 } }],
@@ -184,11 +187,11 @@ describe('validateSpec — arms', () => {
 
   it('refuses a rejected override key WITH THE RUNNER’S OWN REASON', () => {
     const v = validateSpec(
-      good({ scenarios: [{ name: 'dte_14', overrides: { 'strategy.put_target_dte': 14 } }] }),
+      good({ scenarios: [{ name: 'oi_1', overrides: { 'universe.min_open_interest': 1 } }] }),
     );
     expect(v.valid).toBe(false);
     // Verbatim, not a paraphrase: the reason is the actionable half.
-    expect(messages(v)).toContain('cached chains store universe_dte=8');
+    expect(messages(v)).toContain('hardcodes open_interest: 0');
   });
 
   it('refuses an unknown override key and names the allowlist', () => {
@@ -209,9 +212,9 @@ describe('checkOverrideKey', () => {
   });
 
   it('prefers the rejection reason over the generic not-allowed message', () => {
-    const verdict = checkOverrideKey('strategy.put_target_dte', ALLOWLIST);
+    const verdict = checkOverrideKey('universe.min_open_interest', ALLOWLIST);
     expect(verdict.ok).toBe(false);
-    expect((verdict as { reason: string }).reason).toContain('universe_dte=8');
+    expect((verdict as { reason: string }).reason).toContain('open_interest: 0');
   });
 });
 

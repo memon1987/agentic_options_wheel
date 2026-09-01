@@ -1814,3 +1814,112 @@ class TestTheFooterIsPerRun:
         shaped = self._shaped({"strategy.put_target_dte": 14})
         assert shaped["known_biases"] == rendered["known_biases"]
         assert shaped["effective_max_dte"] == rendered["effective_max_dte"]
+
+
+class TestTheEarningsGapsAreStoredAndServed:
+    """REVIEW: the PR claimed `earnings_symbols_without_data` reached the
+    dashboard. It did not — the runner computed it and only the CLI report ever
+    read it, so `/sims` was silent about a gate that never gated.
+
+    It is PERSISTED rather than re-derived on read, because it is a property of
+    the earnings table as it stood when the run replayed: the same spec, run
+    again after the table is refreshed, gives a different answer. A derivation
+    would report today's coverage against yesterday's numbers.
+    """
+
+    def test_the_done_row_carries_the_list_as_json(self):
+        sweep = _sample_sweep()
+        sweep.earnings_symbols_without_data = ["AAPL", "ZZZ"]
+        row = store.status_row(
+            run_id="r", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        assert json.loads(row["earnings_symbols_without_data"]) == ["AAPL", "ZZZ"]
+
+    def test_no_gaps_stores_NULL_not_an_empty_array(self):
+        """"No gaps" and "this run predates the column" are both absences here,
+        and neither is a claim. A stored `"[]"` would assert that the run
+        checked and found nothing — which a pre-column run did not do."""
+        sweep = _sample_sweep()
+        assert sweep.earnings_symbols_without_data == []
+        row = store.status_row(
+            run_id="r", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        assert row["earnings_symbols_without_data"] is None
+
+    def test_every_status_row_carries_the_column(self):
+        """The submitted/running rows must have it too, or the column set
+        diverges by writer and `TestTheSubmittedRowMatchesTheJobsRowShape`
+        stops meaning anything."""
+        row = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00")
+        assert "earnings_symbols_without_data" in row
+        assert row["earnings_symbols_without_data"] is None
+
+    def test_the_column_is_in_the_sweeps_schema_as_a_nullable_string(self):
+        field = next(
+            f for f in store._sweeps_schema()
+            if f.name == "earnings_symbols_without_data")
+        assert field.field_type == "STRING"
+        # NULLABLE: every pre-existing row has no value, and the additive
+        # reconcile can only add a nullable column to a live table.
+        assert (field.mode or "NULLABLE").upper() == "NULLABLE"
+
+    def test_shape_results_serves_it(self):
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done",
+            "earnings_symbols_without_data": json.dumps(["AAPL", "ZZZ"]),
+        }, [])
+        assert shaped["earnings_symbols_without_data"] == ["AAPL", "ZZZ"]
+
+    @pytest.mark.parametrize("stored", [
+        pytest.param(None, id="pre-column run"),
+        pytest.param("", id="empty string"),
+        pytest.param("not json", id="unparseable"),
+        pytest.param('{"a": 1}', id="json but not a list"),
+    ])
+    def test_an_absent_or_malformed_value_renders_as_empty_never_500s(self, stored):
+        """A page that cannot render a sweep from before the column existed is
+        worse than one that renders it without a caveat it never recorded."""
+        shaped = S.shape_results(
+            {"run_id": "r", "status": "done",
+             "earnings_symbols_without_data": stored}, [])
+        assert shaped["earnings_symbols_without_data"] == []
+
+    def test_it_survives_the_real_round_trip(self, shaped_and_engine):
+        """Through `rows_from_sweep`/`status_row` and out of `shape_results`,
+        rather than through a hand-written row that could agree with a wrong
+        implementation."""
+        _shaped, sweep, _rendered = shaped_and_engine
+        sweep.earnings_symbols_without_data = ["NVDA"]
+        row = store.status_row(
+            run_id="rid", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        shaped = S.shape_results(row, [])
+        assert shaped["earnings_symbols_without_data"] == ["NVDA"]
+        # ...and the CLI JSON says the same thing about the same run.
+        assert json.loads(engine_report.render_json(sweep))[
+            "earnings_symbols_without_data"] == ["NVDA"]
+        sweep.earnings_symbols_without_data = []
+
+
+class TestTheAllowlistProseDoesNotCiteARetiredRefusal:
+    """REVIEW: both allowlist docstrings taught the reader with
+    `put_target_dte` / `universe_dte=8` — a refusal that no longer exists. A
+    doc example that the code contradicts is worse than none: it is the first
+    thing a reader checks, and finding it false costs them trust in the rest."""
+
+    @pytest.mark.parametrize("obj", [
+        S.allowlist_payload,
+        pytest.param(None, id="router"),
+    ])
+    def test_no_docstring_cites_the_pre_pr2_dte_refusal(self, obj):
+        if obj is None:
+            import routers.v2 as v2_mod
+            doc = v2_mod.sweeps_allowlist.__doc__ or ""
+        else:
+            doc = obj.__doc__ or ""
+        assert "universe_dte=8" not in doc
+        assert "put_target_dte" not in doc
+        # ...and it still teaches with a REAL refusal, not a generic one.
+        assert "min_open_interest" in doc

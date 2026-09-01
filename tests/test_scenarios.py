@@ -27,8 +27,13 @@ from unittest.mock import patch
 
 import pytest
 
+from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
 from src.backtesting.data.chain_store import ChainStore
-from src.backtesting.engine.simulator import Simulator
+from src.backtesting.engine.simulator import (
+    Materialised,
+    Simulator,
+    narrow_to_dte,
+)
 from src.backtesting.metrics.fitness import MIN_DAYS_IN_POSITION
 from src.backtesting.scenarios import (
     ALLOWED_OVERRIDES,
@@ -1867,3 +1872,250 @@ class TestTheSweepHeaderSurfacesEarningsGaps:
         assert "earnings gate did not gate" not in render_markdown(result)
         assert json.loads(render_json(result))[
             "earnings_symbols_without_data"] == []
+
+
+class TestAnArmIsNotChangedByItsNeighbours:
+    """REVIEW HIGH (FC-096 PR-2). A sweep materialises once at the widest reach
+    any arm asks for. Once DTE became sweepable, that stopped being harmless.
+
+    **Entry selection is capped by the arm's own config; the ROLLER is not.**
+    `_check_call_criteria_detailed` treats `call_target_dte` as a hard ceiling,
+    but the roller's replacement search (`market_data.py`'s `'roll'` criteria
+    profile) is bounded by `old_expiry + rolling.max_extension_days` and by
+    nothing else, and it takes the maximum net credit among whatever it is
+    shown. So an unmasked arm sitting in a spec with a longer-DTE neighbour sees
+    roll candidates its own configuration could never have produced.
+
+    That makes the `base` row — the comparator every delta and the whole
+    sign-agreement column is measured against — depend on which OTHER arms
+    happen to share the spec, while `scenario_hash` and `config_hash` stay
+    byte-identical. Two sweeps whose stored rows disagree and whose identity
+    hashes agree is the worst shape this store can produce.
+
+    MUTATION CHECK: pass the sweep-wide `max_dte` to `_replay_one` instead of
+    `scenario_reaches[...]` and this test fails hard — measured on this fixture,
+    `base` moves option_pnl 843.33 -> 688.17, puts_sold 5 -> 3, calls_sold
+    2 -> 3, cycles_completed 5 -> 3.
+    """
+
+    @staticmethod
+    def _rolling_path():
+        """Down hard (the put assigns), then up hard (the call goes ITM).
+
+        The roller needs stock/strike >= `itm_trigger_ratio` (0.98) on a short
+        call to consider a roll at all, so a monotone slide never exercises it —
+        which is why the ordinary `two_symbols` fixture does not catch this.
+        """
+        warmup = _weekdays(date(2024, 3, 25), 45)
+        days = _weekdays(date(2024, 6, 3), 40)
+        closes = {d: 100.0 for d in warmup}
+        for i, d in enumerate(days):
+            closes[d] = 100.0 - i * 3.0 if i <= 9 else 73.0 + (i - 9) * 3.0
+        expirations = [d for d in days if d.weekday() == 4]
+        return days, _MultiSymbolProvider(
+            {"AAA": ScriptedProvider("AAA", closes, expirations)})
+
+    def _sweep(self, tmp_path, name, scenarios):
+        days, provider = self._rolling_path()
+        config = Config()
+        config._config["stocks"]["symbols"] = ["AAA"]
+        return run_sweep(
+            config, scenarios, ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path / name)), bar_provider=provider,
+            quiet_logs=True)
+
+    @staticmethod
+    def _rows(result, scenario):
+        out = []
+        for row in result.rows:
+            payload = row.as_dict()
+            payload.pop("replay_seconds", None)
+            if payload["scenario"] == scenario:
+                out.append(payload)
+        return out
+
+    def test_the_roller_is_live_on_this_fixture(self, tmp_path):
+        """Guard on the guard: if the roller stopped firing here (a config
+        change, a fixture drift) the identity assertion below would pass
+        vacuously and go on passing for ever."""
+        result = self._sweep(tmp_path, "guard", [])
+        assert result.rows[0].calls_sold, "fixture stopped writing calls"
+        assert not result.errors, [r.error for r in result.errors]
+
+    @pytest.mark.parametrize("neighbour", [
+        pytest.param({"strategy.put_target_dte": 21}, id="put-dte-21"),
+        pytest.param({"strategy.call_target_dte": 21}, id="call-dte-21"),
+    ])
+    def test_a_long_dte_neighbour_does_not_move_the_other_arms(
+            self, tmp_path, neighbour):
+        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
+        alone = self._sweep(tmp_path, "alone", [arm])
+        mixed = self._sweep(tmp_path, "mixed", [arm, Scenario("long", neighbour)])
+
+        assert alone.effective_max_dte == 7
+        assert mixed.effective_max_dte == 21, "the neighbour must widen the run"
+        for scenario in ("base", "x"):
+            assert self._rows(mixed, scenario) == self._rows(alone, scenario), (
+                f"arm '{scenario}' changed because a DTE-21 arm joined the spec"
+            )
+        assert mixed.scenario_hashes["x"] == alone.scenario_hashes["x"]
+        assert mixed.scenario_config_hashes["x"] == alone.scenario_config_hashes["x"]
+
+    def test_the_long_arm_still_sees_its_own_wider_chain(self, tmp_path):
+        """The mask must not be a blanket narrowing: the arm that ASKED for 21
+        has to get 21, or the knob measures nothing and this fix would have
+        traded one silent fiction for another."""
+        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
+        long_arm = Scenario("long", {"strategy.put_target_dte": 21})
+        mixed = self._sweep(tmp_path, "mixed2", [arm, long_arm])
+        long_rows = self._rows(mixed, "long")
+        assert long_rows and long_rows[0]["error"] is None
+        # A 21-DTE put target picks different contracts from a 7-DTE one, so the
+        # long arm must NOT come back as a copy of base.
+        assert long_rows != self._rows(mixed, "base")
+
+
+class TestNarrowToDte:
+    """The view itself: `simulator.narrow_to_dte`."""
+
+    @staticmethod
+    def _materialised(max_dte, dtes=(3, 7, 8, 14, 15, 21, 22)):
+        def quote(dte, kind):
+            return ChainQuote(
+                symbol=f"AAA-{kind}-{dte}", underlying="AAA", as_of=date(2024, 6, 3),
+                expiration=date(2024, 6, 3) + timedelta(days=dte), strike=100.0,
+                option_type=kind, dte=dte, underlying_price=100.0, mark=1.0,
+                bid=0.9, ask=1.1, implied_volatility=0.3, delta=0.2, volume=10)
+        snapshot = ChainSnapshot(
+            underlying="AAA", as_of=date(2024, 6, 3), underlying_price=100.0,
+            puts=[quote(d, "put") for d in dtes],
+            calls=[quote(d, "call") for d in dtes])
+        return Materialised(
+            symbols=["AAA"], start=date(2024, 6, 3), end=date(2024, 6, 28),
+            stock_bars={}, days=[date(2024, 6, 3)], anchors={},
+            chains={"AAA": {date(2024, 6, 3): snapshot}}, max_dte=max_dte)
+
+    def test_it_masks_to_the_reach_plus_the_universe_buffer(self):
+        """The same rule `ChainBuilder.build` fetches under and
+        `ChainStore._rows_to_quotes` re-applies on read, so a view is
+        indistinguishable from a chain materialised at that reach."""
+        view = narrow_to_dte(self._materialised(21), 7)
+        snapshot = view.chains["AAA"][date(2024, 6, 3)]
+        assert [q.dte for q in snapshot.puts] == [3, 7, 8]
+        assert [q.dte for q in snapshot.calls] == [3, 7, 8]
+        assert view.max_dte == 7
+
+    def test_a_no_op_mask_returns_the_INPUT_OBJECT(self):
+        """Identity, not equality. This is what keeps a homogeneous sweep
+        byte-identical to a pre-PR-2 one: no new object, no rebuilt list,
+        nothing to drift."""
+        materialised = self._materialised(7)
+        assert narrow_to_dte(materialised, 7) is materialised
+        assert narrow_to_dte(materialised, 21) is materialised
+
+    def test_the_source_is_never_mutated(self):
+        """`Materialised` is shared across every arm in the sweep; a view that
+        edited it would contaminate every later arm — the exact failure the
+        frozen dataclasses exist to prevent."""
+        materialised = self._materialised(21)
+        before = [q.dte for q in materialised.chains["AAA"][date(2024, 6, 3)].puts]
+        narrow_to_dte(materialised, 3)
+        after = [q.dte for q in materialised.chains["AAA"][date(2024, 6, 3)].puts]
+        assert before == after
+        assert materialised.max_dte == 21
+
+    def test_the_quotes_are_shared_not_copied(self):
+        """A view is cheap by construction: new snapshots, the SAME frozen
+        quotes. Copying them would make a 60-cell sweep pay for the chain twice
+        per arm."""
+        materialised = self._materialised(21)
+        original = materialised.chains["AAA"][date(2024, 6, 3)].puts[0]
+        view = narrow_to_dte(materialised, 7)
+        assert view.chains["AAA"][date(2024, 6, 3)].puts[0] is original
+
+    def test_everything_else_is_carried_across(self):
+        materialised = self._materialised(21)
+        view = narrow_to_dte(materialised, 7)
+        assert view.symbols == materialised.symbols
+        assert (view.start, view.end) == (materialised.start, materialised.end)
+        assert view.days == materialised.days
+        assert view.anchors == materialised.anchors
+        assert view.stock_bars is materialised.stock_bars
+
+
+class TestTheBaseConfigsCallLegCounts:
+    """REVIEW: `effective_max_dte` read only the base's PUT leg, so the
+    covered-call profile — which ships `call_target_dte: 14` and NO
+    `put_target_dte` at all — would have materialised at 7 and reported "no call
+    ever qualified" for every arm."""
+
+    def test_a_base_call_target_widens_the_run_with_no_dte_arm_present(self):
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        config = Config()
+        config._config["strategy"]["put_target_dte"] = 7
+        config._config["strategy"]["call_target_dte"] = 14
+        assert effective_max_dte(config, [Scenario("base")]) == 14
+
+    def test_a_profile_missing_put_target_dte_does_not_raise(self):
+        """`Config.put_target_dte` is a PROPERTY that indexes
+        `_config["strategy"]` directly, so an absent key raises `KeyError` from
+        inside it — and `getattr(config, key, default)` only swallows
+        `AttributeError`. This is the covered-call profile exactly."""
+        from src.backtesting.scenarios.runner import (
+            arm_max_dte, config_target_dte, effective_max_dte,
+        )
+
+        config = Config()
+        del config._config["strategy"]["put_target_dte"]
+        config._config["strategy"]["call_target_dte"] = 14
+
+        with pytest.raises(KeyError):
+            config.put_target_dte          # the hazard, stated
+
+        assert config_target_dte(config, "put") == 7
+        assert config_target_dte(config, "call") == 14
+        assert arm_max_dte(config) == 14
+        assert effective_max_dte(config, [Scenario("base")]) == 14
+
+    def test_the_shipped_covered_call_profile_is_the_case_this_protects(self):
+        """Read off the real file, not a fixture: if the profile's call target
+        moves, this test moves with it rather than pinning a stale 14."""
+        import yaml
+
+        with open("config/covered_call.yaml") as fh:
+            profile = yaml.safe_load(fh)
+        strategy = profile["strategy"]
+        assert "put_target_dte" not in strategy, (
+            "the profile grew a put target; the KeyError hazard above is now "
+            "unreachable, but config_target_dte must still tolerate it"
+        )
+        assert strategy["call_target_dte"] >= 7
+
+
+class TestTheThresholdTracksTheLiveConfig:
+    """REVIEW: `DTE_REACH_BIAS_THRESHOLD` is not a free constant.
+
+    Everything the footer says about fidelity — the ~7% put / ~32% call premium
+    shortfalls, the spread model's calibration — was measured at the LIVE DTE
+    target. The threshold is "the reach this engine was measured on", so the day
+    the live target moves, the caveat's premise moves with it and the wording
+    has to be re-argued. Failing loudly here is the point; this test lives
+    repo-side because the dashboard image has no `config/`.
+    """
+
+    def test_it_equals_the_wheel_profiles_put_target_dte(self):
+        import yaml
+
+        from src.backtesting.scenarios import report as engine_report
+
+        with open("config/settings.yaml") as fh:
+            settings = yaml.safe_load(fh)
+        live = settings["strategy"]["put_target_dte"]
+        assert engine_report.DTE_REACH_BIAS_THRESHOLD == live, (
+            f"config/settings.yaml now targets {live} DTE, but DTE_REACH_BIAS "
+            f"still claims the engine was measured at "
+            f"{engine_report.DTE_REACH_BIAS_THRESHOLD}. The caveat's numbers "
+            f"were measured at the old target — re-argue the wording, then move "
+            f"the constant (and its dashboard copy)."
+        )

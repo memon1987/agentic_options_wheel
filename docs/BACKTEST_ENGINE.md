@@ -606,31 +606,6 @@ pre-split engine.
 
 **Overrides are restricted to selection-only keys**, and the refusals carry their reason:
 
-**Both DTE targets are sweepable, within `1..MAX_SWEEPABLE_DTE` (21) — FC-096 Phase A.**
-`strategy.put_target_dte` used to be refused outright and `strategy.call_target_dte`
-allowed downward only, both because the stored chains reached 7-day DTE: a longer arm was
-not narrowed data but *absent* data, and it read as "no call ever qualified" rather than
-as a test of that reach. The weekly `data-backfill` Job now keeps the lake at
-`universe_dte = 22`, and `scenarios/runner.effective_max_dte` materialises each window at
-the **maximum** reach any arm asks for (both legs, plus the base config) — one number for
-`materialise()` and every `replay()`, because `Simulator.replay` asserts they agree.
-The bound is a property of the **data**, not a policy about the strategy, so it stays a
-constant in `overrides.py` and moves only when the lake does.
-
-Two consequences worth knowing:
-
-- **A DTE-7 sweep is unchanged by the widening.** The read path masks a stored chain to
-  the requested reach, so the same spec over an 8-reach and a 22-reach lake produces
-  identical rows and hashes — pinned by a regression test, because otherwise every stored
-  `scenario_runs` row would have quietly stopped being comparable with every new one.
-- **A run reaching past 7 DTE carries an extra footer caveat** (`DTE_REACH_BIAS`), on the
-  CLI report and on `/sims` alike. These are not extrapolated prices — a 14- or 21-DTE
-  quote is a real print with IV solved from that contract's own trade bar — but
-  longer-dated contracts trade thinly, the builder drops any contract with no trade that
-  day, and a hole in the ladder is indistinguishable from a strike that never existed.
-  That biases **selection**, not just precision. The spread model (FC-051) was also
-  measured on short-dated OTM puts only.
-
 | refused | why |
 |---|---|
 | `risk.profit_taking.*`, the stop-loss switches | `/monitor`-only; the replay's day loop never runs the monitor, so every arm would return an identical row — which reads as "this knob does not matter" |
@@ -645,6 +620,52 @@ Everything else on the list is in `src/backtesting/scenarios/overrides.py`
 (`ALLOWED_OVERRIDES`) and is reproduced in every report. The **fill haircut is a scenario
 field, not a config key** — `config_hash` hashes the module default, so two arms differing
 only in haircut would share a hash.
+
+### DTE is a sweepable knob (FC-096 Phase A)
+
+**Both DTE targets are sweepable, within `1..MAX_SWEEPABLE_DTE` (21).**
+`strategy.put_target_dte` used to be refused outright and `strategy.call_target_dte`
+allowed downward only, both because the stored chains reached 7-day DTE: a longer arm was
+not narrowed data but *absent* data, and it read as "no call ever qualified" rather than
+as a test of that reach. The weekly `data-backfill` Job now keeps the lake at
+`universe_dte = 22`. The bound is a property of the **data**, not a policy about the
+strategy, so it stays a constant in `overrides.py` and moves only when the lake does.
+
+**Materialise wide, replay narrow.** `scenarios/runner.effective_max_dte` builds each
+window at the **maximum** reach any arm asks for (both legs, plus the base config — the
+covered-call profile's base is already `call_target_dte: 14`). Each arm then replays
+against `simulator.narrow_to_dte(materialised, arm_reach)`, a view of that shared window
+masked back to its own reach, with its simulator built at the same number so
+`Simulator.replay`'s equality guard still holds.
+
+The second half is not an optimisation, it is a correctness requirement, and the reason is
+worth stating plainly: **entry selection is capped by the arm's own DTE target, and the
+roller is not.** `_check_call_criteria_detailed` treats `call_target_dte` as a hard
+ceiling, but the roller's replacement search (`market_data.py`'s `'roll'` criteria
+profile) is bounded by `old_expiry + rolling.max_extension_days` and by nothing else, and
+it takes the best net credit among whatever it is shown. Hand a 7-DTE arm a chain built
+for a 21-DTE neighbour and it rolls into contracts its own configuration could never have
+produced — so the `base` row, which every delta and the whole sign-agreement column is
+measured against, would change depending on which *other* arms shared the spec, while
+`scenario_hash` and `config_hash` stayed byte-identical. Measured on the regression
+fixture: `base` moved option P&L 843.33 → 688.17 and puts sold 5 → 3 purely by adding a
+DTE-21 arm.
+
+Two further things to know:
+
+- **A DTE-7 sweep is unchanged by the widening**, from either direction. The lake's read
+  path masks a stored chain to the requested reach, and the view masks a wider
+  materialisation back to the arm's — so the same spec produces identical rows and hashes
+  over an 8-reach and a 22-reach lake, and alone or beside a DTE-21 arm. Both are pinned
+  by regression tests, because otherwise every stored `scenario_runs` row would quietly
+  have stopped being comparable with every new one.
+- **A run reaching past 7 DTE carries an extra footer caveat** (`DTE_REACH_BIAS`), on the
+  CLI report and on `/sims` alike. These are not extrapolated prices — a 14- or 21-DTE
+  quote is a real print with IV solved from that contract's own trade bar — but
+  longer-dated contracts trade thinly, the builder drops any contract with no trade that
+  day, and a hole in the ladder is indistinguishable from a strike that never existed.
+  That biases **selection**, not just precision. The spread model (FC-051) was also
+  measured on short-dated OTM puts only.
 
 **One allowed key is direction-limited.** `risk.max_position_size` binds **downward
 only** until FC-079: the put sizer hardcodes one contract, so raising the cap cannot buy a

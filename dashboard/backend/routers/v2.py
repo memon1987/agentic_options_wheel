@@ -539,9 +539,10 @@ async def sweeps_allowlist() -> Dict[str, Any]:
 
     Served from the engine's own `overrides.py` (copied into this image), so the
     form cannot offer a key the Job would refuse. The refusals are served too:
-    "put_target_dte is not allowed" teaches nothing, "the cached chains store
-    universe_dte=8, so the arm would silently measure something else" tells the
-    operator what to do instead.
+    "universe.min_open_interest is not allowed" teaches nothing, "the engine
+    hardcodes open_interest to 0, so any floor rejects EVERY call and the arm
+    reads as a threshold that killed the call leg" tells the operator what to do
+    instead.
 
     Static — no BigQuery, no auth — so the page can render its form before any
     sweep has ever run.

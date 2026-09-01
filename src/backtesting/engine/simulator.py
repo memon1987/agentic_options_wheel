@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclasses_replace
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -67,7 +68,7 @@ from ...strategy.put_seller import PutSeller
 from ...strategy.wheel_engine import WheelEngine
 from ...strategy.wheel_state_manager import WheelStateManager
 from ...utils.config import Config
-from ..data.chain_builder import ChainBuilder, ChainSnapshot
+from ..data.chain_builder import UNIVERSE_DTE_BUFFER, ChainBuilder, ChainSnapshot
 from ..data.alpaca_provider import UnadjustedCorporateAction, detect_split
 from ..data.dividends import (
     DividendSchedule,
@@ -156,6 +157,73 @@ class Materialised:
     max_dte: int = 7
     built_at: Optional[datetime] = None
     model_fingerprints: Dict[str, str] = field(default_factory=dict)
+
+
+def narrow_to_dte(materialised: Materialised, max_dte: int) -> Materialised:
+    """A read-only VIEW of ``materialised`` masked to ``max_dte``.
+
+    FC-096 Phase A PR-2. A scenario sweep materialises once per (symbol,
+    window), at the widest reach any arm asks for — that is what makes it
+    affordable. Once DTE became sweepable, "widest" stopped being the same as
+    "what this arm asked for", and the difference is not cosmetic:
+
+    **Not every consumer of a chain is capped by the arm's own DTE target.** The
+    entry paths are — ``_check_call_criteria_detailed`` treats
+    ``call_target_dte`` as a hard ceiling — but the ROLLER is not. Its
+    replacement search (``market_data.py``'s ``'roll'`` criteria profile) is
+    bounded by ``old_expiry + rolling.max_extension_days``, never by
+    ``*_target_dte``, and it picks the maximum net credit among whatever it is
+    shown. So an arm replayed against a chain built for a LONGER arm sees roll
+    candidates that its own configuration would never have produced, and its
+    numbers move — measured: a ``base`` row went from 7 puts sold / $983 option
+    P&L to 6 / $956 purely by adding a DTE-21 arm to the same spec, with
+    ``scenario_hash`` and ``config_hash`` byte-identical either way. A sweep
+    whose comparator changes depending on which OTHER arms are present is not a
+    comparison.
+
+    So each arm replays against a view masked to its own reach, and
+    ``Simulator.replay``'s equality guard is satisfied by the view's own
+    ``max_dte`` rather than by the sweep-wide one.
+
+    The mask is ``dte <= max_dte + UNIVERSE_DTE_BUFFER`` — the same rule
+    ``ChainBuilder.build`` fetches under and ``ChainStore._rows_to_quotes``
+    re-applies on read, so a view is indistinguishable from a chain materialised
+    at that reach in the first place.
+
+    **Nothing is mutated, and nothing is copied that need not be.** ``Materialised``
+    and ``ChainSnapshot`` are frozen and shared across every arm; this builds new
+    snapshots holding the SAME ``ChainQuote`` objects (also frozen), and returns
+    the input object unchanged when the mask cannot remove anything. That
+    identity return is what keeps a homogeneous sweep byte-identical to a
+    pre-PR-2 one: no new object, no re-sorted list, nothing to drift.
+
+    Args:
+        materialised: the shared window. Never mutated.
+        max_dte: the arm's own reach.
+
+    Returns:
+        ``materialised`` itself when ``max_dte >= materialised.max_dte``
+        (a mask that removes nothing), otherwise a narrowed copy.
+    """
+    if max_dte >= materialised.max_dte:
+        return materialised
+    cutoff = max_dte + UNIVERSE_DTE_BUFFER
+    chains: Dict[str, Dict[date, ChainSnapshot]] = {}
+    for symbol, by_day in materialised.chains.items():
+        narrowed: Dict[date, ChainSnapshot] = {}
+        for as_of, snapshot in by_day.items():
+            narrowed[as_of] = ChainSnapshot(
+                underlying=snapshot.underlying,
+                as_of=snapshot.as_of,
+                underlying_price=snapshot.underlying_price,
+                # Order is preserved, not re-derived: the builder already sorted
+                # these by strike and a filter keeps ties in place, so a view
+                # cannot reorder a chain the arm would otherwise have seen.
+                puts=[q for q in snapshot.puts if q.dte <= cutoff],
+                calls=[q for q in snapshot.calls if q.dte <= cutoff],
+            )
+        chains[symbol] = narrowed
+    return dataclasses_replace(materialised, chains=chains, max_dte=max_dte)
 
 
 @dataclass

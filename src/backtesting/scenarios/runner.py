@@ -86,7 +86,7 @@ from ..data.bar_store import BarStore, CachedBarProvider
 from ..data.chain_builder import ChainBuilder
 from ..data.chain_store import ChainStore
 from ..data.dividends import load_default_schedule
-from ..engine.simulator import Materialised, Simulator
+from ..engine.simulator import Materialised, Simulator, narrow_to_dte
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
@@ -386,32 +386,68 @@ class _CountingProvider:
         return getattr(self._provider, name)
 
 
-def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
-    """The DTE reach every window in this sweep must be materialised to.
+#: The reach assumed for a DTE target a profile does not declare. The wheel
+#: profile ships 7 on both legs; the covered-call profile declares only
+#: `call_target_dte`, so reading its `put_target_dte` raises.
+DEFAULT_TARGET_DTE = 7
 
-    The MAXIMUM over the base config's ``put_target_dte`` and every arm's
-    ``put_target_dte`` / ``call_target_dte`` override — not the base value, and
-    not a per-arm value.
 
-    Two things this shape is load-bearing for:
+def config_target_dte(config, leg: str) -> int:
+    """``config.{leg}_target_dte``, or ``DEFAULT_TARGET_DTE`` when absent.
 
-    1. **A call-DTE arm has to be materialised too.** ``call_target_dte`` was
-       lowering-only before FC-096 Phase A, so a call arm could never need a
-       wider chain than the put target already bought. Now it can, and a DTE-14
-       call arm replayed against a 7-reach materialisation would report "no call
-       ever qualified" — the exact silent-fiction failure the allowlist exists to
-       prevent, arriving through the door that was just opened.
-    2. **One number, or the replays fail.** ``Simulator.replay`` asserts that the
-       ``Materialised`` it is handed agrees with its own ``max_dte``, so
-       materialise and every replay must be given the SAME value. Per-arm reach
-       would either trip that guard or, worse, require re-materialising per arm
-       and void the sweep's whole cost model.
-
-    The read path masks a stored chain to the requested reach, so materialising
-    wider than an arm asks for is not a change to that arm's inputs — pinned by
-    the 8-vs-22 identity regression in ``tests/test_scenarios.py``.
+    NOT ``getattr(config, key, default)``. ``Config``'s DTE accessors are
+    *properties* that index ``_config["strategy"]`` directly, so a profile
+    missing the key raises ``KeyError`` from inside the property — and
+    ``getattr``'s default only swallows ``AttributeError``. The covered-call
+    profile is exactly that case: it declares ``call_target_dte: 14`` and no
+    ``put_target_dte`` at all, so the three-argument ``getattr`` this replaced
+    would have raised on every covered-call sweep rather than falling back.
     """
-    reach = int(getattr(base_config, "put_target_dte", 7))
+    try:
+        value = getattr(config, f"{leg}_target_dte")
+    except (AttributeError, KeyError, TypeError):
+        return DEFAULT_TARGET_DTE
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TARGET_DTE
+
+
+def arm_max_dte(config) -> int:
+    """The reach ONE arm's own config needs: the max over its two DTE targets.
+
+    Both legs, because either one can be the longer: an arm overriding only
+    ``call_target_dte`` still needs calls that far out, and the covered-call
+    profile's base is already 14 on the call leg with no put leg at all.
+    """
+    return max(config_target_dte(config, "put"), config_target_dte(config, "call"))
+
+
+def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
+    """The DTE reach every window in this sweep is MATERIALISED to.
+
+    The MAXIMUM over the base config's ``put_target_dte`` AND ``call_target_dte``
+    and every arm's overrides of either. The base config's call leg counts: the
+    covered-call profile ships ``call_target_dte: 14``, so a sweep of that
+    profile with no DTE arm at all still needs a 14-reach materialisation.
+
+    **This is the materialisation reach, not what any one arm sees.** Each arm
+    replays against a view of the shared window masked back to its OWN reach
+    (``arm_max_dte`` -> ``simulator.narrow_to_dte``), because not every consumer
+    of a chain is capped by the arm's DTE target — the roller's replacement
+    search is bounded by ``old_expiry + rolling.max_extension_days`` and by
+    nothing else, so an unmasked arm would see roll candidates its own config
+    could never have produced, and its numbers would depend on which OTHER arms
+    shared the spec. Materialise wide, replay narrow.
+
+    A call-DTE arm has to be counted here or it is not materialised at all and
+    reads as "no call ever qualified" — the silent-fiction failure the allowlist
+    exists to prevent, arriving through the door PR-2 opens.
+    """
+    reach = max(
+        config_target_dte(base_config, "put"),
+        config_target_dte(base_config, "call"),
+    )
     for scenario in scenarios:
         for key in DTE_OVERRIDE_KEYS:
             value = scenario.overrides.get(key)
@@ -560,6 +596,13 @@ def run_sweep(
     scenario_configs: Dict[str, Config] = {
         s.name: apply_overrides(base_config, s.overrides) for s in scenarios
     }
+    # Each arm's OWN reach, read off its resolved config rather than off its
+    # overrides: an arm that overrides neither leg still inherits the base
+    # profile's targets, and the covered-call profile's base call leg is 14.
+    scenario_reaches: Dict[str, int] = {
+        name: min(arm_max_dte(cfg), max_dte)
+        for name, cfg in scenario_configs.items()
+    }
     result = SweepResult(
         scenarios=[s.name for s in scenarios],
         symbols=list(symbols),
@@ -631,6 +674,10 @@ def run_sweep(
 
             io_before_replays = _io_signature(fetch_counter, provider)
             by_method_before = dict(fetch_counter.by_method)
+            # One masked view per distinct reach, not per arm: ten arms at the
+            # sweep-wide reach share one object (which `narrow_to_dte` returns
+            # as the input itself), and a mixed spec pays for the mask once.
+            views: Dict[int, Materialised] = {}
             with quiet_strategy_logs(quiet_logs):
                 for scenario in scenarios:
                     row = _replay_one(
@@ -641,10 +688,12 @@ def run_sweep(
                         provider=provider, builder=builder,
                         symbol=symbol, window=window,
                         materialised=materialised,
-                        starting_cash=starting_cash, max_dte=max_dte,
+                        starting_cash=starting_cash,
+                        max_dte=scenario_reaches[scenario.name],
                         dividends=dividends,
                         run_sensitivity=run_sensitivity,
                         earnings_gaps=earnings_gaps,
+                        views=views,
                     )
                     result.rows.append(row)
                     rkey = f"{scenario.name}:{symbol}:{split}"
@@ -769,16 +818,20 @@ def _materialise_window(
     ``max_dte`` is NOT the base config's ``put_target_dte``: since FC-096 Phase A
     both DTE targets are allowlisted, so the caller passes
     ``effective_max_dte(base_config, scenarios)`` — the max over the base and
-    every arm — and the same number goes to every replay. No other allowed
-    override touches chain reach or the strike window, so with the reach settled
-    this way any scenario's materialisation would be byte-identical to this one.
+    every arm. No other allowed override touches chain reach or the strike
+    window, so with the reach settled this way any scenario's materialisation
+    would be byte-identical to this one.
 
-    Materialising WIDER than an arm asks for does not change that arm's inputs:
-    the read path masks a stored chain to the requested reach (pinned by the
-    8-vs-22 identity regression). ``Simulator.replay`` re-checks the
-    universe/window/DTE agreement per scenario, so if that ever stops being true
-    the sweep fails loudly instead of replaying against chains that do not cover
-    it.
+    **Materialising wider than an arm asks for DOES change that arm's inputs, so
+    the widening is undone at replay.** What is capped by the arm's own config is
+    entry selection (``_check_call_criteria_detailed`` treats ``call_target_dte``
+    as a hard ceiling). What is NOT capped by it is the roller, whose replacement
+    search is bounded by ``old_expiry + rolling.max_extension_days`` alone — so a
+    wider chain hands it candidates the arm could never have produced. Each arm
+    therefore replays against ``narrow_to_dte(materialised, arm_reach)`` and its
+    simulator is built at that same reach; ``Simulator.replay`` re-checks the
+    universe/window/DTE agreement, so a mismatch fails loudly rather than
+    replaying against chains that do not match the request.
     """
     return _simulator(
         base_config, provider, builder, symbol, start, end,
@@ -792,7 +845,21 @@ def _replay_one(
     builder, symbol: str, window: Tuple[str, date, date],
     materialised: Materialised, starting_cash: float, max_dte: int, dividends,
     run_sensitivity: bool, earnings_gaps: Optional[set] = None,
+    views: Optional[Dict[int, Materialised]] = None,
 ) -> ScenarioResult:
+    """Replay ONE arm against a view of the shared window masked to its reach.
+
+    ``max_dte`` here is the ARM's reach, not the sweep's. The window was
+    materialised at the widest reach any arm asked for; handing that object to a
+    shorter arm would show it contracts its own config could never have selected
+    — harmless for the entry paths, which cap at ``*_target_dte``, and NOT
+    harmless for the roller, whose replacement search is bounded only by
+    ``rolling.max_extension_days``. See ``simulator.narrow_to_dte``.
+
+    ``views`` is an optional per-window cache keyed by reach, so N arms at one
+    reach mask once rather than N times. An arm at the sweep-wide reach gets the
+    shared object back unchanged.
+    """
     split, w_start, w_end = window
     haircut = (
         DEFAULT_FILL_HAIRCUT if scenario.fill_haircut is None
@@ -801,11 +868,17 @@ def _replay_one(
     t0 = time.perf_counter()
     try:
         bars = materialised.stock_bars.get(symbol, [])
+        if views is None:
+            view = narrow_to_dte(materialised, max_dte)
+        else:
+            if max_dte not in views:
+                views[max_dte] = narrow_to_dte(materialised, max_dte)
+            view = views[max_dte]
         result = _simulator(
             config, provider, builder, symbol, w_start, w_end,
             starting_cash=starting_cash, max_dte=max_dte,
             fill_haircut=haircut, dividends=dividends,
-        ).replay(materialised)
+        ).replay(view)
         # FC-096 A4. The single-symbol report surfaces this; a sweep did not, so
         # a candidate sweep said nothing at all about a symbol its earnings gate
         # never gated. Unioned across arms because the gap is a property of the
@@ -820,7 +893,7 @@ def _replay_one(
                 config, provider, builder, symbol, w_start, w_end,
                 starting_cash=starting_cash, max_dte=max_dte,
                 fill_haircut=BID_FILL_HAIRCUT, dividends=dividends,
-            ).replay(materialised)
+            ).replay(view)
             bid_report = _score(symbol, bid_result, bars, starting_cash, dividends)
             sensitivity = {
                 "mid_haircut": haircut,

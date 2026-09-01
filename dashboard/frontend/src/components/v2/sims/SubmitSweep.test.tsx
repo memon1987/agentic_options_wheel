@@ -14,7 +14,15 @@ import type { SweepAllowlist } from '../../../types/v2';
 
 const ALLOWLIST: SweepAllowlist = {
   allowed: [{ key: 'strategy.put_delta_range', description: 'put delta band [lo, hi]' }],
-  rejected: [{ key: 'strategy.put_target_dte', reason: 'cached chains store universe_dte=8.' }],
+  // A REAL rejection: DTE became sweepable in FC-096 Phase A, and a fixture
+  // that goes on teaching the retired refusal is the first thing a reader
+  // checks and the first thing they find false.
+  rejected: [
+    {
+      key: 'universe.min_open_interest',
+      reason: 'the engine hardcodes open_interest: 0, so any floor rejects EVERY call.',
+    },
+  ],
   presets: [{ name: 'puts_15_25', overrides: { 'strategy.put_delta_range': [0.15, 0.25] } }],
   caps: {
     max_symbols: 12,
@@ -171,8 +179,8 @@ describe('SubmitSweep — cap violations and rejected keys are shown, not swallo
 
   it("quotes the runner's reason for a rejected override key", () => {
     setup();
-    setArms('[{"name":"dte","overrides":{"strategy.put_target_dte":14}}]');
-    expect(screen.getByText(/cached chains store universe_dte=8/)).toBeInTheDocument();
+    setArms('[{"name":"oi","overrides":{"universe.min_open_interest":1}}]');
+    expect(screen.getByText(/hardcodes open_interest: 0/)).toBeInTheDocument();
     expect(submitButton()).toBeDisabled();
   });
 
@@ -256,7 +264,7 @@ describe("SubmitSweep — the server's answer is shown verbatim", () => {
   });
 
   it('shows a 422 reason unaltered', async () => {
-    const reason = 'strategy.put_target_dte — cached chains store universe_dte=8.';
+    const reason = 'universe.min_open_interest — the engine hardcodes open_interest: 0.';
     fetchMock.mockResolvedValue(response(422, { detail: reason }));
     setup();
     fill();
