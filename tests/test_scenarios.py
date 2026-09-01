@@ -1935,12 +1935,50 @@ class TestAnArmIsNotChangedByItsNeighbours:
         return out
 
     def test_the_roller_is_live_on_this_fixture(self, tmp_path):
-        """Guard on the guard: if the roller stopped firing here (a config
-        change, a fixture drift) the identity assertion below would pass
-        vacuously and go on passing for ever."""
+        """Guard on the guard, and it has to assert the ROLLER specifically.
+
+        The defect below is reachable only through the roller — it is the one
+        chain consumer not capped by the arm's own DTE target. So this must
+        assert the roller was EVALUATED, not merely that the wheel wrote calls:
+        a fixture whose price path stopped crossing `itm_trigger_ratio` (0.98)
+        would still sell calls, still pass a `calls_sold` check, and leave
+        `TestAnArmIsNotChangedByItsNeighbours` passing vacuously for ever.
+
+        `rolls_evaluated`, not `rolls_executed`: this roller is credit-only and
+        declines most of what it looks at. Measured on this fixture, the short
+        arms evaluate 12 rolls and execute 0, while the long arm evaluates 22
+        and executes 1 — so an `executed > 0` assertion would be flaky on
+        exactly the arms the identity test compares.
+        """
         result = self._sweep(tmp_path, "guard", [])
-        assert result.rows[0].calls_sold, "fixture stopped writing calls"
         assert not result.errors, [r.error for r in result.errors]
+        base = result.rows[0]
+        assert base.calls_sold, "fixture stopped writing calls"
+        assert base.rolls_evaluated and base.rolls_evaluated > 0, (
+            "the roller evaluated nothing on this fixture, so the mixed-spec "
+            "identity test below can no longer detect the defect it exists for "
+            "— the price path has stopped crossing rolling.itm_trigger_ratio"
+        )
+
+    def test_the_roll_counts_are_not_persisted_in_this_pr(self, tmp_path):
+        """`rolls_evaluated` / `rolls_executed` live on the dataclass ONLY.
+
+        `rows_from_sweep` writes an explicit column list, so exposing them here
+        adds no `scenario_runs` column — which is the point: this PR is the DTE
+        knob, and a schema change belongs to the PR that needs it. Phase E's
+        console wants roll counts; that is when the column gets argued.
+        """
+        from src.backtesting.scenarios import persist as store
+
+        result = self._sweep(tmp_path, "nopersist", [])
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-01T12:00:00+00:00",
+            engine_version="v")
+        assert rows
+        assert "rolls_evaluated" not in rows[0]
+        assert "rolls_executed" not in rows[0]
+        assert not any(
+            f.name.startswith("rolls_") for f in store._runs_schema())
 
     @pytest.mark.parametrize("neighbour", [
         pytest.param({"strategy.put_target_dte": 21}, id="put-dte-21"),

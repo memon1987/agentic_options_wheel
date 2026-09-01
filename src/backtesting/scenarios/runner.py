@@ -208,6 +208,21 @@ class ScenarioResult:
     days_in_position_fraction: Optional[float] = None
     bid_fill_return: Optional[float] = None
     verdict_flips_on_fill: Optional[bool] = None
+    # FC-078 roller activity for THIS cell, off the replay's own
+    # `SimulationResult`. `evaluated` counts ITM-trigger hits the roller looked
+    # at; `executed` counts rolls it actually placed, and the two are far apart
+    # in practice (a credit-only roller declines most of what it evaluates), so
+    # reporting only the second reads as "the roller never ran".
+    #
+    # Deliberately NOT persisted: `rows_from_sweep` writes an explicit column
+    # list, so these stay in-process and add no `scenario_runs` column. Phase E
+    # wants roll counts on the console — that is when the column gets added,
+    # with the schema change argued on its own.
+    #
+    # `None`, never 0, on an errored cell: "the roller evaluated nothing" and
+    # "this cell was never measured" are different statements.
+    rolls_evaluated: Optional[int] = None
+    rolls_executed: Optional[int] = None
     replay_seconds: Optional[float] = None
     error: Optional[str] = None
 
@@ -481,7 +496,8 @@ def _windows(
 def _row_from_report(
     *, scenario: str, symbol: str, window: Tuple[str, date, date],
     cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
-    seconds: float,
+    seconds: float, rolls_evaluated: Optional[int] = None,
+    rolls_executed: Optional[int] = None,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
@@ -513,6 +529,11 @@ def _row_from_report(
         days_in_position_fraction=report.days_in_position_fraction,
         bid_fill_return=(sensitivity or {}).get("bid_return"),
         verdict_flips_on_fill=(sensitivity or {}).get("verdict_flips"),
+        # From the MID replay, not the bid-sensitivity one: the row's other
+        # numbers all describe that replay, and mixing the two would make the
+        # roll counts describe a run nothing else on the row came from.
+        rolls_evaluated=rolls_evaluated,
+        rolls_executed=rolls_executed,
         replay_seconds=round(seconds, 3),
     )
 
@@ -909,6 +930,8 @@ def _replay_one(
             cfg_hash=cfg_hash, scenario_hash=scenario_hash,
             report=report, sensitivity=sensitivity,
             seconds=time.perf_counter() - t0,
+            rolls_evaluated=result.rolls_evaluated,
+            rolls_executed=result.rolls_executed,
         )
     except Exception as exc:  # noqa: BLE001 - one arm must not lose the others
         message = _describe(exc)
