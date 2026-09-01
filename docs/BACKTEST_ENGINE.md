@@ -586,6 +586,29 @@ report names the dataset, the `run_id` and the `sweep_key`, and the JSON carries
 only when the cell rows actually landed; a sweep whose insert failed is `failed`, and
 the CLI exits non-zero rather than printing a "Stored as" line that points at nothing.
 
+**Every persisted cell also writes a detail artifact** (FC-096 Phase B). A
+`scenario_runs` row is ~30 numbers; the replay behind it held the daily equity curve,
+the full broker ledger, the wheel cycles those events reconstruct into, the roll records
+and the rejection tally, and all of it used to be discarded after aggregation. Each
+non-errored cell of a persisting run now also gzips one JSON object to
+`gs://<bucket>/sim-artifacts/v1/<run_id>/<scenario>__<symbol>__<split>.json.gz`,
+readable through `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}`.
+Four properties are worth knowing before reading one:
+
+* it stamps **the fill assumption of the serialised replay** (always mid, plus the arm's
+  haircut). The row's `bid_fill_return` comes from a bid replay that deliberately gets
+  no artifact, and the stamp is what keeps the pair honest;
+* it stamps **the arm's own masked DTE reach**, never the sweep-wide materialisation
+  reach — each arm replays against a view masked to its own reach (see
+  `simulator.narrow_to_dte`), so the parent's number would describe a chain the cell
+  never saw;
+* the write is **best effort**: a GCS failure logs `sim_artifact_write_failed`, is
+  counted, and never fails a cell. The terminal status row carries
+  `artifacts_complete` = (artifacts == non-errored cells);
+* **no `--persist`, no writes anywhere** — no rows, no objects, and no GCS client is
+  even constructed. Set `SIM_ARTIFACT_BUCKET=""` to turn artifacts off while keeping
+  BigQuery persistence.
+
 **`force: true`** in a spec skips the Job's dedup lookup — the only one that decides
 anything — for re-running a question whose answer you no longer trust; it suppresses the
 API's informational hint with it. It is excluded from `sweep_key`, so a forced run stays

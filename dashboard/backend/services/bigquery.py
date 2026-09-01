@@ -1842,39 +1842,56 @@ class BigQueryService:
         A submit before the first Job run therefore fails loudly rather than
         creating a table with half a schema.
 
-        **The one exception is the ``engine_identity`` column** (FC-096 Phase B):
-        a dataset that has not been migrated yet rejects the whole request over
-        one unknown key, which would make every submit fail — including a
-        ``force`` submit, which never touches the hint path. The insert is
-        retried once without that field, loudly. It is still not schema
-        ownership: the row simply lands without a stamp the table cannot hold.
+        **The one exception is an ADDITIVE column the table does not have yet**
+        (``sweeps.ADDITIVE_OPTIONAL_COLUMNS``: ``engine_identity`` from FC-096
+        Phase B PR-a, ``artifacts_complete`` from PR-b). An un-migrated dataset
+        rejects the whole request over one unknown key, which would make every
+        submit fail — including a ``force`` submit, which never touches the hint
+        path. The insert is retried without that field, loudly, one column at a
+        time. It is still not schema ownership: the row simply lands without a
+        stamp the table cannot hold.
         """
-        from services.sweeps import (mentions_missing_identity_column,
-                                     note_identity_insert_degraded)
+        from services.sweeps import (ADDITIVE_OPTIONAL_COLUMNS,
+                                     missing_optional_column,
+                                     note_optional_column_insert_degraded)
 
         table = f"{self.dataset}.scenario_sweeps"
-        try:
-            errors = self.client.insert_rows_json(table, [row])
-        except Exception as exc:  # noqa: BLE001
-            # `insert_rows_json` REPORTS per-row problems as a return value and
-            # RAISES request-level ones; an unknown field has been seen as both,
-            # so both shapes reach the same check below.
-            if not mentions_missing_identity_column(exc):
-                raise
-            errors = [{"errors": [{"message": str(exc)}]}]
 
-        if errors and mentions_missing_identity_column(errors):
-            # ONE retry, without the single field the table does not have yet.
-            # `insert_rows_json` rejects the WHOLE request on an unknown key, so
-            # the real choice is a complete row or NO row — and no row means an
-            # invisible sweep: the dashboard cannot show it, the dedup cannot
-            # find it, and the one-at-a-time gate never counts it. A row missing
-            # the stamp is strictly better; the Job's own rows carry the value
-            # once the column exists, and readers take the latest row per run.
-            note_identity_insert_degraded(errors)
-            retry = {k: v for k, v in row.items() if k != "engine_identity"}
-            if len(retry) != len(row):
-                errors = self.client.insert_rows_json(table, [retry])
+        def _insert(payload):
+            """One attempt, with both wire shapes normalised to an error list.
+
+            ``insert_rows_json`` REPORTS per-row problems as a return value and
+            RAISES request-level ones; an unknown field has been seen as both.
+            Anything that is NOT one of our additive columns still propagates.
+            """
+            try:
+                return self.client.insert_rows_json(table, [payload])
+            except Exception as exc:  # noqa: BLE001
+                if missing_optional_column(exc) is None:
+                    raise
+                return [{"errors": [{"message": str(exc)}]}]
+
+        errors = _insert(row)
+        # At most one retry PER additive column, and every retry must actually
+        # remove something — which is what stops a table that keeps naming a
+        # field the row no longer carries from spinning. `insert_rows_json`
+        # rejects the WHOLE request on an unknown key, so the real choice is a
+        # narrowed row or NO row, and no row means an invisible sweep: the
+        # dashboard cannot show it, the dedup cannot find it, and the
+        # one-at-a-time gate never counts it. The Job's own rows carry the
+        # values once the columns exist, and readers take the latest row per run.
+        for _attempt in range(len(ADDITIVE_OPTIONAL_COLUMNS)):
+            if not errors:
+                break
+            column = missing_optional_column(errors)
+            if column is None:
+                break
+            note_optional_column_insert_degraded(column, errors)
+            retry = {k: v for k, v in row.items() if k != column}
+            if len(retry) == len(row):
+                break
+            row = retry
+            errors = _insert(row)
 
         if errors:
             raise Exception(f"scenario_sweeps insert failed: {str(errors)[:400]}")

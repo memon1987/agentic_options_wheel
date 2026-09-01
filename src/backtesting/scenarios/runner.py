@@ -75,7 +75,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import structlog
 
@@ -550,6 +550,9 @@ def run_sweep(
     chain_store: Optional[ChainStore] = None,
     bar_provider: Optional[object] = None,
     quiet_logs: bool = True,
+    artifact_sink: Optional[Callable[[dict], None]] = None,
+    run_id: Optional[str] = None,
+    engine_identity: Optional[str] = None,
 ) -> SweepResult:
     """Replay every scenario over every symbol, materialising each window once.
 
@@ -568,6 +571,17 @@ def run_sweep(
             and the flip flag matters most on the arm you finally choose.
         chain_store / bar_provider: injected by tests and by the CLI.
         quiet_logs: silence the strategy loggers below WARNING during replays.
+        artifact_sink: optional callable handed one ``cell_artifact`` dict per
+            successfully-replayed cell (FC-096 Phase B B2). It is called LAST —
+            after the row is fully built, the bid-sensitivity pass included — in
+            its own ``try``: a sink that raises logs and is otherwise ignored,
+            because a cell's evidence failing to store must never fail the cell.
+            An ERRORED cell never calls it, which is what makes
+            "artifact count == non-error cell count" a meaningful completeness
+            check on the terminal status row.
+        run_id / engine_identity: provenance stamped into each artifact. Pure
+            pass-through — nothing in the replay reads them — and both default to
+            ``None`` so a caller that wants no artifacts passes nothing at all.
 
     Raises:
         OverrideError: from the up-front validation pass, before any replay
@@ -714,6 +728,10 @@ def run_sweep(
                         run_sensitivity=run_sensitivity,
                         earnings_gaps=earnings_gaps,
                         views=views,
+                        artifact_sink=artifact_sink,
+                        run_id=run_id,
+                        engine_identity=engine_identity,
+                        sweep_max_dte=max_dte,
                     )
                     result.rows.append(row)
                     rkey = f"{scenario.name}:{symbol}:{split}"
@@ -866,6 +884,10 @@ def _replay_one(
     materialised: Materialised, starting_cash: float, max_dte: int, dividends,
     run_sensitivity: bool, earnings_gaps: Optional[set] = None,
     views: Optional[Dict[int, Materialised]] = None,
+    artifact_sink: Optional[Callable[[dict], None]] = None,
+    run_id: Optional[str] = None,
+    engine_identity: Optional[str] = None,
+    sweep_max_dte: Optional[int] = None,
 ) -> ScenarioResult:
     """Replay ONE arm against a view of the shared window masked to its reach.
 
@@ -879,6 +901,22 @@ def _replay_one(
     ``views`` is an optional per-window cache keyed by reach, so N arms at one
     reach mask once rather than N times. An arm at the sweep-wide reach gets the
     shared object back unchanged.
+
+    ``artifact_sink`` (FC-096 Phase B B2) is called ONCE, LAST, with this cell's
+    detail artifact — after the row exists, so the sink can never observe a
+    half-built cell, and after the bid-sensitivity replay, so it cannot be
+    mistaken for a hook that runs mid-cell. Only the MID replay is serialised:
+    the bid replay produces one scalar for the row and gets no artifact, and the
+    artifact's ``fill`` stamp is what keeps that pair honest. Three failure
+    modes are separated deliberately:
+
+    * the sink raises  -> logged as ``sim_artifact_write_failed``, row returned
+      normally. Evidence is not a result.
+    * the replay raises -> the ``except`` below returns an error row and the
+      sink is NEVER called, which is what makes the caller's
+      ``artifacts_complete`` arithmetic (artifacts == non-error cells) true.
+    * building the artifact itself raises -> same as the first case; it is
+      inside the same guarded block, so a serialiser bug cannot cost a run.
     """
     split, w_start, w_end = window
     haircut = (
@@ -924,7 +962,7 @@ def _replay_one(
                 "verdict_flips": report.verdict() != bid_report.verdict(),
                 "return_delta": bid_report.total_return - report.total_return,
             }
-        return _row_from_report(
+        row = _row_from_report(
             scenario=scenario.name, symbol=symbol, window=window,
             cfg_hash=cfg_hash, scenario_hash=scenario_hash,
             report=report, sensitivity=sensitivity,
@@ -932,6 +970,18 @@ def _replay_one(
             rolls_evaluated=result.rolls_evaluated,
             rolls_executed=result.rolls_executed,
         )
+        if artifact_sink is not None:
+            _emit_artifact(
+                artifact_sink, result,
+                scenario=scenario.name, symbol=symbol, window=window,
+                cfg_hash=cfg_hash, scenario_hash=scenario_hash,
+                run_id=run_id, engine_identity=engine_identity,
+                arm_max_dte=max_dte,
+                sweep_max_dte=(materialised.max_dte if sweep_max_dte is None
+                               else sweep_max_dte),
+                haircut=haircut, starting_cash=starting_cash,
+            )
+        return row
     except Exception as exc:  # noqa: BLE001 - one arm must not lose the others
         message = _describe(exc)
         logger.error(
@@ -945,6 +995,46 @@ def _replay_one(
             split=split, config_hash=cfg_hash, scenario_hash=scenario_hash,
             error=message,
             replay_seconds=round(time.perf_counter() - t0, 3),
+        )
+
+
+def _emit_artifact(sink, result, *, scenario: str, symbol: str,
+                   window: Tuple[str, date, date], cfg_hash: str,
+                   scenario_hash: str, run_id: Optional[str],
+                   engine_identity: Optional[str], arm_max_dte: int,
+                   sweep_max_dte: Optional[int], haircut: float,
+                   starting_cash: float) -> None:
+    """Build this cell's artifact and hand it to ``sink``. Swallows everything.
+
+    The import is LOCAL on purpose: ``reporting.artifact`` pulls in the cycle
+    builder, and a sweep run with no sink (every test that is not about
+    artifacts, and every CLI run without ``--persist``) must not pay for a module
+    it never calls.
+
+    ``arm_max_dte`` is the reach ``narrow_to_dte`` was called with for THIS arm,
+    which is the whole point of stamping it: the shared window may reach much
+    further because a different arm asked for it, and an artifact that reported
+    the parent's reach would describe a chain this cell never saw.
+    """
+    from ..reporting.artifact import ArtifactMeta, cell_artifact
+
+    split, w_start, w_end = window
+    try:
+        sink(cell_artifact(result, ArtifactMeta(
+            run_id=run_id, scenario=scenario, symbol=symbol, split=split,
+            scenario_hash=scenario_hash, config_hash=cfg_hash,
+            engine_identity=engine_identity,
+            arm_max_dte=arm_max_dte, sweep_max_dte=sweep_max_dte,
+            window_start=w_start, window_end=w_end,
+            fill_haircut=haircut, starting_cash=starting_cash,
+        )))
+    except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
+        logger.warning(
+            "Detail artifact could not be produced for this cell — its result "
+            "is unaffected",
+            event_category="backtest", event_type="sim_artifact_write_failed",
+            scenario=scenario, symbol=symbol, split=split, run_id=run_id,
+            error=f"{type(exc).__name__}: {exc}"[:300],
         )
 
 

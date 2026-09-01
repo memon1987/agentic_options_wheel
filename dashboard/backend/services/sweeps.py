@@ -172,8 +172,42 @@ _MISSING_COLUMN_MARKERS = (
     "invalid field name",
 )
 
+# **Every additive column this API stamps has the same window**, so the insert
+# degrade is keyed off a CLOSED SET rather than off one column name. FC-096
+# Phase B PR-b adds `artifacts_complete` on exactly the terms `engine_identity`
+# arrived on in PR-a: the Job's writer owns the schema and its reconcile adds
+# the column, but between a dashboard deploy and that reconcile the table does
+# not have it, and `insert_rows_json` rejects the WHOLE request over one unknown
+# key. Without this generalisation the second additive column would have
+# reproduced PR-a's outage verbatim.
+#
+# A closed set, not "drop whatever the error names": a typo'd column
+# (`sweep_ky`) must stay a loud failure rather than a silently narrowed row. The
+# value is the column's BigQuery type, so the remediation the log prints is a
+# runnable `ALTER TABLE`.
+ADDITIVE_OPTIONAL_COLUMNS = (
+    ("engine_identity", "STRING"),
+    ("artifacts_complete", "BOOL"),
+)
+
 _identity_query_degraded_logged = False
-_identity_insert_degraded_logged = False
+_insert_degraded_logged: set = set()
+
+
+def missing_optional_column(error: Any) -> Optional[str]:
+    """Which additive column ``error`` says the table lacks, or ``None``.
+
+    ``None`` for every other failure, including a missing column that is not one
+    of ours — a 403, a 404 and a typo'd name all still raise, which is the same
+    narrowness ``mentions_missing_identity_column`` was written with.
+    """
+    text = str(error).lower()
+    if not any(marker in text for marker in _MISSING_COLUMN_MARKERS):
+        return None
+    for column, _type in ADDITIVE_OPTIONAL_COLUMNS:
+        if column in text:
+            return column
+    return None
 
 
 def mentions_missing_identity_column(error: Any) -> bool:
@@ -204,29 +238,39 @@ def note_identity_query_degraded(error: Any) -> None:
         "error: %s", ENGINE_IDENTITY_ENV, str(error)[:300])
 
 
-def note_identity_insert_degraded(error: Any) -> None:
-    """One log per process: rows are landing without their identity stamp."""
-    global _identity_insert_degraded_logged
-    if _identity_insert_degraded_logged:
+def note_optional_column_insert_degraded(column: str, error: Any) -> None:
+    """One log per process PER COLUMN: rows are landing without ``column``.
+
+    Per column rather than per process, because two missing columns are two
+    separate migrations an operator has to run, and one shared flag would hide
+    the second behind the first.
+    """
+    if column in _insert_degraded_logged:
         return
-    _identity_insert_degraded_logged = True
+    _insert_degraded_logged.add(column)
+    column_type = dict(ADDITIVE_OPTIONAL_COLUMNS).get(column, "STRING")
     logger.error(
-        "engine_identity_column_missing: scenario_sweeps has no "
-        "engine_identity column, so this `submitted` row was written WITHOUT "
-        "it. The row is otherwise complete and the sweep runs normally; the "
-        "Job's own rows will carry the value once the column exists. Fix: "
-        "ALTER TABLE <dataset>.scenario_sweeps ADD COLUMN engine_identity "
-        "STRING. Underlying error: %s", str(error)[:300])
+        "%s_column_missing: scenario_sweeps has no %s column, so this "
+        "`submitted` row was written WITHOUT it. The row is otherwise complete "
+        "and the sweep runs normally; the Job's own rows will carry the value "
+        "once the column exists. Fix: ALTER TABLE <dataset>.scenario_sweeps "
+        "ADD COLUMN %s %s. Underlying error: %s",
+        column, column, column, column_type, str(error)[:300])
+
+
+def note_identity_insert_degraded(error: Any) -> None:
+    """The ``engine_identity`` case of the above, kept under its own name
+    because that is the one PR-a's tests and the rollout runbook reference."""
+    note_optional_column_insert_degraded("engine_identity", error)
 
 
 def _reset_engine_identity_warning() -> None:
     """Test seam: re-arm every one-shot log. Never called in production."""
     global _identity_absence_logged
     global _identity_query_degraded_logged
-    global _identity_insert_degraded_logged
     _identity_absence_logged = False
     _identity_query_degraded_logged = False
-    _identity_insert_degraded_logged = False
+    _insert_degraded_logged.clear()
 
 
 SWEEPS_TABLE = "scenario_sweeps"
@@ -824,6 +868,12 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any],
         # requires `rows_persisted = cell_count`.
         "rows_persisted": None,
         "error_cells": None,
+        # FC-096 Phase B B2. The API writes no artifacts (it has run nothing),
+        # so this is NULL here and filled by the Job's terminal row — but
+        # PRESENT, because every status row of a run must carry the same column
+        # set or the two writers diverge by whichever one happened to know a
+        # field.
+        "artifacts_complete": None,
         # The API has no Config, so it cannot compute the engine hash either.
         "engine_config_hash": None,
         # FC-096 A4. Only a replay knows which symbols the earnings table was

@@ -5,6 +5,12 @@ httpx==0.26.0
 
 # Google Cloud
 google-cloud-bigquery==3.14.1
+# FC-096 Phase B B2: the per-cell detail artifacts the console reads live in
+# GCS (gs://<bucket>/sim-artifacts/v1/...), served by
+# `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}`. Inside
+# the engine's own `requirements.txt` range (>=2.10,<3.0), pinned here because
+# every other dependency in this image is.
+google-cloud-storage==2.19.0
 
 # Data validation
 pydantic==2.5.3

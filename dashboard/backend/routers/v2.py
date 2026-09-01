@@ -13,8 +13,10 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query
+from fastapi.responses import Response
 from typing import List, Dict, Any, Optional
 
+import services.artifacts as artifacts
 import services.sweeps as sweeps
 from services.bigquery import get_bigquery_service
 from services.pause_alert import (
@@ -601,6 +603,62 @@ async def get_sweep(run_id: str) -> Dict[str, Any]:
     shaped["status"] = row.get("status")
     shaped["run_id"] = run_id
     return shaped
+
+
+@router.get("/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}")
+async def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
+                              split: str) -> Response:
+    """One replayed cell's detail artifact: curve, ledger, cycles, rolls, tally.
+
+    FC-096 Phase B B2. The engine gzips one of these per non-errored cell as it
+    replays; this hands it back. Phase E renders it — nothing does yet, and the
+    endpoint exists now because the objects are being written now and an
+    unreachable artifact is indistinguishable from an unwritten one.
+
+    * **400** when any path segment could not address an artifact. The scenario
+      is checked by the ENGINE's own `validate_scenario_name`, so a name that
+      could not have been submitted cannot be requested.
+    * **404** when the object is absent — which is the normal answer for an
+      errored cell (it has no replay to serialise), for a run that predates this
+      PR, and for a run launched from the CLI without `--persist`. The detail
+      says so rather than leaving the operator to guess.
+    * **503** when no artifact bucket is configured for this deployment.
+    * **200** with the DECOMPRESSED JSON. See `services/artifacts.py` for why
+      the gzip is not passed through.
+
+    Exposure: this sits on the public dashboard until IAP lands. Same class as
+    the rest of `/api/v2` (FC-094 / Phase D), called out in the plan's open
+    questions rather than quietly.
+    """
+    store = artifacts.get_artifact_store()
+    if not store.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="No artifact bucket is configured for this deployment "
+                   "(SIM_ARTIFACT_BUCKET), so no detail artifacts can be served.")
+    try:
+        name = artifacts.object_name(run_id, scenario, symbol, split)
+    except artifacts.ArtifactPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        payload = store.fetch(run_id, scenario, symbol, split)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Artifact read failed for %s", name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read the artifact object: "
+                   f"{type(exc).__name__}: {exc}")
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No detail artifact for {scenario}/{symbol}/{split} in run "
+                   f"{run_id}. Cells that errored have none, and neither do "
+                   f"runs replayed before artifacts existed or from the CLI "
+                   f"without --persist.")
+    return Response(content=payload, media_type="application/json",
+                    headers=artifacts.artifact_headers(name))
 
 
 @router.post("/sweeps", status_code=202)
