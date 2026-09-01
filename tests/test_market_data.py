@@ -485,6 +485,18 @@ class TestStage8RejectionBucketsAccountForRejected:
         'rejected_max_premium',
         'rejected_dte_range',
     }
+    EXPECTED_COUNT_KWARGS = {
+        'rejected_below_cost_basis',
+        'rejected_dte_too_high',
+        'rejected_premium_too_low',
+        'rejected_delta_out_of_range',
+        'rejected_no_liquidity',
+        'rejected_expires_into_earnings',
+        'rejected_expiry_beyond_horizon',
+        'rejected_open_interest_too_low',
+        'rejected_spread_too_wide',
+        'rejected_data_validation_failed',
+    }
 
     def _cc_config(self):
         config = Mock(spec=Config)
@@ -547,10 +559,15 @@ class TestStage8RejectionBucketsAccountForRejected:
         """The invariant that was broken in production."""
         kwargs = self._stage8_kwargs(monkeypatch, 'stage_8_complete_not_found')
 
-        bucket_total = sum(
-            value for key, value in kwargs.items()
+        count_keys = {
+            key for key in kwargs
             if key.startswith('rejected_') and key not in self.NON_COUNT_KWARGS
-        )
+        }
+        # The closed set of buckets the STAGE 8 line must emit. A bucket added
+        # to `rejection_stats` but not emitted here would silently re-open the
+        # production gap this test exists for.
+        assert count_keys == self.EXPECTED_COUNT_KWARGS
+        bucket_total = sum(kwargs[key] for key in count_keys)
         assert bucket_total == kwargs['rejected'] == 3
 
     def test_validation_failure_reaches_the_decision_record_side_channel(self, monkeypatch):
@@ -593,8 +610,13 @@ class TestStage8RejectionBucketsAccountForRejected:
         assert kwargs['rejected_open_interest_too_low'] == 1
         assert kwargs['rejected_spread_too_wide'] == 1
         assert kwargs['rejected_data_validation_failed'] == 1
-        bucket_total = sum(
-            value for key, value in kwargs.items()
+        count_keys = {
+            key for key in kwargs
             if key.startswith('rejected_') and key not in self.NON_COUNT_KWARGS
-        )
+        }
+        # The closed set of buckets the STAGE 8 line must emit. A bucket added
+        # to `rejection_stats` but not emitted here would silently re-open the
+        # production gap this test exists for.
+        assert count_keys == self.EXPECTED_COUNT_KWARGS
+        bucket_total = sum(kwargs[key] for key in count_keys)
         assert bucket_total == kwargs['rejected'] == 3

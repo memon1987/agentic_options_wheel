@@ -54,15 +54,20 @@ strategy:
   # Price/volume screening bounds. NOT a selection knob on this profile — the
   # universe is holdings-derived, so nothing here picks a symbol. They are
   # present because `MarketDataManager.get_stock_metrics` hard-indexes
-  # `config.min_stock_price` / `max_stock_price` / `min_avg_volume` on EVERY
-  # symbol it prices, and a missing key raises KeyError *after* the quote fetch:
-  # the method then returns {}, the scanner sees current_price=0 and fails the
-  # symbol closed (`call_scan_skipped_quote_unavailable`). On the call path only
-  # `current_price` is consumed from that dict; `suitable_for_wheel` /
-  # `meets_price_criteria` / `meets_volume_criteria` are read on the put path
-  # only, which this profile skips. Bounds are deliberately wide so no held
+  # `config.min_stock_price` / `max_stock_price` / `min_avg_volume`, and the
+  # call path reaches it on EVERY chain fetch
+  # (`get_option_chain_with_analysis`, market_data.py) and again in
+  # `_create_call_opportunity`. With the keys missing the method raised KeyError
+  # *after* the quote fetch, the broad except returned {}, and the profile logged
+  # `stock_metrics_error` on 100% of symbol-scans 2026-08-24..31 (no candidate
+  # ever reached the opportunity builder, where current_price=0 would have
+  # failed the symbol closed as `call_scan_skipped_quote_unavailable`). On the
+  # call path only `current_price` (and the unconsumed `moneyness`) come out of
+  # that dict; `suitable_for_wheel` / `meets_*_criteria` are read on the put
+  # path only, which this profile skips. Bounds are deliberately wide so no held
   # symbol is ever logged as "not suitable" for being cheap, expensive or thin —
-  # the operator, not a screen, decides what this account holds.
+  # the operator, not a screen, decides what this account holds. Validated at
+  # load for every profile (Config._validate_config).
   min_stock_price: 1.00
   max_stock_price: 100000.00
   min_avg_volume: 0
@@ -101,7 +106,14 @@ universe:
   excluded_symbols: []
   # Inventory validator thresholds (Phase 2): a holding failing these is skipped
   # + logged, never traded.
-  min_open_interest: 500
+  # SUSPENDED 2026-09-01 (was 500): the option-chain source
+  # (`AlpacaClient.get_option_chain` — snapshot endpoint) hardcodes
+  # `open_interest: 0` for every contract, so any floor here rejects EVERY
+  # strike that survives the other gates (prod 2026-08-28: ~114 GOOGL / ~86 UNH
+  # per scan died here, unlogged). `null` skips the check (Config property →
+  # None). This suspends the OI half of the FC-075 DD-3 inventory validator;
+  # restore the floor when FC-097 sources real OI from /v2/options/contracts.
+  min_open_interest: null
   max_spread_pct: 0.10          # reject chains wider than 10% bid/ask
   # (earnings_exclusion_days removed: no consumer, and a symbol-level N-day
   #  blackout is the design FC-013 rev 2.2 rejected for the call leg — the span

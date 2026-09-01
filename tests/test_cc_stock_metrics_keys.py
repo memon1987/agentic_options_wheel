@@ -41,12 +41,57 @@ class TestCoveredCallScreeningKeysPresent:
         assert isinstance(cc_config.min_avg_volume, (int, float))
         assert cc_config.min_stock_price < cc_config.max_stock_price
 
-    def test_wheel_profile_still_has_its_own_bounds(self):
-        """Wheel-neutrality: the wheel's real values are untouched."""
+    def test_wheel_profile_still_resolves_its_own_bounds(self):
+        """Wheel-neutrality: the wheel's keys still resolve and are ordered.
+
+        Deliberately does NOT pin the wheel's values — they are operator
+        tunables (FC in FUTURE_CONSIDERATIONS proposes moving the $400
+        ceiling) and a covered-call test must not veto that.
+        """
         wheel = Config(str(REPO / "config" / "settings.yaml"))
-        assert wheel.min_stock_price == 10.00
-        assert wheel.max_stock_price == 400.00
-        assert wheel.min_avg_volume == 2000000
+        assert wheel.min_stock_price < wheel.max_stock_price
+        assert wheel.min_avg_volume >= 0
+
+    def test_profile_missing_screening_keys_fails_at_load(self, tmp_path):
+        """The class-level guard: a profile without the three keys must fail
+        validation at load on EVERY strategy_id, not at scan time inside
+        `get_stock_metrics`'s broad except."""
+        import yaml
+        data = yaml.safe_load(open(CC_YAML))
+        for key in ("min_stock_price", "max_stock_price", "min_avg_volume"):
+            data["strategy"].pop(key, None)
+        path = tmp_path / "cc_missing.yaml"
+        path.write_text(yaml.safe_dump(data))
+        with pytest.raises(ValueError, match="min_stock_price is required"):
+            Config(str(path))
+
+
+class TestCoveredCallOpenInterestFloorSuspended:
+    """`AlpacaClient.get_option_chain` builds contracts from the snapshot
+    endpoint and hardcodes `open_interest: 0` (src/api/alpaca_client.py). Any
+    `universe.min_open_interest` on this profile therefore rejects every strike
+    that survives the other gates — which is exactly what happened in
+    production 2026-08-24..31 (~114 GOOGL / ~86 UNH per scan, unlogged). The
+    floor is suspended (null) until FC-097 sources real OI; this test pins the
+    suspension to the hardcode so restoring one without the other fails CI.
+    """
+
+    def test_cc_oi_floor_is_unset_while_chain_source_reports_zero_oi(self, cc_config):
+        src = (REPO / "src" / "api" / "alpaca_client.py").read_text()
+        chain_reports_zero_oi = "'open_interest': 0," in src
+        if chain_reports_zero_oi:
+            assert cc_config.min_open_interest is None, (
+                "universe.min_open_interest is set but the chain source "
+                "hardcodes open_interest=0 — every qualifying strike would be "
+                "rejected as open_interest_too_low (see FC-097)"
+            )
+        else:
+            pytest.skip("chain source no longer hardcodes OI=0; FC-097 landed — "
+                        "restore the CC OI floor and retire this test")
+
+    def test_spread_gate_still_active(self, cc_config):
+        """Only the OI half of the DD-3 validator is suspended."""
+        assert cc_config.max_spread_pct == 0.10
 
 
 class TestGetStockMetricsOnCoveredCallProfile:

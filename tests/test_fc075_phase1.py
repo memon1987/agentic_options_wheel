@@ -97,7 +97,9 @@ class TestConfigProfiles:
             "strategy_id": "covered_call",
             "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
                        "expected_account_number": "PA_CC"},
-            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25]},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
+                         "min_stock_price": 1, "max_stock_price": 100000,
+                         "min_avg_volume": 0},
             "risk": {"max_position_size": 0.35},
         }
         with pytest.raises(ValueError, match="opportunity_bucket is required"):
@@ -134,7 +136,9 @@ class TestConfigProfiles:
             "strategy_id": "covered_call",
             "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
                        "expected_account_number": "PA_CC"},
-            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25]},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
+                         "min_stock_price": 1, "max_stock_price": 100000,
+                         "min_avg_volume": 0},
             "risk": {"max_position_size": 0.35},
             "gcs": {"opportunity_bucket": "cc-bucket"},
             "bigquery": {"dataset": "covered_call"},
