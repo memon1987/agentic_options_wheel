@@ -27,8 +27,13 @@ from unittest.mock import patch
 
 import pytest
 
+from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
 from src.backtesting.data.chain_store import ChainStore
-from src.backtesting.engine.simulator import Simulator
+from src.backtesting.engine.simulator import (
+    Materialised,
+    Simulator,
+    narrow_to_dte,
+)
 from src.backtesting.metrics.fitness import MIN_DAYS_IN_POSITION
 from src.backtesting.scenarios import (
     ALLOWED_OVERRIDES,
@@ -159,32 +164,67 @@ class TestApplyOverrides:
         assert "strategy.min_put_premuim" in str(exc.value)
         assert "not a known selection-only key" in str(exc.value)
 
-    def test_put_target_dte_is_refused_with_the_chain_reach_reason(self, sweep_config):
-        with pytest.raises(OverrideError) as exc:
-            apply_overrides(sweep_config, {"strategy.put_target_dte": 14})
-        message = str(exc.value)
-        assert "universe_dte=8" in message
-        assert "re-materialisation" in message
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_both_dte_targets_are_sweepable_up_to_the_lakes_reach(
+            self, sweep_config, key):
+        """FC-096 Phase A PR-2: the knob the whole phase exists for.
 
-    def test_the_dte_knob_is_still_closed_in_pr_1(self, sweep_config):
-        """FC-096 Phase A PR-1 adds a CONSTANT, and nothing else.
-
-        `MAX_SWEEPABLE_DTE = 21` lands with the backfill machinery so both
-        halves of the system read one number — but the allowlist does not move
-        until the data exists (PR-2, gated on the rollout's measurement). This
-        is the test that catches a PR-1 that accidentally opened the knob:
-        flipping it early re-creates the FC-095 quota exposure, a dashboard
-        submit materialising a 22-reach window cold on the live key for hours.
+        `put_target_dte` was refused outright and `call_target_dte` was
+        lowering-only, both because the stored chains reached 7 DTE. The
+        backfill widened the lake to `universe_dte = 22` and the placebo gate
+        confirmed the knob moves selection, so both keys now carry ONE static
+        rule.
         """
         from src.backtesting.scenarios.overrides import (
             ALLOWED_OVERRIDES,
             MAX_SWEEPABLE_DTE,
         )
 
+        assert key in ALLOWED_OVERRIDES
+        leaf = key.split(".")[-1]
+        for good in (1, 7, 14, MAX_SWEEPABLE_DTE):
+            assert getattr(apply_overrides(sweep_config, {key: good}), leaf) == good
+
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_a_dte_past_the_lakes_reach_is_refused_naming_the_constant(
+            self, sweep_config, key):
+        """The bound is a property of the DATA, and the message has to say so.
+
+        A refusal quoting a bare number teaches an operator nothing and reads
+        as an arbitrary cap; one that names `MAX_SWEEPABLE_DTE` and the lake
+        tells them the fix is to widen the backfill, not to argue with the
+        allowlist.
+        """
+        from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
+
+        for bad in (MAX_SWEEPABLE_DTE + 1, 0, -3):
+            with pytest.raises(OverrideError) as exc:
+                apply_overrides(sweep_config, {key: bad})
+            message = str(exc.value)
+            assert "MAX_SWEEPABLE_DTE" in message
+            assert str(MAX_SWEEPABLE_DTE) in message
+            assert key in message
+
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    @pytest.mark.parametrize("value", [14.0, "14", None, [14], True])
+    def test_a_non_integer_dte_is_refused(self, sweep_config, key, value):
+        """`True` is in this list on purpose: `bool` is an `int` subclass, so a
+        naive check would read `put_target_dte: true` as "1 day" — a legal-
+        looking arm nobody asked for. `14.0` and `"14"` used to be coerced by
+        an `int(value)` cast, which silently accepted a spec the dashboard's
+        own value-type table refuses."""
+        with pytest.raises(OverrideError, match="integer number of days"):
+            apply_overrides(sweep_config, {key: value})
+
+    def test_the_constant_is_the_lakes_reach_and_the_backfill_agrees(self):
+        """One number, three consumers: the value rules above, the backfill Job
+        and the dashboard's flat copy of this module."""
+        from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
+
         assert MAX_SWEEPABLE_DTE == 21
-        assert "strategy.put_target_dte" not in ALLOWED_OVERRIDES
-        with pytest.raises(OverrideError):
-            apply_overrides(sweep_config, {"strategy.put_target_dte": 21})
 
     def test_the_backfill_reads_the_constant_rather_than_restating_it(self):
         """One number, two consumers (the Job and the dashboard's flat copy).
@@ -223,17 +263,6 @@ class TestApplyOverrides:
             "there takes the sweep API down"
         )
         assert not any(name.endswith("backfill") for name in runtime_imports)
-
-    def test_a_longer_call_target_dte_is_refused_but_a_shorter_one_is_not(
-            self, sweep_config):
-        with pytest.raises(OverrideError) as exc:
-            apply_overrides(sweep_config, {"strategy.call_target_dte": 14})
-        message = str(exc.value)
-        assert "does NOT widen the chain" in message
-        assert "not in the cached files" in message
-        # Downward is a real question and stays askable.
-        shortened = apply_overrides(sweep_config, {"strategy.call_target_dte": 4})
-        assert shortened.call_target_dte == 4
 
     def test_profit_taking_is_refused_because_the_replay_never_reads_it(
             self, sweep_config):
@@ -308,7 +337,7 @@ class TestApplyOverrides:
         with pytest.raises(OverrideError):
             apply_overrides(sweep_config, {
                 "strategy.min_put_premium": 0.30,
-                "strategy.put_target_dte": 14,
+                "strategy.put_target_dte": 99,
             })
         assert sweep_config.min_put_premium == 0.50
 
@@ -432,7 +461,7 @@ class TestRunSweep:
         days, provider = two_symbols
         scenarios = [
             Scenario("fine", {"strategy.min_put_premium": 0.30}),
-            Scenario("typo", {"strategy.put_target_dte": 14}),
+            Scenario("typo", {"strategy.put_target_dte": 99}),
         ]
         with pytest.raises(OverrideError):
             run_sweep(sweep_config, scenarios, ["AAA", "BBB"], days[0], days[-1],
@@ -960,7 +989,7 @@ class TestSweepCLI:
             "scenarios:\n"
             "  - name: longer_dte\n"
             "    overrides:\n"
-            "      strategy.put_target_dte: 14\n"
+            "      strategy.put_target_dte: 99\n"
         ))
         code = self._invoke(tmp_path, two_symbols, [
             "main.py", "--command", "sweep", "--scenarios", scenarios,
@@ -1614,3 +1643,517 @@ class TestTheCellStatesPartition:
         payload = json.loads(render_json(result))
         for row in payload["rows"]:
             assert not (row["insufficient"] and row["low_activity"]), row
+
+
+# --------------------------------------------------------------------------- #
+# FC-096 Phase A PR-2 — the DTE knob
+# --------------------------------------------------------------------------- #
+class TestTheArmMaxDrivesMaterialisation:
+    """One reach per run, and it is the MAXIMUM, not the base config's value.
+
+    Before PR-2 the reach was readable off `base_config.put_target_dte` alone,
+    because `put_target_dte` was refused and `call_target_dte` could only be
+    lowered. Both bounds are gone, so a DTE-14 arm on either leg now needs a
+    materialisation it did not use to need — and getting this wrong is silent:
+    the arm replays fine and reports "nothing ever qualified", which reads as a
+    finding about that reach rather than as missing data.
+    """
+
+    def _cfg(self, dte=7):
+        config = Config()
+        config._config["strategy"]["put_target_dte"] = dte
+        return config
+
+    def test_no_dte_arm_leaves_the_base_value(self):
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        scenarios = [Scenario("base"),
+                     Scenario("cheap", {"strategy.min_put_premium": 0.30})]
+        assert effective_max_dte(self._cfg(7), scenarios) == 7
+
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_either_legs_dte_arm_raises_the_reach(self, key):
+        """The CALL leg is the one a base-config-only implementation misses."""
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        scenarios = [Scenario("base"), Scenario("longer", {key: 14})]
+        assert effective_max_dte(self._cfg(7), scenarios) == 14
+
+    def test_the_maximum_wins_across_arms_and_legs(self):
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        scenarios = [
+            Scenario("shorter", {"strategy.put_target_dte": 3}),
+            Scenario("mid", {"strategy.call_target_dte": 14}),
+            Scenario("longest", {"strategy.put_target_dte": 21}),
+        ]
+        assert effective_max_dte(self._cfg(7), scenarios) == 21
+
+    def test_a_shorter_arm_never_narrows_the_run(self):
+        """A DTE-3 arm must not shrink the window the other arms need — one
+        variable feeds materialise AND every replay, so narrowing for one arm
+        would either trip `Simulator.replay`'s equality guard or serve every
+        other arm a chain that does not cover it."""
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        scenarios = [Scenario("shorter", {"strategy.put_target_dte": 3})]
+        assert effective_max_dte(self._cfg(7), scenarios) == 7
+
+    def test_a_higher_base_config_still_wins(self):
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        scenarios = [Scenario("shorter", {"strategy.call_target_dte": 5})]
+        assert effective_max_dte(self._cfg(14), scenarios) == 14
+
+    def test_a_call_dte_arm_actually_materialises_that_far(
+            self, tmp_path, two_symbols, sweep_config):
+        """The end-to-end version, asserted on the STORED provenance rather than
+        on the runner's own variable: a run that reported 14 and wrote 8-reach
+        files would pass a weaker test and fail every call arm in production."""
+        days, provider = two_symbols
+        store = ChainStore(str(tmp_path))
+        result = run_sweep(
+            sweep_config, [Scenario("dte14", {"strategy.call_target_dte": 14})],
+            ["AAA", "BBB"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=store, bar_provider=provider, quiet_logs=True)
+
+        assert result.effective_max_dte == 14
+        assert not result.errors, [r.error for r in result.errors]
+        window = store.stored_window("AAA", days[5])
+        # `universe_dte = max_dte + 1` (the universe buffer).
+        assert window is not None and window["universe_dte"] == 15
+
+
+class TestTheDteReadPathIsIdentityPreserving:
+    """MEDIUM-8 / plan §A5: a DTE-7 spec must not change because the lake got
+    wider underneath it.
+
+    The read path masks a stored chain to the requested reach, so this SHOULD
+    hold — but "should" is the whole problem. Every historical sweep result was
+    measured against 8-reach files, and if widening the lake moved a single
+    number then every stored `backtest_runs` / `scenario_runs` row became
+    incomparable with every new one, silently. This is the test that makes the
+    masking a contract rather than an implementation detail.
+    """
+
+    def _run(self, store, days, provider, sweep_config):
+        return run_sweep(
+            sweep_config,
+            [Scenario("cheaper", {"strategy.min_put_premium": 0.30})],
+            ["AAA", "BBB"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=store, bar_provider=provider, quiet_logs=True)
+
+    @staticmethod
+    def _comparable(result):
+        """Every row, minus the one field that is wall-clock noise."""
+        out = []
+        for row in result.rows:
+            payload = row.as_dict()
+            payload.pop("replay_seconds", None)
+            out.append(payload)
+        return out
+
+    def test_a_dte_7_sweep_is_identical_over_an_8_and_a_22_reach_lake(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+
+        narrow = ChainStore(str(tmp_path / "lake8"))
+        seven = self._run(narrow, days, provider, sweep_config)
+        assert seven.effective_max_dte == 7
+        assert narrow.stored_window("AAA", days[5])["universe_dte"] == 8
+
+        # Widen a SECOND lake to 22 by running a DTE-21 arm through it...
+        wide = ChainStore(str(tmp_path / "lake22"))
+        widening = run_sweep(
+            sweep_config, [Scenario("dte21", {"strategy.put_target_dte": 21})],
+            ["AAA", "BBB"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=wide, bar_provider=provider, quiet_logs=True)
+        assert widening.effective_max_dte == 21
+        assert wide.stored_window("AAA", days[5])["universe_dte"] == 22
+
+        # ...then replay the SAME DTE-7 spec against it.
+        over_wide = self._run(wide, days, provider, sweep_config)
+        assert over_wide.effective_max_dte == 7
+
+        assert self._comparable(over_wide) == self._comparable(seven)
+        assert over_wide.scenario_hashes == seven.scenario_hashes
+        assert over_wide.scenario_config_hashes == seven.scenario_config_hashes
+        assert over_wide.base_config_hash == seven.base_config_hash
+
+
+class TestTheDteReachFooter:
+    """`DTE_REACH_BIAS` appears iff the run reached past 7 — and says the right
+    thing when it does.
+
+    A footer that carries every caveat unconditionally is a footer nobody reads,
+    which is the failure mode this conditionality exists to avoid. The wording is
+    pinned too: these quotes are REAL prints, and calling them extrapolated would
+    be a different, also-wrong claim that makes a reader discount a real number.
+    """
+
+    def _result(self, reach):
+        result = _hand_built_holdout()
+        result.effective_max_dte = reach
+        return result
+
+    @pytest.mark.parametrize("reach", [0, 1, 7])
+    def test_a_short_run_does_not_carry_the_caveat(self, reach):
+        from src.backtesting.scenarios import report as engine_report
+
+        result = self._result(reach)
+        title = engine_report.DTE_REACH_BIAS[0]
+        assert title not in render_markdown(result)
+        titles = [b["title"] for b in json.loads(render_json(result))["known_biases"]]
+        assert title not in titles
+
+    @pytest.mark.parametrize("reach", [8, 14, 21])
+    def test_a_long_run_carries_it_in_both_renderings(self, reach):
+        from src.backtesting.scenarios import report as engine_report
+
+        result = self._result(reach)
+        title, detail = engine_report.DTE_REACH_BIAS
+        markdown = render_markdown(result)
+        assert title in markdown
+        assert detail in markdown
+        payload = json.loads(render_json(result))
+        assert {"title": title, "detail": detail} in payload["known_biases"]
+        assert payload["effective_max_dte"] == reach
+
+    def test_the_caveat_names_the_real_degradation_not_extrapolation(self):
+        """The plan's M6 wording requirement, pinned so a future edit that
+        reaches for the easy word has to argue with a test."""
+        from src.backtesting.scenarios import report as engine_report
+
+        detail = engine_report.DTE_REACH_BIAS[1]
+        assert "not extrapolated" in detail
+        assert "no trade that day" in detail
+        assert "SELECTION" in detail
+        assert "spread model" in detail
+
+    def test_the_threshold_is_the_live_dte_target(self):
+        from src.backtesting.scenarios import report as engine_report
+
+        assert engine_report.DTE_REACH_BIAS_THRESHOLD == 7
+
+
+class TestTheSweepHeaderSurfacesEarningsGaps:
+    """FC-096 A4. The FC-013 gate answers "clear" for a symbol it has no row
+    for, which is exactly what a freshly-onboarded candidate looks like — so
+    without this the sweep that evaluates a candidate says nothing at all about
+    the gate having been inert on it."""
+
+    def test_the_field_is_populated_from_the_replays(
+            self, tmp_path, two_symbols, sweep_config):
+        days, provider = two_symbols
+        result = run_sweep(
+            sweep_config, [Scenario("cheaper", {"strategy.min_put_premium": 0.30})],
+            ["AAA", "BBB"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=True)
+        # AAA/BBB are fixtures; neither is in the committed earnings table.
+        assert result.earnings_symbols_without_data == ["AAA", "BBB"]
+
+    def test_the_header_names_them_above_the_numbers(self):
+        result = _hand_built_holdout()
+        result.earnings_symbols_without_data = ["AAA", "ZZZ"]
+        markdown = render_markdown(result)
+        assert "The earnings gate did not gate AAA, ZZZ" in markdown
+        # Above the first grid, not in the footer: it changes what every row
+        # below means for those symbols.
+        assert markdown.index("did not gate") < markdown.index("| scenario |")
+        assert json.loads(render_json(result))[
+            "earnings_symbols_without_data"] == ["AAA", "ZZZ"]
+
+    def test_an_empty_list_says_nothing(self):
+        """Silence is the healthy state; a "no gaps" line would be noise on
+        every ordinary run."""
+        result = _hand_built_holdout()
+        assert "earnings gate did not gate" not in render_markdown(result)
+        assert json.loads(render_json(result))[
+            "earnings_symbols_without_data"] == []
+
+
+class TestAnArmIsNotChangedByItsNeighbours:
+    """REVIEW HIGH (FC-096 PR-2). A sweep materialises once at the widest reach
+    any arm asks for. Once DTE became sweepable, that stopped being harmless.
+
+    **Entry selection is capped by the arm's own config; the ROLLER is not.**
+    `_check_call_criteria_detailed` treats `call_target_dte` as a hard ceiling,
+    but the roller's replacement search (`market_data.py`'s `'roll'` criteria
+    profile) is bounded by `old_expiry + rolling.max_extension_days` and by
+    nothing else, and it takes the maximum net credit among whatever it is
+    shown. So an unmasked arm sitting in a spec with a longer-DTE neighbour sees
+    roll candidates its own configuration could never have produced.
+
+    That makes the `base` row — the comparator every delta and the whole
+    sign-agreement column is measured against — depend on which OTHER arms
+    happen to share the spec, while `scenario_hash` and `config_hash` stay
+    byte-identical. Two sweeps whose stored rows disagree and whose identity
+    hashes agree is the worst shape this store can produce.
+
+    MUTATION CHECK: pass the sweep-wide `max_dte` to `_replay_one` instead of
+    `scenario_reaches[...]` and this test fails hard — measured on this fixture,
+    `base` moves option_pnl 843.33 -> 688.17, puts_sold 5 -> 3, calls_sold
+    2 -> 3, cycles_completed 5 -> 3.
+    """
+
+    @staticmethod
+    def _rolling_path():
+        """Down hard (the put assigns), then up hard (the call goes ITM).
+
+        The roller needs stock/strike >= `itm_trigger_ratio` (0.98) on a short
+        call to consider a roll at all, so a monotone slide never exercises it —
+        which is why the ordinary `two_symbols` fixture does not catch this.
+        """
+        warmup = _weekdays(date(2024, 3, 25), 45)
+        days = _weekdays(date(2024, 6, 3), 40)
+        closes = {d: 100.0 for d in warmup}
+        for i, d in enumerate(days):
+            closes[d] = 100.0 - i * 3.0 if i <= 9 else 73.0 + (i - 9) * 3.0
+        expirations = [d for d in days if d.weekday() == 4]
+        return days, _MultiSymbolProvider(
+            {"AAA": ScriptedProvider("AAA", closes, expirations)})
+
+    def _sweep(self, tmp_path, name, scenarios):
+        days, provider = self._rolling_path()
+        config = Config()
+        config._config["stocks"]["symbols"] = ["AAA"]
+        return run_sweep(
+            config, scenarios, ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path / name)), bar_provider=provider,
+            quiet_logs=True)
+
+    @staticmethod
+    def _rows(result, scenario):
+        out = []
+        for row in result.rows:
+            payload = row.as_dict()
+            payload.pop("replay_seconds", None)
+            if payload["scenario"] == scenario:
+                out.append(payload)
+        return out
+
+    def test_the_roller_is_live_on_this_fixture(self, tmp_path):
+        """Guard on the guard, and it has to assert the ROLLER specifically.
+
+        The defect below is reachable only through the roller — it is the one
+        chain consumer not capped by the arm's own DTE target. So this must
+        assert the roller was EVALUATED, not merely that the wheel wrote calls:
+        a fixture whose price path stopped crossing `itm_trigger_ratio` (0.98)
+        would still sell calls, still pass a `calls_sold` check, and leave
+        `TestAnArmIsNotChangedByItsNeighbours` passing vacuously for ever.
+
+        `rolls_evaluated`, not `rolls_executed`: this roller is credit-only and
+        declines most of what it looks at. Measured on this fixture, the short
+        arms evaluate 12 rolls and execute 0, while the long arm evaluates 22
+        and executes 1 — so an `executed > 0` assertion would be flaky on
+        exactly the arms the identity test compares.
+        """
+        result = self._sweep(tmp_path, "guard", [])
+        assert not result.errors, [r.error for r in result.errors]
+        base = result.rows[0]
+        assert base.calls_sold, "fixture stopped writing calls"
+        assert base.rolls_evaluated and base.rolls_evaluated > 0, (
+            "the roller evaluated nothing on this fixture, so the mixed-spec "
+            "identity test below can no longer detect the defect it exists for "
+            "— the price path has stopped crossing rolling.itm_trigger_ratio"
+        )
+
+    def test_the_roll_counts_are_not_persisted_in_this_pr(self, tmp_path):
+        """`rolls_evaluated` / `rolls_executed` live on the dataclass ONLY.
+
+        `rows_from_sweep` writes an explicit column list, so exposing them here
+        adds no `scenario_runs` column — which is the point: this PR is the DTE
+        knob, and a schema change belongs to the PR that needs it. Phase E's
+        console wants roll counts; that is when the column gets argued.
+        """
+        from src.backtesting.scenarios import persist as store
+
+        result = self._sweep(tmp_path, "nopersist", [])
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-01T12:00:00+00:00",
+            engine_version="v")
+        assert rows
+        assert "rolls_evaluated" not in rows[0]
+        assert "rolls_executed" not in rows[0]
+        assert not any(
+            f.name.startswith("rolls_") for f in store._runs_schema())
+
+    @pytest.mark.parametrize("neighbour", [
+        pytest.param({"strategy.put_target_dte": 21}, id="put-dte-21"),
+        pytest.param({"strategy.call_target_dte": 21}, id="call-dte-21"),
+    ])
+    def test_a_long_dte_neighbour_does_not_move_the_other_arms(
+            self, tmp_path, neighbour):
+        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
+        alone = self._sweep(tmp_path, "alone", [arm])
+        mixed = self._sweep(tmp_path, "mixed", [arm, Scenario("long", neighbour)])
+
+        assert alone.effective_max_dte == 7
+        assert mixed.effective_max_dte == 21, "the neighbour must widen the run"
+        for scenario in ("base", "x"):
+            assert self._rows(mixed, scenario) == self._rows(alone, scenario), (
+                f"arm '{scenario}' changed because a DTE-21 arm joined the spec"
+            )
+        assert mixed.scenario_hashes["x"] == alone.scenario_hashes["x"]
+        assert mixed.scenario_config_hashes["x"] == alone.scenario_config_hashes["x"]
+
+    def test_the_long_arm_still_sees_its_own_wider_chain(self, tmp_path):
+        """The mask must not be a blanket narrowing: the arm that ASKED for 21
+        has to get 21, or the knob measures nothing and this fix would have
+        traded one silent fiction for another."""
+        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
+        long_arm = Scenario("long", {"strategy.put_target_dte": 21})
+        mixed = self._sweep(tmp_path, "mixed2", [arm, long_arm])
+        long_rows = self._rows(mixed, "long")
+        assert long_rows and long_rows[0]["error"] is None
+        # A 21-DTE put target picks different contracts from a 7-DTE one, so the
+        # long arm must NOT come back as a copy of base.
+        assert long_rows != self._rows(mixed, "base")
+
+
+class TestNarrowToDte:
+    """The view itself: `simulator.narrow_to_dte`."""
+
+    @staticmethod
+    def _materialised(max_dte, dtes=(3, 7, 8, 14, 15, 21, 22)):
+        def quote(dte, kind):
+            return ChainQuote(
+                symbol=f"AAA-{kind}-{dte}", underlying="AAA", as_of=date(2024, 6, 3),
+                expiration=date(2024, 6, 3) + timedelta(days=dte), strike=100.0,
+                option_type=kind, dte=dte, underlying_price=100.0, mark=1.0,
+                bid=0.9, ask=1.1, implied_volatility=0.3, delta=0.2, volume=10)
+        snapshot = ChainSnapshot(
+            underlying="AAA", as_of=date(2024, 6, 3), underlying_price=100.0,
+            puts=[quote(d, "put") for d in dtes],
+            calls=[quote(d, "call") for d in dtes])
+        return Materialised(
+            symbols=["AAA"], start=date(2024, 6, 3), end=date(2024, 6, 28),
+            stock_bars={}, days=[date(2024, 6, 3)], anchors={},
+            chains={"AAA": {date(2024, 6, 3): snapshot}}, max_dte=max_dte)
+
+    def test_it_masks_to_the_reach_plus_the_universe_buffer(self):
+        """The same rule `ChainBuilder.build` fetches under and
+        `ChainStore._rows_to_quotes` re-applies on read, so a view is
+        indistinguishable from a chain materialised at that reach."""
+        view = narrow_to_dte(self._materialised(21), 7)
+        snapshot = view.chains["AAA"][date(2024, 6, 3)]
+        assert [q.dte for q in snapshot.puts] == [3, 7, 8]
+        assert [q.dte for q in snapshot.calls] == [3, 7, 8]
+        assert view.max_dte == 7
+
+    def test_a_no_op_mask_returns_the_INPUT_OBJECT(self):
+        """Identity, not equality. This is what keeps a homogeneous sweep
+        byte-identical to a pre-PR-2 one: no new object, no rebuilt list,
+        nothing to drift."""
+        materialised = self._materialised(7)
+        assert narrow_to_dte(materialised, 7) is materialised
+        assert narrow_to_dte(materialised, 21) is materialised
+
+    def test_the_source_is_never_mutated(self):
+        """`Materialised` is shared across every arm in the sweep; a view that
+        edited it would contaminate every later arm — the exact failure the
+        frozen dataclasses exist to prevent."""
+        materialised = self._materialised(21)
+        before = [q.dte for q in materialised.chains["AAA"][date(2024, 6, 3)].puts]
+        narrow_to_dte(materialised, 3)
+        after = [q.dte for q in materialised.chains["AAA"][date(2024, 6, 3)].puts]
+        assert before == after
+        assert materialised.max_dte == 21
+
+    def test_the_quotes_are_shared_not_copied(self):
+        """A view is cheap by construction: new snapshots, the SAME frozen
+        quotes. Copying them would make a 60-cell sweep pay for the chain twice
+        per arm."""
+        materialised = self._materialised(21)
+        original = materialised.chains["AAA"][date(2024, 6, 3)].puts[0]
+        view = narrow_to_dte(materialised, 7)
+        assert view.chains["AAA"][date(2024, 6, 3)].puts[0] is original
+
+    def test_everything_else_is_carried_across(self):
+        materialised = self._materialised(21)
+        view = narrow_to_dte(materialised, 7)
+        assert view.symbols == materialised.symbols
+        assert (view.start, view.end) == (materialised.start, materialised.end)
+        assert view.days == materialised.days
+        assert view.anchors == materialised.anchors
+        assert view.stock_bars is materialised.stock_bars
+
+
+class TestTheBaseConfigsCallLegCounts:
+    """REVIEW: `effective_max_dte` read only the base's PUT leg, so the
+    covered-call profile — which ships `call_target_dte: 14` and NO
+    `put_target_dte` at all — would have materialised at 7 and reported "no call
+    ever qualified" for every arm."""
+
+    def test_a_base_call_target_widens_the_run_with_no_dte_arm_present(self):
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        config = Config()
+        config._config["strategy"]["put_target_dte"] = 7
+        config._config["strategy"]["call_target_dte"] = 14
+        assert effective_max_dte(config, [Scenario("base")]) == 14
+
+    def test_a_profile_missing_put_target_dte_does_not_raise(self):
+        """`Config.put_target_dte` is a PROPERTY that indexes
+        `_config["strategy"]` directly, so an absent key raises `KeyError` from
+        inside it — and `getattr(config, key, default)` only swallows
+        `AttributeError`. This is the covered-call profile exactly."""
+        from src.backtesting.scenarios.runner import (
+            arm_max_dte, config_target_dte, effective_max_dte,
+        )
+
+        config = Config()
+        del config._config["strategy"]["put_target_dte"]
+        config._config["strategy"]["call_target_dte"] = 14
+
+        with pytest.raises(KeyError):
+            config.put_target_dte          # the hazard, stated
+
+        assert config_target_dte(config, "put") == 7
+        assert config_target_dte(config, "call") == 14
+        assert arm_max_dte(config) == 14
+        assert effective_max_dte(config, [Scenario("base")]) == 14
+
+    def test_the_shipped_covered_call_profile_is_the_case_this_protects(self):
+        """Read off the real file, not a fixture: if the profile's call target
+        moves, this test moves with it rather than pinning a stale 14."""
+        import yaml
+
+        with open("config/covered_call.yaml") as fh:
+            profile = yaml.safe_load(fh)
+        strategy = profile["strategy"]
+        assert "put_target_dte" not in strategy, (
+            "the profile grew a put target; the KeyError hazard above is now "
+            "unreachable, but config_target_dte must still tolerate it"
+        )
+        assert strategy["call_target_dte"] >= 7
+
+
+class TestTheThresholdTracksTheLiveConfig:
+    """REVIEW: `DTE_REACH_BIAS_THRESHOLD` is not a free constant.
+
+    Everything the footer says about fidelity — the ~7% put / ~32% call premium
+    shortfalls, the spread model's calibration — was measured at the LIVE DTE
+    target. The threshold is "the reach this engine was measured on", so the day
+    the live target moves, the caveat's premise moves with it and the wording
+    has to be re-argued. Failing loudly here is the point; this test lives
+    repo-side because the dashboard image has no `config/`.
+    """
+
+    def test_it_equals_the_wheel_profiles_put_target_dte(self):
+        import yaml
+
+        from src.backtesting.scenarios import report as engine_report
+
+        with open("config/settings.yaml") as fh:
+            settings = yaml.safe_load(fh)
+        live = settings["strategy"]["put_target_dte"]
+        assert engine_report.DTE_REACH_BIAS_THRESHOLD == live, (
+            f"config/settings.yaml now targets {live} DTE, but DTE_REACH_BIAS "
+            f"still claims the engine was measured at "
+            f"{engine_report.DTE_REACH_BIAS_THRESHOLD}. The caveat's numbers "
+            f"were measured at the old target — re-argue the wording, then move "
+            f"the constant (and its dashboard copy)."
+        )

@@ -1155,8 +1155,8 @@ class TestSpecEnvParsing:
         monkeypatch.setenv("SWEEP_SPEC_JSON", json.dumps({
             "symbols": ["AAPL"], "start": "2025-08-01", "end": "2026-07-31",
             "scenarios": [{"name": "x",
-                           "overrides": {"strategy.put_target_dte": 14}}]}))
-        with pytest.raises(OverrideError, match="universe_dte"):
+                           "overrides": {"strategy.put_target_dte": 99}}]}))
+        with pytest.raises(OverrideError, match="MAX_SWEEPABLE_DTE"):
             main_mod.run_sweep_cmd(cli_args, _config(), _Logger())
 
     def test_both_sources_at_once_is_refused(self, cli_args, job_env):

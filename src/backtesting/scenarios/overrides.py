@@ -11,14 +11,6 @@ read-only properties, so there is no other injection point.
 wrong answer here is not a bad statistic — it is an override that *silently does
 not do what it says*:
 
-* ``strategy.put_target_dte`` changes what the chain must CONTAIN. Every cached
-  file was written at ``universe_dte = 8``; a scenario asking for more misses the
-  cache on every single day and re-fetches a symbol-year from the vendor, and one
-  asking for less is served a chain that still contains the longer-dated
-  contracts. Either way the replay is not the one that was requested.
-* ``strategy.call_target_dte`` above 7 does not widen the chain at all — the
-  contracts simply are not in the file, so the scenario reads as "no call ever
-  qualified" rather than "this reach was tested".
 * ``risk.profit_taking.*`` and the stop-loss knobs are read only by ``/monitor``
   (``PutSeller.should_close_put_early`` / ``CallSeller.should_close_call_early``),
   and the replay's day loop does not run the monitor. A sweep over them would
@@ -41,6 +33,19 @@ that way.
 Each of those gets a rejection message that names the actual reason, because a
 generic "not allowed" invites the reader to assume the sweep is being
 conservative when in fact the answer would have been fiction.
+
+**The two DTE targets graduated by measurement too, and the same way round
+(FC-096 Phase A, PR-2).** ``strategy.put_target_dte`` used to be refused outright
+and ``strategy.call_target_dte`` allowed downward only, both for one reason: the
+stored chains reached 7-day DTE, so a longer arm was not narrowed data but ABSENT
+data, and it read as "nothing qualified" rather than as a test of that reach. The
+FC-096 backfill widened the lake to ``universe_dte = 22``, the placebo gate
+confirmed the knob moves selection — DTE-14 restructured the cycles; see
+``docs/investigations/fc-096-a-placebo-gate-2026-09-01.md`` — and both keys now
+carry the same static rule: ``1 <= int <= MAX_SWEEPABLE_DTE``. Note what
+did NOT change: the bound is what the DATA reaches, not what the strategy could
+want, so it stays a constant here rather than a knob. A longer arm than the lake
+covers is still the old defect wearing a new number.
 
 **Env-shadowed keys fail too.** ``earnings.enabled`` and ``rolling.enabled`` are
 overridden at runtime by ``EARNINGS_ENABLED`` / ``ROLLER_ENABLED`` when those are
@@ -76,6 +81,24 @@ class OverrideError(ValueError):
     """A scenario override that is unknown, disallowed, or silently ineffective."""
 
 
+# The longest DTE target the stored chain lake reaches (FC-096 D1a, Phase A).
+# The weekly `data-backfill` Job writes every day at `universe_dte = 22`, i.e. a
+# 21-day target plus the universe buffer, so 21 is the longest reach a replay can
+# be served real contracts for. **This is a property of the DATA, not a policy
+# about the strategy** — which is why it is a constant and not a knob: raising it
+# without widening the lake first re-creates exactly the defect the DTE keys were
+# refused for, an arm that reads "nothing qualified" because the contracts are
+# not in the file.
+#
+# It lives HERE, in the stdlib-only module that is flat-copied into the dashboard
+# image, and ``src/backtesting/data/backfill.py`` imports it — not the other way
+# round. Backfill can import this file; this file cannot import backfill (that
+# would drag pandas, structlog and the whole data layer into the dashboard). One
+# number, three consumers (the value rules below, the Job, the dashboard's flat
+# copy), no drift.
+MAX_SWEEPABLE_DTE = 21
+
+
 # --------------------------------------------------------------------------- #
 # The allowlist: selection-only keys — things that change WHICH contract the
 # strategy picks out of a chain it already has, never which chain it gets.
@@ -86,10 +109,19 @@ ALLOWED_OVERRIDES: Dict[str, str] = {
     "strategy.call_delta_range": "call delta band [lo, hi]",
     "strategy.min_put_premium": "put premium floor, $/share",
     "strategy.min_call_premium": "call premium floor, $/share",
-    # Allowed only DOWNWARD — see ``validate_override_key``. Shortening the call
-    # leg's reach narrows a chain that is already wide enough; lengthening it
-    # widens nothing, because the contracts are not in the cached file.
-    "strategy.call_target_dte": "call DTE target (may only be LOWERED)",
+    # Both DTE targets, bounded by what the LAKE reaches — see
+    # ``validate_override_key``. FC-096 Phase A widened the stored chains to
+    # `universe_dte = 22`, so anything from 1 to MAX_SWEEPABLE_DTE is served real
+    # contracts; beyond that the file has nothing and the arm would read as
+    # "nothing qualified".
+    "strategy.put_target_dte": (
+        f"put DTE target, days (1-{MAX_SWEEPABLE_DTE} — bounded by the stored "
+        f"chain lake's reach)"
+    ),
+    "strategy.call_target_dte": (
+        f"call DTE target, days (1-{MAX_SWEEPABLE_DTE} — bounded by the stored "
+        f"chain lake's reach)"
+    ),
     # Stage-1 universe screening
     "strategy.min_stock_price": "stage-1 price floor",
     "strategy.max_stock_price": "stage-1 price ceiling",
@@ -130,23 +162,30 @@ ALLOWED_OVERRIDES: Dict[str, str] = {
 # --------------------------------------------------------------------------- #
 # Explicit rejections. Exact keys first, then prefixes.
 # --------------------------------------------------------------------------- #
-_CHAIN_REACH = (
-    "cached chains store universe_dte=8; a scenario needs a re-materialisation "
-    "with a wider reach, which Layer 2 does not support. A shorter reach is no "
-    "safer: the file still contains the longer-dated contracts, so the replay "
-    "would see a chain it did not ask for."
-)
+#: The two override keys that move a run's chain reach. PUBLIC because three
+#: places need exactly this set and a second copy is a place for them to
+#: disagree: the value rule below, ``runner.effective_max_dte`` (which decides
+#: how far to materialise), and the dashboard's per-run footer derivation. This
+#: module is the one all three can import — it is stdlib-only and flat-copied
+#: into the dashboard image.
+DTE_OVERRIDE_KEYS = ("strategy.put_target_dte", "strategy.call_target_dte")
 
-_CALL_DTE_TOO_LONG = (
-    "raising strategy.call_target_dte does NOT widen the chain — the chains for "
-    "this window were built to reach {reach} DTE, so 9-15 DTE calls are simply "
-    "not in the cached files. The scenario would read as 'no call ever "
-    "qualified' rather than as a test of that reach. Lowering it is fine. "
-    + _CHAIN_REACH
+# The two DTE targets share one value rule, so they share one refusal. It names
+# the constant rather than a literal, because the number moves with the lake and
+# a message quoting a stale reach is how an operator concludes the allowlist is
+# broken rather than that their arm is out of range.
+
+_DTE_OUT_OF_RANGE = (
+    "the stored chain lake reaches MAX_SWEEPABLE_DTE = {cap} days "
+    "(`universe_dte = 22`, written by the weekly data-backfill Job — FC-096 "
+    "Phase A). A target beyond that is not a narrower view of data we hold, it "
+    "is data we do not hold: the contracts are absent from the file, so the arm "
+    "would read as 'nothing ever qualified' rather than as a test of that reach. "
+    "A target below 1 is not a contract at all. Widen the lake before widening "
+    "this bound."
 )
 
 REJECTED_OVERRIDES: Dict[str, str] = {
-    "strategy.put_target_dte": _CHAIN_REACH,
     # --- Three the plan's D3 allowlisted and the build measured to be dead. --
     # D3's classification was "selection-only" — correct, none of them
     # invalidates a chain — but selection-only is necessary, not sufficient: the
@@ -250,37 +289,21 @@ def _reject_reason(key: str) -> Optional[str]:
     return None
 
 
-# The DTE reach the chains are built to when nothing says otherwise.
-# ``evaluate`` sets it from ``config.put_target_dte``, so a caller holding a
-# Config should pass it rather than rely on this.
-DEFAULT_CHAIN_REACH_DTE = 7
-
-# The longest DTE target the stored lake is being built to reach (FC-096 D1a,
-# Phase A). **A CONSTANT ONLY IN PR-1** — no allowlist entry and no value rule
-# reads it yet, deliberately: the knob does not open until the data exists
-# (FC-096 Phase A, PR-2, gated on the rollout §5 measurement). Opening it here
-# would let a dashboard submit materialise a 22-reach window cold on the live
-# key for hours, which is the FC-095 quota exposure this sequencing exists to
-# avoid.
-#
-# It lives HERE, in the stdlib-only module that is flat-copied into the
-# dashboard image, and ``src/backtesting/data/backfill.py`` imports it — not the
-# other way round. Backfill can import this file; this file cannot import
-# backfill (that would drag pandas, structlog and the whole data layer into the
-# dashboard). One number, two consumers, no drift: a parity test pins the Job's
-# reach and the dashboard's copy to the same value.
-MAX_SWEEPABLE_DTE = 21
-
-
-def validate_override_key(
-    key: str, value: Any = None, *, chain_reach_dte: int = DEFAULT_CHAIN_REACH_DTE
-) -> None:
+def validate_override_key(key: str, value: Any = None) -> None:
     """Raise ``OverrideError`` unless ``key`` (at ``value``) is a legal override.
 
     Order matters: a key with a *specific* reason gets that reason, and only a
     key nobody has thought about falls through to the generic message. A reader
-    who is told "put_target_dte is not in the allowlist" learns nothing; one who
-    is told the cached chains store ``universe_dte=8`` knows what to do next.
+    who is told "put_target_dte is out of range" learns nothing; one who is told
+    the lake reaches 21 days knows what to do next.
+
+    **No ``chain_reach_dte`` parameter, deliberately (FC-096 Phase A, PR-2).**
+    The DTE rule used to be relative to the CALLER's own reach — the base
+    config's ``put_target_dte`` — which made the same arm legal in one sweep and
+    refused in another, and made the dashboard (which holds no Config) validate
+    against a default it had no way to check. The bound is a property of the
+    stored lake, so it is static: ``1 <= int <= MAX_SWEEPABLE_DTE``, everywhere,
+    for both legs.
     """
     reason = _reject_reason(key)
     if reason is not None:
@@ -295,24 +318,20 @@ def validate_override_key(
             "needs a re-materialisation) or is not read by the replay at all — "
             "in both cases the scenario would not measure what it claims."
         )
-    # The one value-dependent rule. ``call_target_dte`` is a legal override
-    # DOWNWARD (it narrows a chain that already covers the reach) and an illegal
-    # one upward (the contracts are not in the file, so the arm silently reads as
-    # "nothing qualified"). D3 draws the line here rather than banning the key
-    # outright, because shortening the call leg is a real question a sweep should
-    # be able to ask.
-    if key == "strategy.call_target_dte":
-        try:
-            requested = int(value)
-        except (TypeError, ValueError):
+    # The one value-dependent rule, and it is the same rule on both legs: a DTE
+    # target has to be a whole number of days the lake actually stores.
+    if key in DTE_OVERRIDE_KEYS:
+        # `bool` is an `int` subclass, and `put_target_dte: true` would otherwise
+        # mean "1 day" — a legal-looking arm nobody asked for.
+        if isinstance(value, bool) or not isinstance(value, int):
             raise OverrideError(
-                "scenario override 'strategy.call_target_dte' must be an "
-                f"integer number of days (got {value!r})"
+                f"scenario override '{key}' must be an integer number of days "
+                f"(got {value!r})"
             )
-        if requested > chain_reach_dte:
+        if not 1 <= value <= MAX_SWEEPABLE_DTE:
             raise OverrideError(
-                f"scenario override 'strategy.call_target_dte' = {requested} is "
-                "refused: " + _CALL_DTE_TOO_LONG.format(reach=chain_reach_dte)
+                f"scenario override '{key}' = {value} is refused: "
+                + _DTE_OUT_OF_RANGE.format(cap=MAX_SWEEPABLE_DTE)
             )
     env_var = ENV_SHADOWED.get(key)
     if env_var and os.environ.get(env_var) is not None:
@@ -324,14 +343,10 @@ def validate_override_key(
         )
 
 
-def validate_overrides(
-    overrides: Mapping[str, Any],
-    *,
-    chain_reach_dte: int = DEFAULT_CHAIN_REACH_DTE,
-) -> None:
+def validate_overrides(overrides: Mapping[str, Any]) -> None:
     """Validate every key in one scenario. Raises on the first offender."""
     for key, value in overrides.items():
-        validate_override_key(key, value, chain_reach_dte=chain_reach_dte)
+        validate_override_key(key, value)
 
 
 def apply_overrides(config: Config, overrides: Mapping[str, Any]) -> Config:
@@ -349,12 +364,7 @@ def apply_overrides(config: Config, overrides: Mapping[str, Any]) -> Config:
             environment variable. Raised BEFORE anything is written, so a
             scenario cannot be half-applied.
     """
-    validate_overrides(
-        overrides,
-        chain_reach_dte=int(
-            getattr(config, "put_target_dte", DEFAULT_CHAIN_REACH_DTE)
-        ),
-    )
+    validate_overrides(overrides)
     scenario_config = copy.deepcopy(config)
     for key, value in overrides.items():
         section, _, leaf = key.rpartition(".")

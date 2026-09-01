@@ -965,9 +965,8 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     # microseconds and turns that into an immediate, explained refusal.
     from src.backtesting.scenarios.overrides import validate_overrides
 
-    chain_reach = int(getattr(config, 'put_target_dte', 7))
     for scenario in scenarios:
-        validate_overrides(scenario.overrides, chain_reach_dte=chain_reach)
+        validate_overrides(scenario.overrides)
 
     # `base` is implicit UNLESS the file already declares it, so the banner must
     # not blindly add one — a file with an explicit `base` would be announced as

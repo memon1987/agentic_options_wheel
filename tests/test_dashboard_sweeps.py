@@ -72,6 +72,9 @@ class TestTheReportProseIsNotAFork:
     @pytest.mark.parametrize("name", [
         "CROSS_SCENARIO_CAVEAT", "IN_SAMPLE_BANNER", "HOLDOUT_SEMANTICS",
         "TALLY_CAVEAT", "SWEEP_BIASES",
+        # FC-096 Phase A PR-2. Pinned here as a CONSTANT; whether it is emitted
+        # is derived separately on each side — see TestTheDteReachCaveatIsNotAFork.
+        "DTE_REACH_BIAS", "DTE_REACH_BIAS_THRESHOLD",
     ])
     def test_matches_report_py_exactly(self, name):
         assert getattr(T, name) == getattr(engine_report, name), (
@@ -171,21 +174,50 @@ class TestAllowlistAgreementWithTheRunner:
             S.validate_spec(spec(scenarios=[
                 {"name": "x", "overrides": {"strategy.invented_knob": 1}}]))
 
-    def test_call_dte_upward_is_refused_downward_is_allowed(self):
-        """The one value-dependent rule, and the API honours it because it
-        calls the runner's validator rather than checking key membership."""
-        with pytest.raises(S.SweepValidationError, match="not in the cached files"):
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_the_dte_range_is_the_engines_rule_not_a_second_copy(self, key):
+        """FC-096 Phase A PR-2. The API honours `1 <= n <= MAX_SWEEPABLE_DTE`
+        because it calls the runner's validator, not because it re-states the
+        bound. `OVERRIDE_VALUE_TYPES` says only "a whole number" for these keys
+        precisely so there is one definition of the range."""
+        from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
+
+        for good in (1, 7, 14, MAX_SWEEPABLE_DTE):
             S.validate_spec(spec(scenarios=[
-                {"name": "x", "overrides": {"strategy.call_target_dte": 14}}]))
-        S.validate_spec(spec(scenarios=[
-            {"name": "x", "overrides": {"strategy.call_target_dte": 5}}]))
+                {"name": "x", "overrides": {key: good}}]))
+        for bad in (0, -1, MAX_SWEEPABLE_DTE + 1):
+            with pytest.raises(S.SweepValidationError,
+                               match="MAX_SWEEPABLE_DTE"):
+                S.validate_spec(spec(scenarios=[
+                    {"name": "x", "overrides": {key: bad}}]))
+        # ...and a non-integer, which the value-type table also refuses. Either
+        # message is fine; being accepted is not.
+        for bad in (14.0, "14", True):
+            with pytest.raises(S.SweepValidationError):
+                S.validate_spec(spec(scenarios=[
+                    {"name": "x", "overrides": {key: bad}}]))
+
+    def test_a_dte_spec_survives_end_to_end(self):
+        """The whole point of PR-2: a DTE arm submitted through the API is
+        normalised and hashable, not refused. An allowlisted key missing from
+        `OVERRIDE_VALUE_TYPES` is refused by `validate_override_value` with a
+        message about the API rather than the knob, which is how the console's
+        flagship control would have died silently."""
+        out = S.validate_spec(spec(scenarios=[
+            {"name": "dte14", "overrides": {"strategy.put_target_dte": 14}},
+            {"name": "dte21", "overrides": {"strategy.call_target_dte": 21}},
+        ]))
+        assert out["scenarios"][0]["overrides"] == {"strategy.put_target_dte": 14}
+        assert out["scenarios"][1]["overrides"] == {"strategy.call_target_dte": 21}
+        assert S.compute_sweep_key(out, "abc")
 
 
 def _plausible_value(key):
     if key.endswith("_range"):
         return [0.10, 0.20]
-    if key == "strategy.call_target_dte":
-        return 5
+    if key in ("strategy.put_target_dte", "strategy.call_target_dte"):
+        return 14
     if key == "universe.excluded_symbols":
         return ["F"]
     if key in ("earnings.enabled", "rolling.enabled"):
@@ -1109,10 +1141,10 @@ try:
     S.validate_spec({"symbols": ["AAPL"], "start": "2025-08-01",
                      "end": "2026-07-31",
                      "scenarios": [{"name": "t", "overrides":
-                                    {"strategy.put_target_dte": 14}}]})
+                                    {"strategy.put_target_dte": 99}}]})
     raise SystemExit("a rejected override was accepted")
 except S.SweepValidationError as exc:
-    assert "universe_dte" in str(exc), str(exc)
+    assert "MAX_SWEEPABLE_DTE" in str(exc), str(exc)
 print(json.dumps({"key": S.compute_sweep_key(spec, "abc123"),
                   "allowed": len(S.allowlist_payload()["allowed"])}))
 """
@@ -1553,9 +1585,9 @@ class TestTheSubmitEndpoint:
         v2, bq = wired
         with pytest.raises(HTTPException) as exc:
             self.submit(v2, body=spec(scenarios=[
-                {"name": "x", "overrides": {"strategy.put_target_dte": 14}}]))
+                {"name": "x", "overrides": {"strategy.put_target_dte": 99}}]))
         assert exc.value.status_code == 422
-        assert "universe_dte" in str(exc.value.detail)
+        assert "MAX_SWEEPABLE_DTE" in str(exc.value.detail)
         assert bq.rows == []
 
     # -- the happy path ----------------------------------------------------
@@ -1672,3 +1704,222 @@ class TestTheAllowlistPayload:
         assert caps["max_symbols"] == S.MAX_SYMBOLS
         assert caps["max_cells"] == S.MAX_CELLS
         assert caps["min_holdout_days"] == S.MIN_HOLDOUT_DAYS
+
+
+# ==========================================================================
+# FC-096 Phase A PR-2 — the DTE reach caveat, derived per run
+# ==========================================================================
+class TestTheDteReachCaveatIsNotAFork:
+    """The CONSTANT is pinned byte-for-byte; the EMISSION is derived twice.
+
+    The CLI reads `SweepResult.effective_max_dte`, which the runner computed
+    from the base config plus every arm. The dashboard has no Config, so it
+    derives the reach from the persisted spec instead. Two routes to the same
+    condition is a deliberate design decision (the plan's M6), and it is safe
+    only while both sides agree about the WORDS and about the threshold — hence
+    these.
+    """
+
+    def test_the_caveat_text_matches_report_py(self):
+        assert T.DTE_REACH_BIAS == engine_report.DTE_REACH_BIAS
+
+    def test_the_threshold_matches_report_py(self):
+        assert T.DTE_REACH_BIAS_THRESHOLD == engine_report.DTE_REACH_BIAS_THRESHOLD
+
+    def test_the_dte_override_keys_are_imported_not_restated(self):
+        """A key on one side and not the other means one side derives a reach
+        the other does not — the footer would appear on `/sims` and not in
+        `sweep.md`, or the reverse. `overrides.py` is stdlib-only and copied
+        flat into the dashboard image, so both sides can import the SAME object
+        rather than agreeing to keep two tuples equal."""
+        from src.backtesting.scenarios import overrides, runner
+
+        assert S.DTE_OVERRIDE_KEYS is overrides.DTE_OVERRIDE_KEYS
+        assert runner.DTE_OVERRIDE_KEYS is overrides.DTE_OVERRIDE_KEYS
+        assert set(overrides.DTE_OVERRIDE_KEYS) <= set(ALLOWED_OVERRIDES)
+
+
+class TestSpecMaxDte:
+    def test_a_spec_with_no_dte_arms_sits_at_the_threshold(self):
+        assert S.spec_max_dte({"scenarios": [
+            {"name": "a", "overrides": {"strategy.min_put_premium": 0.3}}]}) == 7
+
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_either_leg_raises_it(self, key):
+        assert S.spec_max_dte({"scenarios": [
+            {"name": "a", "overrides": {key: 14}}]}) == 14
+
+    def test_the_maximum_wins(self):
+        assert S.spec_max_dte({"scenarios": [
+            {"name": "a", "overrides": {"strategy.put_target_dte": 3}},
+            {"name": "b", "overrides": {"strategy.call_target_dte": 21}},
+        ]}) == 21
+
+    def test_a_shorter_arm_never_lowers_it(self):
+        """Below the threshold the answer is the threshold: the caveat asks
+        "did this run reach PAST 7", and a DTE-3 arm did not."""
+        assert S.spec_max_dte({"scenarios": [
+            {"name": "a", "overrides": {"strategy.put_target_dte": 3}}]}) == 7
+
+    @pytest.mark.parametrize("spec", [
+        {}, {"scenarios": None}, {"scenarios": []}, {"scenarios": ["not-a-dict"]},
+        {"scenarios": [{"name": "a"}]},
+        {"scenarios": [{"name": "a", "overrides": None}]},
+        {"scenarios": [{"name": "a", "overrides": "nope"}]},
+        {"scenarios": [{"name": "a", "overrides": {"strategy.put_target_dte": "14"}}]},
+        {"scenarios": [{"name": "a", "overrides": {"strategy.put_target_dte": True}}]},
+    ])
+    def test_a_malformed_or_absent_spec_degrades_to_the_threshold(self, spec):
+        """A `submitted` run has no cells and a run from before this field
+        existed has no DTE keys; neither may 500 the results page, and neither
+        may invent a caveat."""
+        assert S.spec_max_dte(spec) == 7
+
+
+class TestTheFooterIsPerRun:
+    def _shaped(self, overrides):
+        return S.shape_results({
+            "run_id": "r", "status": "done", "in_sample_only": True,
+            "spec_json": json.dumps({
+                "symbols": ["AAPL"],
+                "scenarios": [{"name": "x", "overrides": overrides}],
+            }),
+        }, [])
+
+    def test_a_dte_7_run_carries_the_ordinary_footer_only(self):
+        shaped = self._shaped({"strategy.min_put_premium": 0.3})
+        assert shaped["effective_max_dte"] == 7
+        titles = [b["title"] for b in shaped["known_biases"]]
+        assert T.DTE_REACH_BIAS[0] not in titles
+        assert shaped["known_biases"] == [
+            {"title": t, "detail": d} for t, d in T.SWEEP_BIASES]
+
+    @pytest.mark.parametrize("key", [
+        "strategy.put_target_dte", "strategy.call_target_dte"])
+    def test_a_long_dte_run_gains_the_caveat_and_nothing_else(self, key):
+        shaped = self._shaped({key: 14})
+        assert shaped["effective_max_dte"] == 14
+        title, detail = T.DTE_REACH_BIAS
+        assert shaped["known_biases"][-1] == {"title": title, "detail": detail}
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 1
+
+    def test_the_two_renderings_agree_on_a_long_run(self):
+        """The whole point of deriving the condition twice: `/sims` and
+        `sweep.md` must warn the same reader in the same words about the same
+        run."""
+        sweep = _sample_sweep()
+        sweep.effective_max_dte = 14
+        rendered = json.loads(engine_report.render_json(sweep))
+        shaped = self._shaped({"strategy.put_target_dte": 14})
+        assert shaped["known_biases"] == rendered["known_biases"]
+        assert shaped["effective_max_dte"] == rendered["effective_max_dte"]
+
+
+class TestTheEarningsGapsAreStoredAndServed:
+    """REVIEW: the PR claimed `earnings_symbols_without_data` reached the
+    dashboard. It did not — the runner computed it and only the CLI report ever
+    read it, so `/sims` was silent about a gate that never gated.
+
+    It is PERSISTED rather than re-derived on read, because it is a property of
+    the earnings table as it stood when the run replayed: the same spec, run
+    again after the table is refreshed, gives a different answer. A derivation
+    would report today's coverage against yesterday's numbers.
+    """
+
+    def test_the_done_row_carries_the_list_as_json(self):
+        sweep = _sample_sweep()
+        sweep.earnings_symbols_without_data = ["AAPL", "ZZZ"]
+        row = store.status_row(
+            run_id="r", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        assert json.loads(row["earnings_symbols_without_data"]) == ["AAPL", "ZZZ"]
+
+    def test_no_gaps_stores_NULL_not_an_empty_array(self):
+        """"No gaps" and "this run predates the column" are both absences here,
+        and neither is a claim. A stored `"[]"` would assert that the run
+        checked and found nothing — which a pre-column run did not do."""
+        sweep = _sample_sweep()
+        assert sweep.earnings_symbols_without_data == []
+        row = store.status_row(
+            run_id="r", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        assert row["earnings_symbols_without_data"] is None
+
+    def test_every_status_row_carries_the_column(self):
+        """The submitted/running rows must have it too, or the column set
+        diverges by writer and `TestTheSubmittedRowMatchesTheJobsRowShape`
+        stops meaning anything."""
+        row = store.status_row(
+            run_id="r", status=store.STATUS_RUNNING,
+            submitted_at="2026-08-29T12:00:00+00:00")
+        assert "earnings_symbols_without_data" in row
+        assert row["earnings_symbols_without_data"] is None
+
+    def test_the_column_is_in_the_sweeps_schema_as_a_nullable_string(self):
+        field = next(
+            f for f in store._sweeps_schema()
+            if f.name == "earnings_symbols_without_data")
+        assert field.field_type == "STRING"
+        # NULLABLE: every pre-existing row has no value, and the additive
+        # reconcile can only add a nullable column to a live table.
+        assert (field.mode or "NULLABLE").upper() == "NULLABLE"
+
+    def test_shape_results_serves_it(self):
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done",
+            "earnings_symbols_without_data": json.dumps(["AAPL", "ZZZ"]),
+        }, [])
+        assert shaped["earnings_symbols_without_data"] == ["AAPL", "ZZZ"]
+
+    @pytest.mark.parametrize("stored", [
+        pytest.param(None, id="pre-column run"),
+        pytest.param("", id="empty string"),
+        pytest.param("not json", id="unparseable"),
+        pytest.param('{"a": 1}', id="json but not a list"),
+    ])
+    def test_an_absent_or_malformed_value_renders_as_empty_never_500s(self, stored):
+        """A page that cannot render a sweep from before the column existed is
+        worse than one that renders it without a caveat it never recorded."""
+        shaped = S.shape_results(
+            {"run_id": "r", "status": "done",
+             "earnings_symbols_without_data": stored}, [])
+        assert shaped["earnings_symbols_without_data"] == []
+
+    def test_it_survives_the_real_round_trip(self, shaped_and_engine):
+        """Through `rows_from_sweep`/`status_row` and out of `shape_results`,
+        rather than through a hand-written row that could agree with a wrong
+        implementation."""
+        _shaped, sweep, _rendered = shaped_and_engine
+        sweep.earnings_symbols_without_data = ["NVDA"]
+        row = store.status_row(
+            run_id="rid", status=store.STATUS_DONE,
+            submitted_at="2026-08-29T12:00:00+00:00", result=sweep)
+        shaped = S.shape_results(row, [])
+        assert shaped["earnings_symbols_without_data"] == ["NVDA"]
+        # ...and the CLI JSON says the same thing about the same run.
+        assert json.loads(engine_report.render_json(sweep))[
+            "earnings_symbols_without_data"] == ["NVDA"]
+        sweep.earnings_symbols_without_data = []
+
+
+class TestTheAllowlistProseDoesNotCiteARetiredRefusal:
+    """REVIEW: both allowlist docstrings taught the reader with
+    `put_target_dte` / `universe_dte=8` — a refusal that no longer exists. A
+    doc example that the code contradicts is worse than none: it is the first
+    thing a reader checks, and finding it false costs them trust in the rest."""
+
+    @pytest.mark.parametrize("obj", [
+        S.allowlist_payload,
+        pytest.param(None, id="router"),
+    ])
+    def test_no_docstring_cites_the_pre_pr2_dte_refusal(self, obj):
+        if obj is None:
+            import routers.v2 as v2_mod
+            doc = v2_mod.sweeps_allowlist.__doc__ or ""
+        else:
+            doc = obj.__doc__ or ""
+        assert "universe_dte=8" not in doc
+        assert "put_target_dte" not in doc
+        # ...and it still teaches with a REAL refusal, not a generic one.
+        assert "min_open_interest" in doc

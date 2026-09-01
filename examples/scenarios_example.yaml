@@ -9,12 +9,15 @@
 # The `base` scenario (no overrides) is IMPLICIT and always runs first: it is the
 # comparator every other row is read against. Do not declare it.
 #
+# BOTH DTE targets are sweepable within 1..MAX_SWEEPABLE_DTE (21) since FC-096
+# Phase A: the weekly data-backfill Job keeps the chain lake at universe_dte=22,
+# and the runner materialises each window at the MAXIMUM reach any arm asks for.
+# Past that bound the contracts are not in the file, so the arm would read as
+# "nothing qualified" rather than as a test of that reach — which is why the
+# bound tracks the DATA and moves only when the lake does. A run that reaches
+# past 7 DTE picks up an extra footer caveat about ladder thinness; read it.
+#
 # Keys that are refused, and why (short version):
-#   strategy.put_target_dte        - changes the chain's DTE reach; needs a
-#                                    re-materialisation, which Layer 2 has not.
-#   strategy.call_target_dte > 7   - does not widen the chain; the contracts are
-#                                    simply absent, so the arm reads as "nothing
-#                                    qualified". Lowering it is allowed.
 #   risk.profit_taking.*           - /monitor-only; the replay's day loop never
 #   risk.*_stop_loss*                runs it, so every arm would be identical.
 #   strategy.*_limit_spread_fraction - the replay RECORDS a limit price and fills

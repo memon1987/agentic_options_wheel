@@ -108,3 +108,26 @@ SWEEP_BIASES = [('Every arm is measured by the same biased engine, so DIFFERENCE
   'income is short-term gains and buy-and-hold defers to long-term; '
   'published estimates put that drag at ~1-2%/yr, which nothing here '
   'deducts.')]
+
+# FC-096 Phase A PR-2. The DTE-reach caveat, and the threshold that decides
+# whether a run has earned it. **The parity test pins the CONSTANT, not its
+# emission** — the CLI reads `SweepResult.effective_max_dte` and the dashboard
+# derives the same reach from the persisted spec's DTE overrides, so the two
+# arrive at the condition by different routes and must not disagree about the
+# WORDS.
+DTE_REACH_BIAS_THRESHOLD = 7
+
+DTE_REACH_BIAS = ('Arms reaching past 7 DTE are measured on THINNER data, and the thinness '
+ 'biases selection rather than merely adding noise',
+ 'These are not extrapolated prices: a 14- or 21-DTE quote here is a real '
+ "print of a real contract, with implied vol solved from that contract's own "
+ 'daily trade bar. The problem is WHICH contracts survive. Longer-dated '
+ 'contracts trade thinly, and the chain builder drops any contract with no '
+ 'trade that day — so a hole in the ladder is indistinguishable from a strike '
+ 'that never existed, and the strategy picks from whatever happened to trade '
+ 'rather than from the real ladder. That biases SELECTION; it is not a wider '
+ 'error bar around the same choice. Two further limits ride along: the spread '
+ 'model (FC-051) was measured on short-dated OTM puts only and is unvalidated '
+ 'at these tenors, and the premium shortfalls quoted above were measured at 7 '
+ "DTE. Read a long-DTE arm's RANK against other long-DTE arms; a "
+ 'long-versus-short comparison carries this on top of every bias listed here.')

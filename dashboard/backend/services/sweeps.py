@@ -39,6 +39,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from services.sweep_report_text import (
     BASE_SCENARIO_NAME,
     CROSS_SCENARIO_CAVEAT,
+    DTE_REACH_BIAS,
+    DTE_REACH_BIAS_THRESHOLD,
     HOLDOUT_SEMANTICS,
     IN_SAMPLE_BANNER,
     MIN_DAYS_IN_POSITION,
@@ -59,8 +61,8 @@ try:  # repo / test environment
         sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
-        ALLOWED_OVERRIDES, REJECTED_OVERRIDES, OverrideError, describe_allowlist,
-        validate_override_key,
+        ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
+        describe_allowlist, validate_override_key,
     )
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
@@ -68,8 +70,8 @@ except ImportError:  # dashboard image: the same files, copied flat
         sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
-        ALLOWED_OVERRIDES, REJECTED_OVERRIDES, OverrideError, describe_allowlist,
-        validate_override_key,
+        ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
+        describe_allowlist, validate_override_key,
     )
 
 # ============================================================================ #
@@ -180,6 +182,11 @@ OVERRIDE_VALUE_TYPES: Dict[str, str] = {
     "strategy.call_delta_range": _BAND,
     "strategy.min_put_premium": _NUM,
     "strategy.min_call_premium": _NUM,
+    # Both DTE targets, allowlisted since FC-096 Phase A PR-2. The RANGE
+    # (1..MAX_SWEEPABLE_DTE) is the engine's rule and is enforced by the imported
+    # `validate_override_key`, which runs first; this table only says the value
+    # must be a whole number, so the two checks cannot drift apart on the bound.
+    "strategy.put_target_dte": _INT,
     "strategy.call_target_dte": _INT,
     "strategy.min_stock_price": _NUM,
     "strategy.max_stock_price": _NUM,
@@ -658,6 +665,12 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any], sweep_key_value: str,
         "error_cells": None,
         # The API has no Config, so it cannot compute the engine hash either.
         "engine_config_hash": None,
+        # FC-096 A4. Only a replay knows which symbols the earnings table was
+        # missing; the API has run nothing. NULL here, filled by the Job's
+        # terminal row — but PRESENT, because every status row of a run must
+        # carry the same column set or the two writers diverge by whichever one
+        # happened to know a field.
+        "earnings_symbols_without_data": None,
     }
 
 
@@ -768,6 +781,24 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if status != STATUS_SUBMITTED:
         return False
     return now - stamp > timedelta(minutes=STUCK_AFTER_MINUTES)
+
+
+def _json_list(value: Any) -> List[str]:
+    """A stored JSON array of strings, or ``[]`` for anything unreadable.
+
+    Never raises and never 500s the results page: the column is NULL on every
+    run written before it existed, and a page that cannot render an old sweep is
+    worse than one that renders it without a caveat it never recorded.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return [str(v) for v in parsed] if isinstance(parsed, list) else []
 
 
 def _as_date_str(value: Any) -> Optional[str]:
@@ -1026,6 +1057,38 @@ def _ordering(sweep_row: Dict[str, Any], run_rows: Sequence[Dict[str, Any]]):
     return scenarios, symbols, splits, spec
 
 
+def spec_max_dte(spec: Dict[str, Any]) -> int:
+    """The DTE reach a persisted spec's arms imply — the dashboard's half of
+    ``runner.effective_max_dte``.
+
+    The runner takes the max over the base config AND every arm's DTE overrides.
+    This side cannot see the base config — it holds a spec, not a ``Config`` —
+    so the floor is ``DTE_REACH_BIAS_THRESHOLD``, which is the live profile's
+    own ``put_target_dte``. The two therefore agree on the only thing the answer
+    is used for: whether the run reached PAST 7. They would disagree if the
+    wheel profile's base DTE ever moved off 7, which is a config change that has
+    to update the threshold anyway (the fidelity figures in ``SWEEP_BIASES``
+    were measured at 7 and the constant says so).
+
+    Reads the SPEC rather than the per-cell ``overrides_json`` because the spec
+    is the run's declaration: an arm that errored in every cell still asked for
+    its reach, and the caveat is about the DATA the window was built on, not
+    about which cells came back.
+    """
+    reach = DTE_REACH_BIAS_THRESHOLD
+    for arm in (spec.get("scenarios") or []):
+        if not isinstance(arm, dict):
+            continue
+        overrides = arm.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            continue
+        for key in DTE_OVERRIDE_KEYS:
+            value = overrides.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                reach = max(reach, value)
+    return reach
+
+
 def shape_results(sweep_row: Dict[str, Any],
                   run_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Everything ``/sims`` renders, derived once here (D11).
@@ -1127,6 +1190,22 @@ def shape_results(sweep_row: Dict[str, Any],
     if in_sample_only is None:
         in_sample_only = not has_holdout
 
+    # FC-096 Phase A PR-2. Derived per run, appended to THIS run's footer only:
+    # a 7-reach sweep has not earned the caveat, and a footer that warns about
+    # something the run did not do is one people stop reading.
+    effective_max_dte = spec_max_dte(spec)
+    known_biases = list(SWEEP_BIASES)
+    if effective_max_dte > DTE_REACH_BIAS_THRESHOLD:
+        known_biases.append(DTE_REACH_BIAS)
+
+    # FC-096 A4. Read off the PERSISTED row, never re-derived: this is a
+    # property of the earnings table as it stood when the run replayed, and a
+    # symbol onboarded today and refreshed tomorrow has the same spec and a
+    # different answer. `[]` for a run that found no gaps AND for one written
+    # before the column existed — the two are indistinguishable downstream, so
+    # the page must not present an empty list as "checked, all clear".
+    earnings_gaps = _json_list(sweep_row.get("earnings_symbols_without_data"))
+
     return {
         "run": dict(sweep_row),
         "spec": spec,
@@ -1147,7 +1226,14 @@ def shape_results(sweep_row: Dict[str, Any],
         "min_days_in_position": MIN_DAYS_IN_POSITION,
         # The footer, verbatim from the CLI report. Served rather than restated
         # in the frontend so the two readers are warned in the same words.
-        "known_biases": [{"title": t, "detail": d} for t, d in SWEEP_BIASES],
+        "known_biases": [{"title": t, "detail": d} for t, d in known_biases],
+        # Served so a reader can check the footer against its own input — the
+        # CLI report carries the same field.
+        "effective_max_dte": effective_max_dte,
+        # FC-096 A4. Symbols the FC-013 gate could not gate, because they are
+        # absent from the committed earnings table. Rendering it on `/sims` is
+        # Phase E; serving it now means the number exists to render.
+        "earnings_symbols_without_data": earnings_gaps,
         "cross_scenario_caveat": CROSS_SCENARIO_CAVEAT,
         "rejection_tally_caveat": TALLY_CAVEAT,
         "in_sample_banner": IN_SAMPLE_BANNER if in_sample_only else None,
@@ -1192,8 +1278,9 @@ def allowlist_payload() -> Dict[str, Any]:
 
     Rejections are served alongside the allowed keys, with their reasons. A form
     that only listed what is allowed teaches nothing; the reasons are the whole
-    value — "put_target_dte is not in the allowlist" tells an operator nothing,
-    "the cached chains store universe_dte=8" tells them what to do next.
+    value — "universe.min_open_interest is not in the allowlist" tells an
+    operator nothing, "the engine hardcodes open_interest to 0, so any floor
+    rejects every call" tells them what to do next.
     """
     return {
         "allowed": [{"key": key, "description": why}

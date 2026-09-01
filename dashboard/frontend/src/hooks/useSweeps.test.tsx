@@ -138,7 +138,7 @@ describe('submitSweep — one request, never a retry', () => {
 
   it('surfaces a 422 reason VERBATIM', async () => {
     const reason =
-      'strategy.put_target_dte — cached chains store universe_dte=8; a scenario needs a re-materialisation.';
+      'universe.min_open_interest — the engine hardcodes open_interest: 0, so any floor rejects EVERY call.';
     fetchMock.mockResolvedValue(jsonResponse(422, { detail: reason }));
     expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'invalid', detail: reason });
   });

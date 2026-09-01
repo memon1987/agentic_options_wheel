@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 from statistics import median
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..metrics.fitness import MIN_DAYS_IN_POSITION
 from .overrides import describe_allowlist
@@ -150,6 +150,53 @@ SWEEP_BIASES = [
          "buy-and-hold defers to long-term; published estimates put that drag at "
          "~1-2%/yr, which nothing here deducts.")),
 ]
+
+# The reach above which a sweep's chains stop being the ones this engine was
+# measured on. 7 is the live `put_target_dte` and the reach every fidelity
+# figure quoted in `SWEEP_BIASES` was measured at.
+DTE_REACH_BIAS_THRESHOLD = 7
+
+# FC-096 Phase A PR-2. Appended to the footer ONLY when a run's effective reach
+# exceeds `DTE_REACH_BIAS_THRESHOLD` — a 7-reach sweep has not earned this
+# caveat, and a footer that warns about something the run did not do is a footer
+# people stop reading.
+#
+# The wording is deliberately NOT "these quotes are extrapolated". They are not:
+# a 14- or 21-DTE quote here is a real print of a real contract, with IV solved
+# from that contract's own daily trade bar. Saying otherwise would be a stronger
+# claim than the truth and misleading in its own direction — the reader would
+# discount a number that is real. What IS true is thinner, and worse in a
+# specific way, so the caveat says exactly that.
+DTE_REACH_BIAS = (
+    "Arms reaching past 7 DTE are measured on THINNER data, and the thinness "
+    "biases selection rather than merely adding noise", (
+        "These are not extrapolated prices: a 14- or 21-DTE quote here is a real "
+        "print of a real contract, with implied vol solved from that contract's "
+        "own daily trade bar. The problem is WHICH contracts survive. "
+        "Longer-dated contracts trade thinly, and the chain builder drops any "
+        "contract with no trade that day — so a hole in the ladder is "
+        "indistinguishable from a strike that never existed, and the strategy "
+        "picks from whatever happened to trade rather than from the real ladder. "
+        "That biases SELECTION; it is not a wider error bar around the same "
+        "choice. Two further limits ride along: the spread model (FC-051) was "
+        "measured on short-dated OTM puts only and is unvalidated at these "
+        "tenors, and the premium shortfalls quoted above were measured at 7 DTE. "
+        "Read a long-DTE arm's RANK against other long-DTE arms; a long-versus-"
+        "short comparison carries this on top of every bias listed here."),
+)
+
+def sweep_biases(result: SweepResult) -> List[Tuple[str, str]]:
+    """``SWEEP_BIASES``, plus ``DTE_REACH_BIAS`` for a run that reached past 7.
+
+    One function so the markdown footer and the JSON ``known_biases`` cannot
+    disagree about which caveats this run carries — the dashboard derives the
+    same condition from the persisted spec (`services/sweeps.py`).
+    """
+    biases = list(SWEEP_BIASES)
+    if int(getattr(result, "effective_max_dte", 0) or 0) > DTE_REACH_BIAS_THRESHOLD:
+        biases.append(DTE_REACH_BIAS)
+    return biases
+
 
 _VERDICT_GLYPH = {
     "fit": "+",
@@ -279,6 +326,21 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
     a(persistence_note(persistence))
     a("")
 
+    # FC-096 A4. The FC-013 gate answers "clear" for a symbol it has no row for,
+    # which is indistinguishable from a symbol that genuinely has no earnings in
+    # the window — so a sweep over a freshly-onboarded candidate would report a
+    # gated strategy that was never gated. Stated in the HEADER, above the
+    # numbers, because it changes what every row below means for those symbols.
+    if result.earnings_symbols_without_data:
+        a("> **The earnings gate did not gate "
+          f"{', '.join(result.earnings_symbols_without_data)}.** "
+          "These symbols are absent from the committed earnings table entirely, "
+          "so `EarningsCalendarService` had no date to test and every candidate "
+          "on them passed the FC-013 gate by default. Refresh the table and "
+          "re-run before reading their rows as a test of anything earnings-"
+          "related.")
+        a("")
+
     if result.errors:
         a(f"> **{len(result.errors)} of {len(result.rows)} cells errored.** They are "
           "**not** implicitly fine — they were never measured. See *Errors* below.")
@@ -367,12 +429,15 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
     for line in describe_allowlist():
         a(f"- `{line}`")
     a("")
-    a("Keys that change what the chain must CONTAIN (`put_target_dte`, a longer "
-      "`call_target_dte`) are refused: the cached chains reach a fixed DTE, so "
-      "such an arm would silently measure something else. Keys the replay does "
-      "not read at all (`risk.profit_taking.*`, the stop-loss switches — both "
-      "`/monitor`-only) are refused for the mirror reason: every arm would come "
-      "back identical, which reads as \"this knob does not matter\".")
+    a("Both DTE targets are allowed within `1..MAX_SWEEPABLE_DTE` — the reach "
+      "the stored chain lake is kept at (FC-096 Phase A). Beyond it the "
+      "contracts are simply not in the file, so the arm would read as \"nothing "
+      "qualified\" rather than as a test of that reach, which is why the bound "
+      "is a property of the DATA and moves only when the lake does. Keys the "
+      "replay does not read at all (`risk.profit_taking.*`, the stop-loss "
+      "switches — both `/monitor`-only) are refused for the mirror reason: every "
+      "arm would come back identical, which reads as \"this knob does not "
+      "matter\".")
     a("</details>")
     a("")
 
@@ -382,7 +447,7 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
     a("")
     a(TALLY_CAVEAT)
     a("")
-    for title, detail in SWEEP_BIASES:
+    for title, detail in sweep_biases(result):
         a(f"- **{title}.** {detail}")
     a("")
     a("The single-symbol report (`--command backtest`) carries the full "
@@ -598,7 +663,12 @@ def render_json(result: SweepResult, persistence=None) -> str:
             }
             for split, _s, _e in result.windows
         },
-        "known_biases": [{"title": t, "detail": d} for t, d in SWEEP_BIASES],
+        "known_biases": [{"title": t, "detail": d} for t, d in sweep_biases(result)],
+        # The reach this run was materialised to. Reported rather than implied:
+        # it is what decides whether `known_biases` carries DTE_REACH_BIAS, and a
+        # consumer that cannot see the input cannot check the output.
+        "effective_max_dte": result.effective_max_dte,
+        "earnings_symbols_without_data": list(result.earnings_symbols_without_data),
         "cross_scenario_caveat": CROSS_SCENARIO_CAVEAT,
         "rejection_tally_caveat": TALLY_CAVEAT,
         "in_sample_banner": IN_SAMPLE_BANNER if result.in_sample_only else None,
