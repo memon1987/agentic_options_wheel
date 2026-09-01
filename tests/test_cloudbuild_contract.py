@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1065,6 +1066,21 @@ def test_the_identity_file_is_ignored_and_untracked():
         "`git add -A` in any agent or developer session would commit a stale "
         "identity that build-dashboard-image would then bake into the image."
     )
+
+    # Part (b) needs BOTH a .git checkout AND a git binary: Cloud Build's
+
+    # python:3.11-slim run-tests image ships a .git directory in /workspace
+
+    # but no git executable (FileNotFoundError crashed build ad532ab0 —
+
+    # the fifth ambient-environment flavor). Absent either, part (a)
+
+    # (the parsed .gitignore rule) still guards, everywhere.
+
+    if shutil.which("git") is None:
+
+        return
+
 
     if not (REPO_ROOT / ".git").exists():
         # Cloud Build checks the repo out as a TARBALL — no `.git` at all — so
