@@ -15,6 +15,22 @@ It is a one-shot bootstrap, kept in the tree because it is exactly what is
 needed again after any local cache rebuild, and because a second machine's
 cache can be folded into the lake the same way.
 
+SUPERSEDED for routine use by `python main.py --command backfill` (FC-096
+Phase A), which is the deliberate way the lake is kept current: it builds
+missing days from the vendor at `universe_dte = 22`, unions each day's strike
+window with whatever is already stored, and runs weekly as the `data-backfill`
+Cloud Run Job. Prefer it whenever the question is "make the lake current".
+
+TWO THINGS THIS STILL DOES THAT THE BACKFILL CANNOT, which is why it stays:
+
+  * it uploads chains that ALREADY EXIST LOCALLY, without re-fetching them from
+    the vendor — the only route for history we may no longer be entitled to
+    re-fetch (retention, tier limits, rate limits);
+  * `--force` overwrites an object the coverage guard refuses, which is the one
+    escape hatch for a poisoned or unreadable remote file. The backfill will
+    never do that: it is coverage-monotone by construction, so a bad object is
+    something it declines to touch and reports (`lake_skipped`), for ever.
+
 How to re-run
 -------------
     python tools/diagnostics/chain_lake_seed.py \

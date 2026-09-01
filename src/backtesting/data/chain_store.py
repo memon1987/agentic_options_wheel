@@ -1081,6 +1081,67 @@ class ChainStore:
         """
         return self._path(underlying, as_of).exists()
 
+    def stored_window(self, underlying: str, as_of: date) -> Optional[dict]:
+        """What the object this store would serve for ``(underlying, as_of)`` covers.
+
+        FC-096 Phase A. A **read-only** provenance accessor: it answers "what
+        window is already stored here", and changes nothing about ``put``,
+        ``get``, the coverage rule or the FC-091 merge. It exists because the
+        backfill's window rule has to build the UNION of the fresh window and
+        the stored one — and the stored one lives inside the parquet, where no
+        public method reached.
+
+        Returns ``{"universe_dte", "strike_gte", "strike_lte", "model",
+        "underlying_price"}`` (any of the first four ``None`` when the file
+        pre-dates that column), or ``None`` when nothing is stored, the file is
+        unreadable, or it holds no rows.
+
+        Local first, then the lake — the same order ``get`` uses, and for the
+        same reason: on Cloud Run the filesystem is empty every execution, so
+        every answer has to come from GCS. A lake pull leaves the file in the
+        local cache and remembers the remote window, so the ``get``/``put``
+        that follow do not pay for it a second time.
+
+        **A dev-machine caveat, deliberately not hidden.** When a local file
+        exists this returns *its* window, not the lake object's, and the two can
+        differ on a machine with a persistent cache. A union built on the
+        narrower local window can then be refused by the mirror's monotone guard
+        (counted as ``lake_skipped``, logged as ``chain_lake_overwrite_skipped``)
+        — reported, never silent. The Job, whose filesystem starts empty, cannot
+        hit this.
+        """
+        path = self._path(underlying, as_of)
+        pulled = False
+        if not path.exists():
+            if not self._pull_from_lake(underlying, as_of, path):
+                return None
+            pulled = True
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            # Same posture as ``get``: an unreadable file is a miss, not a
+            # raise. Nothing is deleted here — ``get`` owns that decision, and
+            # a provenance read must not have side effects on the cache.
+            return None
+        if pulled:
+            self._remember_remote_window(underlying, as_of, df)
+        if df.empty:
+            return None
+        window = _window_of(df)
+        price = df["underlying_price"].iloc[0] if "underlying_price" in df.columns else _UNKNOWN
+
+        def _num(value):
+            return None if pd.isna(value) else float(value)
+
+        dte = _num(window.universe_dte)
+        return {
+            "universe_dte": None if dte is None else int(dte),
+            "strike_gte": _num(window.strike_gte),
+            "strike_lte": _num(window.strike_lte),
+            "model": window.model or None,
+            "underlying_price": _num(price),
+        }
+
     def put(
         self,
         snapshot: ChainSnapshot,

@@ -565,6 +565,12 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
 # --------------------------------------------------------------------------
 SWEEP_JOB_STEP = "deploy-sweep-job"
 SWEEP_JOB_NAME = "backtest-sweep"
+BACKFILL_JOB_STEP = "deploy-backfill-job"
+BACKFILL_JOB_NAME = "data-backfill"
+
+# Every Cloud Run Job this build deploys. They are the build's tail steps as a
+# SET — see `test_the_job_steps_are_the_tail_and_nothing_hides_behind_them`.
+JOB_STEPS = {SWEEP_JOB_STEP, BACKFILL_JOB_STEP}
 
 
 def test_sweep_job_step_honours_the_superseded_marker_first(by_id):
@@ -698,11 +704,181 @@ def test_sweep_job_runs_after_every_service_promote(by_id, steps):
         f"{SWEEP_JOB_STEP} must waitFor every promote step {sorted(promotes)}; "
         f"got {sorted(wait)}."
     )
+
+
+def test_the_job_steps_are_the_tail_and_nothing_hides_behind_them(steps, by_id):
+    """The Job deploys are the LAST steps, as a set (FC-096 Phase A).
+
+    This was `ids[-1] == "deploy-sweep-job"` while there was exactly one Job.
+    There are now two — `deploy-sweep-job` and `deploy-backfill-job` — and both
+    belong at the tail for the same reason: either can fail on a
+    `run.jobs.create` permission the build account has not been granted, and a
+    step listed AFTER them inherits an implicit dependency on them, so that
+    failure would strand whatever came next. Asserting the tail as a set keeps
+    that guarantee while allowing a third Job to be added the same way.
+
+    What it deliberately does NOT assert is their order relative to each other:
+    they waitFor the same three promotes and Cloud Build runs them
+    concurrently, so which one is listed first is not a property of the deploy.
+    """
     ids = [st["id"] for st in steps]
-    assert ids[-1] == SWEEP_JOB_STEP, (
-        f"{SWEEP_JOB_STEP} should be the LAST step; got {ids[-1]}. A `waitFor` "
-        "edge alone is not enough — a later step listed after it would inherit "
-        "an implicit dependency on it."
+    tail = set(ids[-len(JOB_STEPS):])
+    assert tail == JOB_STEPS, (
+        f"the final {len(JOB_STEPS)} steps must be exactly {sorted(JOB_STEPS)}; "
+        f"got {sorted(tail)}. A `waitFor` edge alone is not enough — a step "
+        "listed after a Job deploy inherits an implicit dependency on it, so a "
+        "Job-permission failure would strand it."
+    )
+    promotes = {roles["promote"] for roles in CHAINS.values()}
+    for step_id in sorted(JOB_STEPS):
+        wait = set(by_id[step_id].get("waitFor") or [])
+        assert promotes <= wait, (
+            f"{step_id} must waitFor every promote step {sorted(promotes)}; "
+            f"got {sorted(wait)}."
+        )
+        script = script_of(by_id[step_id])
+        assert script.strip().startswith(MARKER_CHECK), (
+            f"{step_id} must begin with the superseded-marker check — a Job "
+            "deploy from a superseded build would leave the Job running an "
+            "older commit's image than the services."
+        )
+
+
+# --------------------------------------------------------------------------
+# 5c. The data-backfill Cloud Run Job (FC-096 Phase A).
+# --------------------------------------------------------------------------
+def test_backfill_job_step_deploys_this_builds_image_with_the_backfill_command(by_id):
+    """The Job runs THIS build's image, on the wheel profile, in backfill mode.
+
+    `:$COMMIT_SHA` and not `:latest`: what this Job writes is *vendor data*
+    under a model fingerprint derived from the engine's own constants, so a Job
+    floating on `:latest` could silently start writing chains under a different
+    pricing model than the one the sweeps reading them were built with.
+    """
+    assert BACKFILL_JOB_STEP in by_id, (
+        f"`{BACKFILL_JOB_STEP}` is what creates and updates the "
+        f"`{BACKFILL_JOB_NAME}` Job; without it the weekly scheduler fires at a "
+        "Job that does not exist, and `jobs:run` is async so the scheduler "
+        "records success anyway."
+    )
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    assert f"gcloud run jobs deploy {BACKFILL_JOB_NAME}" in script, (
+        f"{BACKFILL_JOB_STEP} must `gcloud run jobs deploy {BACKFILL_JOB_NAME}`."
+    )
+    assert "options-wheel-strategy:$COMMIT_SHA" in script, (
+        f"{BACKFILL_JOB_STEP} must deploy the strategy image at :$COMMIT_SHA."
+    )
+    assert "--command=python" in script and "--args=main.py,--command,backfill" in script, (
+        f"{BACKFILL_JOB_STEP} must run `python main.py --command backfill`."
+    )
+    assert "backtest-screen" not in script and "backtest-sweep" not in script, (
+        f"{BACKFILL_JOB_STEP} must not touch another Job's definition."
+    )
+
+
+def test_backfill_job_step_takes_no_baked_in_window(by_id):
+    """The four BACKFILL_* overrides are per-EXECUTION, never per-deploy.
+
+    A bare weekly execution is supposed to mean "the trailing 30 days of live +
+    candidate symbols". Baking BACKFILL_SYMBOLS or BACKFILL_START into the Job
+    definition would make what the Saturday scheduler does a property of
+    whatever the last historical-widening deploy happened to set — and because
+    `--set-env-vars` replaces the whole set, it would persist silently until
+    someone noticed a symbol had stopped being refreshed.
+    """
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    for var in ("BACKFILL_SYMBOLS", "BACKFILL_HISTORY_DAYS", "BACKFILL_START",
+                "BACKFILL_END"):
+        assert var not in script, (
+            f"{BACKFILL_JOB_STEP} must not set {var}: it is a per-execution "
+            "override (`gcloud run jobs execute --update-env-vars`), not part "
+            "of the Job definition."
+        )
+
+
+def test_backfill_job_step_carries_every_env_var_and_secret_it_needs(by_id):
+    """`--set-env-vars` REPLACES the whole set. Each omission fails silently:
+
+      CHAIN_LAKE_BUCKET -> the run builds chains into a container filesystem
+                           that is destroyed on exit. It reports success.
+      GCP_PROJECT       -> the GCS client has no project to resolve.
+      the three secrets -> `Config()` raises before a single bar is fetched.
+    """
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    for expected in ("ALPACA_PAPER_TRADING=true", "GCP_PROJECT=$PROJECT_ID",
+                     "CHAIN_LAKE_BUCKET=options-wheel-chain-lake",
+                     "GIT_COMMIT=$COMMIT_SHA"):
+        assert expected in script, f"{BACKFILL_JOB_STEP} must set {expected}"
+    for secret in ("ALPACA_API_KEY=alpaca-api-key:latest",
+                   "ALPACA_SECRET_KEY=alpaca-secret-key:latest",
+                   "FINNHUB_API_KEY=finnhub-api-key:latest"):
+        assert secret in script, f"{BACKFILL_JOB_STEP} must bind {secret}"
+    assert "--service-account=799970961417-compute@developer.gserviceaccount.com" in script
+
+
+def test_backfill_job_never_retries_and_gets_a_six_hour_task_timeout(by_id):
+    """Sizing, both halves of it.
+
+    `--max-retries=0`: a retried execution re-walks every day it already wrote,
+    paying the lake round-trips twice, and can overlap the run it is retrying —
+    two writers on one object, which is exactly the `if_generation_match` race
+    the store's guard has to resolve.
+
+    `--task-timeout=21600` (6h): the historical widening is chunked at roughly
+    one symbol-year per execution, and the measured cold rate puts fourteen
+    symbols over ~275 days at ~7.5h — i.e. it does NOT fit one execution, which
+    is why the rollout chunks it. Six hours is the bound each chunk is sized
+    against; the weekly freshness run finishes in minutes.
+    """
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    assert "--max-retries=0" in script, (
+        f"{BACKFILL_JOB_STEP} must set --max-retries=0."
+    )
+    assert "--task-timeout=21600" in script, (
+        f"{BACKFILL_JOB_STEP} must set --task-timeout=21600 (6h); the rollout "
+        "sizes every widening chunk against that number."
+    )
+
+
+def test_the_wheel_service_carries_the_chain_lake_bucket(by_id):
+    """`/regression`'s lake_freshness check cannot watch a bucket it is not told about.
+
+    FC-096 Phase A. The check reads `CHAIN_LAKE_BUCKET`; without it every hourly
+    run reports `lake_freshness_unconfigured` — a `warn`, so the report stays
+    green, and the one control that notices a paused `backfill-weekly` scheduler
+    is silently doing nothing. That is the same failure shape as FC-081: not an
+    alarm that fired wrongly, but nothing watching at all.
+
+    It is pinned HERE, on the literal `--set-env-vars` string, because
+    `--set-env-vars` replaces the entire env set on every deploy. Setting it
+    out-of-band with `gcloud run services update` works right up until the next
+    merge silently removes it again.
+    """
+    script = script_of(by_id[CHAINS["options-wheel-strategy"]["deploy"]])
+    assert "CHAIN_LAKE_BUCKET=options-wheel-chain-lake" in script, (
+        "deploy-bot-canary must set CHAIN_LAKE_BUCKET; /regression's "
+        "lake_freshness check reads it and warns 'unconfigured' without it."
+    )
+
+
+def test_the_covered_call_service_deliberately_has_no_lake_bucket(by_id):
+    """The omission is a decision, so it is pinned like one.
+
+    `cc-regression-hourly` runs the same monitor code against the covered-call
+    profile, whose universe is holdings-derived — it has no `stocks.symbols` to
+    check the lake against, so the check degrades to a
+    `lake_freshness_no_universe` warn by design. The lake is the wheel's data
+    and the wheel's check is its watcher; a second watcher measuring a different
+    universe would only produce a second opinion nobody reconciles.
+
+    Without this test, "the CC service has no CHAIN_LAKE_BUCKET" is
+    indistinguishable from an oversight, and the obvious fix is to add it.
+    """
+    script = script_of(by_id[CHAINS["covered-call-engine"]["deploy"]])
+    assert "CHAIN_LAKE_BUCKET" not in script, (
+        "deploy-cc-canary must NOT set CHAIN_LAKE_BUCKET — see this test's "
+        "docstring and check_lake_freshness's. If this is being changed "
+        "deliberately, change the docstrings too."
     )
 
 

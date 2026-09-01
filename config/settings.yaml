@@ -177,6 +177,24 @@ stocks:
     - "KMI"    # Kinder Morgan - $28
     - "VZ"     # Verizon - $43
 
+  # FC-096 Phase A — the EVALUATION universe. Symbols here are never traded,
+  # never scanned and never sized; the live scanner reads `symbols` above and
+  # has no reader for this key at all (a structural test in
+  # tests/test_candidate_universe.py enforces that).
+  #
+  # THE ONLY CONSUMER is `python main.py --command backfill` — the weekly
+  # `data-backfill` Cloud Run Job — which keeps bars and chain-lake days
+  # current for `symbols + candidates` so a candidate can be backtested on
+  # demand instead of waiting ~5-20 min/symbol-year for a cold materialise.
+  #
+  # To onboard one: add it here in a config PR, then run the Job once with
+  # BACKFILL_SYMBOLS=<sym> (or wait for Saturday). Refresh the committed
+  # earnings table FIRST — see the checklist in docs/BACKTEST_ENGINE.md; a
+  # symbol missing from it replays with the FC-013 gate silently passing
+  # everything through. Promotion to live trading is a separate, deliberate
+  # move of the symbol into `symbols` above.
+  candidates: []
+
 # FC-069 S1 deleted the `monitoring:` block (7 keys). `check_interval_minutes`
 # read as live cadence config while the real cadence is Cloud Scheduler — a
 # standing operator trap; the other six had no reader of any kind.

@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
                        choices=['scan', 'status', 'report', 'backtest', 'screen',
-                                'sweep'],
+                                'sweep', 'backfill'],
                        help='Command to execute')
 
     # backtest (FC-032 evaluate mode)
@@ -45,7 +45,9 @@ def main():
     parser.add_argument('--scenarios',
                         help='sweep: YAML file of scenarios (see docs/BACKTEST_ENGINE.md)')
     parser.add_argument('--symbols',
-                        help='sweep: comma-separated universe (default: config stocks.symbols)')
+                        help='sweep/backfill: comma-separated universe (default: '
+                             'sweep = config stocks.symbols; backfill = '
+                             'stocks.symbols + stocks.candidates)')
     parser.add_argument('--holdout-start',
                         help='sweep: split the window here into fit/holdout, YYYY-MM-DD')
     # FC-060 Layer 3 — the Cloud Run Job's entry point. The spec arrives as a
@@ -60,6 +62,11 @@ def main():
                         help='sweep: write results to '
                              'options_wheel.scenario_sweeps / scenario_runs '
                              '(NEVER backtest_runs)')
+
+    # backfill (FC-096 Phase A — the data-backfill Cloud Run Job)
+    parser.add_argument('--history-days', type=int, default=None,
+                        help='backfill: trailing calendar days to cover when '
+                             'no --start is given (default 30)')
 
     args = parser.parse_args()
     
@@ -96,6 +103,14 @@ def main():
 
         if args.command == 'sweep':
             rc = run_sweep_cmd(args, config, logger)
+            logger.info("Command completed",
+                        event_category="system", event_type="command_completed")
+            if rc:
+                sys.exit(rc)
+            return
+
+        if args.command == 'backfill':
+            rc = run_backfill_cmd(args, config, logger)
             logger.info("Command completed",
                         event_category="system", event_type="command_completed")
             if rc:
@@ -365,6 +380,181 @@ def run_backtest(args, config: Config, logger):
                 total_return=report.total_return)
 
 
+def _backfill_env(name: str) -> str:
+    """One optional Job-mode environment override, trimmed."""
+    return (os.environ.get(name) or "").strip()
+
+
+def _backfill_date(value: str, var: str):
+    """Parse a YYYY-MM-DD backfill bound, or refuse with the source named."""
+    from datetime import datetime as _dt
+
+    try:
+        return _dt.strptime(value, '%Y-%m-%d').date()
+    except ValueError:
+        raise SystemExit(
+            f"backfill: {var} must be YYYY-MM-DD, got {value!r}"
+        )
+
+
+def backfill_symbols(args, config: Config) -> list:
+    """The universe to backfill: CLI, else Job env, else live + candidates.
+
+    The default is the union the weekly Job exists to keep current — the live
+    trading universe (`stocks.symbols`) plus the evaluation-only candidates
+    (`stocks.candidates`, FC-096 A1). Order is preserved and duplicates
+    collapse, so a symbol promoted from candidate to live during a config PR
+    cannot be backfilled twice.
+
+    `--symbols` beats `BACKFILL_SYMBOLS` beats the config, because the CLI is
+    the human in the room: an operator running a one-off widening on a Job image
+    that already carries an env default must get the symbols they typed.
+    """
+    raw = (args.symbols or '').strip() or _backfill_env('BACKFILL_SYMBOLS')
+    if raw:
+        names = [s.strip().upper() for s in raw.split(',')]
+    else:
+        names = [*config.stock_symbols, *config.candidate_symbols]
+    out, seen = [], set()
+    for name in names:
+        cleaned = str(name).strip().upper()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
+
+
+def run_backfill_cmd(args, config: Config, logger) -> int:
+    """Keep bars + the chain lake current for a symbol set (FC-096 Phase A).
+
+    Two entry shapes, one code path — the sweep Job's arrangement, for the same
+    reason (an operator and a scheduler must not be able to ask for different
+    things):
+
+    * the operator CLI (`--symbols`, `--history-days`, `--start/--end`), used
+      for the one-time historical widening a chunk at a time;
+    * the `data-backfill` Cloud Run Job, whose weekly execution passes no
+      arguments at all and whose per-execution overrides arrive as
+      `BACKFILL_SYMBOLS` / `BACKFILL_HISTORY_DAYS` / `BACKFILL_START` /
+      `BACKFILL_END`. All four are optional: a bare execution backfills the
+      trailing 30 days of live + candidate symbols, which is the weekly job.
+
+    Writes nothing to BigQuery — the output is parquet objects in the shared
+    chain lake and the bars cache, plus the summary below.
+
+    Returns an exit code: non-zero if any symbol failed, or if a CONFIGURED
+    chain lake died mid-run, because a run that half-happened looks exactly
+    like one that worked (the FC-081 lesson) and the Job-failure alert policy
+    is what turns that into a page. A run with no lake configured at all is a
+    legitimate local build and exits 0.
+    """
+    from src.backtesting.data.backfill import (
+        DEFAULT_HISTORY_DAYS,
+        run_backfill,
+        resolve_window,
+    )
+    from src.backtesting.data.chain_store import ChainStore
+
+    symbols = backfill_symbols(args, config)
+    if not symbols:
+        raise SystemExit(
+            "backfill has no symbols: pass --symbols / BACKFILL_SYMBOLS, or "
+            "configure stocks.symbols / stocks.candidates"
+        )
+
+    raw_start = (args.start or '').strip() or _backfill_env('BACKFILL_START')
+    raw_end = (args.end or '').strip() or _backfill_env('BACKFILL_END')
+    start = _backfill_date(raw_start, '--start/BACKFILL_START') if raw_start else None
+    end = _backfill_date(raw_end, '--end/BACKFILL_END') if raw_end else None
+
+    history_days = args.history_days
+    if history_days is None:
+        raw_days = _backfill_env('BACKFILL_HISTORY_DAYS')
+        if raw_days:
+            try:
+                history_days = int(raw_days)
+            except ValueError:
+                raise SystemExit(
+                    f"backfill: BACKFILL_HISTORY_DAYS must be an integer, "
+                    f"got {raw_days!r}"
+                )
+    if history_days is None:
+        history_days = DEFAULT_HISTORY_DAYS
+    if history_days < 1:
+        raise SystemExit(
+            f"backfill: history days must be >= 1, got {history_days}"
+        )
+
+    start, end = resolve_window(history_days=history_days, start=start, end=end)
+    if end < start:
+        raise SystemExit(f"backfill: --end ({end}) must not precede --start ({start})")
+
+    print(f"\nBackfilling {len(symbols)} symbol(s) over {start} -> {end}...\n")
+
+    summary = None
+    try:
+        # THE SIGNAL HANDLER GOES ON FIRST, before any work — the sweep Job's
+        # rule, and for the same reason: `ChainStore.from_env()` probes the
+        # bucket before a single day is built, and a cancel landing in that
+        # window would otherwise kill the process with nothing said.
+        with terminate_on_sigterm(logger, what="backfill"):
+            chain_store = ChainStore.from_env()
+            summary = run_backfill(
+                config, symbols, start, end, chain_store=chain_store,
+            )
+    finally:
+        # SIG_IGN around the terminal write: `terminate_on_sigterm` restores the
+        # default handler exactly as this begins, and a second SIGTERM landing
+        # here would kill the process mid-summary — losing the one record of
+        # what a half-finished run actually wrote.
+        with ignore_sigterm_while_finalising(logger, what="backfill"):
+            if summary is None:
+                # Terminated, or raised, before `run_backfill` returned. The
+                # per-symbol progress lines are the record; say so rather than
+                # printing nothing.
+                logger.error(
+                    "Backfill produced no summary — the run did not finish; "
+                    "the per-symbol backfill_symbol_complete log lines are the "
+                    "record of what was written",
+                    event_category="backtest_data",
+                    event_type="backfill_unfinished",
+                    symbols=symbols, start=start.isoformat(),
+                    end=end.isoformat(),
+                )
+            else:
+                logger.info(
+                    "Backfill complete",
+                    event_category="backtest_data",
+                    event_type="backfill_completed",
+                    **summary.as_log(),
+                )
+                print(summary.render())
+
+    failed = summary.failed_symbols()
+    if failed:
+        print(
+            f"\nWARNING: {len(failed)} symbol(s) did not complete cleanly: "
+            f"{', '.join(failed)}"
+        )
+    if summary.lake_failed:
+        # A CONFIGURED lake that died mid-run fails the execution even if every
+        # symbol looks clean. The store degrades to local-only on purpose — the
+        # right answer for a backtest, which still needs its chains — but this
+        # process exists to put objects in a bucket, and its filesystem is
+        # destroyed when the task exits. Exiting 0 here would report a widened
+        # lake to an operator who would move on to the next chunk.
+        health = summary.lake_health()
+        print(
+            f"\nWARNING: the chain lake was configured "
+            f"({health['lake_bucket']}) and was DISABLED mid-run "
+            f"(reason={health['lake_disabled_reason']}, "
+            f"lake_puts={health['lake_puts']}, "
+            f"lake_errors={health['lake_errors']}). Days built after that "
+            f"point never left this container. Re-run this window."
+        )
+    return 1 if summary.failed() else 0
+
+
 def run_screen_cmd(args, config: Config, logger) -> int:
     """Screen the whole universe (FC-032 Phase 5). Returns a process exit code."""
     from datetime import date, datetime
@@ -588,7 +778,7 @@ class SweepTerminated(BaseException):
 
 
 @contextmanager
-def terminate_on_sigterm(logger):
+def terminate_on_sigterm(logger, *, what: str = "sweep"):
     """Turn SIGTERM into an exception so the store's ``finally`` still runs.
 
     Cloud Run sends SIGTERM and then SIGKILL **10 seconds later** — on a task
@@ -613,14 +803,22 @@ def terminate_on_sigterm(logger):
 
     Restores the previous handler on the way out, and no-ops off the main thread
     (`signal.signal` raises there) so tests and library callers are unaffected.
+
+    ``what`` names the command in the log event only (``sweep_sigterm``,
+    ``backfill_sigterm``). FC-096 Phase A gave the backfill Job the same
+    mechanism rather than a second copy of it — the shape is identical (long
+    Job, terminal write that must survive the grace period), and two copies is
+    how one of them stops getting the next fix. The default keeps the sweep's
+    events byte-identical.
     """
     import signal
 
     def _raise(signum, _frame):
         logger.warning(
-            "SIGTERM received — recording a terminal sweep status before the "
+            f"SIGTERM received — recording a terminal {what} status before the "
             "container is killed",
-            event_category="backtest", event_type="sweep_sigterm", signal=signum)
+            event_category="backtest", event_type=f"{what}_sigterm",
+            signal=signum)
         raise SweepTerminated(
             f"the container received signal {signum} (Cloud Run sends SIGTERM "
             f"then SIGKILL 10s later): task timeout, cancelled execution, or "
@@ -640,7 +838,7 @@ def terminate_on_sigterm(logger):
 
 
 @contextmanager
-def ignore_sigterm_while_finalising(logger):
+def ignore_sigterm_while_finalising(logger, *, what: str = "sweep"):
     """Hold SIGTERM off for the duration of the terminal writes.
 
     `terminate_on_sigterm` restores the previous handler when its block exits —
@@ -654,6 +852,9 @@ def ignore_sigterm_while_finalising(logger):
     do about a second signal, and the writes finish well inside Cloud Run's
     10-second grace. If SIGKILL arrives anyway the row is lost either way, and
     ignoring costs nothing.
+
+    ``what`` names the command in the restore-failure event only; see
+    ``terminate_on_sigterm``.
     """
     import signal
 
@@ -670,7 +871,7 @@ def ignore_sigterm_while_finalising(logger):
         except (ValueError, OSError):  # pragma: no cover - defensive
             logger.warning("could not restore the SIGTERM handler",
                            event_category="backtest",
-                           event_type="sweep_sigterm_restore_failed")
+                           event_type=f"{what}_sigterm_restore_failed")
 
 
 class SweepPersistence:

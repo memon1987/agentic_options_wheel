@@ -340,6 +340,13 @@ steps:
       - '-c'
       - |
         [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        # CHAIN_LAKE_BUCKET is here for `/regression`'s `lake_freshness` check
+        # (FC-096 Phase A), NOT for trading: nothing on the live path reads it.
+        # It must live in this literal list because `--set-env-vars` REPLACES
+        # the whole env set on every deploy, so a var added out-of-band with
+        # `services update` survives exactly until the next merge — and the
+        # check would then report `lake_freshness_unconfigured` for ever, which
+        # is a detective control that looks alive and watches nothing.
         SUFFIX="$${SHORT_SHA}-$${BUILD_ID:0:8}"
         if [ -z "$${SHORT_SHA}" ]; then SUFFIX="b$${BUILD_ID:0:8}"; fi
         REV="options-wheel-strategy-$${SUFFIX}"
@@ -354,7 +361,7 @@ steps:
             --max-instances=1 \
             --min-instances=0 \
             --timeout=300 \
-            --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA \
+            --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA,CHAIN_LAKE_BUCKET=options-wheel-chain-lake \
             --no-traffic \
             --tag=canary \
             --revision-suffix=$${SUFFIX} \
@@ -870,6 +877,58 @@ steps:
           --max-retries=0 \
           --service-account=799970961417-compute@developer.gserviceaccount.com
     id: 'deploy-sweep-job'
+    waitFor: ['promote-bot', 'promote-cc', 'promote-dashboard']
+
+  # ---------------------------------------------------------------------------
+  # FC-096 Phase A — the data-backfill Cloud Run Job.
+  #
+  # Same shape and the same position as `deploy-sweep-job`, and for the same
+  # reasons: it runs the STRATEGY image (one image; the command selects the
+  # work), it is gated on the superseded marker, and it sits BEHIND all three
+  # promotes so that a `run.jobs.create` permission failure cannot abort the
+  # build before the wheel/CC/dashboard revisions have their traffic. A Job
+  # that nothing serves must never take a production deploy down with it.
+  #
+  # There are now TWO tail steps rather than one, which is why the contract test
+  # asserts a tail SET instead of `ids[-1]`. Cloud Build runs them concurrently
+  # (both waitFor the same three promotes); the measured sweep-Job step takes
+  # ~4 s, so the second is noise against the build's ~340 s of headroom.
+  #
+  # `--set-env-vars` REPLACES the whole env set, so everything the Job needs is
+  # listed here. Deliberately absent: BACKFILL_SYMBOLS / BACKFILL_HISTORY_DAYS /
+  # BACKFILL_START / BACKFILL_END. All four are optional per-EXECUTION overrides
+  # (`gcloud run jobs execute data-backfill --update-env-vars=...`) — a bare
+  # weekly execution backfills the trailing 30 days of live + candidate symbols,
+  # which is the whole point of the schedule. Baking a default window in here
+  # would make the scheduler's behaviour a property of the last deploy.
+  #
+  # `--task-timeout=21600` (6h): the historical widening runs one symbol-year
+  # per execution at measured cold rates (~5.5 min/symbol-month at 22-reach),
+  # and the weekly freshness run finishes in minutes. A task killed at the
+  # timeout gets SIGTERM, which main.py turns into a logged terminal summary —
+  # but only if the timeout is generous enough that hitting it means something
+  # is genuinely wrong. `--max-retries=0` for the sweep Job's reason: a retried
+  # execution would re-walk the same days, and every day it already wrote is a
+  # lake round-trip paid twice.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        gcloud run jobs deploy data-backfill \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+          --region=us-central1 \
+          --command=python \
+          --args=main.py,--command,backfill \
+          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA \
+          --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
+          --memory=1Gi \
+          --cpu=1 \
+          --task-timeout=21600 \
+          --max-retries=0 \
+          --service-account=799970961417-compute@developer.gserviceaccount.com
+    id: 'deploy-backfill-job'
     waitFor: ['promote-bot', 'promote-cc', 'promote-dashboard']
 
 # Build configuration

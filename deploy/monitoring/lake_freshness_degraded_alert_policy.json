@@ -1,0 +1,26 @@
+{
+  "displayName": "Chain lake freshness — check degraded (not actually watching)",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "The lake-freshness check could not do its full job",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=(\"options-wheel-strategy\" OR \"covered-call-engine\") AND (jsonPayload.event_type=\"lake_freshness_degraded\" OR textPayload:\"lake_freshness_degraded\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The chain-lake freshness check ran but could not fully do its job. It is reporting `warn` on the `/regression` report, which is NOT the same as watching.\n\nThis policy exists for the same reason its deploy-freshness twin does: a detective control that degrades quietly is indistinguishable from one that is working. The failure this whole phase guards against is a weekly backfill that silently stopped — and a `warn` row nobody reads is that same silence in a different colour.\n\n**This is a NAG, NOT A PAGE**: the notification rate limit is 24h, so a persistent degradation mails once a day rather than six times. It does not mean the lake is stale. It means the thing that would notice a stale lake is impaired.\n\nRead the `reason` field on the log entry:\n\n- `no_bucket` — `CHAIN_LAKE_BUCKET` is not set on this revision, so the check is fully blind. **Expected on `covered-call-engine`, which deliberately does not carry it.** On `options-wheel-strategy` it is a real defect: the var is set in `cloudbuild.yaml`'s `deploy-bot-canary` step and pinned by a contract test, so seeing this there means something deployed outside the build — remember `--set-env-vars` REPLACES the whole env set, so an out-of-band `gcloud run services update` on any *other* variable will drop it.\n- `no_universe` — this profile configures no `stocks.symbols`, so there is no universe to check the lake against. **This is the expected steady state on `covered-call-engine`** (its universe is holdings-derived). The lake is the wheel's data and the wheel's check is its watcher; there is nothing to fix here, and the reason it is reported at all rather than skipped is that a check which silently does nothing is exactly what this policy exists to make visible.\n- `bad_profile` — the strategy config would not load at all. That is a much bigger problem than lake freshness; go and look at the service.\n- `no_client` — `google.cloud.storage` could not be imported or no credential resolved. The image or the service account changed.\n- `list_failed` — a `list_blobs` call raised. A GCS outage, a revoked `storage.objects.list` grant, or a bucket that no longer exists. Only the exception CLASS is recorded, never its text — the same rule the deploy-freshness check follows, because exception messages can echo signed URLs and header values into a log line that `/regression` also returns over HTTP.\n\nNone of these mean the backfill has stopped. If the backfill really has stopped, the OTHER policy (`lake_freshness_stale`) is the one that fires — and while this check is degraded, that policy cannot fire at all, which is the whole point of nagging about it.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "86400s"
+    },
+    "autoClose": "86400s"
+  }
+}
