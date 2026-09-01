@@ -1025,17 +1025,66 @@ def test_the_dashboard_build_bakes_the_identity_and_refuses_an_empty_one():
     )
 
 
-def test_the_identity_file_is_not_committed_at_the_repo_root():
-    """Same hazard as the gate's runtime files: a tracked copy would be read.
+def _gitignore_entries():
+    """The `.gitignore` patterns, comments and blank lines removed.
 
-    Cloud Build checks the repo out into /workspace, so a committed
-    `engine_identity.txt` would be picked up by build-dashboard-image if the
-    compute step ever failed to overwrite it — baking a stale identity into the
-    image, which is the one outcome the empty check exists to prevent.
+    Parsed rather than substring-matched: `"engine_identity.txt" in text` is
+    satisfied by a COMMENT mentioning the file, so a rule that was deleted but
+    still described in prose would read as present.
     """
-    assert not (REPO_ROOT / "engine_identity.txt").exists(), (
-        "engine_identity.txt is written into /workspace at build time and must "
-        "never be a tracked file."
+    lines = (REPO_ROOT / ".gitignore").read_text().splitlines()
+    return {ln.strip() for ln in lines
+            if ln.strip() and not ln.strip().startswith("#")}
+
+
+def test_the_identity_file_is_ignored_and_untracked():
+    """A COMMITTED `engine_identity.txt` would bake a stale identity into the
+    dashboard image; a GENERATED one is the build working correctly.
+
+    The first version of this test asserted `not (REPO_ROOT /
+    "engine_identity.txt").exists()` and turned main red on every build. In
+    Cloud Build the repo root IS `/workspace`, `compute-engine-identity` has
+    `waitFor: ['-']` so it writes the file immediately, and `run-tests` then
+    runs for two minutes in that same directory. `exists()` cannot tell the two
+    cases apart — it was asserting the absence of the very artifact the step
+    this suite pins is supposed to produce. It passed locally only because no
+    build step runs there.
+
+    So the property is stated directly instead: the file is IGNORED, and git is
+    not tracking it. Both are true whether or not a build has just written one.
+
+    (The gate's own runtime files — `superseded`, `gate_decision.py`, the two
+    gate JSONs — keep their `exists()` check and are not affected: their writer,
+    `serialize-builds`, waits on `push-bot-image`, so it cannot have run before
+    `run-tests`. Ordering is what makes that assertion safe, and this step's
+    `waitFor: ['-']` is exactly what took it away.)
+    """
+    assert "engine_identity.txt" in _gitignore_entries(), (
+        ".gitignore must ignore `engine_identity.txt`: Cloud Build writes it "
+        "into /workspace, which is the repo root there, so without the rule a "
+        "`git add -A` in any agent or developer session would commit a stale "
+        "identity that build-dashboard-image would then bake into the image."
+    )
+
+    if not (REPO_ROOT / ".git").exists():
+        # Cloud Build checks the repo out as a TARBALL — no `.git` at all — so
+        # there is nothing to interrogate and nothing that could have committed
+        # anything. Skipped silently rather than xfailed: this is a normal,
+        # expected environment, not a degraded one. The ignore assertion above
+        # is NOT skipped, and it is the half that can actually regress.
+        return
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "engine_identity.txt"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True)
+    assert tracked.returncode == 0, tracked.stderr
+    assert tracked.stdout.strip() == "", (
+        "engine_identity.txt is TRACKED by git. It is a build artifact: "
+        "cloudbuild.yaml's `compute-engine-identity` step writes it into "
+        "/workspace, and build-dashboard-image reads it back. A committed copy "
+        "would be checked out over it and could bake a stale engine identity "
+        "into the dashboard image — the exact outcome the build's empty-value "
+        "check exists to prevent. Remove it: `git rm --cached engine_identity.txt`."
     )
 
 
