@@ -514,6 +514,11 @@ class MarketDataManager:
             # ever non-zero on the 'roll' profile, where the DTE cap is off and
             # this date bound replaces it.
             'expiry_beyond_horizon': 0,
+            # Contracts dropped by `_validate_option_data` before any criterion
+            # runs. Previously counted only in `total_rejected`, which made the
+            # STAGE 8 buckets sum to less than `rejected=` with no way to tell
+            # where the difference went.
+            'data_validation_failed': 0,
             'total_rejected': 0
         }
 
@@ -530,6 +535,7 @@ class MarketDataManager:
             is_valid, validation_reason = self._validate_option_data(call)
             if not is_valid:
                 rejection_stats['total_rejected'] += 1
+                rejection_stats['data_validation_failed'] += 1
                 logger.debug("Call option failed data validation",
                             event_category="filtering",
                             event_type="call_validation_failed",
@@ -647,6 +653,9 @@ class MarketDataManager:
                        rejected_no_liquidity=rejection_stats['no_liquidity'],
                        rejected_expires_into_earnings=rejection_stats['expires_into_earnings'],
                        rejected_expiry_beyond_horizon=rejection_stats['expiry_beyond_horizon'],
+                       rejected_open_interest_too_low=rejection_stats['open_interest_too_low'],
+                       rejected_spread_too_wide=rejection_stats['spread_too_wide'],
+                       rejected_data_validation_failed=rejection_stats['data_validation_failed'],
                        criteria_profile=criteria_profile)
         else:
             # Calculate stats for rejected calls
@@ -671,6 +680,9 @@ class MarketDataManager:
                        rejected_no_liquidity=rejection_stats['no_liquidity'],
                        rejected_expires_into_earnings=rejection_stats['expires_into_earnings'],
                        rejected_expiry_beyond_horizon=rejection_stats['expiry_beyond_horizon'],
+                       rejected_open_interest_too_low=rejection_stats['open_interest_too_low'],
+                       rejected_spread_too_wide=rejection_stats['spread_too_wide'],
+                       rejected_data_validation_failed=rejection_stats['data_validation_failed'],
                        criteria_profile=criteria_profile,
                        # Stats on rejected calls
                        rejected_avg_premium=round(avg_premium, 2),

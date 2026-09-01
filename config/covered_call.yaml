@@ -51,6 +51,21 @@ strategy:
   call_delta_range: [0.15, 0.25]
   # Minimum acceptable call premium (per share).
   min_call_premium: 0.30
+  # Price/volume screening bounds. NOT a selection knob on this profile — the
+  # universe is holdings-derived, so nothing here picks a symbol. They are
+  # present because `MarketDataManager.get_stock_metrics` hard-indexes
+  # `config.min_stock_price` / `max_stock_price` / `min_avg_volume` on EVERY
+  # symbol it prices, and a missing key raises KeyError *after* the quote fetch:
+  # the method then returns {}, the scanner sees current_price=0 and fails the
+  # symbol closed (`call_scan_skipped_quote_unavailable`). On the call path only
+  # `current_price` is consumed from that dict; `suitable_for_wheel` /
+  # `meets_price_criteria` / `meets_volume_criteria` are read on the put path
+  # only, which this profile skips. Bounds are deliberately wide so no held
+  # symbol is ever logged as "not suitable" for being cheap, expensive or thin —
+  # the operator, not a screen, decides what this account holds.
+  min_stock_price: 1.00
+  max_stock_price: 100000.00
+  min_avg_volume: 0
   # FC-072: how far past mid a sell-to-open is priced, as a fraction of the
   # bid/ask spread, off a quote REFRESHED at execution time. 0.0 = rest at mid.
   # Validated to [0.0, 0.5]. Consumer: CallSeller.execute_call_sale.
