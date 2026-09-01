@@ -770,10 +770,15 @@ Three properties worth knowing before running it:
   fail the run: a split recurs across the universe and the trailing window
   slides, so paging weekly for the month it takes to age out is how the
   Job-failure alert gets muted.
-- **The DTE knob is still closed.** `MAX_SWEEPABLE_DTE = 21` exists in
-  `scenarios/overrides.py` and the backfill imports it, but
-  `strategy.put_target_dte` stays allowlist-refused until the historical
-  widening has actually run (FC-096 Phase A, PR-2).
+- **The DTE knob is what this Job exists to make honest.** `MAX_SWEEPABLE_DTE
+  = 21` lives in `scenarios/overrides.py` and the backfill imports it; since
+  FC-096 Phase A PR-2 both `strategy.put_target_dte` and
+  `strategy.call_target_dte` are sweepable within `1..21`. The bound tracks the
+  **data**, not a view about the strategy, so raising it without widening the
+  lake first re-creates exactly the defect the keys were refused for — an arm
+  that reads "nothing qualified" because the contracts are not in the file. A
+  sweep reaching past 7 DTE carries an extra footer caveat about ladder
+  thinness; see `docs/BACKTEST_ENGINE.md`.
 
 Deep history is a **chunked, operator-supervised** job — explicit
 `BACKFILL_SYMBOLS` plus `--start/--end`, one symbol-year per execution

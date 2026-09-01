@@ -91,7 +91,9 @@ from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
 from .identity import scenario_arm_hash
-from .overrides import apply_overrides, validate_overrides
+from .overrides import (
+    DTE_OVERRIDE_KEYS, apply_overrides, validate_overrides,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -302,6 +304,20 @@ class SweepResult:
     provider_calls_during_replays: int = 0
     starting_cash: float = 0.0
     run_sensitivity: bool = False
+    # The reach every window in this run was materialised to — the max over the
+    # base config and every arm's DTE overrides (see `effective_max_dte`). The
+    # report reads it to decide whether the DTE_REACH_BIAS caveat applies: a
+    # 7-reach run carries the engine's ordinary biases and nothing more, and
+    # appending a fidelity warning it does not earn is how a footer stops being
+    # read.
+    effective_max_dte: int = 0
+    # FC-013 coverage, unioned across every replay in this run: symbols absent
+    # from the committed earnings table entirely. Non-empty means the gate was
+    # silently pass-through for those symbols — which matters most for exactly
+    # the runs this field was added for (FC-096 A4: a newly-onboarded candidate
+    # is absent from the table by default). Surfaced in the report header, never
+    # inferred from an empty list.
+    earnings_symbols_without_data: List[str] = field(default_factory=list)
 
     @property
     def errors(self) -> List[ScenarioResult]:
@@ -368,6 +384,40 @@ class _CountingProvider:
 
     def __getattr__(self, name):
         return getattr(self._provider, name)
+
+
+def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
+    """The DTE reach every window in this sweep must be materialised to.
+
+    The MAXIMUM over the base config's ``put_target_dte`` and every arm's
+    ``put_target_dte`` / ``call_target_dte`` override — not the base value, and
+    not a per-arm value.
+
+    Two things this shape is load-bearing for:
+
+    1. **A call-DTE arm has to be materialised too.** ``call_target_dte`` was
+       lowering-only before FC-096 Phase A, so a call arm could never need a
+       wider chain than the put target already bought. Now it can, and a DTE-14
+       call arm replayed against a 7-reach materialisation would report "no call
+       ever qualified" — the exact silent-fiction failure the allowlist exists to
+       prevent, arriving through the door that was just opened.
+    2. **One number, or the replays fail.** ``Simulator.replay`` asserts that the
+       ``Materialised`` it is handed agrees with its own ``max_dte``, so
+       materialise and every replay must be given the SAME value. Per-arm reach
+       would either trip that guard or, worse, require re-materialising per arm
+       and void the sweep's whole cost model.
+
+    The read path masks a stored chain to the requested reach, so materialising
+    wider than an arm asks for is not a change to that arm's inputs — pinned by
+    the 8-vs-22 identity regression in ``tests/test_scenarios.py``.
+    """
+    reach = int(getattr(base_config, "put_target_dte", 7))
+    for scenario in scenarios:
+        for key in DTE_OVERRIDE_KEYS:
+            value = scenario.overrides.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                reach = max(reach, value)
+    return reach
 
 
 def _windows(
@@ -479,10 +529,7 @@ def run_sweep(
     # validates, but doing it here means a bad key fails in milliseconds rather
     # than after the first materialisation.
     for scenario in scenarios:
-        validate_overrides(
-            scenario.overrides,
-            chain_reach_dte=int(getattr(base_config, "put_target_dte", 7)),
-        )
+        validate_overrides(scenario.overrides)
     _check_unique_names(scenarios)
 
     symbols = [s.upper() for s in symbols]
@@ -506,8 +553,9 @@ def run_sweep(
     if chain_store is None:
         chain_store = ChainStore.from_env()
     builder = ChainBuilder(provider, store=chain_store)
-    max_dte = int(getattr(base_config, "put_target_dte", 7))
+    max_dte = effective_max_dte(base_config, scenarios)
     dividends = load_default_schedule()
+    earnings_gaps: set = set()
 
     scenario_configs: Dict[str, Config] = {
         s.name: apply_overrides(base_config, s.overrides) for s in scenarios
@@ -525,6 +573,7 @@ def run_sweep(
         scenario_fill_haircuts={s.name: s.fill_haircut for s in scenarios},
         starting_cash=starting_cash,
         run_sensitivity=run_sensitivity,
+        effective_max_dte=max_dte,
     )
     logger.info(
         "Scenario sweep starting",
@@ -533,6 +582,7 @@ def run_sweep(
         windows=[f"{sp}:{s}..{e}" for sp, s, e in windows],
         base_config_hash=result.base_config_hash,
         in_sample_only=result.in_sample_only,
+        effective_max_dte=max_dte,
     )
 
     for symbol in symbols:
@@ -594,6 +644,7 @@ def run_sweep(
                         starting_cash=starting_cash, max_dte=max_dte,
                         dividends=dividends,
                         run_sensitivity=run_sensitivity,
+                        earnings_gaps=earnings_gaps,
                     )
                     result.rows.append(row)
                     rkey = f"{scenario.name}:{symbol}:{split}"
@@ -626,6 +677,7 @@ def run_sweep(
     result.wall_seconds = round(time.perf_counter() - began, 3)
     result.provider_fetches_total = fetch_counter.calls
     result.bar_cache_hits = _cache_hits(provider)
+    result.earnings_symbols_without_data = sorted(earnings_gaps)
     logger.info(
         "Scenario sweep complete",
         event_category="backtest", event_type="sweep_completed",
@@ -712,14 +764,21 @@ def _materialise_window(
     base_config, provider, builder, symbol: str, start: date, end: date,
     *, starting_cash: float, max_dte: int, dividends,
 ) -> Materialised:
-    """Build the window's data ONCE, under the BASE config.
+    """Build the window's data ONCE, under the BASE config at ``max_dte``.
 
-    Using the base config here is safe *because* the allowlist says so: no
-    allowed override touches chain reach or the strike window, so any scenario's
-    materialisation would be byte-identical to this one. ``Simulator.replay``
-    re-checks the universe/window/DTE agreement per scenario, so if that ever
-    stops being true the sweep fails loudly instead of replaying against chains
-    that do not cover it.
+    ``max_dte`` is NOT the base config's ``put_target_dte``: since FC-096 Phase A
+    both DTE targets are allowlisted, so the caller passes
+    ``effective_max_dte(base_config, scenarios)`` — the max over the base and
+    every arm — and the same number goes to every replay. No other allowed
+    override touches chain reach or the strike window, so with the reach settled
+    this way any scenario's materialisation would be byte-identical to this one.
+
+    Materialising WIDER than an arm asks for does not change that arm's inputs:
+    the read path masks a stored chain to the requested reach (pinned by the
+    8-vs-22 identity regression). ``Simulator.replay`` re-checks the
+    universe/window/DTE agreement per scenario, so if that ever stops being true
+    the sweep fails loudly instead of replaying against chains that do not cover
+    it.
     """
     return _simulator(
         base_config, provider, builder, symbol, start, end,
@@ -732,7 +791,7 @@ def _replay_one(
     *, scenario: Scenario, config, cfg_hash: str, scenario_hash: str, provider,
     builder, symbol: str, window: Tuple[str, date, date],
     materialised: Materialised, starting_cash: float, max_dte: int, dividends,
-    run_sensitivity: bool,
+    run_sensitivity: bool, earnings_gaps: Optional[set] = None,
 ) -> ScenarioResult:
     split, w_start, w_end = window
     haircut = (
@@ -747,6 +806,12 @@ def _replay_one(
             starting_cash=starting_cash, max_dte=max_dte,
             fill_haircut=haircut, dividends=dividends,
         ).replay(materialised)
+        # FC-096 A4. The single-symbol report surfaces this; a sweep did not, so
+        # a candidate sweep said nothing at all about a symbol its earnings gate
+        # never gated. Unioned across arms because the gap is a property of the
+        # TABLE, not of the arm — every arm on that symbol has it.
+        if earnings_gaps is not None:
+            earnings_gaps.update(result.earnings_symbols_without_data)
         report = _score(symbol, result, bars, starting_cash, dividends)
 
         sensitivity = None

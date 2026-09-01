@@ -606,10 +606,33 @@ pre-split engine.
 
 **Overrides are restricted to selection-only keys**, and the refusals carry their reason:
 
+**Both DTE targets are sweepable, within `1..MAX_SWEEPABLE_DTE` (21) — FC-096 Phase A.**
+`strategy.put_target_dte` used to be refused outright and `strategy.call_target_dte`
+allowed downward only, both because the stored chains reached 7-day DTE: a longer arm was
+not narrowed data but *absent* data, and it read as "no call ever qualified" rather than
+as a test of that reach. The weekly `data-backfill` Job now keeps the lake at
+`universe_dte = 22`, and `scenarios/runner.effective_max_dte` materialises each window at
+the **maximum** reach any arm asks for (both legs, plus the base config) — one number for
+`materialise()` and every `replay()`, because `Simulator.replay` asserts they agree.
+The bound is a property of the **data**, not a policy about the strategy, so it stays a
+constant in `overrides.py` and moves only when the lake does.
+
+Two consequences worth knowing:
+
+- **A DTE-7 sweep is unchanged by the widening.** The read path masks a stored chain to
+  the requested reach, so the same spec over an 8-reach and a 22-reach lake produces
+  identical rows and hashes — pinned by a regression test, because otherwise every stored
+  `scenario_runs` row would have quietly stopped being comparable with every new one.
+- **A run reaching past 7 DTE carries an extra footer caveat** (`DTE_REACH_BIAS`), on the
+  CLI report and on `/sims` alike. These are not extrapolated prices — a 14- or 21-DTE
+  quote is a real print with IV solved from that contract's own trade bar — but
+  longer-dated contracts trade thinly, the builder drops any contract with no trade that
+  day, and a hole in the ladder is indistinguishable from a strike that never existed.
+  That biases **selection**, not just precision. The spread model (FC-051) was also
+  measured on short-dated OTM puts only.
+
 | refused | why |
 |---|---|
-| `strategy.put_target_dte` | changes the chain's DTE reach; cached files store `universe_dte=8`, so a wider arm misses the cache on every day and a narrower one is served contracts it did not ask for |
-| `strategy.call_target_dte` **above** the chain reach | does not widen anything — the 9–15 DTE calls are simply absent, so the arm reads as "no call ever qualified" rather than as a test of that reach. **Lowering it is allowed** |
 | `risk.profit_taking.*`, the stop-loss switches | `/monitor`-only; the replay's day loop never runs the monitor, so every arm would return an identical row — which reads as "this knob does not matter" |
 | `strategy.{put,call}_limit_spread_fraction` | the replay does not honour limit prices — `BacktestAlpacaClient.place_option_order` *records* `limit_price` and fills at `mid − fill_haircut × half-spread` regardless. **Measured**: a `put_limit_spread_fraction: 0.0` arm came back byte-identical to base on all six symbols over a year. Vary `fill_haircut` on the scenario instead |
 | `universe.min_open_interest` | the engine has no OI data — `get_options_chain` hardcodes `open_interest: 0` — so any floor ≥ 1 rejects **every** call, and the arm reads as "this threshold kills the call leg" rather than "the engine cannot see the number". (`universe.max_spread_pct` *is* allowed: its input is a documented model with a measured error, not an absent field) |
