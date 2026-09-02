@@ -1121,6 +1121,27 @@ class TestThePerRowLivenessBound:
         assert S.missing_optional_column(
             "Unrecognized name: liveness_seconds") == "liveness_seconds"
 
+    def test_pin_id_is_in_the_additive_degrade_set_too(self):
+        """FC-096 Phase B B4's column, on exactly the same terms.
+
+        `submitted_row` carries `pin_id` as NULL for the one-column-set rule,
+        so an un-migrated table rejects the whole request over it — the fourth
+        instance of PR-a's outage if it were left out.
+        """
+        assert ("pin_id", "STRING") in S.ADDITIVE_OPTIONAL_COLUMNS
+        assert S.missing_optional_column(
+            "no such field: pin_id") == "pin_id"
+
+    def test_every_additive_column_is_one_the_api_actually_stamps(self):
+        """Guard the guard: a name in the set that no row carries would retry
+        forever removing a key that is not there — the loop's own break saves
+        it, but the entry would be a lie about what this API writes."""
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec()), sweep_key_value="k",
+            submitted_at="2026-08-29T12:00:00+00:00", git_commit=None)
+        for column, _type in S.ADDITIVE_OPTIONAL_COLUMNS:
+            assert column in row, column
+
     def test_the_proxy_timeout_outlasts_the_services_own(self):
         """A client timeout on a submit that in fact landed is the worst case.
 
@@ -3038,8 +3059,17 @@ class TestThePinDuplicateCheck:
 
     @staticmethod
     def _stored(spec_dict):
-        return {"pin_id": "p1", "active": True,
-                "spec_json": S.pin_spec_json(S.validate_spec(spec_dict))}
+        normalised = S.validate_spec(spec_dict)
+        window, holdout = S.pin_window_shape(normalised)
+        return {"pin_id": "p1", "active": True, "window_days": window,
+                "holdout_days": holdout,
+                "spec_json": S.pin_spec_json(normalised)}
+
+    @staticmethod
+    def _dup(candidate, stored):
+        window, holdout = S.pin_window_shape(candidate)
+        return S.duplicate_active_pin(candidate, window_days=window,
+                                      holdout_days=holdout, pins=stored)
 
     def test_the_same_question_asked_differently_is_still_a_duplicate(self):
         one = self._stored(spec(symbols=["AAPL", "NVDA"]))
@@ -3048,47 +3078,169 @@ class TestThePinDuplicateCheck:
             "the premise: the STORED text differs, because the normaliser "
             "preserves the operator's symbol order on purpose"
         )
-        assert S.duplicate_active_pin(two, [one])["pin_id"] == "p1"
+        assert self._dup(two, [one])["pin_id"] == "p1"
 
     def test_reordered_scenarios_are_the_same_question_too(self):
         arms = [{"name": "a", "overrides": {"strategy.min_put_premium": 0.75}},
                 {"name": "b", "overrides": {"strategy.min_call_premium": 0.8}}]
         one = self._stored(spec(scenarios=arms))
         two = S.validate_spec(spec(scenarios=list(reversed(arms))))
-        assert S.duplicate_active_pin(two, [one]) is not None
+        assert self._dup(two, [one]) is not None
 
     def test_a_genuinely_different_spec_is_not_a_duplicate(self):
         one = self._stored(spec())
         two = S.validate_spec(spec(end="2026-06-30"))
-        assert S.duplicate_active_pin(two, [one]) is None
+        assert self._dup(two, [one]) is None
 
     def test_an_INACTIVE_pin_is_not_a_duplicate(self):
         """Re-pinning something un-pinned last month is ordinary; refusing it
         would make un-pinning a one-way door."""
         one = self._stored(spec())
         one["active"] = False
-        assert S.duplicate_active_pin(S.validate_spec(spec()), [one]) is None
+        assert self._dup(S.validate_spec(spec()), [one]) is None
 
     def test_a_corrupt_pin_row_does_not_block_a_good_one(self):
         """It is comparable to nothing; the battery refuses it every week and
         says so. Blocking a good pin behind it would be the wrong direction."""
-        assert S.duplicate_active_pin(
+        assert self._dup(
             S.validate_spec(spec()),
-            [{"pin_id": "bad", "active": True, "spec_json": "not json"},
-             {"pin_id": "bad2", "active": True, "spec_json": "[1,2]"}]) is None
+            [{"pin_id": "bad", "active": True, "window_days": 364,
+              "spec_json": "not json"},
+             {"pin_id": "bad2", "active": True, "window_days": 364,
+              "spec_json": "[1,2]"}]) is None
 
-    def test_the_identity_is_the_one_sweep_key_is_taken_over(self):
-        """If these two ever diverge, the check would refuse pins that do NOT
-        dedup against each other, or accept pins that do."""
+    def test_the_identity_is_canonical_spec_minus_the_moving_dates(self):
+        """The relative form: `canonical_spec` with the three absolute dates
+        replaced by the two day-counts. Anything else would either make a
+        rolling pin a new question every week, or lose the arm/symbol
+        normalisation that makes two spellings of one sweep compare equal."""
         from src.backtesting.scenarios.identity import canonical_spec
 
         normalised = S.validate_spec(spec())
-        assert S.pin_identity(normalised) == json.dumps(
-            canonical_spec(normalised), sort_keys=True)
+        expected = dict(canonical_spec(normalised))
+        for absolute in ("start", "end", "holdout_start"):
+            expected.pop(absolute, None)
+        expected["window_days"] = 364
+        expected["holdout_days"] = None
+        assert S.pin_identity(normalised, window_days=364,
+                              holdout_days=None) == json.dumps(
+            expected, sort_keys=True)
 
     def test_the_active_count_ignores_retired_pins(self):
         pins = [{"active": True}, {"active": False}, {"active": True}]
         assert S.active_pin_count(pins) == 2
+
+
+class TestPinWindowsAreStoredAsAShape:
+    """FC-096 D1's "re-measured weekly", made real at the create step.
+
+    The API's shape does not change — an operator posts the same absolute-dated
+    spec `POST /sweeps` takes — and the conversion to a moving window happens
+    here, once. The first build of this PR skipped it, and a pin was then
+    frozen to a historical window whose answer cannot change: the dedup hits on
+    the second Saturday and the trend series holds one point for ever.
+    """
+
+    def test_the_shape_is_derived_from_the_submitted_window(self):
+        window, holdout = S.pin_window_shape(
+            S.validate_spec(spec(start="2025-08-01", end="2026-07-31",
+                                 holdout_start="2026-05-01")))
+        assert window == (date(2026, 7, 31) - date(2025, 8, 1)).days == 364
+        assert holdout == (date(2026, 7, 31) - date(2026, 5, 1)).days == 91
+
+    def test_the_holdout_is_measured_from_the_END(self):
+        """Both counts are re-anchored to the same edge. Measuring the holdout
+        from the START would move its boundary every time the window slid."""
+        _window, holdout = S.pin_window_shape(
+            S.validate_spec(spec(start="2025-08-01", end="2026-07-31",
+                                 holdout_start="2026-05-01")))
+        assert holdout < 180, "measured from the end, not from the start"
+
+    def test_a_spec_with_no_holdout_has_no_holdout_days(self):
+        _window, holdout = S.pin_window_shape(S.validate_spec(spec()))
+        assert holdout is None
+
+    def test_the_row_carries_both_and_so_does_a_deactivation(self):
+        create = S.pin_row(pin_id="p", spec_json="{}", active=True,
+                           window_days=365, holdout_days=90)
+        assert create["window_days"] == 365 and create["holdout_days"] == 90
+        retire = S.pin_row(pin_id="p", spec_json="{}", active=False,
+                           window_days=365, holdout_days=90)
+        assert retire["window_days"] == 365, (
+            "the row is a state transition, not a tombstone"
+        )
+
+    def test_the_engines_row_builder_agrees_on_the_columns(self):
+        api = S.pin_row(pin_id="p", spec_json='{"a": 1}', active=True,
+                        window_days=365, holdout_days=90, note="n")
+        engine = store.pin_row(pin_id="p", spec_json='{"a": 1}', active=True,
+                               window_days=365, holdout_days=90, note="n")
+        assert set(api) == set(engine)
+        assert {k: v for k, v in api.items() if k != "written_at"} == {
+            k: v for k, v in engine.items() if k != "written_at"}
+
+    def test_the_shape_is_surfaced_by_the_list(self):
+        """A console showing only the stored dates would describe a window the
+        pin stopped using the week after it was created."""
+        shaped = S.shape_pin({"pin_id": "p", "active": True, "note": None,
+                              "spec_json": "{}", "written_at": None,
+                              "window_days": 365, "holdout_days": 90})
+        assert shaped["window_days"] == 365 and shaped["holdout_days"] == 90
+
+
+class TestThePinIdentityIsRELATIVE:
+    """The same question is ONE pin across weeks — and across re-anchorings.
+
+    An identity that included the absolute dates would make a rolling pin a
+    different question every Saturday, so the duplicate check would never fire
+    and the same question could be pinned once a week for ever, each copy
+    looking new.
+    """
+
+    def test_the_absolute_dates_are_not_in_it(self):
+        ident = S.pin_identity(S.validate_spec(spec()), window_days=364,
+                               holdout_days=None)
+        assert "2025-08-01" not in ident and "2026-07-31" not in ident
+        assert '"window_days": 364' in ident
+
+    def test_two_windows_of_the_same_LENGTH_are_the_same_question(self):
+        one = S.validate_spec(spec(start="2025-08-01", end="2026-07-31"))
+        two = S.validate_spec(spec(start="2024-08-01", end="2025-07-31"))
+        assert S.pin_identity(one, window_days=364, holdout_days=None) == \
+            S.pin_identity(two, window_days=364, holdout_days=None)
+
+    def test_a_different_window_LENGTH_is_a_different_question(self):
+        one = S.validate_spec(spec())
+        assert S.pin_identity(one, window_days=364, holdout_days=None) != \
+            S.pin_identity(one, window_days=180, holdout_days=None)
+
+    def test_a_different_holdout_LENGTH_is_a_different_question(self):
+        one = S.validate_spec(spec())
+        assert S.pin_identity(one, window_days=364, holdout_days=90) != \
+            S.pin_identity(one, window_days=364, holdout_days=120)
+
+    def test_the_duplicate_check_reads_the_stored_shape(self):
+        stored = {"pin_id": "p1", "active": True, "window_days": 364,
+                  "holdout_days": None,
+                  "spec_json": S.pin_spec_json(
+                      S.validate_spec(spec(start="2020-01-02",
+                                           end="2020-12-31")))}
+        # A DIFFERENT absolute window, the same length and the same question.
+        candidate = S.validate_spec(spec(start="2025-08-01", end="2026-07-31"))
+        assert S.duplicate_active_pin(
+            candidate, window_days=364, holdout_days=None,
+            pins=[stored])["pin_id"] == "p1"
+
+    def test_a_stored_pin_with_no_shape_is_skipped_not_matched(self):
+        """It is not comparable to anything; the battery refuses it weekly and
+        says so. Blocking a good pin behind a broken one is the wrong
+        direction."""
+        stored = {"pin_id": "p1", "active": True, "window_days": None,
+                  "holdout_days": None,
+                  "spec_json": S.pin_spec_json(S.validate_spec(spec()))}
+        assert S.duplicate_active_pin(
+            S.validate_spec(spec()), window_days=364, holdout_days=None,
+            pins=[stored]) is None
 
 
 class TestShapingAPin:
@@ -3181,8 +3333,16 @@ class FakePinBQ:
 
 def stored_pin(pin_id="pin0000000000001", *, active=True, note=None,
                spec_dict=None):
+    """A pin row as the store holds it — including the ROLLING shape.
+
+    Derived from the spec rather than hardcoded, so a test that varies the
+    window varies the identity with it, exactly as the create endpoint does.
+    """
+    normalised = S.validate_spec(spec_dict or spec())
+    window, holdout = S.pin_window_shape(normalised)
     return {"pin_id": pin_id, "active": active, "note": note,
-            "spec_json": S.pin_spec_json(S.validate_spec(spec_dict or spec())),
+            "spec_json": S.pin_spec_json(normalised),
+            "window_days": window, "holdout_days": holdout,
             "written_at": "2026-09-01T12:00:00+00:00"}
 
 
@@ -3271,6 +3431,47 @@ class TestThePinEndpoints:
         assert row["active"] is True and row["note"] == "delta band"
         assert json.loads(row["spec_json"]) == S.validate_spec(spec())
 
+    def test_the_created_row_carries_the_rolling_shape(self, wired):
+        """The conversion happens at create, and the response says so.
+
+        Without it the pin is frozen to the window that was posted: the dedup
+        hits from the second Saturday on and the trend series holds one point
+        for ever, with nothing in the UI to say so.
+        """
+        v2, bq = wired
+        out = self._create(v2, {"spec": spec(holdout_start="2026-05-01")})
+        assert out["window_days"] == 364 and out["holdout_days"] == 91
+        row = bq.inserted[0]
+        assert row["window_days"] == 364 and row["holdout_days"] == 91
+        assert json.loads(row["spec_json"])["end"] == "2026-07-31", (
+            "the dates the operator typed are STORED as the record of what "
+            "they asked for; they are simply not what gets replayed"
+        )
+
+    def test_the_same_question_over_a_different_absolute_window_is_a_duplicate(
+            self, wired):
+        """The point of a relative identity: re-pinning "a year, 90-day
+        holdout" a month later is the SAME standing question."""
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000ef",
+                              spec_dict=spec(start="2024-08-02",
+                                             end="2025-08-01"))]
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2, {"spec": spec(start="2025-08-01",
+                                           end="2026-07-31")})
+        assert exc.value.status_code == 409
+        assert "pin00000000000ef" in str(exc.value.detail)
+
+    def test_deleting_carries_the_shape_onto_the_retiring_row(self, wired):
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000cd",
+                              spec_dict=spec(holdout_start="2026-05-01"))]
+        self._delete(v2, "pin00000000000cd")
+        assert bq.inserted[0]["window_days"] == 364
+        assert bq.inserted[0]["holdout_days"] == 91
+
     def test_creating_a_pin_launches_nothing(self, wired):
         """It takes effect on the next battery. A pin that also submitted would
         double the cost of every pinning decision."""
@@ -3313,9 +3514,13 @@ class TestThePinEndpoints:
         from fastapi import HTTPException
 
         v2, bq = wired
+        # Twenty DISTINCT questions: the identity is relative, so varying the
+        # start varies the window LENGTH, which is what makes them different.
         bq.pins = [stored_pin(f"pin{i:013d}", spec_dict=spec(
-            symbols=["AAPL"], start=f"2025-0{1 + i % 9}-01"))
+            symbols=["AAPL"], start=f"2025-08-{1 + i:02d}"))
             for i in range(S.MAX_ACTIVE_PINS)]
+        assert len({(p["window_days"], p["holdout_days"]) for p in bq.pins}) == \
+            S.MAX_ACTIVE_PINS, "the fixture must not contain duplicates"
         with pytest.raises(HTTPException) as exc:
             self._create(v2)
         assert exc.value.status_code == 409
@@ -3326,7 +3531,7 @@ class TestThePinEndpoints:
     def test_the_cap_counts_only_ACTIVE_pins(self, wired):
         v2, bq = wired
         bq.pins = [stored_pin(f"pin{i:013d}", active=False, spec_dict=spec(
-            symbols=["AAPL"], start=f"2025-0{1 + i % 9}-01"))
+            symbols=["AAPL"], start=f"2025-08-{1 + i:02d}"))
             for i in range(S.MAX_ACTIVE_PINS)]
         out = self._create(v2)
         assert out["active_pins"] == 1, (
@@ -3342,7 +3547,7 @@ class TestThePinEndpoints:
         v2, bq = wired
         bq.pins = [stored_pin("pin00000000000ab")] + [
             stored_pin(f"pin{i:013d}", spec_dict=spec(
-                symbols=["NVDA"], start=f"2025-0{1 + i % 9}-01"))
+                symbols=["NVDA"], start=f"2025-08-{1 + i:02d}"))
             for i in range(S.MAX_ACTIVE_PINS)]
         with pytest.raises(HTTPException) as exc:
             self._create(v2)

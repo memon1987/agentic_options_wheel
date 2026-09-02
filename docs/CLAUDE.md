@@ -808,14 +808,37 @@ scheduler needed no change. Four properties are worth knowing:
   rules move (FC-096 Phase A PR-2 made the DTE keys sweepable): a pin that is no
   longer legal gets a `failed` row whose `error` begins `pin invalid: `, and a
   pin refused three consecutive weeks emits `battery_pin_nag`.
-- **A wall cap.** `BATTERY_MAX_SECONDS` (14400 = 4 h, env-overridable) bounds
-  when a NEW sweep may START; the one in flight always finishes. It exists
-  because the battery shares the Job's 6 h `--task-timeout` with the backfill,
-  and an engine-change week genuinely replays everything — the dedup key is a
-  content hash of `src/**`, so any merge touching the engine invalidates every
-  stored result exactly once.
+- **A wall cap, measured across the EXECUTION.** `BATTERY_MAX_SECONDS`
+  (14400 = 4 h, env-overridable) bounds when a NEW sweep may START; the one in
+  flight always finishes. The backfill's own elapsed time is handed in and
+  counts against it — measuring only from the battery's start would let a
+  five-hour widening chunk give it a fresh four hours inside the six-hour task
+  timeout, and the SIGKILL at that timeout takes the BACKFILL's exit code with
+  it. The cap matters because an engine-change week genuinely replays
+  everything: the dedup key is a content hash of `src/**`, so any merge
+  touching the engine invalidates every stored result exactly once.
+- **The exit boundary is structural.** The backfill branch exits with the
+  backfill's code and nothing can move it: the battery's return value is
+  discarded and every way it can fail — a crash, or a `SystemExit` from its own
+  argument checks — is caught and logged as `battery_degraded
+  reason=battery_crashed`. A `BATTERY_MAX_SECONDS` typo is resolved BEFORE the
+  backfill runs, so that one configuration error fails fast and non-zero with
+  no data work done rather than being swallowed six hours later. A SIGTERM
+  between items is summarised and exits 0 too: Cloud Run reclaiming the
+  container after a successful backfill is not a data failure.
 - **A quiet week is nearly free.** Every spec whose answer is already stored
   deduplicates, replays nothing and still writes its row.
+
+**Pins are ROLLING, and that is the whole point.** A pin stores the SHAPE of
+its window — `window_days` and `holdout_days`, derived at create time from the
+absolute dates you post — and the battery re-anchors both to the last settled
+session every Saturday. The dates in the stored spec are the record of what you
+asked for; they are not what gets replayed after the first week. A FIXED pin
+would deduplicate against itself from the second Saturday on (the engine
+identity has not moved and neither has the window), so its "trend series" would
+hold exactly one point for ever, with nothing in the UI to say so. That is
+signed decision D1's "re-measured weekly", and it is the difference between a
+trend and a repeated answer.
 
 **Pins** are the operator's standing questions, capped at 20 active (FC-096 D1)
 and stored in `options_wheel.scenario_pins` — insert-only and latest-row-wins
@@ -837,11 +860,18 @@ curl -H "Authorization: Bearer $SWEEP_SUBMIT_TOKEN" -X DELETE \
 ```
 
 The spec is wrapped in `{"spec": ..., "note": ...}` rather than spread, so a
-misspelled spec field is still refused as one. Two refusals are worth knowing:
+misspelled spec field is still refused as one. Three refusals are worth knowing:
 `force` cannot be pinned (standing, it would defeat the dedup every Saturday for
-ever), and a second pin asking the SAME question — compared on
-`identity.canonical_spec`, so a reordered symbol list does not buy a second one
-— is a 409 naming the pin that already asks it.
+ever — and the battery strips it from a hand-written row rather than trusting
+the API to be the only writer); a pin over more than
+`main.BATTERY_MAX_PIN_CELLS` (60) cells is refused BY THE BATTERY, because a pin
+is a weekly commitment rather than one submission and two API-sized pins (240
+cells) would eat the wall cap between them; and a second pin asking the SAME
+question is a 409 naming the pin that already asks it. "The same question" is
+compared on the RELATIVE form — `identity.canonical_spec` with the absolute
+dates replaced by the two day-counts — so a reordered symbol list does not buy a
+second pin, and neither does re-pinning "a year with a 90-day holdout" a month
+later.
 
 Deep history is a **chunked, operator-supervised** job — explicit
 `BACKFILL_SYMBOLS` plus `--start/--end`, one symbol-year per execution

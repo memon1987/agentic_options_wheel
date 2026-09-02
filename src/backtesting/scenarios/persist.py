@@ -340,18 +340,21 @@ def _sweeps_schema():
 def _pins_schema():
     """One row per state transition of one pin (FC-096 Phase B B4).
 
-    Five columns and no more. A pin is a spec plus a note plus a bit saying
-    whether the battery should still run it; everything else about what happened
-    to it lives on the `scenario_sweeps` rows the battery writes, keyed by
-    ``pin_id``. Putting a failure counter here instead would mean the battery
-    UPDATES this table, and an insert-only table that one writer updates is the
-    worst of both.
+    A pin is a **question asked of a rolling window**, plus a note, plus a bit
+    saying whether the battery should still run it. Everything about what
+    HAPPENED to it lives on the ``scenario_sweeps`` rows the battery writes,
+    keyed by ``pin_id``. Putting a failure counter here instead would mean the
+    battery UPDATES this table, and an insert-only table with one updating
+    writer is the worst of both.
 
     ``spec_json`` is the DASHBOARD-normalised spec (``validate_spec``'s output,
-    ``sort_keys=True``), which is what makes "two active pins with the same
-    spec" answerable by string equality: the normaliser is the one canonical
-    form in this system, so a pin submitted with the symbols in a different
-    order is the same string here.
+    ``sort_keys=True``) as the operator submitted it, **absolute dates and
+    all** — it is the readable record of what was pinned, in their own symbol
+    order.
+
+    ``window_days`` / ``holdout_days`` are what make the pin ROLLING, and they
+    are the reason those absolute dates are a record rather than an
+    instruction. See ``ROLLING_PINS`` below.
     """
     f = bigquery.SchemaField
     return [
@@ -362,6 +365,27 @@ def _pins_schema():
         f("active", "BOOL", mode="REQUIRED"),
         f("written_at", "TIMESTAMP", mode="REQUIRED"),
         f("note", "STRING"),
+        # ROLLING_PINS (FC-096 D1, restored by PR-d's data review).
+        #
+        # The window's SHAPE, not its position: how many calendar days the pin
+        # spans, and how many of those are holdout. The battery re-anchors both
+        # to `last_settled_day()` every Saturday, so a pin measures the same
+        # question over a window that MOVES.
+        #
+        # Without them a pin is a fixed historical window whose answer never
+        # changes: the engine-identity dedup would hit on the second Saturday
+        # and every Saturday after it, and the pin's "trend series" would hold
+        # exactly one point. That is not a small inefficiency — it is the whole
+        # feature silently not existing, and the first build of this PR had it.
+        #
+        # NULLABLE for the additive-reconcile rule (a column added to a live
+        # table can only be nullable), and a pin WITHOUT `window_days` is
+        # REFUSED by the battery rather than run as a fixed window: the only
+        # way to have one is a hand-written row, and quietly measuring a frozen
+        # window is the failure these columns exist to prevent.
+        # `holdout_days` NULL means "no holdout", which is a legitimate pin.
+        f("window_days", "INTEGER"),
+        f("holdout_days", "INTEGER"),
     ]
 
 
@@ -802,11 +826,13 @@ class ScenarioRunWriter:
         query = f"""
         WITH latest AS (
           SELECT pin_id, spec_json, active, written_at, note,
+                 window_days, holdout_days,
                  ROW_NUMBER() OVER (
                    PARTITION BY pin_id ORDER BY {PINS_LATEST_ORDER_BY}) AS rn
           FROM `{table}`
         )
-        SELECT pin_id, spec_json, active, written_at, note
+        SELECT pin_id, spec_json, active, written_at, note,
+               window_days, holdout_days
         FROM latest
         WHERE rn = 1
           AND (@active_only = FALSE OR active = TRUE)
@@ -1197,21 +1223,28 @@ def new_pin_id() -> str:
 
 def pin_row(*, pin_id: str, spec: Optional[Dict[str, Any]] = None,
             spec_json: Optional[str] = None, active: bool,
+            window_days: Optional[int] = None,
+            holdout_days: Optional[int] = None,
             note: Optional[str] = None,
             written_at: Optional[str] = None) -> Dict[str, Any]:
     """One ``scenario_pins`` row — a create, or a deactivation.
 
     Exactly one of ``spec`` and ``spec_json`` is given. ``spec_json`` is the
-    form the API already holds (it validated and canonicalised the spec, and
-    that STRING is what the duplicate check compares), and re-encoding a decoded
-    copy of it would risk a byte the comparison then misses. ``spec`` is the
-    convenience for a caller holding a dict.
+    form the API already holds (it validated and normalised the spec, and that
+    STRING is what is stored verbatim), and re-encoding a decoded copy of it
+    would risk a byte the record then misses. ``spec`` is the convenience for a
+    caller holding a dict.
 
-    A deactivation carries the SAME ``spec_json`` as the create it retires. The
-    row is a state transition of the pin, not a tombstone: a reader that took
-    the latest row must be able to see what was un-pinned without walking back
-    through the history, exactly as a ``failed`` sweep row still carries the
-    spec that failed.
+    ``window_days`` / ``holdout_days`` are the ROLLING half (see
+    ``_pins_schema``). They are what the battery re-anchors each Saturday; the
+    dates inside ``spec_json`` are the record of the window the operator typed,
+    not the window that will be replayed.
+
+    A deactivation carries the SAME payload as the create it retires — spec,
+    window shape and note. The row is a state transition of the pin, not a
+    tombstone: a reader taking the latest row must see what was un-pinned
+    without walking back through the history, exactly as a ``failed`` sweep row
+    still carries the spec that failed.
     """
     if (spec is None) == (spec_json is None):
         raise ValueError("pin_row takes exactly one of `spec` / `spec_json`")
@@ -1225,6 +1258,8 @@ def pin_row(*, pin_id: str, spec: Optional[Dict[str, Any]] = None,
         "active": bool(active),
         "written_at": written_at or _now(),
         "note": (note[:PIN_NOTE_MAX_CHARS] if note else None),
+        "window_days": (None if window_days is None else int(window_days)),
+        "holdout_days": (None if holdout_days is None else int(holdout_days)),
     }
 
 

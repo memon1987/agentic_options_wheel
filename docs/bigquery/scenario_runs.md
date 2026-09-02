@@ -461,10 +461,12 @@ measured" stays answerable. Day-partitioned on `written_at`, clustered on
 | column | type | notes |
 |---|---|---|
 | `pin_id` | STRING REQ | 16 hex characters, the same shape as a `run_id`. **Not content-addressed**: two operators may pin the same question for different reasons, and un-pinning one must not un-pin the other |
-| `spec_json` | STRING REQ | the DASHBOARD-normalised spec (`validate_spec`'s output, `sort_keys=True`) — the readable record of what was pinned, in the operator's own symbol order |
+| `spec_json` | STRING REQ | the DASHBOARD-normalised spec (`validate_spec`'s output, `sort_keys=True`) — the readable record of what was pinned, in the operator's own symbol order. **Its dates are a record, not an instruction**: the battery replays the window `window_days` / `holdout_days` describe |
 | `active` | BOOL REQ | REQUIRED, not "NULL means active": a pin whose current state is unreadable must not default to *run it every week for ever* |
 | `written_at` | TIMESTAMP REQ | **partition key**, and the clock that orders the transitions |
 | `note` | STRING | the author's own reminder, ≤ 200 characters. A reminder, not a document — and operator-typed text that a public dashboard renders |
+| `window_days` | INTEGER | **what makes the pin ROLLING**: the window's LENGTH in calendar days, derived at create time from the absolute spec. The battery re-anchors it to `last_settled_day()` every Saturday, so the pin measures the same question over a window that MOVES. A pin with NULL here is REFUSED by the battery rather than run as a fixed window — the only way to have one is a hand-written row |
+| `holdout_days` | INTEGER | the holdout's length, measured from the **END** (the edge both counts are re-anchored to; from the start it would move every time the window slid). NULL means no holdout, which is a legitimate pin |
 
 The latest row for a `pin_id` is `written_at DESC, active ASC`. The tiebreak
 direction is deliberate: a create and a delete landing in the same microsecond
@@ -472,16 +474,39 @@ resolve to **deleted**, because the other direction would leave a pin the
 operator removed running every Saturday for ever, while this one costs one
 re-pin that they notice immediately.
 
+### Rolling, and why a fixed pin is not a pin
+
+The battery re-anchors every pin each Saturday: `end = last_settled_day()`,
+`start = end - window_days`, `holdout_start = end - holdout_days`. The spec's
+own dates are never replayed after the first week.
+
+Without that, a pin is a fixed historical window. Its answer cannot change, so
+the engine-identity dedup hits on the SECOND Saturday and every one after it:
+the pin writes a `deduplicated` row a week for ever and its trend series holds
+exactly one point. Nothing in the UI says so — the pin looks alive. This is
+signed decision D1's "pinned combos re-measured weekly", and the first build of
+FC-096 PR-d lost it by reusing the submit endpoint's validator unchanged.
+
 ### What "the same pin" means
 
-Two pins are duplicates when they are the same **question**, compared on
-`identity.canonical_spec` — the same normalisation `sweep_key` is taken over —
-and NOT on `spec_json` byte equality. `validate_spec` deliberately does not sort
+Two pins are duplicates when they are the same **question**, and the comparison
+is over the RELATIVE form: `identity.canonical_spec` — the same normalisation
+`sweep_key` is taken over — with `start` / `end` / `holdout_start` removed and
+`window_days` / `holdout_days` put in their place.
+
+Both halves of that are load-bearing. `validate_spec` deliberately does not sort
 `symbols` (the grid's columns are read in the operator's order), so
-`["AAPL","NVDA"]` and `["NVDA","AAPL"]` are two strings and one sweep: comparing
-the stored text would have accepted both, and the battery would then replay one
-and deduplicate the other every Saturday for ever. `force` cannot be pinned at
-all — standing, it would defeat the dedup permanently.
+`["AAPL","NVDA"]` and `["NVDA","AAPL"]` are two strings and one sweep — byte
+equality on `spec_json` would have accepted both pins, and the battery would
+replay one and deduplicate the other every Saturday. And dropping the absolute
+dates is what makes a rolling pin ONE question across weeks: an identity that
+kept them would change every Saturday, so the duplicate check would never fire
+and the same question could be pinned once a week for ever, each copy looking
+new.
+
+`force` cannot be pinned at all — standing, it would defeat the dedup
+permanently — and the battery STRIPS it from a hand-written row rather than
+trusting the API to be the only writer.
 
 ### Who writes it
 
@@ -512,7 +537,10 @@ FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps`
 WHERE pin_id = '<pin_id>'
 ORDER BY submitted_at DESC;
 
--- the weekly trend series, excluding smoke rows and ad-hoc runs
+-- the weekly trend series, excluding smoke rows and ad-hoc runs.
+-- `window_end` MOVES week to week because pins and the standing set are both
+-- rolling; a series whose window_end never changed would be one measurement
+-- repeated, which is the defect rolling pins exist to prevent.
 SELECT r.symbol, s.window_end, r.split, r.annualized_return
 FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` s
 JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r

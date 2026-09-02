@@ -161,12 +161,20 @@ def _config():
 
 
 def pin(pin_id="pin0000000000001", spec=None, *, active=True, note=None,
-        spec_json=None):
+        spec_json=None, window_days=365, holdout_days=None):
+    """A stored pin row.
+
+    `window_days` defaults to a year because a pin without one is REFUSED (it
+    cannot be re-anchored, and running it as a fixed window is the failure
+    rolling pins exist to prevent) — the tests that want that case pass
+    `window_days=None` explicitly.
+    """
     if spec_json is None:
         spec_json = json.dumps(spec if spec is not None else valid_spec(),
                                sort_keys=True)
     return {"pin_id": pin_id, "spec_json": spec_json, "active": active,
-            "written_at": "2026-09-01T12:00:00+00:00", "note": note}
+            "written_at": "2026-09-01T12:00:00+00:00", "note": note,
+            "window_days": window_days, "holdout_days": holdout_days}
 
 
 def valid_spec(**over):
@@ -634,20 +642,63 @@ class TestExitCodeClasses:
             _config().stock_symbols)
         assert logger.payload("battery_degraded")["measured"] == 0
 
-    def test_a_failing_item_is_counted_but_its_row_is_not_duplicated(
+    def test_a_failing_item_that_REACHED_the_store_is_not_given_a_second_row(
             self, wired, monkeypatch):
-        """`run_sweep_cmd`'s own `finally` already wrote the `failed` row with
-        the reason on it; a second row here would be a duplicate record."""
+        """`run_sweep_cmd`'s own `finally` already wrote the terminal row with
+        the reason on it; a second row here would be a duplicate record of one
+        attempt — and would feed the nag on a pin that is not invalid.
+
+        The fake writes the `running` row exactly as the real one does before
+        it raises, which is the signal the battery reads.
+        """
         logger = _Logger()
-        monkeypatch.setattr(
-            cli, "run_sweep_cmd",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        def boom(*_a, **kw):
+            kw["writer_override"].write_status(
+                {"run_id": kw["run_id"], "status": "running"})
+            raise RuntimeError("materialisation exploded")
+        monkeypatch.setattr(cli, "run_sweep_cmd", boom)
+
         cli.run_battery_cmd(battery_args(), _config(), logger)
-        assert wired.statuses == [], (
-            "the battery must not write its own row for a sweep that got far "
-            "enough to write one"
+        assert [r["status"] for r in wired.statuses] == [
+            "running"] * len(_config().stock_symbols), (
+            "the battery must add nothing to a run that recorded itself"
         )
         assert logger.payload("battery_pin_failed")["invalid"] is False
+
+    def test_a_failure_BEFORE_the_store_still_leaves_a_row(self, wired,
+                                                           monkeypatch):
+        """The probe shape: `starting_cash: "abc"` raises `ValueError` out of
+        the job-mode parse, before any row exists.
+
+        It is not a `SystemExit`, so an implementation that keyed off the
+        exception CLASS recorded nothing at all: the pin's week vanished
+        without trace and the nag could never count it. The battery decides on
+        the store's own memory instead — no row for this run_id means the
+        attempt failed before the store, which is by construction a refusal.
+        """
+        logger = _Logger()
+        wired._pins = [pin("pin00000000000ff",
+                           spec=valid_spec(starting_cash="abc"))]
+        rc = cli.run_battery_cmd(battery_args(), _config(), logger)
+        assert rc == 0
+        row = next(r for r in wired.statuses
+                   if r["pin_id"] == "pin00000000000ff")
+        assert row["status"] == "failed"
+        assert row["error"].startswith(cli.BATTERY_PIN_INVALID_PREFIX)
+        assert logger.payload("battery_pin_failed")["invalid"] is True
+
+    def test_that_pre_store_failure_feeds_the_nag(self, wired):
+        """Same event to an operator as a refused override, so the same streak."""
+        logger = _Logger()
+        wired._pins = [pin("pin00000000000ff",
+                           spec=valid_spec(starting_cash="abc"))]
+        wired.history = {"pin00000000000ff": [
+            {"run_id": f"prior{i}", "status": "failed",
+             "error": f"{cli.BATTERY_PIN_INVALID_PREFIX}earlier"}
+            for i in range(2)]}
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+        assert "battery_pin_nag" in logger.types("error")
 
     def test_a_nonzero_exit_from_an_item_is_a_failure_not_a_measurement(
             self, wired, monkeypatch):
@@ -672,15 +723,42 @@ class TestExitCodeClasses:
         assert cli.run_battery_cmd(battery_args(), _config(), logger) == 0
         assert logger.payload("battery_degraded")["reason"] == "store_unavailable"
 
-    def test_a_sigterm_mid_battery_propagates(self, wired, monkeypatch):
-        """Cloud Run is killing the container. The sweep in flight has already
-        written its terminal row; there is no next item, and spending the
-        10-second grace on another BigQuery round-trip would lose it."""
+    def test_a_sigterm_mid_battery_is_summarised_not_paged(self, wired,
+                                                           monkeypatch):
+        """Cloud Run reclaiming the container is not a data failure.
+
+        On the composed path the BACKFILL has already succeeded, and letting
+        the termination escape `main()` exits the execution non-zero — firing
+        the `data-backfill` Job-failure PAGE for a measurement pass that was
+        simply cut short. The sweep in flight has already written its own
+        terminal row (`run_sweep_cmd`'s handler runs inside this one); what is
+        left is to say what got done and exit 0.
+        """
+        logger = _Logger()
+        calls = []
+
         def terminate(*_a, **_k):
+            calls.append(1)
             raise cli.SweepTerminated("SIGTERM")
         monkeypatch.setattr(cli, "run_sweep_cmd", terminate)
-        with pytest.raises(cli.SweepTerminated):
-            cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        assert cli.run_battery_cmd(battery_args(), _config(), logger) == 0
+        assert calls == [1], "the loop must stop at the termination, not go on"
+        assert "battery_terminated" in logger.types("warning")
+        assert logger.payload("battery_degraded")["reason"] == "terminated"
+
+    def test_the_terminated_battery_writes_no_row_of_its_own(self, wired,
+                                                             monkeypatch):
+        """The item in flight owns its record; the battery must not add one.
+
+        A termination is not a refusal of the spec, and a `pin invalid:` row
+        would feed the nag on a pin that is perfectly fine.
+        """
+        monkeypatch.setattr(
+            cli, "run_sweep_cmd",
+            lambda *a, **k: (_ for _ in ()).throw(cli.SweepTerminated("x")))
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        assert wired.statuses == []
 
 
 class TestTheComposedBackfillThenBattery:
@@ -764,6 +842,117 @@ class TestTheComposedBackfillThenBattery:
             "on the composed path"
         )
 
+    def test_a_CRASHING_battery_cannot_redden_a_good_backfill(self,
+                                                              monkeypatch):
+        """The boundary is structural, not conventional.
+
+        `run_battery_cmd` returning 0 is a promise its own code makes; this is
+        the guard that holds when the promise is broken — a crash, or a
+        `SystemExit` from one of its own argument checks. A stale trend chart
+        must never fire the `data-backfill` Job-failure PAGE.
+        """
+        import sys
+
+        logger = _Logger()
+        monkeypatch.setenv("BACKFILL_THEN_BATTERY", "true")
+        monkeypatch.setattr(cli, "run_backfill_cmd", lambda *a, **k: 0)
+
+        def crash(*_a, **_k):
+            raise RuntimeError("the battery exploded")
+        monkeypatch.setattr(cli, "run_battery_cmd", crash)
+        monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "configure_analytics_writer", lambda **k: None)
+        monkeypatch.setattr(cli, "get_logger", lambda *a, **k: logger)
+        monkeypatch.setattr(sys, "argv", ["main.py", "--command", "backfill"])
+
+        code = 0
+        try:
+            cli.main()
+        except SystemExit as exc:
+            code = exc.code
+        assert code == 0
+        assert logger.payload("battery_degraded")["reason"] == "battery_crashed"
+
+    @pytest.mark.parametrize("boom", [
+        lambda *_a, **_k: (_ for _ in ()).throw(SystemExit("battery: bad arg")),
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+    ])
+    def test_no_exception_class_from_the_battery_reaches_the_exit_code(
+            self, monkeypatch, boom):
+        """`SystemExit` included — that is the one an `except Exception` misses,
+        and it is exactly what an argument check raises."""
+        import sys
+
+        monkeypatch.setenv("BACKFILL_THEN_BATTERY", "true")
+        monkeypatch.setattr(cli, "run_backfill_cmd", lambda *a, **k: 0)
+        monkeypatch.setattr(cli, "run_battery_cmd", boom)
+        monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "configure_analytics_writer", lambda **k: None)
+        monkeypatch.setattr(sys, "argv", ["main.py", "--command", "backfill"])
+        code = 0
+        try:
+            cli.main()
+        except SystemExit as exc:
+            code = exc.code
+        assert code == 0
+
+    def test_a_bad_wall_cap_fails_BEFORE_the_backfill_runs(self, monkeypatch):
+        """A typo'd `BATTERY_MAX_SECONDS` is a configuration error.
+
+        The honest place to fail on one is immediately and non-zero, with no
+        data work done — not six hours later, where the crash guard above
+        would (correctly) swallow it and the operator would see a degraded
+        battery instead of the typo they made.
+        """
+        import sys
+
+        ran = []
+        monkeypatch.setenv("BACKFILL_THEN_BATTERY", "true")
+        monkeypatch.setenv("BATTERY_MAX_SECONDS", "four hours")
+        monkeypatch.setattr(cli, "run_backfill_cmd",
+                            lambda *a, **k: ran.append(1) or 0)
+        monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "configure_analytics_writer", lambda **k: None)
+        monkeypatch.setattr(sys, "argv", ["main.py", "--command", "backfill"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code != 0
+        assert ran == [], "no data work may have happened"
+
+    def test_a_bad_wall_cap_does_not_block_a_backfill_that_wants_no_battery(
+            self, monkeypatch):
+        """The check is scoped to the composed path; an operator running a
+        plain widening chunk is not affected by a stale battery variable."""
+        import sys
+
+        ran = []
+        monkeypatch.setenv("BACKFILL_THEN_BATTERY", "false")
+        monkeypatch.setenv("BATTERY_MAX_SECONDS", "four hours")
+        monkeypatch.setattr(cli, "run_backfill_cmd",
+                            lambda *a, **k: ran.append(1) or 0)
+        monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "configure_analytics_writer", lambda **k: None)
+        monkeypatch.setattr(sys, "argv", ["main.py", "--command", "backfill"])
+        cli.main()
+        assert ran == [1]
+
+    def test_the_backfills_elapsed_time_is_handed_to_the_battery(self,
+                                                                monkeypatch):
+        """The two share one execution budget, so the clock has to carry."""
+        import sys
+
+        got = {}
+        monkeypatch.setenv("BACKFILL_THEN_BATTERY", "true")
+        monkeypatch.setattr(cli, "run_backfill_cmd", lambda *a, **k: 0)
+        monkeypatch.setattr(
+            cli, "run_battery_cmd",
+            lambda *a, **k: got.update(k) or 0)
+        monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "configure_analytics_writer", lambda **k: None)
+        monkeypatch.setattr(sys, "argv", ["main.py", "--command", "backfill"])
+        cli.main()
+        assert "elapsed_seconds" in got and got["elapsed_seconds"] >= 0.0
+
     def test_battery_is_a_command_in_its_own_right(self, monkeypatch, wired):
         """`--command battery` runs it alone — which is how an operator
         re-runs a degraded week without waiting for Saturday."""
@@ -808,32 +997,374 @@ class TestADedupHitWeekReplaysNothing:
     def test_a_deduplicated_item_counts_as_measured_not_failed(
             self, wired, monkeypatch):
         logger = _Logger()
+        replays = []
         import src.backtesting.scenarios as scenarios_pkg
+        # Recorded rather than `pytest.fail`: the battery catches BaseException
+        # per item, and a test that raised inside it would be reported as a
+        # failed battery item instead of as a failed test.
         monkeypatch.setattr(scenarios_pkg, "run_sweep",
-                            lambda *a, **k: pytest.fail("replayed"))
+                            lambda *a, **k: replays.append(1))
         wired.prior = {"run_id": "earlierrun000001"}
         cli.run_battery_cmd(battery_args(), _config(), logger)
+        assert replays == []
         assert "battery_degraded" not in logger.types()
         assert logger.payload("battery_completed")["measured"] == len(
             _config().stock_symbols)
 
 
 # ==========================================================================
+# ROLLING pins — the review's HIGH, and the reason the feature exists
+# ==========================================================================
+class TestPinsAreRollingWindows:
+    """FC-096 D1: "pinned combos re-measured weekly".
+
+    The first build of this PR reused `validate_spec` unchanged, so a pin was
+    frozen to the historical window the operator typed. Its answer cannot
+    change, so the engine-identity dedup hits on the SECOND Saturday and every
+    one after it: the pin's trend series holds exactly one point for ever, and
+    nothing in the UI says so. These tests are what make the window move.
+    """
+
+    SATURDAYS = (date(2026, 9, 5), date(2026, 9, 12))
+
+    def test_the_window_is_re_anchored_to_the_last_settled_session(self):
+        spec, _dropped = cli.battery_pin_spec(
+            pin(window_days=365, holdout_days=90), today=self.SATURDAYS[0])
+        assert spec["end"] == "2026-09-04"
+        assert spec["start"] == "2025-09-04"
+        assert spec["holdout_start"] == "2026-06-06"
+
+    def test_the_stored_dates_are_a_RECORD_not_an_instruction(self):
+        """The pin keeps the window the operator typed; the battery replays a
+        moving one. A reader of `spec_json` sees what was asked for."""
+        stored = valid_spec(start="2020-01-01", end="2020-12-31")
+        spec, _ = cli.battery_pin_spec(
+            pin(spec=stored, window_days=180), today=self.SATURDAYS[0])
+        assert spec["start"] != "2020-01-01" and spec["end"] != "2020-12-31"
+        assert (date.fromisoformat(spec["end"])
+                - date.fromisoformat(spec["start"])).days == 180
+
+    def test_two_saturdays_produce_two_different_sweep_keys(self):
+        """The headline property, stated the way the dedup reads it."""
+        from src.backtesting.scenarios.identity import sweep_key
+
+        keys = []
+        for today in self.SATURDAYS:
+            spec, _ = cli.battery_pin_spec(pin(window_days=365,
+                                               holdout_days=90), today=today)
+            keys.append(sweep_key(spec, engine_version=ENGINE_VERSION,
+                                  engine_identity="deadbeefdeadbeef"))
+        assert keys[0] != keys[1], (
+            "a pin whose key does not move week to week deduplicates against "
+            "itself for ever and records one trend point"
+        )
+
+    def test_two_saturdays_produce_two_MEASURED_runs(self, wired, monkeypatch):
+        """End to end through the loop, with the clock injected.
+
+        The store answers the dedup for keys it has already seen, exactly as
+        BigQuery would, so week two only replays if its key genuinely moved.
+        """
+        seen, replayed = set(), []
+        import src.backtesting.scenarios as scenarios_pkg
+        monkeypatch.setattr(scenarios_pkg, "run_sweep",
+                            lambda *a, **k: replayed.append(1)
+                            or clean_sweep())
+
+        def prior_for(key, base_config_hash=None, engine_identity=None):
+            if key in seen:
+                return {"run_id": "earlierrun000001"}
+            seen.add(key)
+            return None
+        wired.find_done_sweep = prior_for
+        wired._pins = [pin("pin000000000aaa1", window_days=365,
+                           holdout_days=90)]
+
+        for today in self.SATURDAYS:
+            monkeypatch.setattr(cli, "battery_standing_specs",
+                                lambda *_a, **_k: [])
+            monkeypatch.setattr(
+                cli, "battery_pin_spec",
+                lambda p, today=today: _real_pin_spec(p, today=today))
+            cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        terminal = [r for r in wired.statuses if r["status"] != "running"]
+        assert [r["status"] for r in terminal] == ["done", "done"], (
+            f"expected two measured runs, got {[r['status'] for r in terminal]}"
+        )
+        assert len(replayed) == 2
+
+    def test_a_FIXED_window_would_dedup_on_the_second_saturday(self, wired,
+                                                              monkeypatch):
+        """The counterfactual, so the test above is known to be discriminating.
+
+        Same harness, same store, with the re-anchoring removed: week two comes
+        back `deduplicated` and replays nothing — the defect, reproduced.
+        """
+        seen, replayed = set(), []
+        import src.backtesting.scenarios as scenarios_pkg
+        monkeypatch.setattr(scenarios_pkg, "run_sweep",
+                            lambda *a, **k: replayed.append(1)
+                            or clean_sweep())
+
+        def prior_for(key, base_config_hash=None, engine_identity=None):
+            if key in seen:
+                return {"run_id": "earlierrun000001"}
+            seen.add(key)
+            return None
+        wired.find_done_sweep = prior_for
+        wired._pins = [pin("pin000000000aaa2")]
+        monkeypatch.setattr(cli, "battery_standing_specs", lambda *_a, **_k: [])
+        monkeypatch.setattr(cli, "battery_pin_spec",
+                            lambda p, today=None: (json.loads(p["spec_json"]), ()))
+
+        for _ in self.SATURDAYS:
+            cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        terminal = [r["status"] for r in wired.statuses if r["status"] != "running"]
+        assert terminal == ["done", "deduplicated"]
+        assert len(replayed) == 1
+
+    def test_the_standing_set_was_already_rolling_and_is_unchanged(self):
+        one = cli.battery_standing_specs(_config(), today=self.SATURDAYS[0])
+        two = cli.battery_standing_specs(_config(), today=self.SATURDAYS[1])
+        assert one[0]["end"] == "2026-09-04" and two[0]["end"] == "2026-09-11"
+        assert one[0]["symbols"] == two[0]["symbols"]
+
+    def test_a_pin_with_no_window_days_is_REFUSED_not_run_frozen(self, wired):
+        """The only way to have one is a hand-written row, and running it as a
+        fixed window is precisely the failure these columns prevent."""
+        logger = _Logger()
+        wired._pins = [pin("pin000000000aaa3", window_days=None)]
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+        row = next(r for r in wired.statuses if r["pin_id"] == "pin000000000aaa3")
+        assert row["status"] == "failed"
+        assert "window_days" in row["error"]
+
+    @pytest.mark.parametrize("window,holdout,fragment", [
+        (0, None, "window_days must be >= 1"),
+        ("abc", None, "window_days is not a number"),
+        (365, 365, "must fall inside"),
+        (365, 0, "must fall inside"),
+        (365, "x", "holdout_days is not a number"),
+    ])
+    def test_an_unusable_shape_is_refused_with_its_reason(self, window,
+                                                          holdout, fragment):
+        with pytest.raises(ValueError) as exc:
+            cli.battery_pin_spec(pin(window_days=window, holdout_days=holdout))
+        assert fragment in str(exc.value)
+
+    def test_a_holdout_free_pin_is_legal(self):
+        spec, _ = cli.battery_pin_spec(pin(window_days=200, holdout_days=None),
+                                       today=self.SATURDAYS[0])
+        assert spec["holdout_start"] is None
+
+
+def _real_pin_spec(pin_row, *, today):
+    """`cli.battery_pin_spec` bound to a clock — the tests monkeypatch the name,
+    so the original has to be reachable under another one."""
+    return _ORIGINAL_PIN_SPEC(pin_row, today=today)
+
+
+_ORIGINAL_PIN_SPEC = cli.battery_pin_spec
+
+
+class TestForceIsStrippedInTheLoop:
+    """A hand-written pin row must not bypass the dedup every week for ever.
+
+    The API refuses `force` at create time; this is the belt for a row that
+    arrived another way. STRIPPED rather than refused: the question is
+    legitimate and measuring it correctly is free, whereas refusing would cost
+    a real trend point over a field that only ever wasted money.
+    """
+
+    def test_it_is_removed_and_named(self):
+        spec, dropped = cli.battery_pin_spec(
+            pin(spec=valid_spec(force=True)), today=date(2026, 9, 5))
+        assert dropped == ("force",)
+        assert "force" not in spec
+
+    def test_the_battery_says_so_once_per_pin(self, wired):
+        logger = _Logger()
+        wired._pins = [pin("pin000000000bb1", spec=valid_spec(force=True))]
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+        assert "battery_pin_field_stripped" in logger.types("warning")
+        assert logger.payload("battery_pin_field_stripped")["dropped"] == ["force"]
+
+    def test_the_submitted_spec_carries_no_force(self, wired, monkeypatch):
+        submitted = []
+        monkeypatch.setattr(cli, "run_sweep_cmd",
+                            lambda *a, **k: submitted.append(k["spec_override"])
+                            or 0)
+        wired._pins = [pin("pin000000000bb2", spec=valid_spec(force=True))]
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        assert all("force" not in s for s in submitted)
+
+
+class TestThePerPinCellCap:
+    """A pin is a WEEKLY commitment, not one submission.
+
+    The API's own ceiling (240 cells) is sized for a one-off; two pins that
+    size would consume the wall cap between them and everything after them
+    would be skipped week after week, with only the skip list to say so.
+    """
+
+    @staticmethod
+    def _big_spec():
+        # 7 arms (6 + base) x 6 symbols x 2 splits = 84 cells.
+        return valid_spec(
+            symbols=["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "UNH"],
+            holdout_start="2026-05-01",
+            scenarios=[{"name": f"arm{i}",
+                        "overrides": {"strategy.min_put_premium": 0.5 + i / 100},
+                        "fill_haircut": None} for i in range(6)])
+
+    def test_the_count_matches_the_apis_arithmetic(self):
+        from tests._dashboard_path import add_dashboard_backend_to_path
+
+        add_dashboard_backend_to_path()
+        from services import sweeps as S
+
+        spec = self._big_spec()
+        assert cli.battery_cell_count(spec) == S.cell_count(spec) == 84
+
+    def test_an_oversized_pin_is_refused_and_named(self, wired):
+        logger = _Logger()
+        wired._pins = [pin("pin000000000cc1", spec=self._big_spec(),
+                           window_days=365, holdout_days=90)]
+        rc = cli.run_battery_cmd(battery_args(), _config(), logger)
+        assert rc == 0
+        row = next(r for r in wired.statuses if r["pin_id"] == "pin000000000cc1")
+        assert row["status"] == "failed"
+        assert str(cli.BATTERY_MAX_PIN_CELLS) in row["error"]
+        assert logger.payload("battery_degraded")["reason"] == "pin_too_large"
+        assert logger.payload("battery_degraded")["oversized_labels"] == [
+            "pin:pin000000000cc1"]
+
+    def test_it_does_not_stop_the_standing_set(self, wired):
+        wired._pins = [pin("pin000000000cc2", spec=self._big_spec())]
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        done = [r for r in wired.statuses
+                if r["status"] == "done" and r["pin_id"] is None]
+        assert len(done) == len(_config().stock_symbols)
+
+    def test_the_cap_is_well_under_the_apis_per_submission_ceiling(self):
+        from tests._dashboard_path import add_dashboard_backend_to_path
+
+        add_dashboard_backend_to_path()
+        from services import sweeps as S
+
+        assert cli.BATTERY_MAX_PIN_CELLS < S.MAX_CELLS
+        assert cli.BATTERY_MAX_PIN_CELLS >= 24, (
+            "it must still admit a 12-symbol base pin with a holdout, which is "
+            "the largest shape the standing set's own arithmetic produces"
+        )
+
+    def test_a_pin_at_the_cap_runs(self, wired):
+        # 1 arm (base) x 6 symbols x 2 splits = 12 cells — comfortably legal.
+        wired._pins = [pin("pin000000000cc3", spec=valid_spec(
+            symbols=["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "UNH"],
+            scenarios=[]), window_days=365, holdout_days=90)]
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        rows = [r for r in wired.statuses if r["pin_id"] == "pin000000000cc3"]
+        assert [r["status"] for r in rows] == ["running", "done"]
+
+
+class TestTheExecutionClock:
+    """The wall cap is a budget for the EXECUTION, not for this function.
+
+    Measuring only from the battery's own start lets a five-hour widening chunk
+    hand it a fresh four hours inside a six-hour task timeout — and the SIGKILL
+    at that timeout takes the BACKFILL's exit code with it.
+    """
+
+    def test_time_already_spent_counts_against_the_cap(self, wired,
+                                                       monkeypatch):
+        logger = _Logger()
+        monkeypatch.setattr(cli, "battery_max_seconds", lambda: 100)
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        rc = cli.run_battery_cmd(battery_args(), _config(), logger,
+                                 elapsed_seconds=120.0)
+        assert rc == 0
+        payload = logger.payload("battery_degraded")
+        assert payload["reason"] == "wall_cap"
+        assert payload["measured"] == 0, (
+            "the execution was already past the cap before the battery began"
+        )
+        assert payload["skipped"] == len(_config().stock_symbols)
+
+    def test_the_reported_wall_includes_it(self, wired, monkeypatch):
+        logger = _Logger()
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        cli.run_battery_cmd(battery_args(), _config(), logger,
+                            elapsed_seconds=600.0)
+        assert logger.payload("battery_completed")["wall_seconds"] >= 600
+
+    def test_a_negative_or_absent_elapsed_is_treated_as_zero(self, wired,
+                                                             monkeypatch):
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        for value in (None, 0.0, -5.0):
+            logger = _Logger()
+            cli.run_battery_cmd(battery_args(), _config(), logger,
+                                elapsed_seconds=value)
+            assert logger.payload("battery_completed")["measured"] == len(
+                _config().stock_symbols)
+
+    def test_the_execution_budget_fits_the_job_timeout(self):
+        """The sizing claim, arithmetic and all.
+
+        backfill chunk + cap + the one sweep that may be in flight when the cap
+        passes must fit `--task-timeout`. The in-flight term is bounded by
+        `BATTERY_MAX_PIN_CELLS` against a WARM lake (the backfill just ran) at
+        the PR-c measured ~40 s/symbol materialise.
+        """
+        import re
+        from pathlib import Path
+
+        yaml_text = (Path(__file__).resolve().parents[1]
+                     / "cloudbuild.yaml").read_text()
+        block = yaml_text[yaml_text.index("gcloud run jobs deploy data-backfill"):]
+        timeout = int(re.search(r"--task-timeout=(\d+)", block).group(1))
+
+        longest_backfill_chunk = 66 * 60          # measured, FC-096 Phase A
+        materialise_per_symbol = 40               # measured, PR-c rollout
+        # The widest legal pin: 12 symbols x 2 splits of materialisation.
+        in_flight = 12 * 2 * materialise_per_symbol
+        assert (longest_backfill_chunk + cli.BATTERY_MAX_SECONDS
+                + in_flight) < timeout, (
+            f"{longest_backfill_chunk} + {cli.BATTERY_MAX_SECONDS} + "
+            f"{in_flight} does not fit {timeout}s"
+        )
+
+
+# ==========================================================================
 # The pin store: schema and row derivation (no BigQuery)
 # ==========================================================================
 class TestThePinTable:
-    def test_the_schema_is_the_five_columns_and_no_counter(self):
+    def test_the_schema_is_the_spec_the_shape_and_no_counter(self):
+        """A pin is a spec, a window SHAPE, a note and a bit. No counter.
+
+        A failure counter here would mean the battery UPDATES this table, and
+        an insert-only table with one updating writer is the worst of both; the
+        nag counts `scenario_sweeps` rows by `pin_id` instead.
+        """
         pytest.importorskip("google.cloud.bigquery")
         fields = {f.name: f for f in store._pins_schema()}
         assert set(fields) == {"pin_id", "spec_json", "active", "written_at",
-                               "note"}
+                               "note", "window_days", "holdout_days"}
         assert store._canonical_type(fields["active"].field_type) == "BOOL"
         for required in ("pin_id", "spec_json", "active", "written_at"):
             assert fields[required].mode == "REQUIRED", (
                 f"{required} must be REQUIRED: a pin whose current state is "
                 f"unreadable must not default to 'run it every week for ever'"
             )
-        assert (fields["note"].mode or "NULLABLE").upper() == "NULLABLE"
+        for nullable in ("note", "window_days", "holdout_days"):
+            assert (fields[nullable].mode or "NULLABLE").upper() == "NULLABLE", (
+                f"{nullable} must be NULLABLE — the additive reconcile can only "
+                f"add a nullable column to a live table"
+            )
+        for day_count in ("window_days", "holdout_days"):
+            assert store._canonical_type(
+                fields[day_count].field_type) == "INT64"
 
     def test_a_pin_id_is_run_id_shaped(self):
         pin_id = store.new_pin_id()

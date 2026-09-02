@@ -882,11 +882,20 @@ async def create_pin(
     body: Dict[str, Any] = Body(...),
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    """Pin a spec into the weekly battery.
+    """Pin a spec into the weekly battery, as a ROLLING window.
 
-    Body: `{"spec": {...}, "note": "optional"}`. The spec is validated by the
-    SAME `validate_spec` the submit endpoint uses — a pin the Job would refuse
-    is refused now rather than discovered by the battery three Saturdays later.
+    Body: `{"spec": {...}, "note": "optional"}` — the same absolute-dated spec
+    `POST /sweeps` takes, validated by the SAME `validate_spec`, so a pin the
+    Job would refuse is refused now rather than discovered by the battery three
+    Saturdays later.
+
+    **The window the spec carries becomes a SHAPE.** `(end - start)` and
+    `(end - holdout_start)` are stored as `window_days` / `holdout_days`, and
+    every Saturday the battery re-anchors them to the last settled session. So
+    a pin measures the same question over a window that MOVES, which is what
+    makes its weekly rows a trend series rather than one answer repeated. The
+    dates you post are kept verbatim in the stored spec as the record of what
+    you asked for; they are not what gets replayed after the first week.
 
     * **503** when `SWEEP_SUBMIT_TOKEN` is unset — fail closed, as the submit does.
     * **401** when the bearer does not match (constant-time compare).
@@ -909,6 +918,13 @@ async def create_pin(
         raise HTTPException(status_code=422, detail=str(exc))
 
     spec_json = sweeps.pin_spec_json(spec)
+    # The window the operator typed becomes a SHAPE here, and this is the whole
+    # of the conversion: the spec they posted is stored verbatim as the record,
+    # and these two numbers are what the battery re-anchors every Saturday.
+    # Without them a pin is frozen to a historical window whose answer cannot
+    # change, so the dedup hits from the second week on and the trend series
+    # holds one point (FC-096 D1; the defect this PR's data review caught).
+    window_days, holdout_days = sweeps.pin_window_shape(spec)
     bq = get_bigquery_service()
     try:
         existing = bq.get_pins(active_only=True)
@@ -917,7 +933,9 @@ async def create_pin(
             raise _tables_missing()
         raise
 
-    duplicate = sweeps.duplicate_active_pin(spec, existing)
+    duplicate = sweeps.duplicate_active_pin(
+        spec, window_days=window_days, holdout_days=holdout_days,
+        pins=existing)
     if duplicate is not None:
         # Checked BEFORE the cap: an operator re-pinning something already
         # pinned should be told that, not told the list is full — the second
@@ -946,6 +964,7 @@ async def create_pin(
 
     pin_id = sweeps.new_pin_id()
     row = sweeps.pin_row(pin_id=pin_id, spec_json=spec_json, active=True,
+                         window_days=window_days, holdout_days=holdout_days,
                          note=note)
     try:
         bq.insert_pin(row)
@@ -954,6 +973,9 @@ async def create_pin(
             raise _tables_missing()
         raise
     return {"pin_id": pin_id, "active": True, "note": note, "spec": spec,
+            # Echoed so the caller can SEE that the window became rolling — the
+            # dates they posted are a record, and the two numbers are what runs.
+            "window_days": window_days, "holdout_days": holdout_days,
             "active_pins": active + 1, "max_active_pins": sweeps.MAX_ACTIVE_PINS}
 
 
@@ -996,7 +1018,10 @@ async def delete_pin(
         return {"pin_id": pin_id, "active": False, "deactivated": False,
                 "detail": "this pin was already inactive; nothing was written"}
     row = sweeps.pin_row(pin_id=pin_id, spec_json=current.get("spec_json"),
-                         active=False, note=current.get("note"))
+                         active=False,
+                         window_days=current.get("window_days"),
+                         holdout_days=current.get("holdout_days"),
+                         note=current.get("note"))
     try:
         bq.insert_pin(row)
     except Exception as exc:  # noqa: BLE001
