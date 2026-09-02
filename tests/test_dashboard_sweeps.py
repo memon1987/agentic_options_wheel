@@ -57,6 +57,24 @@ from src.backtesting.screen import ENGINE_VERSION  # noqa: E402
 BAKED_IDENTITY = "0123456789abcdef"
 
 
+def function_source(module_path, name: str) -> str:
+    """The source of ONE function in a file, by name.
+
+    Used by the source-scanning tests below instead of slicing between two
+    string literals. A slice like `src[index("async def run_sim"):index("@router.post(\"/sweeps\"")]`
+    silently widens the moment a route is added between the two anchors — which
+    is exactly what happened when FC-096 Phase B PR-d put the pin routes there,
+    and a widened slice makes an assertion about one function quietly become an
+    assertion about three.
+    """
+    src = module_path.read_text()
+    tree = ast.parse(src)
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == name)
+    return ast.get_source_segment(src, node)
+
+
 def spec(**overrides):
     base = {
         "symbols": ["AAPL", "NVDA"],
@@ -2538,7 +2556,8 @@ class TestTheSimProxyIsAProxy:
         pinned rather than left to review.
         """
         src = (BACKEND / "routers" / "v2.py").read_text()
-        proxy = src[src.index("def _sim_identity_token"):src.index("@router.post(\"/sweeps\"")]
+        proxy = function_source(BACKEND / "routers" / "v2.py",
+                                "_sim_identity_token")
         assert "google.oauth2.id_token" in proxy
         assert "fetch_id_token" in proxy
         # NAMES, not text: the docstring names `_access_token` on purpose, to
@@ -2554,8 +2573,7 @@ class TestTheSimProxyIsAProxy:
                 )
 
     def test_the_token_is_minted_off_the_event_loop(self):
-        src = (BACKEND / "routers" / "v2.py").read_text()
-        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        body = function_source(BACKEND / "routers" / "v2.py", "run_sim")
         assert "run_in_threadpool(_sim_identity_token" in body, (
             "minting hits the metadata server; awaiting it inline in an "
             "`async def` stalls every other dashboard request, not just this one"
@@ -2568,8 +2586,7 @@ class TestTheSimProxyIsAProxy:
         lake covers it lives in the service, which holds a real `Config`. A
         second copy here is the two-parsers failure FC-060 D7 exists to prevent.
         """
-        src = (BACKEND / "routers" / "v2.py").read_text()
-        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        body = function_source(BACKEND / "routers" / "v2.py", "run_sim")
         assert "validate_spec" not in body
         assert "blocking_sweep" not in body
 
@@ -2893,3 +2910,528 @@ class TestTheAsgiStackIsPinnedAndMatchesTheDashboard:
         bot = self._pins(BACKEND.parent.parent / "requirements.txt")
         assert bot["fastapi"] == "0.109.0"
         assert bot["starlette"].startswith("0.35."), bot["starlette"]
+
+
+# ==========================================================================
+# ==========================================================================
+# Pins (FC-096 Phase B B4)
+#
+# A pin is a spec the weekly battery re-measures for ever. Everything that
+# could be got wrong is decided in `services/sweeps.py`, so most of this suite
+# needs no FastAPI; the three routes get their own class behind the router
+# guard.
+# ==========================================================================
+class TestThePinConstantsAreNotAFork:
+    """Three values the engine and this API must agree on, byte for byte.
+
+    Each disagreement is silent and each is different: a smaller cap here
+    refuses pins the battery would happily run; a different ORDER BY shows a
+    pin the battery does not run (or hides one it does); a different note
+    ceiling truncates in one place and not the other.
+    """
+
+    def test_the_active_cap_matches(self):
+        assert S.MAX_ACTIVE_PINS == store.MAX_ACTIVE_PINS == 20
+
+    def test_the_latest_row_order_by_matches(self):
+        assert S.PINS_LATEST_ORDER_BY == store.PINS_LATEST_ORDER_BY
+
+    def test_the_note_ceiling_matches(self):
+        assert S.PIN_NOTE_MAX_CHARS == store.PIN_NOTE_MAX_CHARS
+
+    def test_the_table_name_matches(self):
+        assert S.PINS_TABLE == store.PINS_TABLE == "scenario_pins"
+
+
+class TestThePinRowMatchesTheEnginesShape:
+    def test_same_columns_as_the_engines_builder(self):
+        """`submitted_row`'s rule, applied to the second table this API writes:
+        a column one side omits is a column the other side's reader renders as
+        blank while looking correct."""
+        api = S.pin_row(pin_id="p", spec_json='{"a": 1}', active=True,
+                        note="n")
+        engine = store.pin_row(pin_id="p", spec_json='{"a": 1}', active=True,
+                               note="n")
+        assert set(api) == set(engine)
+        assert {k: v for k, v in api.items() if k != "written_at"} == {
+            k: v for k, v in engine.items() if k != "written_at"}
+
+    def test_every_column_is_declared_in_the_schema(self):
+        pytest.importorskip("google.cloud.bigquery")
+        declared = {f.name for f in store._pins_schema()}
+        assert set(S.pin_row(pin_id="p", spec_json="{}", active=True)) <= declared
+
+    def test_the_note_is_truncated_not_rejected_at_row_build_time(self):
+        """The API refuses an over-long note with a 422; this is the second
+        belt, for a note that arrived some other way."""
+        row = S.pin_row(pin_id="p", spec_json="{}", active=True,
+                        note="x" * 1000)
+        assert len(row["note"]) == S.PIN_NOTE_MAX_CHARS
+
+
+class TestValidatingAPinBody:
+    def test_the_spec_goes_through_the_submit_validator_unchanged(self):
+        normalised, note = S.validate_pin_body({"spec": spec()})
+        assert normalised == S.validate_spec(spec())
+        assert note is None
+
+    def test_a_spec_the_submit_endpoint_would_refuse_is_refused_here(self):
+        """Refused at PIN time, not discovered by the battery three Saturdays
+        later."""
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_pin_body({"spec": spec(symbols=[])})
+        assert "non-empty list" in str(exc.value)
+
+    def test_the_spec_is_wrapped_not_spread(self):
+        """A `note` beside the spec's own fields would have to be stripped
+        before `validate_spec` — and stripping is how a typo'd `holdout`
+        becomes a note instead of a refusal."""
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_pin_body(dict(spec(), note="mine"))
+        assert "unknown field" in str(exc.value)
+
+    def test_a_missing_spec_is_refused(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_pin_body({"note": "just a note"})
+        assert "needs a 'spec'" in str(exc.value)
+
+    @pytest.mark.parametrize("body", [None, [], "spec", 3])
+    def test_a_body_that_is_not_an_object_is_refused(self, body):
+        with pytest.raises(S.SweepValidationError):
+            S.validate_pin_body(body)
+
+    def test_force_cannot_be_pinned(self):
+        """`force` is an instruction about ONE submission. Standing, it would
+        make the battery re-replay this spec every Saturday for ever —
+        converting the cheap week the dedup exists to give into the expensive
+        one, silently, until somebody read the bill."""
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_pin_body({"spec": spec(force=True)})
+        assert "'force' cannot be pinned" in str(exc.value)
+
+    def test_a_note_is_trimmed_and_an_empty_one_becomes_null(self):
+        _spec, note = S.validate_pin_body({"spec": spec(), "note": "  hi  "})
+        assert note == "hi"
+        _spec, note = S.validate_pin_body({"spec": spec(), "note": "   "})
+        assert note is None
+
+    def test_an_over_long_note_is_refused_with_its_length(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_pin_body({"spec": spec(),
+                                 "note": "x" * (S.PIN_NOTE_MAX_CHARS + 1)})
+        assert str(S.PIN_NOTE_MAX_CHARS) in str(exc.value)
+
+    def test_a_non_string_note_is_refused(self):
+        with pytest.raises(S.SweepValidationError):
+            S.validate_pin_body({"spec": spec(), "note": {"a": 1}})
+
+
+class TestThePinDuplicateCheck:
+    """Two pins are duplicates when they are the same QUESTION, not the same text.
+
+    Found by this suite rather than reasoned about: `validate_spec` deliberately
+    does NOT sort `symbols` (the grid's columns are read in the operator's
+    order), so byte equality on the stored spec would have let the same sweep be
+    pinned twice — and the battery would then replay one and deduplicate the
+    other every Saturday for ever.
+    """
+
+    @staticmethod
+    def _stored(spec_dict):
+        return {"pin_id": "p1", "active": True,
+                "spec_json": S.pin_spec_json(S.validate_spec(spec_dict))}
+
+    def test_the_same_question_asked_differently_is_still_a_duplicate(self):
+        one = self._stored(spec(symbols=["AAPL", "NVDA"]))
+        two = S.validate_spec(spec(symbols=["NVDA", "AAPL"]))
+        assert one["spec_json"] != S.pin_spec_json(two), (
+            "the premise: the STORED text differs, because the normaliser "
+            "preserves the operator's symbol order on purpose"
+        )
+        assert S.duplicate_active_pin(two, [one])["pin_id"] == "p1"
+
+    def test_reordered_scenarios_are_the_same_question_too(self):
+        arms = [{"name": "a", "overrides": {"strategy.min_put_premium": 0.75}},
+                {"name": "b", "overrides": {"strategy.min_call_premium": 0.8}}]
+        one = self._stored(spec(scenarios=arms))
+        two = S.validate_spec(spec(scenarios=list(reversed(arms))))
+        assert S.duplicate_active_pin(two, [one]) is not None
+
+    def test_a_genuinely_different_spec_is_not_a_duplicate(self):
+        one = self._stored(spec())
+        two = S.validate_spec(spec(end="2026-06-30"))
+        assert S.duplicate_active_pin(two, [one]) is None
+
+    def test_an_INACTIVE_pin_is_not_a_duplicate(self):
+        """Re-pinning something un-pinned last month is ordinary; refusing it
+        would make un-pinning a one-way door."""
+        one = self._stored(spec())
+        one["active"] = False
+        assert S.duplicate_active_pin(S.validate_spec(spec()), [one]) is None
+
+    def test_a_corrupt_pin_row_does_not_block_a_good_one(self):
+        """It is comparable to nothing; the battery refuses it every week and
+        says so. Blocking a good pin behind it would be the wrong direction."""
+        assert S.duplicate_active_pin(
+            S.validate_spec(spec()),
+            [{"pin_id": "bad", "active": True, "spec_json": "not json"},
+             {"pin_id": "bad2", "active": True, "spec_json": "[1,2]"}]) is None
+
+    def test_the_identity_is_the_one_sweep_key_is_taken_over(self):
+        """If these two ever diverge, the check would refuse pins that do NOT
+        dedup against each other, or accept pins that do."""
+        from src.backtesting.scenarios.identity import canonical_spec
+
+        normalised = S.validate_spec(spec())
+        assert S.pin_identity(normalised) == json.dumps(
+            canonical_spec(normalised), sort_keys=True)
+
+    def test_the_active_count_ignores_retired_pins(self):
+        pins = [{"active": True}, {"active": False}, {"active": True}]
+        assert S.active_pin_count(pins) == 2
+
+
+class TestShapingAPin:
+    def test_the_spec_comes_back_decoded(self):
+        row = {"pin_id": "p", "active": True, "note": "n",
+               "spec_json": json.dumps(S.validate_spec(spec()), sort_keys=True),
+               "written_at": "2026-09-01T12:00:00+00:00"}
+        shaped = S.shape_pin(row)
+        assert shaped["spec"]["symbols"] == ["AAPL", "NVDA"]
+        assert shaped["spec_json"] is None, (
+            "handing back the text as well would make every caller choose, and "
+            "the one that chose wrong would render JSON in a table cell"
+        )
+
+    def test_an_undecodable_pin_is_surfaced_not_hidden(self):
+        """It is precisely the row worth seeing: the battery refuses it every
+        week and says so."""
+        shaped = S.shape_pin({"pin_id": "p", "active": True,
+                              "spec_json": "not json", "note": None,
+                              "written_at": None})
+        assert shaped["spec"] is None and shaped["spec_json"] == "not json"
+
+    def test_a_timestamp_object_is_rendered_iso(self):
+        shaped = S.shape_pin({"pin_id": "p", "active": True, "spec_json": "{}",
+                              "note": None,
+                              "written_at": datetime(2026, 9, 1, 12, 0,
+                                                     tzinfo=timezone.utc)})
+        assert shaped["written_at"] == "2026-09-01T12:00:00+00:00"
+
+
+class TestThePinSql:
+    def test_the_list_takes_the_latest_row_per_pin(self):
+        sql = S.pins_sql("proj.options_wheel")
+        assert "PARTITION BY pin_id" in sql
+        assert S.PINS_LATEST_ORDER_BY in sql
+        assert "rn = 1" in sql
+
+    def test_the_active_filter_is_a_parameter_not_a_second_query(self):
+        """The battery's question and the console's must be demonstrably the
+        same one with a filter."""
+        assert "@active_only" in S.pins_sql("d")
+
+    def test_one_pin_is_looked_up_inside_the_window_function(self):
+        """A predicate applied OUTSIDE would rank every pin in the table on
+        every delete — `pin_id` is the clustering key precisely so it does
+        not have to."""
+        sql = S.one_pin_sql("d")
+        assert sql.index("WHERE pin_id = @pin_id") < sql.index("WHERE rn = 1")
+
+    def test_no_user_text_reaches_the_sql(self):
+        assert "@pin_id" in S.one_pin_sql("d")
+
+
+# The pin routes need FastAPI and NOTHING else optional: they call BigQuery
+# through the injected service and never touch httpx, so `_HAS_FASTAPI` — not
+# `_HAS_TESTCLIENT` — is the right gate, and it is the one that lets these
+# tests actually RUN in the bot CI image rather than skipping there. The
+# distinction is the whole subject of `tests/_dashboard_path`'s guard block and
+# of `TestTheRouterImportsWithoutHttpx` above, which is what makes "the router
+# imports with FastAPI alone" an executable property rather than an assumption
+# this class quietly depends on.
+class FakePinBQ:
+    """A BigQueryService stand-in for the pin routes."""
+
+    def __init__(self, *, pins=None, raises=None, insert_raises=None):
+        self.pins = list(pins or [])
+        self.raises = raises
+        self.insert_raises = insert_raises
+        self.inserted = []
+
+    def _maybe_raise(self):
+        if self.raises is not None:
+            raise self.raises
+
+    def get_pins(self, *, active_only=False):
+        self._maybe_raise()
+        return [p for p in self.pins if not active_only or p.get("active")]
+
+    def get_pin(self, pin_id):
+        self._maybe_raise()
+        return next((p for p in self.pins if p["pin_id"] == pin_id), None)
+
+    def insert_pin(self, row):
+        if self.insert_raises is not None:
+            raise self.insert_raises
+        self.inserted.append(row)
+        self.pins = [p for p in self.pins if p["pin_id"] != row["pin_id"]]
+        self.pins.append(row)
+
+
+def stored_pin(pin_id="pin0000000000001", *, active=True, note=None,
+               spec_dict=None):
+    return {"pin_id": pin_id, "active": active, "note": note,
+            "spec_json": S.pin_spec_json(S.validate_spec(spec_dict or spec())),
+            "written_at": "2026-09-01T12:00:00+00:00"}
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="the router needs FastAPI (httpx is not required "
+                           "here — see TestTheRouterImportsWithoutHttpx)")
+class TestThePinEndpoints:
+    """The routes that COST something every Saturday, and every refusal."""
+
+    TOKEN = "s3cret-token-value"
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    @pytest.fixture
+    def wired(self, monkeypatch):
+        import routers.v2 as v2
+
+        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        bq = FakePinBQ()
+        monkeypatch.setattr(v2, "get_bigquery_service", lambda: bq)
+        return v2, bq
+
+    def _create(self, v2, body=None, token=None):
+        return self._run(v2.create_pin(
+            body=body if body is not None else {"spec": spec()},
+            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+
+    def _delete(self, v2, pin_id, token=None):
+        return self._run(v2.delete_pin(
+            pin_id=pin_id,
+            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+
+    # -- the gate ----------------------------------------------------------
+    def test_an_unconfigured_token_disables_the_writes(self, wired,
+                                                       monkeypatch):
+        """Fail CLOSED, exactly as the submit does. A pin spends Job time every
+        Saturday for ever, which is a bigger commitment than one submit."""
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2)
+        assert exc.value.status_code == 503
+        assert "sweeps are disabled" in str(exc.value.detail)
+
+    @pytest.mark.parametrize("token", ["wrong", "", "s3cret-token-valu"])
+    def test_a_bad_bearer_is_401(self, wired, token):
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2, token=token)
+        assert exc.value.status_code == 401
+
+    def test_the_delete_is_gated_too(self, wired):
+        """An un-gated delete would let anyone silently stop a measurement."""
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.pins = [stored_pin()]
+        with pytest.raises(HTTPException) as exc:
+            self._delete(v2, "pin0000000000001", token="wrong")
+        assert exc.value.status_code == 401
+        assert bq.inserted == []
+
+    def test_the_list_is_public_like_every_other_read(self, wired):
+        """FC-094 owns that decision: a pin is a hypothetical over historical
+        data, and the same spec is visible on any sweep it has produced."""
+        v2, bq = wired
+        bq.pins = [stored_pin()]
+        rows = self._run(v2.list_pins())      # no Authorization at all
+        assert [r["pin_id"] for r in rows] == ["pin0000000000001"]
+
+    # -- create ------------------------------------------------------------
+    def test_a_valid_pin_is_stored_active(self, wired):
+        v2, bq = wired
+        out = self._create(v2, {"spec": spec(), "note": "delta band"})
+        assert out["active"] is True and out["note"] == "delta band"
+        assert len(out["pin_id"]) == 16
+        assert len(bq.inserted) == 1
+        row = bq.inserted[0]
+        assert row["active"] is True and row["note"] == "delta band"
+        assert json.loads(row["spec_json"]) == S.validate_spec(spec())
+
+    def test_creating_a_pin_launches_nothing(self, wired):
+        """It takes effect on the next battery. A pin that also submitted would
+        double the cost of every pinning decision."""
+        v2, bq = wired
+        self._create(v2)
+        assert not hasattr(bq, "rows"), "no sweep row may be written here"
+
+    def test_an_invalid_spec_is_422_with_the_runners_reason(self, wired):
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2, {"spec": spec(symbols=["not a ticker"])})
+        assert exc.value.status_code == 422
+        assert "plausible ticker" in str(exc.value.detail)
+
+    def test_a_pinned_force_is_422(self, wired):
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2, {"spec": spec(force=True)})
+        assert exc.value.status_code == 422
+        assert "cannot be pinned" in str(exc.value.detail)
+
+    def test_a_duplicate_active_pin_is_409_NAMING_the_pin(self, wired):
+        """"It is already pinned" is only actionable if it says which one."""
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000ab", note="Ed asked")]
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2)
+        assert exc.value.status_code == 409
+        assert "pin00000000000ab" in str(exc.value.detail)
+        assert "Ed asked" in str(exc.value.detail)
+        assert bq.inserted == []
+
+    def test_the_cap_is_409_and_says_how_to_make_room(self, wired):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.pins = [stored_pin(f"pin{i:013d}", spec_dict=spec(
+            symbols=["AAPL"], start=f"2025-0{1 + i % 9}-01"))
+            for i in range(S.MAX_ACTIVE_PINS)]
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2)
+        assert exc.value.status_code == 409
+        assert str(S.MAX_ACTIVE_PINS) in str(exc.value.detail)
+        assert "DELETE /api/v2/sims/pins" in str(exc.value.detail)
+        assert bq.inserted == []
+
+    def test_the_cap_counts_only_ACTIVE_pins(self, wired):
+        v2, bq = wired
+        bq.pins = [stored_pin(f"pin{i:013d}", active=False, spec_dict=spec(
+            symbols=["AAPL"], start=f"2025-0{1 + i % 9}-01"))
+            for i in range(S.MAX_ACTIVE_PINS)]
+        out = self._create(v2)
+        assert out["active_pins"] == 1, (
+            "retired pins cost nothing every Saturday, so they must not "
+            "consume the cap"
+        )
+
+    def test_a_duplicate_is_reported_before_the_cap(self, wired):
+        """Otherwise an operator re-pinning something already pinned is told
+        to go and delete a pin to make room for one that is already there."""
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000ab")] + [
+            stored_pin(f"pin{i:013d}", spec_dict=spec(
+                symbols=["NVDA"], start=f"2025-0{1 + i % 9}-01"))
+            for i in range(S.MAX_ACTIVE_PINS)]
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2)
+        assert "pin00000000000ab" in str(exc.value.detail)
+
+    def test_an_uncreated_table_is_503_not_500(self, wired):
+        """"the dashboard is broken" and "the engine has not written yet" send
+        an operator to different places."""
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        v2, bq = wired
+        bq.raises = NotFound("scenario_pins")
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2)
+        assert exc.value.status_code == 503
+
+    # -- delete ------------------------------------------------------------
+    def test_deleting_writes_an_inactive_row_and_keeps_the_spec(self, wired):
+        """Insert-only: "what was pinned last quarter" stays answerable, and
+        the retiring row carries the spec so a reader taking the latest row can
+        see what was un-pinned."""
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000cd", note="n")]
+        out = self._delete(v2, "pin00000000000cd")
+        assert out == {"pin_id": "pin00000000000cd", "active": False,
+                       "deactivated": True}
+        assert len(bq.inserted) == 1
+        row = bq.inserted[0]
+        assert row["active"] is False
+        assert row["spec_json"] == bq.pins[0]["spec_json"]
+        assert row["note"] == "n"
+
+    def test_an_unknown_pin_is_404_never_a_silent_success(self, wired):
+        """A typo'd id answering 200 leaves the operator believing a pin they
+        are still paying for every Saturday is gone."""
+        from fastapi import HTTPException
+
+        v2, _bq = wired
+        with pytest.raises(HTTPException) as exc:
+            self._delete(v2, "pin0000000000nope")
+        assert exc.value.status_code == 404
+        assert "include_inactive" in str(exc.value.detail)
+
+    def test_deleting_an_already_inactive_pin_writes_nothing(self, wired):
+        """Idempotent AND honest: a retry must not stack identical rows."""
+        v2, bq = wired
+        bq.pins = [stored_pin("pin00000000000cd", active=False)]
+        out = self._delete(v2, "pin00000000000cd")
+        assert out["deactivated"] is False
+        assert bq.inserted == []
+
+    @pytest.mark.parametrize("pin_id", ["", "x" * 65])
+    def test_an_implausible_id_is_refused_before_any_query(self, wired,
+                                                           pin_id):
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        bq.raises = AssertionError("the store must not be queried")
+        with pytest.raises(HTTPException) as exc:
+            self._delete(v2, pin_id)
+        assert exc.value.status_code == 400
+
+    # -- list --------------------------------------------------------------
+    def test_the_list_is_active_only_by_default(self, wired):
+        v2, bq = wired
+        bq.pins = [stored_pin("pin0000000000001"),
+                   stored_pin("pin0000000000002", active=False,
+                              spec_dict=spec(end="2026-06-30"))]
+        assert [r["pin_id"] for r in self._run(v2.list_pins())] == [
+            "pin0000000000001"]
+
+    def test_include_inactive_shows_the_retired_ones(self, wired):
+        v2, bq = wired
+        bq.pins = [stored_pin("pin0000000000001"),
+                   stored_pin("pin0000000000002", active=False,
+                              spec_dict=spec(end="2026-06-30"))]
+        rows = self._run(v2.list_pins(include_inactive=True))
+        assert {r["pin_id"] for r in rows} == {"pin0000000000001",
+                                               "pin0000000000002"}
+
+    def test_the_list_returns_decoded_specs(self, wired):
+        v2, bq = wired
+        bq.pins = [stored_pin()]
+        assert self._run(v2.list_pins())[0]["spec"]["symbols"] == ["AAPL",
+                                                                  "NVDA"]
+
+    def test_a_created_pin_is_immediately_in_the_list(self, wired):
+        v2, _bq = wired
+        out = self._create(v2)
+        assert [r["pin_id"] for r in self._run(v2.list_pins())] == [
+            out["pin_id"]]

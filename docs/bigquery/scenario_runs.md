@@ -1,12 +1,14 @@
-# `options_wheel.scenario_sweeps` / `options_wheel.scenario_runs`
+# `options_wheel.scenario_sweeps` / `options_wheel.scenario_runs` / `options_wheel.scenario_pins`
 
 The scenario store (FC-060 Layer 3). Written by
 `src/backtesting/scenarios/persist.py` — from the `backtest-sweep` Cloud Run
 Job, or from `python main.py --command sweep … --persist` — and read by the
 dashboard's `/api/v2/sweeps*` endpoints.
 
-Both tables are **day-partitioned on `submitted_at`** and **insert-only**.
-Nothing in this system ever UPDATEs a row here.
+Both sweep tables are **day-partitioned on `submitted_at`** and
+**insert-only**. Nothing in this system ever UPDATEs a row here. A third table,
+`scenario_pins` (FC-096 Phase B B4), joined them at a different grain and
+follows the same rules — see the bottom of this file.
 
 > **These tables are not `backtest_runs`, and that separation is the point.**
 > `backtest_runs`'s documented "current demotion candidates" query takes the
@@ -88,6 +90,7 @@ ORDER BY submitted_at DESC
 | `error_cells` | INTEGER | cells whose `error IS NOT NULL`. Counted from the cells, not inferred from the exit code |
 | `artifacts_complete` | BOOL | FC-096 Phase B. TRUE when every **non-errored** cell also stored its detail artifact in GCS; FALSE when some did not (the console will show empty ledgers, and that is a storage failure rather than a quiet replay) — **including a run that crashed mid-replay having already written some objects**, which is incomplete rather than empty; **NULL** when the question does not apply: the run wrote no artifacts at all (a CLI run without `--persist`, a row written before the column existed), or it had **no non-errored cell to write one for** (every arm errored — `0 == 0` would claim a complete set the run has not one object of). NULL is not a defect |
 | `engine_config_hash` | STRING | `bq_writer.config_hash` — nine strategy keys plus the scoring constants. This is the column that lines a sweep row up with a `backtest_runs` row; `base_config_hash` is a different hash answering a different question (below) |
+| `pin_id` | STRING | FC-096 Phase B B4. The **pin** this run re-measured, or NULL — which is what every dashboard, CLI, Job and sim-service row means, and what every row written before the column existed means. Stored rather than joined because it is what makes a pin's weekly history queryable, and the 3-week `battery_pin_nag` counts exactly that history. Not a substitute for `sweep_key` and not substitutable by it: two pins may legally ask the same question, and the nag is addressed to the operator who created one of them |
 
 ### Effective, not as written
 
@@ -439,6 +442,89 @@ results: a GCS failure logs `sim_artifact_write_failed`, is counted, and never
 fails a cell. `artifacts_complete` on the terminal `scenario_sweeps` row is what
 tells an operator whether the set is whole, without listing the bucket. There is
 no lifecycle rule on the prefix today; revisit at ~1 GB.
+
+## `scenario_pins` — one row per state transition of a pin (FC-096 Phase B B4)
+
+A **pin** is a spec the weekly battery re-measures for ever, until somebody
+un-pins it. Capped at **20 active** (FC-096 D1) — every pin is a sweep that runs
+inside one `data-backfill` execution every Saturday, and the cap is what keeps
+that execution inside its wall clock.
+
+Insert-only and **latest-row-wins per `pin_id`**, exactly like
+`scenario_sweeps`: un-pinning writes a row with `active = FALSE` rather than
+deleting anything, so "what was pinned last quarter, and when did it stop being
+measured" stays answerable. Day-partitioned on `written_at`, clustered on
+`pin_id`.
+
+### Schema
+
+| column | type | notes |
+|---|---|---|
+| `pin_id` | STRING REQ | 16 hex characters, the same shape as a `run_id`. **Not content-addressed**: two operators may pin the same question for different reasons, and un-pinning one must not un-pin the other |
+| `spec_json` | STRING REQ | the DASHBOARD-normalised spec (`validate_spec`'s output, `sort_keys=True`) — the readable record of what was pinned, in the operator's own symbol order |
+| `active` | BOOL REQ | REQUIRED, not "NULL means active": a pin whose current state is unreadable must not default to *run it every week for ever* |
+| `written_at` | TIMESTAMP REQ | **partition key**, and the clock that orders the transitions |
+| `note` | STRING | the author's own reminder, ≤ 200 characters. A reminder, not a document — and operator-typed text that a public dashboard renders |
+
+The latest row for a `pin_id` is `written_at DESC, active ASC`. The tiebreak
+direction is deliberate: a create and a delete landing in the same microsecond
+resolve to **deleted**, because the other direction would leave a pin the
+operator removed running every Saturday for ever, while this one costs one
+re-pin that they notice immediately.
+
+### What "the same pin" means
+
+Two pins are duplicates when they are the same **question**, compared on
+`identity.canonical_spec` — the same normalisation `sweep_key` is taken over —
+and NOT on `spec_json` byte equality. `validate_spec` deliberately does not sort
+`symbols` (the grid's columns are read in the operator's order), so
+`["AAPL","NVDA"]` and `["NVDA","AAPL"]` are two strings and one sweep: comparing
+the stored text would have accepted both, and the battery would then replay one
+and deduplicate the other every Saturday for ever. `force` cannot be pinned at
+all — standing, it would defeat the dedup permanently.
+
+### Who writes it
+
+`persist.py` owns the schema, like both sweep tables, and its reconcile creates
+it — from the sweep Job, the sim service, a `--persist` CLI sweep, or the
+battery itself. That reconcile is deliberately in **its own guard**: a dataset
+whose `scenario_pins` cannot be created still persists every sweep, because
+pins are not on a sweep's critical path. The dashboard only inserts rows
+(`POST` / `DELETE /api/v2/sims/pins`, both token-gated) and reads them; a pin
+write before the first reconcile fails loudly with the tables-missing 503
+rather than creating a table with half a schema.
+
+### Useful queries
+
+```sql
+-- the pins the battery will run this Saturday
+WITH latest AS (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY pin_id ORDER BY written_at DESC, active ASC) AS rn
+  FROM `gen-lang-client-0607444019.options_wheel.scenario_pins`
+)
+SELECT pin_id, note, spec_json, written_at
+FROM latest WHERE rn = 1 AND active ORDER BY written_at;
+
+-- one pin's weekly history: what the nag counts
+SELECT run_id, status, error, submitted_at
+FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps`
+WHERE pin_id = '<pin_id>'
+ORDER BY submitted_at DESC;
+
+-- the weekly trend series, excluding smoke rows and ad-hoc runs
+SELECT r.symbol, s.window_end, r.split, r.annualized_return
+FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` s
+JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r
+  USING (run_id)
+WHERE s.submitted_via = 'battery' AND s.status = 'done' AND r.measured
+ORDER BY s.window_end DESC, r.symbol;
+```
+
+A `failed` battery row whose `error` begins `pin invalid: ` is a pin the
+current allowlist **refuses** — as opposed to one that ran and broke. Only the
+first kind counts towards `battery_pin_nag`, because a vendor outage is not
+something an operator can fix by editing a pin.
 
 ## Operational notes
 

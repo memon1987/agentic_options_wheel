@@ -1,4 +1,4 @@
-"""The scenario store — two tables a sweep may write, and neither is the screen's.
+"""The scenario store — the tables a sweep may write, and none of them is the screen's.
 
 FC-060 Layer 3. Modelled deliberately closely on
 ``src/backtesting/reporting/bq_writer.py`` (additive schema reconcile, streaming
@@ -30,6 +30,15 @@ Two tables, because a sweep has two grains and collapsing them loses one of them
   them would eventually get it wrong, and a mis-classified cell is a fabricated
   return.
 
+A third table joined them in FC-096 Phase B B4, at a different grain again:
+
+* ``scenario_pins`` — one row per **state transition of a pin**: a combination
+  an operator asked the weekly battery to keep re-measuring. Insert-only and
+  latest-row-wins like ``scenario_sweeps``, so un-pinning is a row with
+  ``active = FALSE`` rather than a delete, and "what was pinned last quarter"
+  stays answerable. It is not a sweep and never blocks one: a dataset whose pin
+  table cannot be created still persists every sweep (see ``__init__``).
+
 **Ordering within a run_id is by ``written_at``, never ``submitted_at``.** Every
 row of one submission carries the SAME ``submitted_at`` (it is the partition key
 and the submission's identity), so ordering by it is a three-way tie and "latest
@@ -59,6 +68,12 @@ except ImportError:  # pragma: no cover
 
 SWEEPS_TABLE = "scenario_sweeps"
 RUNS_TABLE = "scenario_runs"
+# FC-096 Phase B B4. The third table: combinations an operator asked to have
+# re-measured every week. Insert-only and latest-row-wins, exactly like
+# `scenario_sweeps` — "delete" is a row with `active = FALSE`, so the history of
+# what was pinned and when is never destroyed by an un-pin. The battery reads
+# the latest row per `pin_id` and runs the ones that are still active.
+PINS_TABLE = "scenario_pins"
 
 # The status vocabulary. `submitted` is the dashboard's; the rest are the Job's,
 # except `deduplicated`, which either side may write depending on which one
@@ -127,6 +142,37 @@ LATEST_STATUS_ORDER_BY = (
                for status, rank in sorted(STATUS_RANK.items()))
     + " ELSE -1 END DESC"
 )
+
+
+# FC-096 Phase B B4 — pins.
+#
+# How many pins may be ACTIVE at once (FC-096 D1: "capped ~20"). The cap is a
+# WRITE-time rule the dashboard enforces; the battery does not silently drop
+# pins beyond it, because dropping measurement quietly is worse than running
+# long and the wall cap (`main.BATTERY_MAX_SECONDS`) already bounds the Saturday.
+# `services/sweeps.MAX_ACTIVE_PINS` is pinned equal to this by a test.
+MAX_ACTIVE_PINS = 20
+
+# A pin's note is a reminder to its author ("the delta band Ed asked about"),
+# not a document. Bounded here as well as at the API boundary because this
+# module builds the row: a note is operator-typed text on a row a public
+# dashboard renders, and an unbounded one is a paste of a whole spec.
+PIN_NOTE_MAX_CHARS = 200
+
+# "Latest row wins" for one ``pin_id``. ``written_at`` is the clock, and the
+# tiebreak on a shared microsecond is `active ASC` — INACTIVE wins.
+#
+# That direction is deliberate: the only realistic collision is a create and a
+# delete landing in the same microsecond, and resolving it towards "still
+# pinned" would leave a pin the operator deleted running every Saturday for
+# ever. Resolving it towards "deleted" costs one re-pin, which the operator will
+# notice immediately because the pin is missing from the list.
+#
+# Mirrored in ``services/sweeps.PINS_LATEST_ORDER_BY`` (the dashboard cannot
+# import this module) and pinned equal by a test, for `LATEST_STATUS_ORDER_BY`'s
+# reason: two sides disagreeing about which row is current would make the API
+# show a pin the battery does not run, or hide one it does.
+PINS_LATEST_ORDER_BY = "written_at DESC, active ASC"
 
 
 # BigQuery speaks TWO names for the same type, and the API answers in the older
@@ -277,6 +323,45 @@ def _sweeps_schema():
         # questions: this one lines a sweep row up with a `backtest_runs` row;
         # that one decides whether two sweeps ran the same engine configuration.
         f("engine_config_hash", "STRING"),
+        # FC-096 Phase B B4. Which PIN this run re-measured, or NULL — which is
+        # what every non-battery row means, and what every row written before
+        # this column existed means. Additive and NULLABLE.
+        #
+        # Stored rather than joined for two reasons. It is what makes a pin's
+        # weekly history queryable at all (`recent_pin_statuses`), which is what
+        # the 3-week nag counts; and a pin's SPEC can be re-created under a new
+        # `pin_id`, so `sweep_key` is not a substitute — two pins can legally
+        # ask the same question, and the operator who pinned one of them is the
+        # one the nag is addressed to.
+        f("pin_id", "STRING"),
+    ]
+
+
+def _pins_schema():
+    """One row per state transition of one pin (FC-096 Phase B B4).
+
+    Five columns and no more. A pin is a spec plus a note plus a bit saying
+    whether the battery should still run it; everything else about what happened
+    to it lives on the `scenario_sweeps` rows the battery writes, keyed by
+    ``pin_id``. Putting a failure counter here instead would mean the battery
+    UPDATES this table, and an insert-only table that one writer updates is the
+    worst of both.
+
+    ``spec_json`` is the DASHBOARD-normalised spec (``validate_spec``'s output,
+    ``sort_keys=True``), which is what makes "two active pins with the same
+    spec" answerable by string equality: the normaliser is the one canonical
+    form in this system, so a pin submitted with the symbols in a different
+    order is the same string here.
+    """
+    f = bigquery.SchemaField
+    return [
+        f("pin_id", "STRING", mode="REQUIRED"),
+        f("spec_json", "STRING", mode="REQUIRED"),
+        # REQUIRED, not "NULL means active": a pin whose current state is
+        # unreadable must not default to "run it every week for ever".
+        f("active", "BOOL", mode="REQUIRED"),
+        f("written_at", "TIMESTAMP", mode="REQUIRED"),
+        f("note", "STRING"),
     ]
 
 
@@ -368,6 +453,7 @@ class ScenarioRunWriter:
         self._enabled = False
         self._sweeps = None
         self._runs = None
+        self._pins = None
         self._dataset_id = dataset_id
 
         if not _HAS_BIGQUERY:
@@ -402,6 +488,28 @@ class ScenarioRunWriter:
                 clustering=["run_id", "scenario_name", "symbol"],
             )
             self._enabled = True
+            # FC-096 Phase B B4. The pins table is reconciled by the SAME
+            # writer — one schema owner, and it is the side that knows every
+            # column — but in its OWN guard, and AFTER `_enabled` is set.
+            #
+            # That ordering is the point: pins are not on the sweep's critical
+            # path. A dataset whose `scenario_pins` cannot be created (a
+            # permission, a retype, a quota) must not disable sweep persistence
+            # as a side effect — that would turn a pinning problem into "the Job
+            # replayed for eight minutes and stored nothing". Pins simply
+            # report themselves unavailable instead.
+            try:
+                self._pins = self._ensure_table(
+                    dataset_ref, PINS_TABLE, _pins_schema(),
+                    partition_field="written_at", clustering=["pin_id"],
+                )
+            except Exception:
+                logger.warning(
+                    "Pin store unavailable — sweeps are unaffected, but the "
+                    "weekly battery will run the standing set only",
+                    event_category="backtest",
+                    event_type="pin_store_unavailable",
+                    dataset=dataset_id, exc_info=True)
         except Exception:
             logger.warning("ScenarioRunWriter init failed — sweep results will "
                            "NOT be persisted", exc_info=True)
@@ -652,6 +760,131 @@ class ScenarioRunWriter:
             return None
         return dict(rows[0].items()) if rows else None
 
+    # ---------------------------------------------------------------- pins --
+    @property
+    def pins_enabled(self) -> bool:
+        """Whether the pin table is usable. Separate from ``enabled``.
+
+        A writer can be perfectly able to store sweep results and unable to
+        store pins (see the guarded reconcile in ``__init__``), and the battery
+        has to be able to tell those apart: "no pins are configured" and "the
+        pin table could not be read" send an operator to different places, and
+        neither is a reason to skip the standing set.
+        """
+        return bool(self._enabled and self._pins is not None)
+
+    def write_pin(self, row: Dict[str, Any]) -> bool:
+        """Insert one ``scenario_pins`` row (a create, or a deactivation)."""
+        if not self.pins_enabled:
+            logger.error("Pin NOT persisted — pin store unavailable",
+                         event_category="backtest",
+                         event_type="pin_write_skipped",
+                         pin_id=row.get("pin_id"))
+            return False
+        return self._insert(self._pins, PINS_TABLE, [row])
+
+    def list_pins(self, *, active_only: bool = True) -> List[Dict[str, Any]]:
+        """The CURRENT state of every pin — latest row per ``pin_id``.
+
+        ``active_only`` is what the battery asks for; the dashboard's list view
+        wants the deactivated ones too, so it is a parameter rather than two
+        queries.
+
+        **A query failure returns an empty list, loudly.** The battery's
+        alternative would be to abort, which trades "the pins were not
+        re-measured this week" for "nothing was re-measured this week" —
+        strictly worse, because the standing set is what the trend charts are
+        built on. The caller logs the degradation; see ``main.run_battery_cmd``.
+        """
+        if not self.pins_enabled:
+            return []
+        table = f"{self._project_id}.{self._dataset_id}.{PINS_TABLE}"
+        query = f"""
+        WITH latest AS (
+          SELECT pin_id, spec_json, active, written_at, note,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY pin_id ORDER BY {PINS_LATEST_ORDER_BY}) AS rn
+          FROM `{table}`
+        )
+        SELECT pin_id, spec_json, active, written_at, note
+        FROM latest
+        WHERE rn = 1
+          AND (@active_only = FALSE OR active = TRUE)
+        ORDER BY written_at ASC
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("active_only", "BOOL",
+                                              bool(active_only)),
+            ])
+            rows = list(self._client.query(query, job_config=job_config).result(
+                timeout=60))
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            logger.error("Pin lookup failed — the battery will run the "
+                         "standing set only",
+                         event_category="backtest",
+                         event_type="pin_lookup_failed",
+                         error=str(exc)[:200])
+            return []
+        return [dict(row.items()) for row in rows]
+
+    def recent_pin_statuses(self, pin_id: str, *, limit: int = 2,
+                            exclude_run_id: Optional[str] = None
+                            ) -> List[Dict[str, Any]]:
+        """The last ``limit`` battery attempts at ``pin_id``, newest first.
+
+        One row per run: the LATEST status of each, by the same clause every
+        other reader of this table uses. It is what the 3-week nag counts, and
+        it exists as a query rather than as a counter column on the pin because
+        a counter would mean the battery UPDATES the pin table — and an
+        insert-only table with one updating writer is the worst of both.
+
+        ``exclude_run_id`` skips the attempt currently being recorded. The
+        caller has just inserted that row and knows its outcome; asking
+        BigQuery to hand it back would make the nag depend on how fast a
+        streamed row becomes visible to a query, which is not a property
+        anything here should be sensitive to.
+
+        **A query failure returns an empty list.** The nag then does not fire —
+        the right direction: a nag is a convenience, and inventing one from a
+        failed lookup would teach the operator to ignore it.
+        """
+        if not self._enabled or not pin_id:
+            return []
+        table = f"{self._project_id}.{self._dataset_id}.{SWEEPS_TABLE}"
+        query = f"""
+        WITH latest AS (
+          SELECT run_id, status, error, submitted_at, written_at, pin_id,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
+          FROM `{table}`
+          WHERE pin_id = @pin_id
+        )
+        SELECT run_id, status, error, submitted_at, written_at
+        FROM latest
+        WHERE rn = 1
+          AND (@exclude IS NULL OR run_id != @exclude)
+        ORDER BY submitted_at DESC
+        LIMIT @limit
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("pin_id", "STRING", pin_id),
+                bigquery.ScalarQueryParameter("exclude", "STRING",
+                                              exclude_run_id),
+                bigquery.ScalarQueryParameter("limit", "INT64", int(limit)),
+            ])
+            rows = list(self._client.query(query, job_config=job_config).result(
+                timeout=60))
+        except Exception as exc:  # noqa: BLE001 - a failed lookup must not nag
+            logger.warning("Pin history lookup failed — no nag will be emitted "
+                           "for this pin",
+                           event_category="backtest",
+                           event_type="pin_history_lookup_failed",
+                           pin_id=pin_id, error=str(exc)[:200])
+            return []
+        return [dict(row.items()) for row in rows]
+
     def write_status(self, row: Dict[str, Any]) -> bool:
         """Insert one ``scenario_sweeps`` row."""
         return self._insert(self._sweeps, SWEEPS_TABLE, [row])
@@ -717,6 +950,7 @@ def status_row(
     engine_config_hash: Optional[str] = None,
     artifacts_complete: Optional[bool] = None,
     liveness_seconds: Optional[int] = None,
+    pin_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One ``scenario_sweeps`` row.
 
@@ -800,6 +1034,11 @@ def status_row(
                                else bool(artifacts_complete)),
         "engine_config_hash": engine_config_hash,
         "earnings_symbols_without_data": None,
+        # FC-096 Phase B B4. The pin this run re-measured, or NULL on every run
+        # that is not a pin's — which is every dashboard, CLI, Job and
+        # sim-service run. Present on EVERY row for the reason the block above
+        # gives: one column set per run, whichever writer produced it.
+        "pin_id": pin_id,
     }
 
     if result is not None:
@@ -937,6 +1176,56 @@ def _ordered_unique(values) -> List[str]:
             seen.add(value)
             out.append(value)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Pins (FC-096 Phase B B4) — pure, so they are tested without BigQuery.
+# --------------------------------------------------------------------------- #
+def new_pin_id() -> str:
+    """16 hex characters, the same shape as a ``run_id``.
+
+    Deliberately not derived from the spec. Two operators may pin the same
+    question for different reasons, with different notes, and un-pinning one of
+    them must not un-pin the other — which is exactly what a content-addressed
+    id would do. The "no two ACTIVE pins with the same spec" rule is enforced at
+    write time by the API, where it can say WHICH pin already asks it.
+    """
+    import uuid
+
+    return uuid.uuid4().hex[:16]
+
+
+def pin_row(*, pin_id: str, spec: Optional[Dict[str, Any]] = None,
+            spec_json: Optional[str] = None, active: bool,
+            note: Optional[str] = None,
+            written_at: Optional[str] = None) -> Dict[str, Any]:
+    """One ``scenario_pins`` row — a create, or a deactivation.
+
+    Exactly one of ``spec`` and ``spec_json`` is given. ``spec_json`` is the
+    form the API already holds (it validated and canonicalised the spec, and
+    that STRING is what the duplicate check compares), and re-encoding a decoded
+    copy of it would risk a byte the comparison then misses. ``spec`` is the
+    convenience for a caller holding a dict.
+
+    A deactivation carries the SAME ``spec_json`` as the create it retires. The
+    row is a state transition of the pin, not a tombstone: a reader that took
+    the latest row must be able to see what was un-pinned without walking back
+    through the history, exactly as a ``failed`` sweep row still carries the
+    spec that failed.
+    """
+    if (spec is None) == (spec_json is None):
+        raise ValueError("pin_row takes exactly one of `spec` / `spec_json`")
+    if not pin_id:
+        raise ValueError("pin_row requires a pin_id")
+    encoded = (spec_json if spec_json is not None
+               else json.dumps(spec, sort_keys=True, default=str))
+    return {
+        "pin_id": pin_id,
+        "spec_json": encoded,
+        "active": bool(active),
+        "written_at": written_at or _now(),
+        "note": (note[:PIN_NOTE_MAX_CHARS] if note else None),
+    }
 
 
 # Every knob a scenario may override, plus the three env-shadowed switches,
