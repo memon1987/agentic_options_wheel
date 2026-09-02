@@ -87,6 +87,22 @@ TERMINAL_STATUSES = (STATUS_DONE, STATUS_FAILED, STATUS_DEDUPLICATED)
 # sweep whose cells are in the table is done, whatever a launch-side timeout
 # thought. The reverse ranking would hide a completed run behind a spurious
 # failure — and, worse, keep it out of the dedup so it would be replayed.
+# How long a NON-TERMINAL row may go without an update before a reader may
+# presume its writer is dead. Both numbers MIRROR `services/sweeps.py`
+# (`JOB_TASK_TIMEOUT_SECONDS` / `STALE_GRACE_MINUTES`), and a test pins them
+# equal: the dashboard decides when a row stops holding the submit lock and this
+# module decides when it stops blocking a duplicate, and the two answering
+# differently is how a sweep gets refused by one side after the other released
+# it.
+#
+# `DEFAULT_LIVENESS_SECONDS` is what a row with no `liveness_seconds` MEANS —
+# every row written before that column existed, and every row the sweep JOB
+# writes, because Cloud Run kills the task at its `--task-timeout` and nothing
+# will write its terminal row afterwards. Only a writer with a SHORTER life
+# stamps a value; the sim service stamps 900.
+DEFAULT_LIVENESS_SECONDS = 10_800   # 3h — the Job's --task-timeout
+LIVENESS_GRACE_SECONDS = 600        # 10m — the terminal-write window
+
 STATUS_RANK: Dict[str, int] = {
     STATUS_SUBMITTED: 0,
     STATUS_RUNNING: 1,
@@ -172,8 +188,27 @@ def _sweeps_schema():
         f("started_at", "TIMESTAMP"),
         f("finished_at", "TIMESTAMP"),
         # Provenance
-        f("submitted_via", "STRING"),      # 'dashboard' | 'cli'
+        f("submitted_via", "STRING"),      # 'dashboard' | 'cli' | 'sim-service'
         f("execution_name", "STRING"),     # CLOUD_RUN_EXECUTION, for debugging
+        # FC-096 Phase B B3. How long a NON-TERMINAL row of this run may go
+        # without an update before a reader may declare it dead, in seconds.
+        # Additive and NULLABLE; NULL means "use the Job's clock"
+        # (`services/sweeps.JOB_TASK_TIMEOUT_SECONDS`, 3 h), which is what every
+        # row written before this column existed means and what every Job row
+        # still means.
+        #
+        # It exists because the sim service is NOT the Job. A Cloud Run service
+        # instance that is scaled in mid-replay writes no terminal row, and the
+        # Job's 3 h clock would hold the one-at-a-time submit lock for three
+        # hours and ten minutes on a run whose process died in seconds. The
+        # service stamps 900 s, so the lock releases in ~25 min
+        # (900 s + the reader's existing 10-minute grace).
+        #
+        # Stamped on the row rather than inferred from `submitted_via` on
+        # purpose: the reader must not have to know the deployment topology of
+        # every writer, and a future writer with a different lifetime says so
+        # in its rows instead of teaching the reader a fourth special case.
+        f("liveness_seconds", "INTEGER"),
         f("git_commit", "STRING"),
         f("engine_version", "STRING"),
         # FC-096 Phase B: the content hash of `src/**` (`engine_identity.py`),
@@ -527,6 +562,96 @@ class ScenarioRunWriter:
             return None
         return dict(rows[0].items()) if rows else None
 
+    def find_running_sweep(self, sweep_key: str, *,
+                           exclude_run_id: Optional[str] = None
+                           ) -> Optional[Dict[str, Any]]:
+        """A live, non-stale ``running`` run under ``sweep_key``, or None.
+
+        FC-096 Phase B PR-c, from the service review. The sim service holds a
+        per-PROCESS lock so one instance never replays two specs at once — and
+        ``--max-instances=2`` means a second CONTAINER can accept the same spec
+        a second later and replay it in parallel. The plan's "they would contend
+        on one chain cache" rationale is false across containers (each has its
+        own tmpfs), but the waste is real and so is the confusion: two `running`
+        rows for one question, two sets of cells, and a dedup that can serve
+        either.
+
+        So this is the cross-instance half of the same gate. It is advisory by
+        construction — two requests inside one query round-trip still race — and
+        that is acceptable: the cost of losing the race is a duplicate replay,
+        which is what happens today, while the cost of being wrong in the other
+        direction would be refusing a legitimate submission for ever.
+
+        **The age bound is PER ROW, off that row's own ``liveness_seconds``** —
+        the same rule ``services/sweeps.row_liveness_seconds`` applies, mirrored
+        into SQL so the two sides cannot answer differently. A caller-supplied
+        single bound was the review's finding and it was wrong in the direction
+        that matters: bounding every row at the SIM service's ~25 minutes made a
+        **Job** legitimately 30+ minutes into replaying the same spec invisible,
+        so the check waved through a concurrent duplicate — the exact confusion
+        it exists to prevent — while the 409 it did not raise promised a release
+        window that was never true for Job rows.
+
+        So: a row stamped 900 (the sim service) stops blocking at 1500 s; a row
+        with NULL — every Job row, and every row written before the column
+        existed — stops at 11400 s (3 h + the 10-minute grace). A stamped value
+        that is zero or negative is treated as absence, exactly as the Python
+        reader treats it, because shortening the bound is the dangerous
+        direction: it releases under a run that is still going.
+
+        Without an upper bound at all this would be a permanent lock on a dead
+        run, which is the failure ``blocking_sweep``'s expiry exists to prevent.
+
+        A query failure returns None: "we could not tell" must mean "run it".
+        """
+        if not self._enabled or not sweep_key:
+            return None
+        table = f"{self._project_id}.{self._dataset_id}.{SWEEPS_TABLE}"
+        query = f"""
+        WITH latest AS (
+          SELECT run_id, status, submitted_at, written_at, submitted_via,
+                 liveness_seconds,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
+          FROM `{table}`
+          WHERE sweep_key = @sweep_key
+        )
+        SELECT run_id, submitted_at, written_at, submitted_via,
+               liveness_seconds
+        FROM latest
+        WHERE rn = 1
+          AND status = '{STATUS_RUNNING}'
+          AND written_at > TIMESTAMP_SUB(
+                CURRENT_TIMESTAMP(),
+                INTERVAL CAST(
+                  IF(COALESCE(liveness_seconds, 0) > 0,
+                     liveness_seconds, @default_liveness) + @grace
+                  AS INT64) SECOND)
+          AND (@exclude IS NULL OR run_id != @exclude)
+        ORDER BY written_at DESC
+        LIMIT 1
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+                bigquery.ScalarQueryParameter("default_liveness", "INT64",
+                                              DEFAULT_LIVENESS_SECONDS),
+                bigquery.ScalarQueryParameter("grace", "INT64",
+                                              LIVENESS_GRACE_SECONDS),
+                bigquery.ScalarQueryParameter("exclude", "STRING",
+                                              exclude_run_id),
+            ])
+            rows = list(self._client.query(query, job_config=job_config).result(
+                timeout=30))
+        except Exception as exc:  # noqa: BLE001 - a failed lookup must not block
+            logger.warning("Live-sweep lookup failed — accepting rather than "
+                           "assuming a duplicate is in flight",
+                           event_category="backtest",
+                           event_type="sweep_running_lookup_failed",
+                           sweep_key=sweep_key, error=str(exc)[:200])
+            return None
+        return dict(rows[0].items()) if rows else None
+
     def write_status(self, row: Dict[str, Any]) -> bool:
         """Insert one ``scenario_sweeps`` row."""
         return self._insert(self._sweeps, SWEEPS_TABLE, [row])
@@ -591,6 +716,7 @@ def status_row(
     rows_persisted: Optional[int] = None,
     engine_config_hash: Optional[str] = None,
     artifacts_complete: Optional[bool] = None,
+    liveness_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One ``scenario_sweeps`` row.
 
@@ -620,6 +746,12 @@ def status_row(
         "finished_at": finished_at,
         "submitted_via": submitted_via,
         "execution_name": execution_name,
+        # FC-096 Phase B B3. NULL means "this writer runs under the Job's
+        # clock"; the sim service stamps 900. Present on EVERY row, like every
+        # other column here, so the two writers cannot diverge by whichever one
+        # happened to know a field.
+        "liveness_seconds": (None if liveness_seconds is None
+                             else int(liveness_seconds)),
         "git_commit": git_commit,
         "engine_version": engine_version,
         "engine_identity": engine_identity,

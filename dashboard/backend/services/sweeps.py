@@ -188,6 +188,13 @@ _MISSING_COLUMN_MARKERS = (
 ADDITIVE_OPTIONAL_COLUMNS = (
     ("engine_identity", "STRING"),
     ("artifacts_complete", "BOOL"),
+    # FC-096 Phase B PR-c. The sim service stamps a per-row liveness bound so a
+    # killed instance releases the submit lock in ~25 min rather than 3 h 10 m.
+    # This API never SETS it (it has run nothing), but `submitted_row` carries
+    # the key as NULL — every status row of a run must have the same column set
+    # — so an un-migrated table rejects the whole request over it exactly as it
+    # would over the other two.
+    ("liveness_seconds", "INT64"),
 )
 
 _identity_query_degraded_logged = False
@@ -893,6 +900,11 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any],
         # set or the two writers diverge by whichever one happened to know a
         # field.
         "artifacts_complete": None,
+        # FC-096 Phase B PR-c. The API launches the JOB, whose liveness bound is
+        # `JOB_TASK_TIMEOUT_SECONDS` — the reader's default — so this is NULL
+        # here by meaning, not by omission. Present because every status row of
+        # a run must carry the same column set.
+        "liveness_seconds": None,
         # The API has no Config, so it cannot compute the engine hash either.
         "engine_config_hash": None,
         # FC-096 A4. Only a replay knows which symbols the earnings table was
@@ -923,6 +935,55 @@ def stale_cutoff(now: Optional[datetime] = None) -> datetime:
                            + STALE_GRACE_MINUTES * 60)
 
 
+def row_liveness_seconds(row: Dict[str, Any]) -> int:
+    """How long THIS row's writer may go quiet before it is presumed dead.
+
+    ``liveness_seconds`` off the row when it carries a usable one (FC-096 Phase
+    B PR-c), else ``JOB_TASK_TIMEOUT_SECONDS``.
+
+    **NULL is not zero and not a default worth inventing.** Every row written
+    before the column existed, and every row the sweep Job writes today, has no
+    value — and for those the Job's task timeout is exactly right, because Cloud
+    Run kills the task at that point and nothing will ever write their terminal
+    row afterwards. Only a writer with a *shorter* life says so, and the sim
+    service is the first one: a Cloud Run service instance scaled in mid-replay
+    dies in seconds, and holding the one-at-a-time lock for 3 h 10 m on it would
+    take the feature offline for the rest of the afternoon.
+
+    Junk is treated as absence, deliberately. A non-numeric or non-positive
+    value would otherwise shorten the bound to nothing and release the lock
+    under a run that is still going — the one direction of error that lets two
+    replays contend for one chain cache. An unreadable stamp falls back to the
+    conservative clock and says nothing; the row is still visible and still
+    terminalises normally.
+    """
+    raw = row.get("liveness_seconds")
+    # `bool` is an `int` in Python, so `True` would become a ONE-SECOND bound
+    # and release the lock under every live run. Treated as absence.
+    if raw is None or isinstance(raw, bool):
+        return JOB_TASK_TIMEOUT_SECONDS
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return JOB_TASK_TIMEOUT_SECONDS
+    return seconds if seconds > 0 else JOB_TASK_TIMEOUT_SECONDS
+
+
+def row_stale_cutoff(row: Dict[str, Any],
+                     now: Optional[datetime] = None) -> datetime:
+    """``stale_cutoff`` for one row, honouring its own liveness bound.
+
+    The grace stays ``STALE_GRACE_MINUTES`` whatever the bound: it covers the
+    window in which a writer that has just been told to stop is writing its
+    terminal row, and that window is a property of Cloud Run's SIGTERM handling,
+    not of how long the writer was allowed to run. 900 s + 10 min = ~25 min for
+    the sim service; unchanged 3 h 10 m for the Job.
+    """
+    now = now or datetime.now(timezone.utc)
+    return now - timedelta(seconds=row_liveness_seconds(row)
+                           + STALE_GRACE_MINUTES * 60)
+
+
 def _last_seen(row: Dict[str, Any]) -> Optional[datetime]:
     """The row's own clock: ``written_at``, falling back to ``submitted_at``."""
     return (_as_datetime(row.get("written_at"))
@@ -939,10 +1000,13 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
 
     **Two expiries, because the two states mean different things.**
 
-    * A ``running`` row holds the lock until ``stale_cutoff`` — the Job's task
-      timeout plus a grace — because until then a legitimate cold sweep may well
-      still be replaying, and releasing early lets a second execution contend
-      with it for the same chain cache.
+    * A ``running`` row holds the lock until ``row_stale_cutoff`` — the row's
+      OWN liveness bound plus a grace — because until then a legitimate cold
+      sweep may well still be replaying, and releasing early lets a second
+      execution contend with it for the same chain cache. The bound is the
+      Job's task timeout for a Job row (and for every row written before
+      FC-096 Phase B PR-c) and 900 s for a sim-service row, whose writer is a
+      Cloud Run *service* instance that can be scaled in mid-replay.
     * A ``submitted`` row holds it only until ``STUCK_AFTER_MINUTES``. It has
       already been declared *stuck* at that point (``is_stuck``), and a
       submission that produced no ``running`` row within ten minutes — three to
@@ -957,7 +1021,6 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
     with no way back except a manual BigQuery insert.
     """
     now = now or datetime.now(timezone.utc)
-    cutoff = stale_cutoff(now)
     submitted_cutoff = now - timedelta(minutes=STUCK_AFTER_MINUTES)
     for row in rows:
         status = row.get("status")
@@ -969,7 +1032,10 @@ def blocking_sweep(rows: Sequence[Dict[str, Any]],
         if status == STATUS_SUBMITTED:
             if stamp < submitted_cutoff:
                 continue
-        elif stamp < cutoff:
+        # PER ROW, not one cutoff for the batch (FC-096 Phase B PR-c): a
+        # `running` row written by the sim service carries a 900 s bound and a
+        # Job row carries none, and the two can be in the same history list.
+        elif stamp < row_stale_cutoff(row, now):
             continue
         return row
     return None
@@ -983,8 +1049,10 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     * ``submitted`` with no ``running`` row after ``STUCK_AFTER_MINUTES`` — the
       Job never reported in. Container start is 3-4 minutes, so 10 is real
       headroom rather than crying wolf.
-    * ``running`` past ``stale_cutoff`` — Cloud Run has killed the task by now
-      (``--task-timeout``), so nothing will ever write its terminal row.
+    * ``running`` past ``row_stale_cutoff`` — whatever was running it has been
+      killed by now (the Job's ``--task-timeout``, or a scaled-in service
+      instance past its stamped ``liveness_seconds``), so nothing will ever
+      write its terminal row.
 
     **Both clocks are ``_last_seen`` (``written_at``), the same one
     ``blocking_sweep`` uses.** They must agree, and reading ``submitted_at`` here
@@ -1007,7 +1075,12 @@ def is_stuck(row: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if stamp is None:
         return False
     if status == STATUS_RUNNING:
-        return stamp < stale_cutoff(now)
+        # The row's own bound (FC-096 Phase B PR-c). It MUST be the same clock
+        # `blocking_sweep` uses, for the reason the paragraph above gives about
+        # `written_at`: the two are read side by side in the UI, and a row
+        # labelled stuck while still holding the lock is a contradiction the
+        # operator has to resolve by guessing.
+        return stamp < row_stale_cutoff(row, now)
     if status != STATUS_SUBMITTED:
         return False
     return now - stamp > timedelta(minutes=STUCK_AFTER_MINUTES)

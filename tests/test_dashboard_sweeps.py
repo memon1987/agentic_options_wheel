@@ -990,6 +990,139 @@ class TestTheOneAtATimeGate:
         assert S.blocking_sweep([row], now=self.now()) is not None
 
 
+class TestThePerRowLivenessBound:
+    """FC-096 Phase B PR-c. A killed sim instance frees the lock in ~25 min.
+
+    Both readers — `blocking_sweep` (the 409 gate) and `is_stuck` (the label) —
+    take the bound off the row rather than from the Job constant. They are read
+    side by side in the UI, so a row labelled stuck while still holding the lock
+    is a contradiction the operator has to resolve by guessing; the two are
+    pinned to the same clock here.
+
+    The numbers: the sim service stamps 900 s and the reader adds its existing
+    10-minute grace, so a `running` sim row expires at 25 minutes. A Job row
+    carries no stamp and keeps 3 h 10 m — a cold sweep can legitimately replay
+    that long, and releasing early lets a second execution contend for one chain
+    cache.
+    """
+
+    def now(self):
+        return datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+
+    def row(self, *, minutes_ago, liveness=None):
+        out = {"run_id": "sim1", "status": "running",
+               "written_at": (self.now()
+                              - timedelta(minutes=minutes_ago)).isoformat()}
+        if liveness is not None:
+            out["liveness_seconds"] = liveness
+        return out
+
+    def test_the_sim_bound_is_the_plans_twenty_five_minutes(self):
+        assert (900 + S.STALE_GRACE_MINUTES * 60) == 25 * 60
+
+    @pytest.mark.parametrize("minutes,expected_blocking,expected_stuck", [
+        (24, True, False),    # inside 900s + 10m grace: alive, holds the lock
+        (26, False, True),    # past it: released, and labelled stuck
+    ])
+    def test_both_readers_agree_on_a_sim_row(self, minutes, expected_blocking,
+                                             expected_stuck):
+        row = self.row(minutes_ago=minutes, liveness=900)
+        assert (S.blocking_sweep([row], now=self.now()) is not None) \
+            is expected_blocking
+        assert S.is_stuck(row, now=self.now()) is expected_stuck
+
+    def test_a_job_row_keeps_the_three_hour_clock(self):
+        """NULL is not zero and not a shortcut: the Job really does run 3 h."""
+        row = self.row(minutes_ago=120)          # no liveness_seconds
+        assert S.blocking_sweep([row], now=self.now()) is not None
+        assert S.is_stuck(row, now=self.now()) is False
+        assert S.row_liveness_seconds(row) == S.JOB_TASK_TIMEOUT_SECONDS
+
+    def test_a_sim_row_at_two_hours_is_released_but_a_job_row_is_not(self):
+        """The whole point, in one assertion.
+
+        Before this, a service instance scaled in mid-replay held the submit
+        lock for 3 h 10 m — the feature offline for the rest of the afternoon.
+        """
+        sim_row = self.row(minutes_ago=120, liveness=900)
+        job_row = self.row(minutes_ago=120)
+        assert S.blocking_sweep([sim_row], now=self.now()) is None
+        assert S.blocking_sweep([job_row], now=self.now()) is not None
+
+    def test_the_bound_is_read_per_row_not_once_for_the_batch(self):
+        """A history list holds rows from BOTH writers at the same time."""
+        sim_row = self.row(minutes_ago=120, liveness=900)
+        job_row = dict(self.row(minutes_ago=120), run_id="job1")
+        blocking = S.blocking_sweep([sim_row, job_row], now=self.now())
+        assert blocking is not None and blocking["run_id"] == "job1"
+
+    @pytest.mark.parametrize("value", [None, 0, -1, "", "abc", object(),
+                                       True, False])
+    def test_junk_and_absence_both_fall_back_to_the_conservative_clock(self,
+                                                                      value):
+        """Shortening the bound is the dangerous direction.
+
+        A zero or unreadable stamp that shortened the window to nothing would
+        release the lock under a run that is still going, and two replays would
+        contend for one chain cache. Absence and junk therefore both mean "use
+        the Job's clock" — the row is still visible and still terminalises.
+
+        ``True`` is in the list because `bool` IS an `int` in Python: without an
+        explicit guard it becomes a ONE-SECOND bound and releases the lock under
+        every live run.
+        """
+        assert S.row_liveness_seconds({"liveness_seconds": value}) == \
+            S.JOB_TASK_TIMEOUT_SECONDS
+
+    def test_a_terminal_row_is_never_blocking_whatever_its_bound(self):
+        row = dict(self.row(minutes_ago=1, liveness=900), status="done")
+        assert S.blocking_sweep([row], now=self.now()) is None
+        assert S.is_stuck(row, now=self.now()) is False
+
+    def test_the_engine_and_the_api_agree_on_both_numbers(self):
+        """`persist` decides when a row stops blocking a DUPLICATE; this module
+        decides when it stops holding the SUBMIT LOCK. The two answering
+        differently is how a sweep gets refused by one side after the other has
+        already released it — the same divergence hazard
+        `LATEST_STATUS_ORDER_BY` is pinned against.
+        """
+        assert store.DEFAULT_LIVENESS_SECONDS == S.JOB_TASK_TIMEOUT_SECONDS
+        assert store.LIVENESS_GRACE_SECONDS == S.STALE_GRACE_MINUTES * 60
+
+    def test_the_column_is_in_the_additive_degrade_set(self):
+        """`submitted_row` carries the key, so an un-migrated table rejects it.
+
+        `insert_rows_json` refuses the WHOLE request over one unknown key, so
+        without this every dashboard submit would fail between the deploy and
+        the ALTER — PR-a's outage, for the third time.
+        """
+        assert ("liveness_seconds", "INT64") in S.ADDITIVE_OPTIONAL_COLUMNS
+        assert S.missing_optional_column(
+            "Unrecognized name: liveness_seconds") == "liveness_seconds"
+
+    def test_the_proxy_timeout_outlasts_the_services_own(self):
+        """A client timeout on a submit that in fact landed is the worst case.
+
+        The operator resubmits, and the second attempt 409s against the first.
+        150 s sits above the service's `--timeout=120` and deliberately BELOW
+        the measured ~240 s cold-start tail, which the 502 message says out
+        loud rather than pretending a bigger number would fix.
+        """
+        src = (BACKEND / "routers" / "v2.py").read_text()
+        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        assert "AsyncClient(timeout=150.0)" in body
+        assert "150 s timeout" in body, (
+            "the 502 must admit that a genuinely cold start can still land here"
+        )
+
+    def test_the_api_writes_it_as_null_because_it_launches_the_job(self):
+        row = S.submitted_row(
+            run_id="r", spec=S.validate_spec(spec()), sweep_key_value="k",
+            submitted_at="2026-08-29T12:00:00+00:00", git_commit=None)
+        assert "liveness_seconds" in row
+        assert row["liveness_seconds"] is None
+
+
 class TestStuckDetection:
     def test_submitted_past_the_window_is_stuck(self):
         now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
@@ -1750,12 +1883,14 @@ class TestTheSubmitEndpoint:
             self._run(v2.list_sweeps(limit=10))
 
     # -- gates -------------------------------------------------------------
-    def _blocked_detail(self, v2, monkeypatch, status):
+    def _blocked_detail(self, v2, monkeypatch, status, **extra):
         from fastapi import HTTPException
 
         stamp = datetime.now(timezone.utc).isoformat()
-        live = FakeBQ(history=[{"run_id": "other", "status": status,
-                                "written_at": stamp, "submitted_at": stamp}])
+        row = {"run_id": "other", "status": status,
+               "written_at": stamp, "submitted_at": stamp}
+        row.update(extra)
+        live = FakeBQ(history=[row])
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: live)
         with pytest.raises(HTTPException) as exc:
             self.submit(v2)
@@ -1776,9 +1911,23 @@ class TestTheSubmitEndpoint:
             self, wired, monkeypatch):
         v2, _bq = wired
         detail = self._blocked_detail(v2, monkeypatch, "running")
-        assert "task timeout" in detail
+        assert "liveness bound" in detail
         assert f"{S.JOB_TASK_TIMEOUT_SECONDS // 3600}h" in detail
         assert f"{S.STUCK_AFTER_MINUTES} minutes" not in detail
+
+    def test_the_409_quotes_the_BLOCKING_ROWS_bound_not_the_jobs(
+            self, wired, monkeypatch):
+        """FC-096 Phase B PR-c, and the same lesson as the `submitted` branch.
+
+        A sim-service run's lock frees in ~25 minutes. Quoting the Job's three
+        hours at the operator blocked by one is exactly the "wait three hours"
+        advice that gets a feature abandoned.
+        """
+        v2, _bq = wired
+        detail = self._blocked_detail(v2, monkeypatch, "running",
+                                      liveness_seconds=900)
+        assert "15m" in detail
+        assert f"{S.JOB_TASK_TIMEOUT_SECONDS // 3600}h" not in detail
 
     def test_a_running_sweep_is_409(self, wired, monkeypatch):
         from fastapi import HTTPException
@@ -2353,3 +2502,222 @@ class TestTheAllowlistProseDoesNotCiteARetiredRefusal:
         assert "put_target_dte" not in doc
         # ...and it still teaches with a REAL refusal, not a generic one.
         assert "min_open_interest" in doc
+
+
+# ==========================================================================
+# (15) The sim-service proxy (FC-096 Phase B PR-c)
+# ==========================================================================
+class TestTheSimProxyIsAProxy:
+    """Source-level guards, so they run in the bot image too.
+
+    Read from SOURCE rather than imported, for the reason the class below this
+    file's endpoint tests gives: `routers/v2.py` imports FastAPI, which this
+    suite's environment may not have.
+    """
+
+    def test_it_uses_the_identity_token_not_the_control_plane_token(self):
+        """The one confusion the plan names the file to prevent.
+
+        `run.googleapis.com` is the Cloud Run CONTROL plane and takes an OAuth
+        access token with the cloud-platform scope (`_access_token`, used by
+        `_launch_job`). A private Cloud Run SERVICE authenticates its callers
+        with an OIDC ID token whose `aud` is the service's own URL — the
+        `routers/live.py` pattern. Each one presented to the other end is a 401,
+        and the same service account issues both, which is exactly why this is
+        pinned rather than left to review.
+        """
+        src = (BACKEND / "routers" / "v2.py").read_text()
+        proxy = src[src.index("def _sim_identity_token"):src.index("@router.post(\"/sweeps\"")]
+        assert "google.oauth2.id_token" in proxy
+        assert "fetch_id_token" in proxy
+        # NAMES, not text: the docstring names `_access_token` on purpose, to
+        # say which token this is NOT. What must be absent is a reference to it.
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in {"_sim_identity_token", "run_sim"}):
+                names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                assert "_access_token" not in names, (
+                    f"{node.name} reaches for the control-plane OAuth token; a "
+                    f"private Cloud Run service answers that with a 401"
+                )
+
+    def test_the_token_is_minted_off_the_event_loop(self):
+        src = (BACKEND / "routers" / "v2.py").read_text()
+        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        assert "run_in_threadpool(_sim_identity_token" in body, (
+            "minting hits the metadata server; awaiting it inline in an "
+            "`async def` stalls every other dashboard request, not just this one"
+        )
+
+    def test_it_does_not_reimplement_the_services_validation(self):
+        """A proxy, not a second API.
+
+        Every rule about what a spec may contain, what it costs and whether the
+        lake covers it lives in the service, which holds a real `Config`. A
+        second copy here is the two-parsers failure FC-060 D7 exists to prevent.
+        """
+        src = (BACKEND / "routers" / "v2.py").read_text()
+        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        assert "validate_spec" not in body
+        assert "blocking_sweep" not in body
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
+class TestTheSimProxyEndpoint:
+    """Auth, configuration, and verbatim pass-through."""
+
+    TOKEN = "s3cret-token-value"
+    URL = "https://sim-service-799970961417.us-central1.run.app"
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    @pytest.fixture
+    def v2(self, monkeypatch):
+        import routers.v2 as module
+
+        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        monkeypatch.setenv("SIM_SERVICE_URL", self.URL)
+        monkeypatch.setattr(module, "SIM_SERVICE_URL", self.URL)
+        monkeypatch.setattr(module, "_sim_identity_token", lambda aud: "id-tok")
+        return module
+
+    def _post(self, v2, *, auth=None):
+        return self._run(v2.run_sim(
+            spec=spec(), authorization=auth or f"Bearer {self.TOKEN}"))
+
+    def _fake_transport(self, monkeypatch, v2, *, status, body,
+                        content_type="application/json"):
+        import httpx
+
+        seen = {}
+
+        class FakeResponse:
+            status_code = status
+            content = body
+            headers = {"content-type": content_type}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                seen["timeout"] = k.get("timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                seen.update(url=url, json=json, headers=headers)
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        return seen
+
+    def test_no_submit_token_configured_is_503_and_never_calls_out(
+            self, v2, monkeypatch):
+        from fastapi import HTTPException
+
+        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2)
+        assert exc.value.status_code == 503
+        assert "SWEEP_SUBMIT_TOKEN" in str(exc.value.detail)
+
+    def test_a_wrong_bearer_is_401(self, v2):
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2, auth="Bearer nope")
+        assert exc.value.status_code == 401
+
+    def test_an_unset_service_url_is_503_naming_the_variable(
+            self, v2, monkeypatch):
+        """Fails closed rather than defaulting to a URL that may not exist.
+
+        Without the URL there is no audience to mint a token for, so a default
+        would produce a token for the wrong service and a 401 the operator
+        cannot interpret.
+        """
+        from fastapi import HTTPException
+
+        monkeypatch.setattr(v2, "SIM_SERVICE_URL", None)
+        monkeypatch.delenv("SIM_SERVICE_URL", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2)
+        assert exc.value.status_code == 503
+        assert "SIM_SERVICE_URL" in str(exc.value.detail)
+        assert "/api/v2/sweeps" in str(exc.value.detail), (
+            "a 503 that does not name the batch path leaves the operator with "
+            "no way to run the sweep at all"
+        )
+
+    def test_it_forwards_the_identity_token_and_the_spec(self, v2, monkeypatch):
+        seen = self._fake_transport(monkeypatch, v2, status=202,
+                                    body=b'{"run_id":"abc"}')
+        self._post(v2)
+        assert seen["url"] == f"{self.URL}/simulate"
+        assert seen["headers"]["Authorization"] == "Bearer id-tok"
+        assert seen["json"] == spec()
+
+    @pytest.mark.parametrize("status,body", [
+        (200, b'{"run_id":"prior","deduplicated":true}'),
+        (202, b'{"run_id":"new"}'),
+        (409, b'{"detail":"estimated 900s ...","total_seconds":900}'),
+        (422, b'{"detail":"run_sensitivity is not available ..."}'),
+        (503, b'{"detail":"the scenario store is unavailable"}'),
+    ])
+    def test_the_services_answer_comes_back_verbatim(self, v2, monkeypatch,
+                                                     status, body):
+        """Status AND body, unwrapped.
+
+        The 409 and 422 bodies carry the estimate, the missing symbol-days and
+        the backfill command. Re-shaping them into a generic `{"detail": ...}`
+        would drop exactly the part an operator acts on.
+        """
+        self._fake_transport(monkeypatch, v2, status=status, body=body)
+        response = self._post(v2)
+        assert response.status_code == status
+        assert response.body == body
+
+    def test_a_token_failure_is_502_with_the_grant_named(self, v2, monkeypatch):
+        from fastapi import HTTPException
+
+        def boom(audience):
+            raise RuntimeError("no credential")
+
+        monkeypatch.setattr(v2, "_sim_identity_token", boom)
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2)
+        assert exc.value.status_code == 502
+        assert "run.invoker" in str(exc.value.detail)
+
+    def test_an_unreachable_service_is_502_not_a_500(self, v2, monkeypatch):
+        import httpx
+        from fastapi import HTTPException
+
+        class Exploding:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx, "AsyncClient", Exploding)
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2)
+        assert exc.value.status_code == 502
+        assert "scale-to-zero" in str(exc.value.detail), (
+            "a cold start of up to ~4 minutes is the expected cause here; a "
+            "bare transport error sends the operator looking for an outage"
+        )

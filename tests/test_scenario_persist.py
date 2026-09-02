@@ -386,6 +386,172 @@ class TestBigQueryLegacyTypeNames:
         assert "error_cells" in updated["names"]
 
 
+class TestTheLivenessColumn:
+    """FC-096 Phase B PR-c. The schema half of the ~25-minute lock release.
+
+    `persist.py` OWNS this column (it owns both sweep tables' schemas); the
+    reader is `dashboard/backend/services/sweeps.row_liveness_seconds`. It exists
+    because the sim service is not the Job: a Cloud Run service instance scaled
+    in mid-replay writes no terminal row, and the Job's 3 h clock would hold the
+    one-at-a-time submit lock for 3 h 10 m on a process that died in seconds.
+    """
+
+    def test_it_is_an_additive_nullable_integer(self):
+        pytest.importorskip("google.cloud.bigquery")
+        field = next(f for f in store._sweeps_schema()
+                     if f.name == "liveness_seconds")
+        assert store._canonical_type(field.field_type) == "INT64"
+        # NULLABLE: every pre-existing row has no value, and the additive
+        # reconcile can only add a nullable column to a live table.
+        assert (field.mode or "NULLABLE").upper() == "NULLABLE"
+
+    def test_every_row_carries_the_key_even_when_it_has_no_value(self):
+        """The two writers must not diverge by whichever one knew a field.
+
+        `TestTheSubmittedRowMatchesTheJobsRowShape` compares the API's column
+        set against this one; a key present on only one side makes that test
+        meaningless and renders blank for half the sweeps in the results view.
+        """
+        row = store.status_row(run_id="r", status=store.STATUS_RUNNING,
+                               submitted_at="2026-09-01T12:00:00+00:00")
+        assert "liveness_seconds" in row
+        assert row["liveness_seconds"] is None
+
+    def test_the_stamp_survives_as_an_int(self):
+        row = store.status_row(run_id="r", status=store.STATUS_RUNNING,
+                               submitted_at="2026-09-01T12:00:00+00:00",
+                               liveness_seconds=900)
+        assert row["liveness_seconds"] == 900
+        assert isinstance(row["liveness_seconds"], int)
+
+
+class TestTheLiveSweepLookup:
+    """FC-096 Phase B PR-c: the cross-instance half of one-replay-per-spec.
+
+    `--max-instances=2` means a second CONTAINER can accept the same spec a
+    second later, and the sim service's per-process lock cannot see it. This is
+    the store-side question that closes it — deliberately advisory (two requests
+    inside one query round-trip still race) and deliberately bounded, so an
+    orphaned `running` row from a killed instance stops blocking at the same
+    moment the dashboard's readers stop counting it.
+    """
+
+    @staticmethod
+    def _writer(client):
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._enabled = True
+        writer._client = client
+        writer._project_id = "p"
+        writer._dataset_id = "options_wheel"
+        return writer
+
+    def test_the_query_bounds_each_row_by_its_OWN_liveness(self):
+        """The review's finding: one bound for every row was wrong.
+
+        Bounding everything at the sim service's ~25 minutes made a JOB
+        legitimately 30+ minutes into replaying the same spec invisible, so the
+        cross-instance check waved a concurrent duplicate through — and the 409
+        it therefore did not raise would have promised a release window that is
+        never true for a Job row.
+        """
+        pytest.importorskip("google.cloud.bigquery")
+        captured = {}
+
+        class Client:
+            def query(self, sql, job_config=None):
+                captured["sql"] = sql
+                captured["params"] = {p.name: p.value
+                                      for p in job_config.query_parameters}
+                raise RuntimeError("stop after the query is built")
+
+        assert self._writer(Client()).find_running_sweep("k") is None
+        sql = captured["sql"]
+        assert f"status = '{store.STATUS_RUNNING}'" in sql
+        assert "TIMESTAMP_SUB" in sql
+        # The bound is computed FROM THE ROW, not from a bound parameter.
+        assert "liveness_seconds" in sql
+        assert "COALESCE(liveness_seconds, 0) > 0" in sql, (
+            "zero and negative must fall back to the Job clock, exactly as "
+            "`services/sweeps.row_liveness_seconds` does — shortening the bound "
+            "is the direction that releases under a live run"
+        )
+        assert "max_age" not in captured["params"]
+        assert captured["params"]["default_liveness"] == \
+            store.DEFAULT_LIVENESS_SECONDS
+        assert captured["params"]["grace"] == store.LIVENESS_GRACE_SECONDS
+        assert captured["params"]["sweep_key"] == "k"
+
+    def test_the_two_bounds_are_the_ones_the_dashboard_reads(self):
+        """25 minutes for a sim row, 3 h 10 m for a Job row."""
+        assert store.DEFAULT_LIVENESS_SECONDS == 10_800
+        assert store.LIVENESS_GRACE_SECONDS == 600
+        assert (900 + store.LIVENESS_GRACE_SECONDS) // 60 == 25
+        assert ((store.DEFAULT_LIVENESS_SECONDS
+                 + store.LIVENESS_GRACE_SECONDS) // 60) == 190
+
+    @pytest.mark.parametrize("liveness,age_minutes,still_blocking", [
+        # A JOB row (NULL) half an hour into a legitimate replay: the review's
+        # case. Under the old single 25-minute bound it was invisible here, and
+        # the cross-instance check waved a concurrent duplicate straight through.
+        (None, 30, True),
+        # A SIM row of the same age is dead — its writer is a service instance
+        # that stamps 900 s — and must stop blocking.
+        (900, 30, False),
+        # ...and the sim boundary itself, either side of 900 + 600.
+        (900, 24, True),
+        (900, 26, False),
+        # A Job row does not release until 3 h 10 m.
+        (None, 189, True),
+        (None, 191, False),
+    ])
+    def test_the_bound_each_row_is_judged_by(self, liveness, age_minutes,
+                                             still_blocking):
+        """The arithmetic the SQL performs, on the constants the SQL binds.
+
+        The predicate itself is pinned above (it reads `liveness_seconds` with
+        the zero/NULL fallbacks); this pins what those numbers MEAN, which is
+        the half a shape assertion cannot cover.
+        """
+        bound = ((liveness if liveness else store.DEFAULT_LIVENESS_SECONDS)
+                 + store.LIVENESS_GRACE_SECONDS)
+        assert ((age_minutes * 60) < bound) is still_blocking
+
+    def test_the_liveness_column_is_selected_so_the_caller_can_read_it(self):
+        """The 409 message quotes the blocking row's own release window."""
+        pytest.importorskip("google.cloud.bigquery")
+        captured = {}
+
+        class Client:
+            def query(self, sql, job_config=None):
+                captured["sql"] = sql
+                raise RuntimeError("stop")
+
+        self._writer(Client()).find_running_sweep("k")
+        select = captured["sql"].split("FROM latest")[0]
+        assert "liveness_seconds" in select
+
+    def test_a_query_failure_accepts_rather_than_blocks(self):
+        """"We could not tell" must mean "run it".
+
+        The opposite posture would let one BigQuery blip refuse every
+        submission, which is worse than the duplicate replay it is preventing.
+        """
+        pytest.importorskip("google.cloud.bigquery")
+
+        class Angry:
+            def query(self, *a, **k):
+                raise RuntimeError("bq down")
+
+        assert self._writer(Angry()).find_running_sweep("k") is None
+
+    def test_a_disabled_writer_or_an_empty_key_never_queries(self):
+        writer = self._writer(None)
+        writer._enabled = False
+        assert writer.find_running_sweep("k") is None
+        writer._enabled = True
+        assert writer.find_running_sweep("") is None
+
+
 class TestTheSchemaTypeNamesAreCovered:
     """Every type the schemas declare must be one the canonical map knows.
 

@@ -936,7 +936,13 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         holdout_start = _spec_date(spec, 'holdout_start')
         symbols = [str(x).strip().upper() for x in (spec.get('symbols') or [])
                    if str(x).strip()]
-        starting_cash = float(spec.get('starting_cash') or args.starting_cash)
+        # Explicit None check, never `or`: a spec that asked for
+        # `starting_cash: 0` would otherwise silently become the CLI
+        # default and the run would report a capital base nobody chose.
+        # (0 is refused downstream, but it must be refused as 0.)
+        raw_cash = spec.get('starting_cash')
+        starting_cash = float(args.starting_cash if raw_cash is None
+                              else raw_cash)
         run_sensitivity = bool(spec.get('run_sensitivity', False))
     else:
         if not args.scenarios:

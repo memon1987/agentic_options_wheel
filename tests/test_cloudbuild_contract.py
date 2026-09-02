@@ -50,7 +50,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLOUDBUILD = REPO_ROOT / "cloudbuild.yaml"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cloudbuild_contract.json"
 
-SERVICES = ("options-wheel-strategy", "covered-call-engine", "options-wheel-dashboard")
+SERVICES = ("options-wheel-strategy", "covered-call-engine",
+            "options-wheel-dashboard", "sim-service")
 
 # The image each chain deploys, as it must appear in that promote's MY_IMAGE. The
 # `:$COMMIT_SHA` tag is the load-bearing half: MY_IMAGE decides whether a revision this
@@ -63,6 +64,10 @@ PROMOTE_IMAGE = {
     "options-wheel-strategy": "options-wheel-strategy:$COMMIT_SHA",
     "covered-call-engine": "options-wheel-strategy:$COMMIT_SHA",
     "options-wheel-dashboard": "options-wheel-dashboard:$COMMIT_SHA",
+    # The sim service runs the STRATEGY image too (FC-096 Phase B PR-c: one
+    # image, the COMMAND selects the work) — `python deploy/sim_service.py`
+    # instead of `deploy/cloud_run_server.py`.
+    "sim-service": "options-wheel-strategy:$COMMIT_SHA",
 }
 
 CHAINS = {
@@ -81,7 +86,22 @@ CHAINS = {
         "smoke": "smoke-test-dashboard",
         "promote": "promote-dashboard",
     },
+    "sim-service": {
+        "deploy": "deploy-sim-canary",
+        "smoke": "smoke-test-sim",
+        "promote": "promote-sim",
+    },
 }
+
+# The three chains whose services carry PRODUCTION traffic. The Job deploys wait
+# on these promotes and deliberately NOT on `promote-sim`: the Job steps sit at
+# the tail precisely so a failure in a measurement tool cannot strand a
+# production deploy, and `sim-service` is a measurement tool by the same
+# definition. Making them wait on it would mean a broken sim chain also stops the
+# sweep and backfill Jobs from picking up this build's image — the failure this
+# whole ordering exists to prevent, arriving from the other direction.
+PRODUCTION_SERVICES = ("options-wheel-strategy", "covered-call-engine",
+                       "options-wheel-dashboard")
 
 GATE_ID = "serialize-builds"
 GATE_WAITS_FOR = "push-bot-image"
@@ -700,7 +720,7 @@ def test_sweep_job_runs_after_every_service_promote(by_id, steps):
     build loudly — the operator finds out — but only after the services are out.
     """
     wait = set(by_id[SWEEP_JOB_STEP].get("waitFor") or [])
-    promotes = {roles["promote"] for roles in CHAINS.values()}
+    promotes = {CHAINS[svc]["promote"] for svc in PRODUCTION_SERVICES}
     assert promotes <= wait, (
         f"{SWEEP_JOB_STEP} must waitFor every promote step {sorted(promotes)}; "
         f"got {sorted(wait)}."
@@ -730,7 +750,7 @@ def test_the_job_steps_are_the_tail_and_nothing_hides_behind_them(steps, by_id):
         "listed after a Job deploy inherits an implicit dependency on it, so a "
         "Job-permission failure would strand it."
     )
-    promotes = {roles["promote"] for roles in CHAINS.values()}
+    promotes = {CHAINS[svc]["promote"] for svc in PRODUCTION_SERVICES}
     for step_id in sorted(JOB_STEPS):
         wait = set(by_id[step_id].get("waitFor") or [])
         assert promotes <= wait, (
@@ -881,6 +901,278 @@ def test_the_covered_call_service_deliberately_has_no_lake_bucket(by_id):
         "docstring and check_lake_freshness's. If this is being changed "
         "deliberately, change the docstrings too."
     )
+
+
+# --------------------------------------------------------------------------
+# 5d. The interactive sim service (FC-096 Phase B PR-c).
+# --------------------------------------------------------------------------
+SIM_DEPLOY_STEP = "deploy-sim-canary"
+SIM_SMOKE_STEP = "smoke-test-sim"
+
+
+def test_sim_service_runs_the_strategy_image_on_the_sim_command(by_id):
+    """One image; the COMMAND selects the work (FC-075's rule, FC-096's reuse).
+
+    `:$COMMIT_SHA`, not `:latest`, for the reason every other chain pins it: the
+    promote compares the latest ready revision's image against this build's, and
+    an untagged value matches any revision built from this repo — including an
+    older commit's.
+    """
+    script = script_of(by_id[SIM_DEPLOY_STEP])
+    assert "options-wheel-strategy:$COMMIT_SHA" in script, (
+        f"{SIM_DEPLOY_STEP} must deploy THIS build's strategy image."
+    )
+    assert "--command=python" in script and "--args=deploy/sim_service.py" in script, (
+        f"{SIM_DEPLOY_STEP} must run `python deploy/sim_service.py`. Without the "
+        "command override it would start `deploy/cloud_run_server.py` — the "
+        "TRADING bot, on a service that is supposed to replay history."
+    )
+
+
+def test_sim_service_gets_instance_billing_and_serialised_concurrency(by_id):
+    """The two flags without which this service is silently broken.
+
+    `--no-cpu-throttling`: `/simulate` returns 202 and the replay continues on a
+    worker thread. Under Cloud Run's default request-based billing the CPU is
+    throttled the moment that response returns, and nothing ever supplies
+    another in-flight request — the console polls BigQuery through the
+    dashboard and never touches this service. The replay would not fail; it
+    would crawl and then be scaled in. This is the plan's rev-3 blocker fix.
+
+    `--concurrency=1`: the engine mutates process-global state during a replay
+    (`ExecutionEngine._failed_symbols`, the frozen clock, stdlib logger levels,
+    the analytics singleton). Two replays in one process do not crash; they
+    corrupt each other's numbers.
+    """
+    flags = set(deploy_flags(by_id[SIM_DEPLOY_STEP]))
+    assert "--no-cpu-throttling" in flags, (
+        "deploy-sim-canary must pass --no-cpu-throttling. Without it the "
+        "background replay starves as soon as the 202 is returned."
+    )
+    assert "--concurrency=1" in flags, (
+        "deploy-sim-canary must pin --concurrency=1. The engine's process-"
+        "global swaps are safe only serialized."
+    )
+    assert "--memory=2Gi" in flags and "--cpu=1" in flags, (
+        "deploy-sim-canary must keep 2Gi/1cpu: the tmpfs bar and chain caches "
+        "count against memory and 512Mi OOMs on a multi-symbol window."
+    )
+    assert "--no-allow-unauthenticated" in flags, (
+        "the sim service is PRIVATE — invoker is the compute service account "
+        "only. It holds Alpaca credentials and writes to the sweep store."
+    )
+
+
+def test_sim_service_carries_the_buckets_and_the_wheel_profile(by_id):
+    """`--set-env-vars` REPLACES the env set, so everything it needs is listed.
+
+    `CHAIN_LAKE_BUCKET` is not optional here the way it is for the covered-call
+    service: without it `ChainStore.from_env()` returns a lake-less store, the
+    coverage pre-flight has nothing to list, and every request is refused as
+    uncoverable. `SIM_ARTIFACT_BUCKET` is where the per-cell detail artifacts
+    go (PR-b). `STRATEGY_CONFIG` names the WHEEL profile explicitly — this
+    service must never inherit whatever the image's default happens to be.
+    """
+    script = script_of(by_id[SIM_DEPLOY_STEP])
+    for needed in ("CHAIN_LAKE_BUCKET=options-wheel-chain-lake",
+                   "SIM_ARTIFACT_BUCKET=",
+                   "STRATEGY_CONFIG=config/settings.yaml",
+                   "GIT_COMMIT=$COMMIT_SHA",
+                   "GCP_PROJECT=$PROJECT_ID"):
+        assert needed in script, f"{SIM_DEPLOY_STEP} must set {needed}"
+    for secret in ("ALPACA_API_KEY=alpaca-api-key:latest",
+                   "ALPACA_SECRET_KEY=alpaca-secret-key:latest",
+                   "FINNHUB_API_KEY=finnhub-api-key:latest"):
+        assert secret in script, (
+            f"{SIM_DEPLOY_STEP} must bind {secret}. Unlike the wheel and CC "
+            "steps, this one CREATES its service, so a first deploy without "
+            "the bindings produces a container whose Config() cannot validate."
+        )
+
+
+def test_the_dashboard_knows_where_the_sim_service_is(by_id):
+    """The proxy fails closed on an absent `SIM_SERVICE_URL`, so it must be set.
+
+    In the literal `--set-env-vars` list, because that flag replaces the whole
+    env set: a value added out of band with `services update` survives exactly
+    until the next merge, and the proxy would then 503 for every operator with
+    a message about a variable somebody had already set.
+    """
+    script = script_of(by_id[CHAINS["options-wheel-dashboard"]["deploy"]])
+    assert "SIM_SERVICE_URL=https://sim-service-" in script
+
+
+def test_sim_chain_runs_behind_the_production_promotes(by_id, steps):
+    """It must not be able to strand a production deploy.
+
+    Same rule as the two Job steps, and for the same reason: this chain is new,
+    it is the first thing here to use `--no-cpu-throttling`, and its smoke test
+    makes an authenticated HTTP call. Any of those can fail for reasons that
+    have nothing to do with the trading bot, and the failure must land after the
+    wheel, covered-call and dashboard revisions have their traffic.
+    """
+    wait = set(by_id[SIM_DEPLOY_STEP].get("waitFor") or [])
+    assert "promote-dashboard" in wait, (
+        f"{SIM_DEPLOY_STEP} must waitFor promote-dashboard (the last production "
+        f"promote); got {sorted(wait)}."
+    )
+    ids = [st["id"] for st in steps]
+    for promote in (CHAINS[svc]["promote"] for svc in PRODUCTION_SERVICES):
+        assert ids.index(promote) < ids.index(SIM_DEPLOY_STEP)
+
+
+def test_the_job_deploys_do_not_wait_on_the_sim_chain(by_id):
+    """...and the ordering does not run the other way either.
+
+    The Job steps are at the tail so a measurement tool cannot strand a
+    production deploy. `sim-service` IS a measurement tool, so making the Jobs
+    wait on `promote-sim` would let a broken sim chain stop the sweep and
+    backfill Jobs from picking up this build's image — the same failure, from
+    the other direction.
+    """
+    for step_id in sorted(JOB_STEPS):
+        wait = set(by_id[step_id].get("waitFor") or [])
+        assert "promote-sim" not in wait, (
+            f"{step_id} must NOT waitFor promote-sim; see this test's docstring."
+        )
+
+
+def test_sim_smoke_polls_readiness_then_probes_health_and_simulate(by_id):
+    """The smoke's three assertions, and the two places it deliberately degrades.
+
+    HARD: this build's revision reaches Ready. For an ASGI service that means
+    uvicorn bound the port and `create_app()` imported, which is where a broken
+    dependency, a syntax error or a missing secret actually surfaces.
+
+    HARD: `/health` returns a NON-EMPTY `engine_identity`. An empty one means
+    the service cannot hash its own tree, and the dashboard's baked value would
+    then be keying against nothing — the dedup would silently stop firing.
+
+    HARD: `/simulate` answers 200 (dedup hit) or 202 (accepted). BOTH, because
+    the first deploy and a fresh project have no seeded spec to hit; the strict
+    dedup-hit assertion is rollout verification, not a deploy gate.
+
+    DEGRADES (named, greppable, exit 0): if an OIDC identity token cannot be
+    minted from inside Cloud Build — a capability this project has never
+    exercised — the HTTP half is skipped with `SMOKE_SIM_HTTP_UNAVAILABLE`
+    rather than turning every merge red over an unproven capability. And a 409
+    is reported as `SMOKE_SIM_SPEC_UNCOVERED`: the service answered correctly
+    and the smoke spec names a window the lake does not hold, which is a data
+    fact, not a deploy defect. Rollout step 3 checks this step's log for
+    `PASS: /health` and resolves either marker if it appears.
+    """
+    script = script_of(by_id[SIM_SMOKE_STEP])
+    assert "/workspace/rev-sim-service.txt" in script, (
+        f"{SIM_SMOKE_STEP} must poll THIS build's revision, not whatever is "
+        "newest on the service."
+    )
+    assert "'Ready'" in script and "seq 1 30" in script, (
+        f"{SIM_SMOKE_STEP} must poll for the Ready condition rather than "
+        "sampling once — a revision still coming up reports Unknown."
+    )
+    assert "/health" in script and "engine_identity" in script
+    assert "FAIL: /health returned no engine_identity" in script, (
+        f"{SIM_SMOKE_STEP} must FAIL on an empty identity, not merely print it."
+    )
+    assert "/simulate" in script
+    for code, label in (("200)", "dedup hit"), ("202)", "accepted")):
+        assert code in script, (
+            f"{SIM_SMOKE_STEP} must accept {code[:-1]} ({label})."
+        )
+    assert "SMOKE_SIM_HTTP_UNAVAILABLE" in script, (
+        f"{SIM_SMOKE_STEP}'s token-minting degrade must be NAMED, so a build "
+        "log can be grepped for a control that ran nothing."
+    )
+    assert "SMOKE_SIM_SPEC_UNCOVERED" in script
+    assert "-H 'X-Sim-Provenance: smoke'" in script, (
+        f"{SIM_SMOKE_STEP} must label its rows. Its POST is a dedup hit only "
+        "while the engine identity has not moved, so every build touching "
+        "`src/**` or `requirements.txt` makes it a REAL replay writing real "
+        "rows — and an unlabelled build artifact reads as an operator's "
+        "experiment in the battery and the trend view."
+    )
+
+
+def test_sim_smoke_probes_unauthenticated_before_it_blames_the_identity(by_id):
+    """The IAM/identity confusion the review caught, closed.
+
+    A 403 on the authenticated `/health` used to fall through to "no
+    engine_identity" — a message about hashing, for what is an invoker grant.
+    The unauthenticated probe runs FIRST and is a HARD gate that separates the
+    two states the authed call cannot:
+
+    * ``000`` (refused/DNS/timeout) -> the service is not serving. FAIL.
+    * ``401``/``403``               -> up, and IAM is enforcing. Proceed.
+    * ``200``                       -> the service is answering ANONYMOUS
+      callers, on a container holding broker credentials and writing to the
+      sweep store. FAIL, loudly — `--no-allow-unauthenticated` is in the deploy
+      flags and something has overridden it.
+
+    Only then, if the authed call 403s, the failure names the missing grant and
+    the command that fixes it.
+    """
+    script = script_of(by_id[SIM_SMOKE_STEP])
+    # The ASSIGNMENT must be the curl itself. Asserting only that the block
+    # mentions curl lets `ANON="401"` sit above a commented-out request and the
+    # gate becomes a constant — which is a control that watches nothing.
+    assert re.search(r"^\s*ANON=\$\(curl\b", script, re.M), (
+        "smoke-test-sim's unauthenticated probe must actually issue the request "
+        "it gates on"
+    )
+    anon = script[script.index("ANON="):script.index("TOKEN=")]
+    assert "Authorization" not in anon, (
+        "the first probe must be UNAUTHENTICATED; that is the whole point"
+    )
+    for state in ("401|403)", "200)", "000)"):
+        assert state in anon, f"the probe must distinguish {state}"
+    assert "not serving" in anon or "not up" in anon.lower()
+    assert "made it public" in anon, (
+        "a private service answering anonymously is a security defect, not a "
+        "curiosity"
+    )
+    assert "BUILD service account is not an invoker" in script
+    assert "roles/run.invoker" in script
+    assert "799970961417@cloudbuild.gserviceaccount.com" in script, (
+        "the failure has to name the exact member an operator must grant"
+    )
+    assert "NOT a missing engine identity" in script
+
+
+def test_sim_smoke_separates_the_three_409s(by_id):
+    """Busy is not a lake gap, and the log line rollout greps must not say it is.
+
+    Three different 409s reach this step: BUSY (a replay of this spec is in
+    flight — names a run_id), COVERAGE (the smoke spec's window is not in the
+    lake — carries `missing_symbol_days`), and BUDGET (the smoke spec has grown
+    too big to be a smoke, which is a real defect and fails).
+    """
+    script = script_of(by_id[SIM_SMOKE_STEP])
+    assert "missing_symbol_days" in script
+    assert "SMOKE_SIM_BUSY" in script
+    assert "not a smoke" in script, (
+        "an unexplained 409 must FAIL — otherwise a smoke spec that outgrew the "
+        "service's own budget would report for ever as a lake gap"
+    )
+
+
+def test_the_smoke_spec_exists_and_is_small_enough_to_be_a_smoke():
+    """The file the smoke POSTs. A spec too big for the service is not a smoke.
+
+    One symbol, no declared arms: one cell, and an estimate far under
+    `SIM_MAX_ESTIMATE_SECONDS`. If it ever grew past the service's own budget
+    the smoke would start reporting a 409 for the wrong reason and the
+    `SMOKE_SIM_SPEC_UNCOVERED` marker would stop meaning what it says.
+    """
+    spec = json.loads((REPO_ROOT / "deploy" / "smoke_sim_spec.json").read_text())
+    assert spec["symbols"] and len(spec["symbols"]) == 1
+    assert spec.get("scenarios") == []
+    assert spec.get("run_sensitivity") is False, (
+        "the smoke spec must not ask for the sensitivity pass — the service "
+        "refuses it with a 422, which the smoke reports as a FAIL."
+    )
+    assert spec["start"] < spec["end"]
+    script = script_of(load_steps()[0])  # touch the loader so a rename fails here
+    assert isinstance(script, str)
 
 
 def test_dashboard_service_knows_the_sweep_job_name(by_id):
