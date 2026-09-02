@@ -3231,16 +3231,24 @@ class TestThePinIdentityIsRELATIVE:
             candidate, window_days=364, holdout_days=None,
             pins=[stored])["pin_id"] == "p1"
 
-    def test_a_stored_pin_with_no_shape_is_skipped_not_matched(self):
+    @pytest.mark.parametrize("candidate_window", [364, 1, 0])
+    def test_a_stored_pin_with_no_shape_is_SKIPPED_whatever_is_asked(
+            self, candidate_window):
         """It is not comparable to anything; the battery refuses it weekly and
         says so. Blocking a good pin behind a broken one is the wrong
-        direction."""
+        direction.
+
+        Parametrised down to the small values a "default it to something"
+        implementation would reach for: substituting a number for the missing
+        one does not make the pin comparable, it makes it accidentally equal to
+        whichever candidate happens to share that number.
+        """
         stored = {"pin_id": "p1", "active": True, "window_days": None,
                   "holdout_days": None,
                   "spec_json": S.pin_spec_json(S.validate_spec(spec()))}
         assert S.duplicate_active_pin(
-            S.validate_spec(spec()), window_days=364, holdout_days=None,
-            pins=[stored]) is None
+            S.validate_spec(spec()), window_days=candidate_window,
+            holdout_days=None, pins=[stored]) is None
 
 
 class TestShapingAPin:

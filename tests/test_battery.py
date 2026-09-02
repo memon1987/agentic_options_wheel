@@ -747,6 +747,54 @@ class TestExitCodeClasses:
         assert "battery_terminated" in logger.types("warning")
         assert logger.payload("battery_degraded")["reason"] == "terminated"
 
+    def test_a_REAL_sigterm_between_items_is_converted(self, wired,
+                                                       monkeypatch):
+        """The handler itself, exercised by an actual signal.
+
+        The tests above raise `SweepTerminated` directly, which proves what the
+        battery does with one and NOT that anything would ever produce it.
+        Between items no sweep is running, so `run_sweep_cmd`'s own handler is
+        not installed — the battery's is the only thing standing between a
+        Cloud Run reclaim and Python's default SIGTERM handler, which exits the
+        interpreter immediately: no summary, no exit code of our choosing, and
+        the execution reads as a data failure.
+
+        Delivered to this process on purpose. With the handler in place it
+        becomes an exception and the battery summarises; without it, this test
+        would take the test runner down with it, which is the honest
+        demonstration that the line is load-bearing.
+        """
+        import os
+        import signal
+
+        logger = _Logger()
+        calls = []
+
+        def fake_sweep(*_a, **_k):
+            calls.append(1)
+            if len(calls) >= 2:
+                os.kill(os.getpid(), signal.SIGTERM)
+            return 0
+        monkeypatch.setattr(cli, "run_sweep_cmd", fake_sweep)
+
+        assert cli.run_battery_cmd(battery_args(), _config(), logger) == 0
+        assert len(calls) == 2, "the loop must stop where the signal landed"
+        assert logger.payload("battery_degraded")["reason"] == "terminated"
+
+    def test_the_handler_is_restored_afterwards(self, wired, monkeypatch):
+        """`terminate_on_sigterm` restores the previous handler on the way out.
+
+        A battery that left its own handler installed would turn every later
+        SIGTERM in the process — including one arriving during `main()`'s own
+        shutdown — into a `SweepTerminated` nobody is catching.
+        """
+        import signal
+
+        before = signal.getsignal(signal.SIGTERM)
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        assert signal.getsignal(signal.SIGTERM) is before
+
     def test_the_terminated_battery_writes_no_row_of_its_own(self, wired,
                                                              monkeypatch):
         """The item in flight owns its record; the battery must not add one.
@@ -1132,13 +1180,26 @@ class TestPinsAreRollingWindows:
 
     def test_a_pin_with_no_window_days_is_REFUSED_not_run_frozen(self, wired):
         """The only way to have one is a hand-written row, and running it as a
-        fixed window is precisely the failure these columns prevent."""
+        fixed window is precisely the failure these columns prevent.
+
+        The message is asserted, not just the refusal: an absent shape is a
+        different problem from a malformed one — it means somebody wrote the
+        row by hand — and the remedy (re-create it through the API) is the part
+        an operator acts on. A generic "not a number" would send them looking
+        for a typo that is not there.
+        """
         logger = _Logger()
         wired._pins = [pin("pin000000000aaa3", window_days=None)]
         cli.run_battery_cmd(battery_args(), _config(), logger)
         row = next(r for r in wired.statuses if r["pin_id"] == "pin000000000aaa3")
         assert row["status"] == "failed"
-        assert "window_days" in row["error"]
+        assert "no window_days" in row["error"]
+        assert "re-anchored" in row["error"]
+        assert "POST /api/v2/sims/pins" in row["error"]
+        # And nothing was submitted under the frozen window.
+        assert not [r for r in wired.statuses
+                    if r["pin_id"] == "pin000000000aaa3"
+                    and r["status"] == "running"]
 
     @pytest.mark.parametrize("window,holdout,fragment", [
         (0, None, "window_days must be >= 1"),
