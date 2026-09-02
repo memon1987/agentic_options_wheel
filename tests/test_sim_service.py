@@ -76,9 +76,10 @@ class FakeWriter:
         self.dedup_calls.append((sweep_key, base_config_hash, engine_identity))
         return self.prior
 
-    def find_running_sweep(self, sweep_key, *, max_age_seconds,
-                           exclude_run_id=None):
-        self.live_calls.append((sweep_key, max_age_seconds))
+    def find_running_sweep(self, sweep_key, **kwargs):
+        # `**kwargs`, so a caller that reintroduces a caller-supplied age bound
+        # is visible to the test rather than a TypeError three layers down.
+        self.live_calls.append((sweep_key, kwargs))
         return self.live
 
     def write_status(self, row):
@@ -419,13 +420,21 @@ class TestTheCoverageGuard:
         assert report.missing == {}
         assert report.sessions == len(self.WEEK)
 
-    def test_a_gap_in_ONE_symbol_is_caught(self):
-        """The union missed this: the day simply left the union with it."""
+    def test_a_gap_in_a_SINGLE_SYMBOL_SPEC_is_caught(self):
+        """The union's blind spot, with nothing else in the spec to cover it.
+
+        This is the case a two-symbol version does NOT pin: with a second symbol
+        holding the day, the union still contains it and a union implementation
+        catches the gap anyway. One symbol is the only shape where the union IS
+        that symbol's own lake days, so the missing day leaves the calendar with
+        it and "complete" becomes a tautology. Mutation-checked: reverting the
+        calendar to the union fails this test.
+        """
         hole = [d for d in self.WEEK if d != "2025-09-08"]
         report = self._check(
-            {"AAPL": sessions(*hole), "NVDA": sessions(*self.WEEK)},
-            {"AAPL": sessions(*self.WEEK), "NVDA": sessions(*self.WEEK)},
-            ["AAPL", "NVDA"])
+            {"AAPL": sessions(*hole)},
+            {"AAPL": sessions(*self.WEEK)},
+            ["AAPL"])
         assert not report.complete
         assert report.missing == {"AAPL": [date(2025, 9, 8)]}
         detail = report.describe()
@@ -434,6 +443,22 @@ class TestTheCoverageGuard:
             "a 409 that names the gap and not the remedy makes the operator go "
             "and look up the command"
         )
+
+    def test_a_gap_in_ONE_symbol_of_MANY_is_caught(self):
+        """The same defect with a second symbol present, kept for the message.
+
+        Weaker than the single-symbol case above — a union implementation passes
+        this one — but it is what pins the per-symbol ATTRIBUTION: the 409 has to
+        say which symbol is short, not just that something is.
+        """
+        hole = [d for d in self.WEEK if d != "2025-09-08"]
+        report = self._check(
+            {"AAPL": sessions(*hole), "NVDA": sessions(*self.WEEK)},
+            {"AAPL": sessions(*self.WEEK), "NVDA": sessions(*self.WEEK)},
+            ["AAPL", "NVDA"])
+        assert not report.complete
+        assert report.missing == {"AAPL": [date(2025, 9, 8)]}
+        assert "NVDA" not in report.describe()
 
     def test_a_gap_SHARED_by_every_symbol_is_caught(self):
         """The union missed this too, and this is the LIKELY shape.
@@ -1278,16 +1303,66 @@ class TestTheCrossInstanceDuplicateCheck:
         assert wired.status_rows == []
         assert not sim._RUN_LOCK.locked()
 
-    def test_the_age_bound_matches_the_readers_clock(self, wired, monkeypatch):
-        """An orphaned `running` row must stop blocking when the dashboard
-        stops counting it — not sooner, and emphatically not for ever."""
+    def test_the_service_does_not_impose_one_bound_on_every_row(
+            self, wired, monkeypatch):
+        """The age bound belongs to the ROW, not to the caller.
+
+        A single 25-minute bound (this service's own) made a JOB legitimately
+        half an hour into replaying the same spec invisible here — so the check
+        waved a concurrent duplicate through, which is the exact confusion it
+        exists to prevent. `persist.find_running_sweep` now reads each row's
+        `liveness_seconds` in SQL; the service passes no bound at all.
+        """
         monkeypatch.setattr("src.backtesting.scenarios.run_sweep",
                             lambda *a, **k: sweep_result())
         sim._simulate(spec())
         sim._WORKER.join(timeout=5)
-        (_key, max_age), = wired.live_calls
-        assert max_age == sim.LIVENESS_SECONDS + sim.STALE_GRACE_SECONDS
-        assert max_age == 1500
+        (_key, kwargs), = wired.live_calls
+        assert "max_age_seconds" not in kwargs
+
+    @pytest.mark.parametrize("row,minutes", [
+        ({"liveness_seconds": 900}, 25),      # a sim row: 900 + 600
+        ({"liveness_seconds": None}, 190),    # a Job row: 10800 + 600
+        ({}, 190),                            # written before the column
+        ({"liveness_seconds": 0}, 190),       # junk is absence, never sooner
+        ({"liveness_seconds": True}, 190),    # bool is an int in Python
+    ])
+    def test_the_409_quotes_the_BLOCKING_ROWS_release_window(self, row,
+                                                             minutes):
+        """Telling an operator blocked by a Job to wait 25 minutes is a lie.
+
+        The dashboard's submit 409 had to learn this same lesson; the message
+        reads the bound off the row that is actually blocking.
+        """
+        assert sim._release_minutes(row) == minutes
+
+    def test_a_live_JOB_run_blocks_and_the_409_quotes_ITS_window(
+            self, wired, monkeypatch):
+        """The row the old single bound could never see.
+
+        A Job replaying the same spec carries no `liveness_seconds`, so it stays
+        live for 3 h 10 m — and the 409 has to say 190 minutes, not this
+        service's 25, or the operator is told to wait for a lock that has not
+        expired.
+        """
+        wired.live = {"run_id": "jobrun00001", "submitted_via": "dashboard",
+                      "liveness_seconds": None}
+        monkeypatch.setattr(
+            "src.backtesting.scenarios.run_sweep",
+            lambda *a, **k: pytest.fail("must not replay alongside the Job"))
+        with pytest.raises(sim.SpecRefused) as exc:
+            sim._simulate(spec())
+        assert exc.value.status == 409
+        assert "jobrun00001" in exc.value.detail
+        assert "190 minutes" in exc.value.detail
+        assert "25 minutes" not in exc.value.detail
+
+    def test_a_live_SIM_run_quotes_the_short_window(self, wired, monkeypatch):
+        wired.live = {"run_id": "simrun00001", "submitted_via": "sim-service",
+                      "liveness_seconds": 900}
+        with pytest.raises(sim.SpecRefused) as exc:
+            sim._simulate(spec())
+        assert "25 minutes" in exc.value.detail
 
     def test_force_does_not_skip_it(self, wired, monkeypatch):
         """`force` says "ignore the CACHE", never "run it twice at once"."""

@@ -452,6 +452,28 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
             "end": end, "holdout_start": holdout_start, "force": force}
 
 
+def _release_minutes(row: Dict[str, Any]) -> int:
+    """When the blocking row stops blocking, in minutes after its last update.
+
+    Read off THAT row rather than assumed from this service's own constants: a
+    sim row frees in ~25 minutes and a Job row in 3 h 10 m, and quoting the
+    wrong one is the same "wait three hours for a lock that frees in ten
+    minutes" mistake the dashboard's 409 already had to fix. The fallbacks
+    mirror `persist`'s SQL and `services/sweeps.row_liveness_seconds`: NULL,
+    zero and negative all mean "the Job's clock".
+    """
+    from src.backtesting.scenarios import persist as sweep_store
+
+    raw = row.get("liveness_seconds")
+    try:
+        seconds = int(raw) if raw is not None and not isinstance(raw, bool) else 0
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 0:
+        seconds = sweep_store.DEFAULT_LIVENESS_SECONDS
+    return (seconds + sweep_store.LIVENESS_GRACE_SECONDS) // 60
+
+
 def normalise_provenance(header: Optional[str]) -> str:
     """``submitted_via`` for this request, from the ``X-Sim-Provenance`` header.
 
@@ -1033,11 +1055,13 @@ def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None)
 
     # CROSS-INSTANCE. `--max-instances=2`, so the per-process lock below cannot
     # see a replay of this same spec running in another container. Advisory (two
-    # requests inside one query round-trip still race) and bounded by the same
-    # liveness clock the dashboard's readers use, so an orphaned `running` row
-    # from a killed instance stops blocking at ~25 minutes rather than for ever.
-    live = writer.find_running_sweep(
-        key, max_age_seconds=LIVENESS_SECONDS + STALE_GRACE_SECONDS)
+    # requests inside one query round-trip still race) and bounded PER ROW by
+    # that row's own `liveness_seconds`, so an orphaned `running` row from a
+    # killed sim instance stops blocking at ~25 minutes while a JOB legitimately
+    # half an hour into the same spec still does — the review's finding: a
+    # single 25-minute bound made the Job invisible here and waved a concurrent
+    # duplicate straight through.
+    live = writer.find_running_sweep(key)
     if live is not None:
         raise SpecRefused(
             409,
@@ -1045,8 +1069,7 @@ def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None)
             f"(submitted via {live.get('submitted_via') or 'unknown'}). Poll "
             f"GET /api/v2/sweeps/{live['run_id']} rather than replaying it "
             f"twice; if that run turns out to be dead, it stops blocking "
-            f"{(LIVENESS_SECONDS + STALE_GRACE_SECONDS) // 60} minutes after "
-            f"its last update.",
+            f"{_release_minutes(live)} minutes after its last update.",
             run_id=live["run_id"])
 
     # THE SLOT, taken before any row is written so a `running` row can never

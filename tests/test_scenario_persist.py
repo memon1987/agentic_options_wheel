@@ -436,7 +436,24 @@ class TestTheLiveSweepLookup:
     moment the dashboard's readers stop counting it.
     """
 
-    def test_the_query_requires_running_and_bounds_its_age(self):
+    @staticmethod
+    def _writer(client):
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._enabled = True
+        writer._client = client
+        writer._project_id = "p"
+        writer._dataset_id = "options_wheel"
+        return writer
+
+    def test_the_query_bounds_each_row_by_its_OWN_liveness(self):
+        """The review's finding: one bound for every row was wrong.
+
+        Bounding everything at the sim service's ~25 minutes made a JOB
+        legitimately 30+ minutes into replaying the same spec invisible, so the
+        cross-instance check waved a concurrent duplicate through — and the 409
+        it therefore did not raise would have promised a release window that is
+        never true for a Job row.
+        """
         pytest.importorskip("google.cloud.bigquery")
         captured = {}
 
@@ -447,16 +464,71 @@ class TestTheLiveSweepLookup:
                                       for p in job_config.query_parameters}
                 raise RuntimeError("stop after the query is built")
 
-        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
-        writer._enabled = True
-        writer._client = Client()
-        writer._project_id = "p"
-        writer._dataset_id = "options_wheel"
-        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
-        assert f"status = '{store.STATUS_RUNNING}'" in captured["sql"]
-        assert "TIMESTAMP_SUB" in captured["sql"]
-        assert captured["params"]["max_age"] == 1500
+        assert self._writer(Client()).find_running_sweep("k") is None
+        sql = captured["sql"]
+        assert f"status = '{store.STATUS_RUNNING}'" in sql
+        assert "TIMESTAMP_SUB" in sql
+        # The bound is computed FROM THE ROW, not from a bound parameter.
+        assert "liveness_seconds" in sql
+        assert "COALESCE(liveness_seconds, 0) > 0" in sql, (
+            "zero and negative must fall back to the Job clock, exactly as "
+            "`services/sweeps.row_liveness_seconds` does — shortening the bound "
+            "is the direction that releases under a live run"
+        )
+        assert "max_age" not in captured["params"]
+        assert captured["params"]["default_liveness"] == \
+            store.DEFAULT_LIVENESS_SECONDS
+        assert captured["params"]["grace"] == store.LIVENESS_GRACE_SECONDS
         assert captured["params"]["sweep_key"] == "k"
+
+    def test_the_two_bounds_are_the_ones_the_dashboard_reads(self):
+        """25 minutes for a sim row, 3 h 10 m for a Job row."""
+        assert store.DEFAULT_LIVENESS_SECONDS == 10_800
+        assert store.LIVENESS_GRACE_SECONDS == 600
+        assert (900 + store.LIVENESS_GRACE_SECONDS) // 60 == 25
+        assert ((store.DEFAULT_LIVENESS_SECONDS
+                 + store.LIVENESS_GRACE_SECONDS) // 60) == 190
+
+    @pytest.mark.parametrize("liveness,age_minutes,still_blocking", [
+        # A JOB row (NULL) half an hour into a legitimate replay: the review's
+        # case. Under the old single 25-minute bound it was invisible here, and
+        # the cross-instance check waved a concurrent duplicate straight through.
+        (None, 30, True),
+        # A SIM row of the same age is dead — its writer is a service instance
+        # that stamps 900 s — and must stop blocking.
+        (900, 30, False),
+        # ...and the sim boundary itself, either side of 900 + 600.
+        (900, 24, True),
+        (900, 26, False),
+        # A Job row does not release until 3 h 10 m.
+        (None, 189, True),
+        (None, 191, False),
+    ])
+    def test_the_bound_each_row_is_judged_by(self, liveness, age_minutes,
+                                             still_blocking):
+        """The arithmetic the SQL performs, on the constants the SQL binds.
+
+        The predicate itself is pinned above (it reads `liveness_seconds` with
+        the zero/NULL fallbacks); this pins what those numbers MEAN, which is
+        the half a shape assertion cannot cover.
+        """
+        bound = ((liveness if liveness else store.DEFAULT_LIVENESS_SECONDS)
+                 + store.LIVENESS_GRACE_SECONDS)
+        assert ((age_minutes * 60) < bound) is still_blocking
+
+    def test_the_liveness_column_is_selected_so_the_caller_can_read_it(self):
+        """The 409 message quotes the blocking row's own release window."""
+        pytest.importorskip("google.cloud.bigquery")
+        captured = {}
+
+        class Client:
+            def query(self, sql, job_config=None):
+                captured["sql"] = sql
+                raise RuntimeError("stop")
+
+        self._writer(Client()).find_running_sweep("k")
+        select = captured["sql"].split("FROM latest")[0]
+        assert "liveness_seconds" in select
 
     def test_a_query_failure_accepts_rather_than_blocks(self):
         """"We could not tell" must mean "run it".
@@ -470,19 +542,14 @@ class TestTheLiveSweepLookup:
             def query(self, *a, **k):
                 raise RuntimeError("bq down")
 
-        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
-        writer._enabled = True
-        writer._client = Angry()
-        writer._project_id = "p"
-        writer._dataset_id = "options_wheel"
-        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
+        assert self._writer(Angry()).find_running_sweep("k") is None
 
     def test_a_disabled_writer_or_an_empty_key_never_queries(self):
-        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer = self._writer(None)
         writer._enabled = False
-        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
+        assert writer.find_running_sweep("k") is None
         writer._enabled = True
-        assert writer.find_running_sweep("", max_age_seconds=1500) is None
+        assert writer.find_running_sweep("") is None
 
 
 class TestTheSchemaTypeNamesAreCovered:

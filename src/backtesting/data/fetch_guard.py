@@ -13,9 +13,12 @@ different model fingerprint — falls straight through ``ChainBuilder.build`` in
 and vendor rate limit for a request that was supposed to be instant. Nothing in
 the RESULT would show it: the numbers come out identical, just far later.
 
-So the contract is enforced rather than assumed. Wrapped around the vendor
-client, INNERMOST (see ``run_sweep(vendor_guard=...)``), this refuses the two
-calls that constitute a chain fetch and lets everything else through:
+So the contract is enforced rather than assumed. Inserted between the fetch
+counter and the bar cache (see ``run_sweep(vendor_guard=...)``) — ABOVE the
+counter, so a refused call, which never left the process, is not counted as a
+network round-trip; BELOW the cache, so nothing can route around it — this
+refuses the two calls that constitute a chain fetch and lets everything else
+through:
 
 * ``get_contract_universe`` — REFUSED
 * ``get_option_bars``       — REFUSED

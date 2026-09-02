@@ -87,6 +87,22 @@ TERMINAL_STATUSES = (STATUS_DONE, STATUS_FAILED, STATUS_DEDUPLICATED)
 # sweep whose cells are in the table is done, whatever a launch-side timeout
 # thought. The reverse ranking would hide a completed run behind a spurious
 # failure — and, worse, keep it out of the dedup so it would be replayed.
+# How long a NON-TERMINAL row may go without an update before a reader may
+# presume its writer is dead. Both numbers MIRROR `services/sweeps.py`
+# (`JOB_TASK_TIMEOUT_SECONDS` / `STALE_GRACE_MINUTES`), and a test pins them
+# equal: the dashboard decides when a row stops holding the submit lock and this
+# module decides when it stops blocking a duplicate, and the two answering
+# differently is how a sweep gets refused by one side after the other released
+# it.
+#
+# `DEFAULT_LIVENESS_SECONDS` is what a row with no `liveness_seconds` MEANS —
+# every row written before that column existed, and every row the sweep JOB
+# writes, because Cloud Run kills the task at its `--task-timeout` and nothing
+# will write its terminal row afterwards. Only a writer with a SHORTER life
+# stamps a value; the sim service stamps 900.
+DEFAULT_LIVENESS_SECONDS = 10_800   # 3h — the Job's --task-timeout
+LIVENESS_GRACE_SECONDS = 600        # 10m — the terminal-write window
+
 STATUS_RANK: Dict[str, int] = {
     STATUS_SUBMITTED: 0,
     STATUS_RUNNING: 1,
@@ -546,7 +562,7 @@ class ScenarioRunWriter:
             return None
         return dict(rows[0].items()) if rows else None
 
-    def find_running_sweep(self, sweep_key: str, *, max_age_seconds: int,
+    def find_running_sweep(self, sweep_key: str, *,
                            exclude_run_id: Optional[str] = None
                            ) -> Optional[Dict[str, Any]]:
         """A live, non-stale ``running`` run under ``sweep_key``, or None.
@@ -566,10 +582,24 @@ class ScenarioRunWriter:
         which is what happens today, while the cost of being wrong in the other
         direction would be refusing a legitimate submission for ever.
 
-        ``max_age_seconds`` is the caller's liveness bound plus its grace, so a
-        killed instance's orphaned `running` row stops blocking at exactly the
-        moment the dashboard's readers stop counting it (~25 min for the sim
-        service). Without that bound this would be a permanent lock on a dead
+        **The age bound is PER ROW, off that row's own ``liveness_seconds``** —
+        the same rule ``services/sweeps.row_liveness_seconds`` applies, mirrored
+        into SQL so the two sides cannot answer differently. A caller-supplied
+        single bound was the review's finding and it was wrong in the direction
+        that matters: bounding every row at the SIM service's ~25 minutes made a
+        **Job** legitimately 30+ minutes into replaying the same spec invisible,
+        so the check waved through a concurrent duplicate — the exact confusion
+        it exists to prevent — while the 409 it did not raise promised a release
+        window that was never true for Job rows.
+
+        So: a row stamped 900 (the sim service) stops blocking at 1500 s; a row
+        with NULL — every Job row, and every row written before the column
+        existed — stops at 11400 s (3 h + the 10-minute grace). A stamped value
+        that is zero or negative is treated as absence, exactly as the Python
+        reader treats it, because shortening the bound is the dangerous
+        direction: it releases under a run that is still going.
+
+        Without an upper bound at all this would be a permanent lock on a dead
         run, which is the failure ``blocking_sweep``'s expiry exists to prevent.
 
         A query failure returns None: "we could not tell" must mean "run it".
@@ -580,17 +610,23 @@ class ScenarioRunWriter:
         query = f"""
         WITH latest AS (
           SELECT run_id, status, submitted_at, written_at, submitted_via,
+                 liveness_seconds,
                  ROW_NUMBER() OVER (
                    PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
           FROM `{table}`
           WHERE sweep_key = @sweep_key
         )
-        SELECT run_id, submitted_at, written_at, submitted_via
+        SELECT run_id, submitted_at, written_at, submitted_via,
+               liveness_seconds
         FROM latest
         WHERE rn = 1
           AND status = '{STATUS_RUNNING}'
-          AND written_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
-                                         INTERVAL @max_age SECOND)
+          AND written_at > TIMESTAMP_SUB(
+                CURRENT_TIMESTAMP(),
+                INTERVAL CAST(
+                  IF(COALESCE(liveness_seconds, 0) > 0,
+                     liveness_seconds, @default_liveness) + @grace
+                  AS INT64) SECOND)
           AND (@exclude IS NULL OR run_id != @exclude)
         ORDER BY written_at DESC
         LIMIT 1
@@ -598,8 +634,10 @@ class ScenarioRunWriter:
         try:
             job_config = bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
-                bigquery.ScalarQueryParameter("max_age", "INT64",
-                                              int(max_age_seconds)),
+                bigquery.ScalarQueryParameter("default_liveness", "INT64",
+                                              DEFAULT_LIVENESS_SECONDS),
+                bigquery.ScalarQueryParameter("grace", "INT64",
+                                              LIVENESS_GRACE_SECONDS),
                 bigquery.ScalarQueryParameter("exclude", "STRING",
                                               exclude_run_id),
             ])

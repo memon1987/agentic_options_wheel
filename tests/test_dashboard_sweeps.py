@@ -1079,6 +1079,16 @@ class TestThePerRowLivenessBound:
         assert S.blocking_sweep([row], now=self.now()) is None
         assert S.is_stuck(row, now=self.now()) is False
 
+    def test_the_engine_and_the_api_agree_on_both_numbers(self):
+        """`persist` decides when a row stops blocking a DUPLICATE; this module
+        decides when it stops holding the SUBMIT LOCK. The two answering
+        differently is how a sweep gets refused by one side after the other has
+        already released it — the same divergence hazard
+        `LATEST_STATUS_ORDER_BY` is pinned against.
+        """
+        assert store.DEFAULT_LIVENESS_SECONDS == S.JOB_TASK_TIMEOUT_SECONDS
+        assert store.LIVENESS_GRACE_SECONDS == S.STALE_GRACE_MINUTES * 60
+
     def test_the_column_is_in_the_additive_degrade_set(self):
         """`submitted_row` carries the key, so an un-migrated table rejects it.
 
