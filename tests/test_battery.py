@@ -337,6 +337,26 @@ class TestTheBatteryMeasuresEverything:
             "collapse fourteen runs into one unreadable timeline"
         )
 
+    def test_the_per_execution_env_overrides_are_ignored(self, wired,
+                                                         monkeypatch):
+        """`SWEEP_RUN_ID` / `SWEEP_SUBMITTED_AT` are per-EXECUTION overrides.
+
+        One battery execution submits the standing set plus every pin. If the
+        in-process path honoured them, all thirty runs would share one run_id
+        and one `submitted_at` partition — thirty runs collapsed into an
+        unreadable timeline, and a dedup that can serve any of them for any
+        other. The battery is not the Job; it takes its identity per
+        submission.
+        """
+        monkeypatch.setenv("SWEEP_RUN_ID", "envrun0123456789")
+        monkeypatch.setenv("SWEEP_SUBMITTED_AT", "2020-01-01T00:00:00+00:00")
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+        run_ids = [r["run_id"] for r in wired.statuses]
+        assert "envrun0123456789" not in run_ids
+        assert len(set(run_ids)) == len(_config().stock_symbols)
+        assert {r["submitted_at"] for r in wired.statuses} != {
+            "2020-01-01T00:00:00+00:00"}
+
     def test_a_pin_run_carries_its_pin_id_on_every_row(self, wired):
         wired._pins = [pin("pin0000000000009")]
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
