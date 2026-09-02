@@ -1863,9 +1863,12 @@ class BigQueryService:
         The caller has already told the operator what it is about to do; a
         swallowed failure here would report a pin that the battery will never
         see. There is no additive-column degrade on this path: the table has
-        five columns and this build knows all of them, so an unknown-field error
-        means the table is not the one this code was written against — which is
-        a migration to look at, not a row to narrow.
+        seven columns (``pin_id``, ``spec_json``, ``active``, ``written_at``,
+        ``note``, and the rolling shape ``window_days`` / ``holdout_days``) and
+        this build knows all of them, so an unknown-field error means the table
+        is not the one this code was written against — which is a migration to
+        look at, not a row to narrow. The count is not decorative: it is the
+        reason this path may raise where ``insert_sweep_status`` degrades.
         """
         table = f"{self.dataset}.scenario_pins"
         errors = self.client.insert_rows_json(table, [row])
