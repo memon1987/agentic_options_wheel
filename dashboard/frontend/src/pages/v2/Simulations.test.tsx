@@ -167,3 +167,49 @@ describe('Simulations — a done run renders the report', () => {
     );
   });
 });
+
+
+describe('Simulations — an expired IAP session is said once, at the top', () => {
+  // FC-096 Phase D PR-2. Without this the operator reads three separate "could
+  // not be read" errors (list, detail, allowlist) and concludes the backend is
+  // down, when the truth is that they are signed out and one reload fixes it.
+  const signedOut = () =>
+    ({
+      ok: false,
+      status: 401,
+      statusText: '',
+      type: 'basic',
+      text: async () => JSON.stringify({ detail: 'no IAP assertion on this request' }),
+      json: async () => ({ detail: 'no IAP assertion on this request' }),
+    }) as unknown as Response;
+
+  it('renders the banner with a reload action when a poll comes back 401', async () => {
+    fetchMock.mockResolvedValue(signedOut());
+    show();
+    const banner = await screen.findByTestId('session-expired-banner');
+    expect(banner.textContent).toMatch(/Session expired/i);
+    expect(banner.textContent).toMatch(/reload/i);
+    expect(screen.getByRole('button', { name: /reload/i })).toBeInTheDocument();
+  });
+
+  it('renders no banner while the session is good', async () => {
+    serve(shapedHoldout);
+    show();
+    await waitFor(() => expect(screen.getByTestId('sweep-results')).toBeInTheDocument());
+    expect(screen.queryByTestId('session-expired-banner')).toBeNull();
+  });
+
+  it('renders no banner for an ordinary read failure — that is not a sign-out', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: '',
+      type: 'basic',
+      text: async () => JSON.stringify({ detail: 'boom' }),
+      json: async () => ({ detail: 'boom' }),
+    } as unknown as Response);
+    show();
+    await waitFor(() => expect(screen.getByText(/could not be read/i)).toBeInTheDocument());
+    expect(screen.queryByTestId('session-expired-banner')).toBeNull();
+  });
+});

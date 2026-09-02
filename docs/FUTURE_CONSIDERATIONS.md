@@ -909,22 +909,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 **Rider (2026-08-31, from the FC-096 PR-1 build):** the lake circuit breaker (`MAX_CONSECUTIVE_LAKE_ERRORS=5`) can never trip under a read-then-write-per-day workload — each day's successful provenance read calls `note_success()` and resets the consecutive count the failed upload just incremented (measured: 12 consecutive failed uploads left the count at 1, breaker never opened). The backfill compensates by keying its own failure verdict on `lake_errors > 0` rather than the breaker (`test_the_breaker_does_not_trip_under_this_workload` pins it), but the breaker's semantics — consecutive-anything vs consecutive-per-operation-class — deserve a deliberate revisit for every lake consumer.
 ---
 
-### FC-094: the dashboard is publicly reachable — decide: keep it read-only-public, or put it behind IAM/IAP
-
-**Scope:** shared (dashboard service + deploy)
-**Status:** **Decided 2026-08-31 (operator, binding): option (b)+roles — IAP over the whole dashboard, Google SSO, operator/viewer roles in-app; token retired.** Execution = FC-096 Phase D; this entry closes when that phase ships.
-**Size estimate:** S (decision) / S–M (build, if lock-down)
-**Owner:** zeshan (operator decision)
-**Plan file:** not yet
-
-**Problem:** `options-wheel-dashboard` carries `roles/run.invoker` → `allUsers` and no application-level auth on any `/api/*` route (verified: `/api/health` answers 200 with no credentials). Today that exposes read-only paper-account analytics (positions, P&L, decision events) and one scheduler-invoked POST (`/bot-health/pause-alert-check`, harmless). FC-060 Layer 4 adds a **submit** path that launches a Cloud Run Job spending the live bot's Alpaca quota; that path is token-gated (`SWEEP_SUBMIT_TOKEN`) as a minimal control, but the broader posture — a public dashboard for a trading account — was never decided on the record. The bot service itself is correctly private (invoker = compute SA + operator).
-
-**Options:** (a) accept public read-only, document it, keep every write path token- or IAM-gated (status quo + FC-060 D6); (b) remove `allUsers`, put the dashboard behind IAP / Google sign-in for the operator's identity — the scheduler's `pause-alert-check` call already uses the compute SA and keeps working; (c) both: public read, IAP-gated writes. Decide deliberately; note that Cloud Run + IAP for a single user is a one-time console setup.
-
-**Links:** FC-060 (Layers 3+4 plan, D6), `docs/plans/fc-060-scenario-store-ui.md`, `deploy/cloudbuild.yaml` dashboard chain, FC-076 (structural interlock — the bot side).
-
----
-
 ### FC-095: sweep Job hygiene — dedicated Alpaca data key / market-hours guard, submit race, dedup granularity, execution-state polling
 
 **Scope:** shared (backtest Job + dashboard)
@@ -941,7 +925,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 - **Status is BigQuery-only.** A `running` row is labelled stuck by age, never confirmed against `run.executions.get`. The SA's `run.jobs.run` is project-level, so `executions.get` is almost certainly held; one call on `execution_name` for a non-terminal row would turn the label into a fact. *Deferred because:* the SIGTERM handler + age rule (rev 2) closes the common case.
 - **No `.dockerignore`** — `.env`/`cache/` enter the local build context (never the image; every `COPY` is explicit). *Deferred because:* Cloud Build's context is the GitHub fetch; local builds are the only exposure.
 
-**Links:** FC-060 (`docs/plans/fc-060-scenario-store-ui.md`), PR #103 review findings, FC-094 (public dashboard).
+**Links:** FC-060 (`docs/plans/fc-060-scenario-store-ui.md`), PR #103 review findings, FC-094 (Completed 2026-09-02 — the dashboard is behind IAP; the "public-facing" framing below predates that).
 
 ---
 
@@ -998,7 +982,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Cost delta:** ~ **$2-5/mo** total — weekly Job < $1/mo, storage < $0.10/mo, sim-service usage pennies, $0 idle. (Warm option, if ever enabled: +$4-18/mo depending on schedule.)
 
-**Links:** FC-060 (Completed — substrate), FC-094 (resolved by D3), FC-095 (dedup-granularity item moves here; the rest stands), FC-055 (ceiling question = an early console use-case), FC-075 (covered-call profile), `docs/plans/fc-060-scenario-store-ui.md` §Review addendum.
+**Links:** FC-060 (Completed — substrate), FC-094 (Completed 2026-09-02, by Phase D), FC-095 (dedup-granularity item moves here; the rest stands), FC-055 (ceiling question = an early console use-case), FC-075 (covered-call profile), `docs/plans/fc-060-scenario-store-ui.md` §Review addendum.
 
 ### FC-097: source real option open interest — the chain reports `open_interest: 0` for every contract, so any OI floor rejects everything
 
@@ -1060,6 +1044,30 @@ _Move entries here once a plan has been published, executed, and merged. Include
 _2026-08-28 (evening): 5 more entries closed today moved here (FC-041/072/079/081/084); full bodies at `cd70fc8`._
 
 _2026-08-28 status sweep: 28 entries moved here from Active in one pass (condensed to this section's convention). Their full original bodies are in git history at `571ecf7`._
+
+### FC-094: the dashboard is publicly reachable — decide: keep it read-only-public, or put it behind IAM/IAP
+- Plan: `docs/plans/fc-096-d.md` (FC-096 Phase D — IAP over the dashboard: Google SSO, operator/viewer roles, token retirement)
+- PRs: #119 `671285f` (PR-1, the roles layer) · PR-2 (token retirement) — plus one operator console session, 2026-09-02
+- Closed: 2026-09-02, by the operator's binding 2026-08-31 decision **(b)+roles**
+- Notes: `allUsers` is off `options-wheel-dashboard`'s invoker policy and the whole
+  service — every `/api/*` route and the artifact endpoint included — is behind
+  Identity-Aware Proxy with Google sign-in. Admission is
+  `roles/iap.httpsResourceAccessor`; **writes** additionally require the signed
+  assertion's `email` claim to be in the `OPERATORS` env allowlist, so an invited
+  account is a read-only viewer that gets a 403 naming the mechanism. Three
+  details worth keeping: (1) the scheduler survived the flip only because a
+  **custom OAuth client** was created and allowlisted for programmatic callers —
+  the Google-managed default blocks programmatic OIDC outright, and the
+  `drawdown-pause-alert-daily` job 401'd at IAP under its old run-URL audience
+  until it was re-pointed at the client id (reproduced live, then fixed:
+  401 → 200); (2) `POST /bot-health/pause-alert-check` is exempt from the
+  OPERATORS chain but NOT from verification — a service account will never be on
+  a human allowlist, and a uniform gate would have taken the drawdown alert
+  offline every evening (the FC-030 silence class); (3) `POST /api/errors` stays
+  ungated by decision, because a viewer's browser posts it and IAP already
+  removed the anonymous caller. The `SWEEP_SUBMIT_TOKEN` bearer that was this
+  entry's "minimal control" is retired: the gate is deleted from the code and
+  the secret unbound and deleted by the operator, in that order.
 
 ### FC-060: scenario-analysis platform (chain lake, scenario runner, sweep store + Job + API, /sims)
 - Plans: `docs/plans/fc-060-chain-lake.md`, `fc-060-scenario-runner.md`, `fc-060-scenario-store-ui.md` (each Done with §Execution)

@@ -5,6 +5,22 @@ The scenario store (FC-060 Layer 3). Written by
 Job, or from `python main.py --command sweep … --persist` — and read by the
 dashboard's `/api/v2/sweeps*` endpoints.
 
+**Who can read these rows (FC-096 Phase D, 2026-09-02).** They are no longer
+world-readable. The dashboard that serves them sits behind Identity-Aware Proxy
+and `allUsers` has been removed from its invoker policy, so the audience is
+exactly the identities holding `roles/iap.httpsResourceAccessor` on
+`options-wheel-dashboard` — plus anyone with BigQuery access to the dataset,
+which is unchanged. Two consequences worth stating rather than assuming:
+
+* **Viewers see everything these tables hold.** The read routes are ungated
+  beyond the sign-in (the plan's signed assumption), so an invited viewer reads
+  every spec, every config snapshot and every result — `OPERATORS` bounds who
+  may *write*, never who may read.
+* **A write to these tables now requires a named human.** Every `submitted` row
+  and every pin is attributable to an IAP-verified identity on the `OPERATORS`
+  allowlist, where it used to require only possession of a shared bearer token
+  that several places had a copy of.
+
 Both sweep tables are **day-partitioned on `submitted_at`** and
 **insert-only**. Nothing in this system ever UPDATEs a row here. A third table,
 `scenario_pins` (FC-096 Phase B B4), joined them at a different grain and
@@ -75,7 +91,7 @@ ORDER BY submitted_at DESC
 | `engine_version` | STRING | `screen.ENGINE_VERSION`; an input to `sweep_key` |
 | `engine_identity` | STRING | sha256[:16] of the **contents of `src/**`** (`src/backtesting/scenarios/engine_identity.py`); the other input to `sweep_key`, and a dedup predicate in its own right. **NULL on every row written before 2026-09-01** — those rows were keyed by a commit SHA, so they are readable by `run_id` for ever and can never be served as a dedup hit |
 | `base_config_hash` | STRING | sha256[:16] of the **effective** snapshot below. This is the dedup's configuration guard, not the `backtest_runs` linkage — see *Effective, not as written* |
-| `base_config_json` | STRING | the `strategy`/`risk`/`earnings`/`rolling`/`universe` sections **plus an `effective` block read through `Config`'s accessors**. The payload, not just the hash — a hash proves two runs matched and tells a reader nothing about what they matched on. `alpaca:` is excluded: these tables are read by a public dashboard |
+| `base_config_json` | STRING | the `strategy`/`risk`/`earnings`/`rolling`/`universe` sections **plus an `effective` block read through `Config`'s accessors**. The payload, not just the hash — a hash proves two runs matched and tells a reader nothing about what they matched on. `alpaca:` is excluded, and it stays excluded: the dashboard that serves this column is no longer world-readable (FC-096 Phase D put it behind IAP on 2026-09-02, closing FC-094), but its audience is now every invited viewer rather than only the operator, and credentials-adjacent config does not belong in a payload a viewer can read |
 | `spec_json` | STRING | the normalised submission (symbols, window, arms with their overrides and haircuts, cash, sensitivity) |
 | `symbols` | STRING REPEATED | denormalised out of `spec_json`, in **declaration order** (de-duplicated in place, never sorted) — the grid's columns are read in the order the operator typed their universe, and the API shapes the grid from this same list |
 | `window_start` / `window_end` / `holdout_start` | DATE | |
@@ -464,7 +480,7 @@ measured" stays answerable. Day-partitioned on `written_at`, clustered on
 | `spec_json` | STRING REQ | the DASHBOARD-normalised spec (`validate_spec`'s output, `sort_keys=True`) — the readable record of what was pinned, in the operator's own symbol order. **Its dates are a record, not an instruction**: the battery replays the window `window_days` / `holdout_days` describe |
 | `active` | BOOL REQ | REQUIRED, not "NULL means active": a pin whose current state is unreadable must not default to *run it every week for ever* |
 | `written_at` | TIMESTAMP REQ | **partition key**, and the clock that orders the transitions |
-| `note` | STRING | the author's own reminder, ≤ 200 characters. A reminder, not a document — and operator-typed text that a public dashboard renders |
+| `note` | STRING | the author's own reminder, ≤ 200 characters. A reminder, not a document — and operator-typed text the dashboard renders to every signed-in viewer. Since FC-096 Phase D that audience is IAP-admitted rather than anonymous, which changes who can *inject* such text (only an operator, who alone may write a pin) but not who can read it |
 | `window_days` | INTEGER | **what makes the pin ROLLING**: the window's LENGTH in calendar days, derived at create time from the absolute spec. The battery re-anchors it to `last_settled_day()` every Saturday, so the pin measures the same question over a window that MOVES. A pin with NULL here is REFUSED by the battery rather than run as a fixed window — the only way to have one is a hand-written row |
 | `holdout_days` | INTEGER | the holdout's length, measured from the **END** (the edge both counts are re-anchored to; from the start it would move every time the window slid). NULL means no holdout, which is a legitimate pin |
 
@@ -515,7 +531,9 @@ it — from the sweep Job, the sim service, a `--persist` CLI sweep, or the
 battery itself. That reconcile is deliberately in **its own guard**: a dataset
 whose `scenario_pins` cannot be created still persists every sweep, because
 pins are not on a sweep's critical path. The dashboard only inserts rows
-(`POST` / `DELETE /api/v2/sims/pins`, both token-gated) and reads them; a pin
+(`POST` / `DELETE /api/v2/sims/pins`, both **IAP-operator-gated** since FC-096
+Phase D — the `SWEEP_SUBMIT_TOKEN` bearer they used to take is retired) and
+reads them; a pin
 write before the first reconcile fails loudly with the tables-missing 503
 rather than creating a table with half a schema.
 

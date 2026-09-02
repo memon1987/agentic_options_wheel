@@ -336,8 +336,10 @@ async def bot_health_uncovered_symbols() -> Dict[str, Any]:
 # evaluation an admitted viewer may see.
 #
 # What it is NOT exempt from is looking at the header. `_verify_assertion_if_present`:
-#   absent            -> pass. Pre-flip that is every request, the scheduler's
-#                        included; post-flip IAP does not admit one.
+#   absent            -> pass. IAP does not admit an unauthenticated request,
+#                        so post-flip this is the degenerate case rather than
+#                        the normal one; it stays a PASS because this route's
+#                        authorization is IAP admission, full stop.
 #   present + INVALID -> 401, same sanitized `iap_assertion_invalid` event as
 #                        everywhere else. Uniform loudness: the documented
 #                        exception must not also be the one endpoint where a
@@ -418,54 +420,53 @@ async def pause_alert_check(
 # FC-060 Layer 3 — scenario sweeps.
 #
 # The router is deliberately THIN. Every decision worth getting wrong —
-# what the allowlist permits, what the caps are, whether a token matches,
-# whether another sweep is running, what the launch body looks like, how a
-# cell is classified — lives in `services/sweeps.py`, which the root test
-# suite exercises directly. FastAPI is absent from the bot's CI image, so
-# anything decided in this file is decided untested.
+# what the allowlist permits, what the caps are, whether another sweep is
+# running, what the launch body looks like, how a cell is classified — lives
+# in `services/sweeps.py`, which the root test suite exercises directly.
+# FastAPI is absent from the bot's CI image, so anything decided in this file
+# is decided untested.
 #
-# THE GETs ARE PUBLIC, like every other route on this dashboard (which is
-# reachable by `allUsers` — FC-094 owns that decision). Sweep results are
-# hypotheticals over historical data, not the live book. Only the SUBMIT is
-# gated, because a submit spends money and Job time.
+# EVERY ROUTE HERE IS BEHIND IAP (FC-096 Phase D). There is no anonymous
+# caller any more: `allUsers` was removed from the service's invoker policy at
+# the console session, so a request that reaches this process was admitted by
+# Identity-Aware Proxy and carries a signed assertion. The GETs are ungated
+# BEYOND that — every admitted identity may read everything (the plan's signed
+# viewer assumption) — and the WRITES additionally require the assertion's
+# email to be in `OPERATORS`, because a write spends money and Job time.
 # ----------------------------------------------------------------------
 
 SWEEP_JOB_NAME = os.getenv("SWEEP_JOB_NAME", "backtest-sweep")
 SWEEP_REGION = os.getenv("SWEEP_JOB_REGION", "us-central1")
 
 
-def _sweep_token() -> Optional[str]:
-    """The configured submit token, or None when sweeps are disabled.
-
-    Fails CLOSED: an unset `SWEEP_SUBMIT_TOKEN` disables submission entirely
-    rather than accepting anything. The secret is wired out-of-band
-    (`--update-secrets`, the same recipe as GITHUB_TOKEN), so "not configured
-    yet" is a state this endpoint will genuinely be in between the merge and
-    the operator's step 1.
-    """
-    return os.getenv("SWEEP_SUBMIT_TOKEN") or None
-
-
-def _require_sweep_token(authorization: Optional[str]) -> None:
-    """The submit gate, applied verbatim to the pin writes.
-
-    Extracted rather than repeated a third time: the 503-when-unconfigured and
-    the constant-time compare are the two halves that must not drift between
-    the endpoints that spend money.
-    """
-    configured = _sweep_token()
-    if not configured:
-        raise HTTPException(
-            status_code=503,
-            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
-                    "on this service. Create the `sweep-submit-token` secret "
-                    "and wire it with `gcloud run services update "
-                    "options-wheel-dashboard --update-secrets="
-                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
-    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
-        raise HTTPException(
-            status_code=401,
-            detail="a valid `Authorization: Bearer <token>` is required to submit")
+#: The 401 a write gets when nothing on the request claims an identity.
+#:
+#: **This replaced the `SWEEP_SUBMIT_TOKEN` bearer gate in FC-096 Phase D
+#: PR-2.** Post-flip the case is unusual rather than routine — IAP does not
+#: admit an unauthenticated request at all — so it means one of exactly three
+#: things, and the message names all three: a browser whose IAP session has
+#: expired (the SPA sends `X-Requested-With: XMLHttpRequest` precisely so IAP
+#: answers 401 here instead of a 302 to a sign-in page the fetch cannot
+#: follow), a programmatic caller that minted no id-token, or someone still
+#: reaching for the retired bearer token.
+#:
+#: It lives in the router rather than in `services/auth.py` because it is a
+#: ROUTE-CLASS decision, not an identity decision: `authorize_write` returning
+#: `None` means "nobody claimed to be anybody", and the two exempt routes
+#: deliberately answer that same fact by proceeding. The retired token gate sat
+#: in this file for the same reason, and its detail strings were pinned by
+#: tests exactly as this one is.
+NO_ASSERTION_DETAIL = (
+    "no IAP assertion on this request — this endpoint is behind Identity-Aware "
+    "Proxy and writes require a verified operator identity. In a browser: "
+    "reload the page to sign in again (your session may have expired). "
+    "Programmatically: mint an OIDC id-token for the IAP OAuth client and send "
+    "it as `Authorization: Bearer <id-token>` — `gcloud auth "
+    "print-identity-token --impersonate-service-account=<SA> "
+    "--audiences=<IAP_CLIENT_ID> --include-email` (the `--include-email` is "
+    "required; IAP refuses an id-token with no email claim). The "
+    "`SWEEP_SUBMIT_TOKEN` bearer token was retired in FC-096 Phase D and is no "
+    "longer accepted.")
 
 
 def _assertion_header(value) -> Optional[str]:
@@ -486,8 +487,9 @@ def _assertion_header(value) -> Optional[str]:
 def _verify_assertion_if_present(assertion) -> Optional[object]:
     """Verify-when-present, never authorize — the EXEMPT routes' whole gate.
 
-    Absent assertion → pass (IAP admission is the authorization, and pre-flip
-    nothing carries one). Present and INVALID → **401**, with the same
+    Absent assertion → pass (IAP admission is this route's authorization, and
+    IAP does not admit an unauthenticated request). Present and INVALID →
+    **401**, with the same
     sanitized log event every other route emits. Present and valid → pass,
     whatever the identity, `OPERATORS` not consulted.
 
@@ -501,46 +503,45 @@ def _verify_assertion_if_present(assertion) -> Optional[object]:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
-def _require_write_access(assertion: Optional[str],
-                          authorization: Optional[str]):
+def _require_write_access(assertion: Optional[str]):
     """FC-096 Phase D — the ONE gate every write route on this service uses.
 
-    Three branches, and which one runs is decided entirely by whether IAP put a
-    signed assertion on the request:
+    **PR-2: the bearer token is gone.** A write now requires a VALID signed IAP
+    assertion whose email is in `OPERATORS`, and nothing else is an
+    alternative. Four branches, decided entirely by the assertion:
 
-    * **No assertion** (every request until the operator flips IAP on) -> the
-      pre-existing token gate, called with the same argument and reaching the
-      same 503/401 with the same detail strings. This is the PR-1 no-op
-      property, and `TestThePr1NoOpProbe` exists to prove it: for
-      NO-ASSERTION requests on the API routes, deploying this change ahead of
-      the console session does not alter one byte of the answer. (Scope, stated
-      because it is not total: `/openapi.json` does change — the routes gain a
-      header parameter — and an assertion-BEARING request is deliberately
-      handled differently from `main`, which ignored the header.)
+    * **No assertion** -> **401** (`NO_ASSERTION_DETAIL`). PR-1's third branch
+      — fall through to `SWEEP_SUBMIT_TOKEN` — is deleted, not disabled. The
+      env var may still be bound to this revision (the operator unbinds the
+      secret AFTER this deploys, in that order, because deleting it first
+      bricks the next revision's startup) and this file must not read it: a
+      code path that revives itself when a variable reappears is not a retired
+      code path.
     * **Assertion present but invalid** -> 401 with a distinct log event,
-      emitted by `services/auth.py`. **Never** a fall-through to the token
-      path: a forged pre-flip header or a broken `IAP_AUDIENCE` has to be loud.
-    * **Assertion present and valid** -> the `OPERATORS` allowlist decides, and
-      the bearer token is IGNORED. A valid non-operator gets a 403 naming the
-      mechanism rather than a second chance with a token, because one leaked
-      token would otherwise defeat the whole migration.
+      emitted by `services/auth.py`. A forged header or a broken `IAP_AUDIENCE`
+      has to be loud, and post-flip it is also what an expired session looks
+      like from the wire.
+    * **Assertion present and valid, email NOT in `OPERATORS`** -> 403 naming
+      the mechanism.
+    * **Assertion present and valid, email in `OPERATORS`** -> the verified
+      `Identity` is returned.
 
-    The decisions and the messages live in `services/auth.py`, which the root
-    suite exercises without FastAPI; this function is the translation into
-    `HTTPException` and nothing else -- the same division of labour the sweep
-    router comment above describes.
+    The identity decisions and their messages live in `services/auth.py`, which
+    the root suite exercises without FastAPI; this function is the translation
+    into `HTTPException` plus the one ROUTE-CLASS decision `auth.py` cannot
+    make for us — that on these four routes "nobody claimed to be anybody" is a
+    refusal, where on `pause-alert-check` it is a pass.
 
-    Returns the verified `Identity` when one authorised the write, else None
-    (the token path). Nothing in PR-1 reads the return value; it is there so a
-    later audit trail has an identity to record without another signature
-    change.
+    Returns the verified `Identity`, never None. Callers do not read it today;
+    it is there so an audit trail has an identity to record without another
+    signature change.
     """
     try:
         identity = auth.authorize_write(_assertion_header(assertion))
     except auth.IapAuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     if identity is None:
-        _require_sweep_token(authorization)
+        raise HTTPException(status_code=401, detail=NO_ASSERTION_DETAIL)
     return identity
 
 
@@ -857,18 +858,15 @@ def _sim_identity_token(audience: str) -> str:
 @router.post("/sims/run")
 async def run_sim(
     spec: Dict[str, Any] = Body(...),
-    authorization: Optional[str] = Header(default=None),
     x_goog_iap_jwt_assertion: Optional[str] = Header(default=None),
 ) -> Response:
     """Forward a spec to the sim service; return its answer unchanged.
 
-    * **Auth: `_require_write_access`** (FC-096 Phase D). With no IAP assertion
-      on the request — every request until the console flip — this is exactly
-      the token gate it always was: **503** when `SWEEP_SUBMIT_TOKEN` is unset
-      (submissions disabled, fail closed) and **401** when the bearer does not
-      match (constant-time compare). With an assertion: **401** if it does not
-      verify, **403** if the verified identity is not in `OPERATORS`, and the
-      bearer token is ignored entirely.
+    * **Auth: `_require_write_access`** (FC-096 Phase D PR-2). A valid signed
+      IAP assertion whose email is in `OPERATORS`, or nothing: **401** with no
+      assertion (naming IAP) or with one that does not verify, **403** for a
+      verified non-operator. The retired `SWEEP_SUBMIT_TOKEN` bearer is not
+      read, even if the variable is still bound to the revision.
     * **503** when `SIM_SERVICE_URL` is unset — the service is not deployed, or
       this revision predates it. Said plainly rather than guessed at: without
       the URL there is no audience to mint a token for, and a hardcoded default
@@ -882,7 +880,7 @@ async def run_sim(
     import httpx
     from starlette.concurrency import run_in_threadpool
 
-    _require_write_access(x_goog_iap_jwt_assertion, authorization)
+    _require_write_access(x_goog_iap_jwt_assertion)
 
     # Re-read the env rather than trusting only the import-time constant: the
     # module-level value is what production uses, and the re-read is what lets a
@@ -951,11 +949,11 @@ async def run_sim(
 # below are a thin caller over `services/sweeps.py`, where every rule lives and
 # where the bot CI image can actually run it.
 #
-# The GET is public, like every other read on this dashboard (FC-094 owns that
-# decision): a pin is a hypothetical over historical data, and the same spec is
-# already visible on any sweep it has produced. The WRITES are token-gated,
-# because a pin spends Job time every Saturday for ever — which is a bigger
-# commitment than one submit, not a smaller one.
+# The GET is readable by every identity IAP admits: a pin is a hypothetical
+# over historical data, and the same spec is already visible on any sweep it has
+# produced. The WRITES are OPERATOR-gated (FC-096 Phase D), because a pin spends
+# Job time every Saturday for ever — which is a bigger commitment than one
+# submit, not a smaller one.
 # ----------------------------------------------------------------------
 
 
@@ -992,7 +990,6 @@ async def list_pins(include_inactive: bool = False) -> List[Dict[str, Any]]:
 @router.post("/sims/pins", status_code=201)
 async def create_pin(
     body: Dict[str, Any] = Body(...),
-    authorization: Optional[str] = Header(default=None),
     x_goog_iap_jwt_assertion: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """Pin a spec into the weekly battery, as a ROLLING window.
@@ -1010,10 +1007,9 @@ async def create_pin(
     dates you post are kept verbatim in the stored spec as the record of what
     you asked for; they are not what gets replayed after the first week.
 
-    * **Auth: `_require_write_access`** — the same chain as `POST /sweeps`.
-      Pre-flip: **503** when `SWEEP_SUBMIT_TOKEN` is unset, **401** when the
-      bearer does not match. Post-flip: **401** on an unverifiable IAP
-      assertion, **403** when the verified identity is not in `OPERATORS`.
+    * **Auth: `_require_write_access`** — the same chain as `POST /sweeps`:
+      **401** with no IAP assertion or an unverifiable one, **403** when the
+      verified identity is not in `OPERATORS`.
     * **422** with the runner's own reason for a spec that could not run, for a
       body that is not `{spec, note}`, or for a pinned `force`.
     * **409** when there are already `MAX_ACTIVE_PINS` active — naming the cap,
@@ -1026,7 +1022,7 @@ async def create_pin(
     Nothing here launches anything. The pin takes effect on the next battery,
     which runs after the Saturday backfill.
     """
-    _require_write_access(x_goog_iap_jwt_assertion, authorization)
+    _require_write_access(x_goog_iap_jwt_assertion)
     try:
         spec, note = sweeps.validate_pin_body(body)
     except sweeps.SweepValidationError as exc:
@@ -1097,7 +1093,6 @@ async def create_pin(
 @router.delete("/sims/pins/{pin_id}")
 async def delete_pin(
     pin_id: str,
-    authorization: Optional[str] = Header(default=None),
     x_goog_iap_jwt_assertion: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """Un-pin: write an `active=false` row. The history is never destroyed.
@@ -1107,7 +1102,7 @@ async def delete_pin(
     deactivation row carries the same spec so a reader taking the latest row can
     see what was retired without walking back.
 
-    * **503 / 401 / 403** exactly as the create does — the same
+    * **401 / 403** exactly as the create does — the same
       `_require_write_access` chain.
     * **404** when no pin has ever had this id — never a silent success, because
       a typo'd id that returned 200 would leave the operator believing a pin
@@ -1116,7 +1111,7 @@ async def delete_pin(
       and honest: nothing was written, and the answer says so rather than
       stacking identical rows on every retry.
     """
-    _require_write_access(x_goog_iap_jwt_assertion, authorization)
+    _require_write_access(x_goog_iap_jwt_assertion)
     if not pin_id or len(pin_id) > 64:
         raise HTTPException(status_code=400, detail="Invalid pin_id")
     bq = get_bigquery_service()
@@ -1151,16 +1146,15 @@ async def delete_pin(
 @router.post("/sweeps", status_code=202)
 async def submit_sweep(
     spec: Dict[str, Any] = Body(...),
-    authorization: Optional[str] = Header(default=None),
     x_goog_iap_jwt_assertion: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """Validate, gate, launch, record. In that order, and the order matters.
 
-    * **Auth: `_require_write_access`** (FC-096 Phase D). Pre-flip: **503**
-      when `SWEEP_SUBMIT_TOKEN` is unset (sweeps disabled, fail closed) and
-      **401** when the bearer does not match (constant-time compare).
-      Post-flip: **401** on an unverifiable IAP assertion, **403** when the
-      verified identity is not in `OPERATORS`.
+    * **Auth: `_require_write_access`** (FC-096 Phase D PR-2). **401** with
+      no IAP assertion (the detail names IAP and the programmatic recipe) or
+      with one that does not verify; **403** when the verified identity is not
+      in `OPERATORS`. There is no token fallback — the bearer gate was retired
+      with the secret.
     * **422** with the runner's own reason for any spec the Job would refuse.
     * **409** while another sweep is live. One 1-vCPU Job; two executions would
       contend on one chain cache.
@@ -1193,7 +1187,7 @@ async def submit_sweep(
     never a silent one. The reverse order has the worse failure: an execution
     running with no row, which no reader can see and no dedup can find.
     """
-    _require_write_access(x_goog_iap_jwt_assertion, authorization)
+    _require_write_access(x_goog_iap_jwt_assertion)
 
     try:
         normalised = sweeps.validate_spec(spec)

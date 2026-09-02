@@ -3,10 +3,17 @@
 FastAPI is not installed in the image Cloud Build tests with, so a rule that
 lives in `routers/v2.py` is a rule nobody checks. Everything worth getting wrong
 therefore lives in `dashboard/backend/services/sweeps.py` and is exercised here:
-the allowlist agreement with the runner, the caps, the token compare, the
-one-at-a-time gate, the launch body, and — the largest piece — `shape_results`,
-which is asserted EQUAL to `report.py` on a real sweep rather than merely
-plausible.
+the allowlist agreement with the runner, the caps, the one-at-a-time gate, the
+launch body, and — the largest piece — `shape_results`, which is asserted EQUAL
+to `report.py` on a real sweep rather than merely plausible.
+
+**Authentication moved out of this file in FC-096 Phase D PR-2.** The
+`SWEEP_SUBMIT_TOKEN` compare used to live in `services/sweeps.py` and is gone
+with the credential; a write is now authorised by a verified IAP assertion whose
+email is in `OPERATORS` (`services/auth.py`, `tests/test_dashboard_iap_auth.py`).
+Every router test below therefore authenticates through `as_operator()`, which
+stubs the verifier — the real one fetches Google's public keys over the network,
+which this suite's ambient-environment discipline forbids.
 
 Same import trick as `tests/test_dashboard_pause_alert.py`: put
 `dashboard/backend` on the path and import `services.*` directly.
@@ -55,6 +62,51 @@ from src.backtesting.screen import ENGINE_VERSION  # noqa: E402
 # that computed the hash itself, which is precisely what it must not do (it
 # ships no `src/` tree).
 BAKED_IDENTITY = "0123456789abcdef"
+
+#: FC-096 Phase D. The router tests below call handlers that now require a
+#: verified IAP assertion, so every one of them needs these three things: the
+#: audience the deployed revision is configured with, an operator on the
+#: allowlist, and a stubbed verifier.
+IAP_AUDIENCE = ("/projects/799970961417/locations/us-central1/services/"
+                "options-wheel-dashboard")
+IAP_OPERATOR = "zeshan@tkzmgroup.com"
+#: The header value itself is opaque here — the verifier is stubbed, and the
+#: real JWT matrix lives in `tests/test_dashboard_iap_auth.py`.
+IAP_ASSERTION = "an-operator-assertion"
+
+
+def _refuse(assertion, audience):
+    """A verifier that refuses everything — a forged or expired assertion."""
+    raise ValueError("bad signature")
+
+
+def _ok_launch(monkeypatch):
+    """Make `jobs.run` answer 200, so a submit reaches its `submitted` row."""
+    import httpx
+
+    async def ok(self, url, **kwargs):
+        return httpx.Response(200, json={"metadata": {"name": "exec-1"}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", ok)
+
+
+def as_operator(monkeypatch, *, email=IAP_OPERATOR):
+    """Make `IAP_ASSERTION` verify as `email`, an operator.
+
+    The verifier is replaced rather than a real token minted: the genuine
+    `verify_assertion` fetches the IAP public keys over the network on every
+    call. `services/auth.py` documents itself as the injection point for exactly
+    this, and the ONE test that exercises the real ES256 path (injecting the
+    certs transport instead) lives in the IAP suite.
+    """
+    from services import auth as A
+
+    monkeypatch.setenv(A.AUDIENCE_ENV, IAP_AUDIENCE)
+    monkeypatch.setenv(A.OPERATORS_ENV, email)
+    monkeypatch.setattr(
+        A, "verify_assertion",
+        lambda assertion, audience: {"iss": A.ISSUER, "aud": audience,
+                                     "email": email, "sub": "sub-1"})
 
 
 def function_source(module_path, name: str) -> str:
@@ -808,60 +860,6 @@ class TestForce:
         plain = S.compute_sweep_key(S.validate_spec(spec()), "abc")
         forced = S.compute_sweep_key(S.validate_spec(spec(force=True)), "abc")
         assert plain == forced
-
-
-class TestTheToken:
-    def test_matching_token_passes(self):
-        assert S.token_matches("s3cret", "s3cret") is True
-
-    def test_wrong_token_fails(self):
-        assert S.token_matches("s3cret", "other") is False
-
-    def test_a_prefix_does_not_pass(self):
-        """The mutation guard: replace `hmac.compare_digest` with `in` or a
-        prefix compare and this fails."""
-        assert S.token_matches("s3c", "s3cret") is False
-        assert S.token_matches("s3cretXXX", "s3cret") is False
-
-    def test_a_non_ascii_bearer_is_rejected_not_a_500(self):
-        """`hmac.compare_digest` on `str` raises TypeError for non-ASCII.
-
-        The bearer is attacker-controlled input on a publicly reachable service
-        (FC-094), so `Authorization: Bearer \u00e9` was a one-request uncaught
-        500, not a hypothetical. Comparing bytes makes it an ordinary 401.
-        """
-        assert S.token_matches("s3cr\u00e9t", "s3cret") is False
-        assert S.token_matches("s3cret", "s3cr\u00e9t") is False
-        assert S.token_matches("\u00e9\u00e9\u00e9", "\u00e9\u00e9\u00e9") is True
-        assert S.token_matches("\U0001f512", "s3cret") is False
-
-    def test_an_unconfigured_token_never_matches(self):
-        """Fail CLOSED. `None == None` would otherwise let an empty
-        Authorization header submit sweeps on a service with no secret wired."""
-        assert S.token_matches(None, None) is False
-        assert S.token_matches("", "") is False
-        assert S.token_matches("anything", None) is False
-        assert S.token_matches(None, "configured") is False
-
-    @pytest.mark.parametrize("header,expected", [
-        ("Bearer abc", "abc"),
-        ("bearer abc", "abc"),
-        ("BEARER   abc  ", "abc"),
-        ("Basic abc", None),
-        ("abc", None),
-        ("Bearer", None),
-        ("Bearer ", None),
-        ("", None),
-        (None, None),
-    ])
-    def test_bearer_extraction(self, header, expected):
-        assert S.extract_bearer(header) == expected
-
-    def test_uses_constant_time_comparison(self):
-        """Read the source: the dashboard is publicly reachable (FC-094), so a
-        timing oracle here turns a 32-character secret into 32 guesses."""
-        src = Path(S.__file__).read_text()
-        assert "hmac.compare_digest" in src
 
 
 class TestTheOneAtATimeGate:
@@ -1724,8 +1722,6 @@ class TestTheSubmitEndpoint:
     hands the operator a stack trace instead of a reason.
     """
 
-    TOKEN = "s3cret-token-value"
-
     @staticmethod
     def _run(coro):
         import asyncio
@@ -1735,7 +1731,7 @@ class TestTheSubmitEndpoint:
     def wired(self, monkeypatch):
         import routers.v2 as v2
 
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        as_operator(monkeypatch)
         monkeypatch.setenv("GIT_COMMIT", "cafebabe")
         # What cloudbuild's `compute-engine-identity` step bakes in. Set here
         # rather than per test because EVERY submit path reads it now: an image
@@ -1746,10 +1742,9 @@ class TestTheSubmitEndpoint:
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: bq)
         return v2, bq
 
-    def submit(self, v2, body=None, token=None):
+    def submit(self, v2, body=None, assertion=IAP_ASSERTION):
         return self._run(v2.submit_sweep(
-            spec=body or spec(),
-            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+            spec=body or spec(), x_goog_iap_jwt_assertion=assertion))
 
     # -- transport failures ------------------------------------------------
     def test_an_httpx_timeout_becomes_502_and_a_failed_row(self, wired, monkeypatch):
@@ -1851,37 +1846,59 @@ class TestTheSubmitEndpoint:
         assert "run.jobs.run" in str(exc.value.detail)
         assert [r["status"] for r in bq.rows] == ["submitted", "failed"]
 
-    # -- auth --------------------------------------------------------------
-    def test_a_wrong_token_is_401_and_writes_nothing(self, wired):
+    # -- auth (FC-096 Phase D PR-2: IAP, not a token) -----------------------
+    def test_no_assertion_is_401_and_writes_nothing(self, wired):
+        """The retired token's replacement, checked where it costs money.
+
+        A refusal that had already written a `submitted` row would hold the
+        one-at-a-time gate until the stale cutoff on behalf of a caller who was
+        never admitted.
+        """
         from fastapi import HTTPException
 
         v2, bq = wired
         with pytest.raises(HTTPException) as exc:
-            self.submit(v2, token="wrong")
+            self.submit(v2, assertion=None)
         assert exc.value.status_code == 401
+        assert "Identity-Aware Proxy" in str(exc.value.detail)
         assert bq.rows == []
 
-    def test_a_non_ascii_token_is_401_not_500(self, wired):
-        """`hmac.compare_digest` on `str` raises TypeError for non-ASCII; from
-        inside a handler that is an uncaught 500 on attacker-controlled input."""
-        from fastapi import HTTPException
-
-        v2, _bq = wired
-        with pytest.raises(HTTPException) as exc:
-            self.submit(v2, token="s3cr\u00e9t")
-        assert exc.value.status_code == 401
-
-    def test_an_unconfigured_secret_is_503_and_writes_nothing(
+    def test_an_unverifiable_assertion_is_401_and_writes_nothing(
             self, wired, monkeypatch):
         from fastapi import HTTPException
+        from services import auth as A
 
         v2, bq = wired
-        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        monkeypatch.setattr(A, "verify_assertion", _refuse)
         with pytest.raises(HTTPException) as exc:
             self.submit(v2)
-        assert exc.value.status_code == 503
-        assert "sweeps are disabled" in str(exc.value.detail)
+        assert exc.value.status_code == 401
         assert bq.rows == []
+
+    def test_a_viewer_is_403_and_writes_nothing(self, wired, monkeypatch):
+        """Signed in, not on the allowlist. Reads everything, spends nothing."""
+        from fastapi import HTTPException
+
+        v2, bq = wired
+        as_operator(monkeypatch, email="someone.else@example.com")
+        monkeypatch.setenv("OPERATORS", IAP_OPERATOR)
+        with pytest.raises(HTTPException) as exc:
+            self.submit(v2)
+        assert exc.value.status_code == 403
+        assert bq.rows == []
+
+    def test_the_retired_token_variable_changes_nothing(self, wired,
+                                                        monkeypatch):
+        """`SWEEP_SUBMIT_TOKEN` is still bound between this deploy and the
+        operator's `--remove-secrets`. It must buy nothing and cost nothing."""
+        v2, bq = wired
+        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "s3cret-token-value")
+        monkeypatch.setattr(v2, "_access_token", lambda: "tok")
+        _ok_launch(monkeypatch)
+        out = self.submit(v2)
+        assert out["status"] == "submitted"
+        assert out["launched"] is True
+        assert "failed" not in [r["status"] for r in bq.rows]
 
     # -- store not created yet --------------------------------------------
     def test_missing_tables_are_503_with_the_rollout_step(self, wired, monkeypatch):
@@ -2618,7 +2635,6 @@ class TestTheSimProxyIsAProxy:
 class TestTheSimProxyEndpoint:
     """Auth, configuration, and verbatim pass-through."""
 
-    TOKEN = "s3cret-token-value"
     URL = "https://sim-service-799970961417.us-central1.run.app"
 
     @staticmethod
@@ -2630,15 +2646,15 @@ class TestTheSimProxyEndpoint:
     def v2(self, monkeypatch):
         import routers.v2 as module
 
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        as_operator(monkeypatch)
         monkeypatch.setenv("SIM_SERVICE_URL", self.URL)
         monkeypatch.setattr(module, "SIM_SERVICE_URL", self.URL)
         monkeypatch.setattr(module, "_sim_identity_token", lambda aud: "id-tok")
         return module
 
-    def _post(self, v2, *, auth=None):
+    def _post(self, v2, *, assertion=IAP_ASSERTION):
         return self._run(v2.run_sim(
-            spec=spec(), authorization=auth or f"Bearer {self.TOKEN}"))
+            spec=spec(), x_goog_iap_jwt_assertion=assertion))
 
     def _fake_transport(self, monkeypatch, v2, *, status, body,
                         content_type="application/json"):
@@ -2668,22 +2684,39 @@ class TestTheSimProxyEndpoint:
         monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
         return seen
 
-    def test_no_submit_token_configured_is_503_and_never_calls_out(
-            self, v2, monkeypatch):
+    def test_no_assertion_is_401_and_never_calls_out(self, v2, monkeypatch):
+        """The proxy mints an OIDC token and reaches a private service — both
+        of which an unauthenticated caller must not be able to make it do."""
+        import httpx
         from fastapi import HTTPException
 
-        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        def bomb(*a, **k):  # pragma: no cover - the point is it is not called
+            raise AssertionError("called out before the auth gate")
+
+        monkeypatch.setattr(v2, "_sim_identity_token", bomb)
+        monkeypatch.setattr(httpx, "AsyncClient", bomb)
+        with pytest.raises(HTTPException) as exc:
+            self._post(v2, assertion=None)
+        assert exc.value.status_code == 401
+        assert "Identity-Aware Proxy" in str(exc.value.detail)
+
+    def test_an_unverifiable_assertion_is_401(self, v2, monkeypatch):
+        from fastapi import HTTPException
+        from services import auth as A
+
+        monkeypatch.setattr(A, "verify_assertion", _refuse)
         with pytest.raises(HTTPException) as exc:
             self._post(v2)
-        assert exc.value.status_code == 503
-        assert "SWEEP_SUBMIT_TOKEN" in str(exc.value.detail)
+        assert exc.value.status_code == 401
 
-    def test_a_wrong_bearer_is_401(self, v2):
+    def test_a_viewer_is_403(self, v2, monkeypatch):
         from fastapi import HTTPException
 
+        as_operator(monkeypatch, email="someone.else@example.com")
+        monkeypatch.setenv("OPERATORS", IAP_OPERATOR)
         with pytest.raises(HTTPException) as exc:
-            self._post(v2, auth="Bearer nope")
-        assert exc.value.status_code == 401
+            self._post(v2)
+        assert exc.value.status_code == 403
 
     def test_an_unset_service_url_is_503_naming_the_variable(
             self, v2, monkeypatch):
@@ -3360,8 +3393,6 @@ def stored_pin(pin_id="pin0000000000001", *, active=True, note=None,
 class TestThePinEndpoints:
     """The routes that COST something every Saturday, and every refusal."""
 
-    TOKEN = "s3cret-token-value"
-
     @staticmethod
     def _run(coro):
         import asyncio
@@ -3371,43 +3402,51 @@ class TestThePinEndpoints:
     def wired(self, monkeypatch):
         import routers.v2 as v2
 
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", self.TOKEN)
+        as_operator(monkeypatch)
         bq = FakePinBQ()
         monkeypatch.setattr(v2, "get_bigquery_service", lambda: bq)
         return v2, bq
 
-    def _create(self, v2, body=None, token=None):
+    def _create(self, v2, body=None, assertion=IAP_ASSERTION):
         return self._run(v2.create_pin(
             body=body if body is not None else {"spec": spec()},
-            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+            x_goog_iap_jwt_assertion=assertion))
 
-    def _delete(self, v2, pin_id, token=None):
+    def _delete(self, v2, pin_id, assertion=IAP_ASSERTION):
         return self._run(v2.delete_pin(
-            pin_id=pin_id,
-            authorization=f"Bearer {self.TOKEN if token is None else token}"))
+            pin_id=pin_id, x_goog_iap_jwt_assertion=assertion))
 
-    # -- the gate ----------------------------------------------------------
-    def test_an_unconfigured_token_disables_the_writes(self, wired,
-                                                       monkeypatch):
+    # -- the gate (FC-096 Phase D PR-2) ------------------------------------
+    def test_no_assertion_is_401(self, wired):
         """Fail CLOSED, exactly as the submit does. A pin spends Job time every
         Saturday for ever, which is a bigger commitment than one submit."""
         from fastapi import HTTPException
 
         v2, _bq = wired
-        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            self._create(v2, assertion=None)
+        assert exc.value.status_code == 401
+        assert "Identity-Aware Proxy" in str(exc.value.detail)
+
+    def test_an_unverifiable_assertion_is_401(self, wired, monkeypatch):
+        from fastapi import HTTPException
+        from services import auth as A
+
+        v2, _bq = wired
+        monkeypatch.setattr(A, "verify_assertion", _refuse)
         with pytest.raises(HTTPException) as exc:
             self._create(v2)
-        assert exc.value.status_code == 503
-        assert "sweeps are disabled" in str(exc.value.detail)
+        assert exc.value.status_code == 401
 
-    @pytest.mark.parametrize("token", ["wrong", "", "s3cret-token-valu"])
-    def test_a_bad_bearer_is_401(self, wired, token):
+    def test_a_viewer_is_403(self, wired, monkeypatch):
         from fastapi import HTTPException
 
         v2, _bq = wired
+        as_operator(monkeypatch, email="someone.else@example.com")
+        monkeypatch.setenv("OPERATORS", IAP_OPERATOR)
         with pytest.raises(HTTPException) as exc:
-            self._create(v2, token=token)
-        assert exc.value.status_code == 401
+            self._create(v2)
+        assert exc.value.status_code == 403
 
     def test_the_delete_is_gated_too(self, wired):
         """An un-gated delete would let anyone silently stop a measurement."""
@@ -3416,7 +3455,7 @@ class TestThePinEndpoints:
         v2, bq = wired
         bq.pins = [stored_pin()]
         with pytest.raises(HTTPException) as exc:
-            self._delete(v2, "pin0000000000001", token="wrong")
+            self._delete(v2, "pin0000000000001", assertion=None)
         assert exc.value.status_code == 401
         assert bq.inserted == []
 

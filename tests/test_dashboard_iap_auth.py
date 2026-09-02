@@ -14,15 +14,14 @@ Four things are under test here, and they fail in very different ways:
 3. **The router wiring** — that all four write routes go through the chain,
    that the header actually binds through FastAPI, and that the two exempt
    routes are genuinely exempt.
-4. **The PR-1 no-op property.** This PR ships BEFORE the console flip. For
-   **no-assertion requests on the API routes** the service must answer
-   byte-identically to the revision before it — same statuses, same detail
-   strings, and the verifier never even consulted. That is the whole safety
-   argument for merging and deploying this ahead of the IAP session, so it is
-   probed rather than asserted in prose. Two deliberate exclusions from that
-   claim: `/openapi.json` gains the header parameter, and an
-   assertion-BEARING request is handled differently from `main` (which ignored
-   the header) — that difference is the feature.
+4. **That the `SWEEP_SUBMIT_TOKEN` path is GONE** (PR-2). PR-1's third
+   branch — no assertion falls through to the bearer token — is deleted, so a
+   write with no assertion is a **401 naming IAP**, on all four routes, with
+   the detail string pinned here because an operator runbook quotes it. The
+   sharp test is `TestTheTokenIsRetired`: the env var is SET and the old bearer
+   header presented, and the answer is still 401. That case is not
+   hypothetical — the operator unbinds the secret AFTER this deploys, in that
+   order, because deleting it first bricks the next revision's startup.
 
 Network discipline: every test either injects the verifier or injects the certs
 transport. Nothing here reaches the IAP keys endpoint, GCP, or BigQuery.
@@ -505,7 +504,7 @@ class TestTheLogNeverCarriesTheToken:
         stub_verifier(monkeypatch,
                       raises=ValueError(f"Can't parse segment: {self.ASSERTION}"))
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access(self.ASSERTION, None)
+            v2._require_write_access(self.ASSERTION)
         assert exc.value.status_code == 401
         assert self.ASSERTION not in str(exc.value.detail)
 
@@ -800,24 +799,25 @@ class TestEveryWriteRouteGoesThroughTheChain:
         raise AssertionError(name)
 
     @pytest.mark.parametrize("name", WRITE_ROUTES)
-    def test_the_route_calls_the_gate_with_both_headers(self, v2, monkeypatch,
-                                                        name):
+    def test_the_route_calls_the_gate_with_the_assertion(self, v2, monkeypatch,
+                                                         name):
         """Wiring, not semantics: the assertion header reaches the gate.
 
         A route that took the header but passed the wrong variable would sail
-        through every semantic test in this file and still admit anyone.
+        through every semantic test in this file and still admit anyone. PR-2
+        drops the second argument with the token gate, so the gate is now
+        called with exactly one thing — and it must be the assertion.
         """
         seen = []
 
-        def spy(assertion, authorization):
-            seen.append((assertion, authorization))
+        def spy(assertion):
+            seen.append(assertion)
             raise RuntimeError("stop here")
 
         monkeypatch.setattr(v2, "_require_write_access", spy)
         with pytest.raises(RuntimeError):
-            self._call(v2, name, authorization="Bearer tok",
-                       x_goog_iap_jwt_assertion="the-assertion")
-        assert seen == [("the-assertion", "Bearer tok")], name
+            self._call(v2, name, x_goog_iap_jwt_assertion="the-assertion")
+        assert seen == ["the-assertion"], name
 
     @pytest.mark.parametrize("name", WRITE_ROUTES)
     def test_the_gate_is_the_first_thing_the_route_does(self, v2, monkeypatch,
@@ -836,8 +836,7 @@ class TestEveryWriteRouteGoesThroughTheChain:
         from fastapi import HTTPException
 
         with pytest.raises(HTTPException) as exc:
-            self._call(v2, name, authorization=None,
-                       x_goog_iap_jwt_assertion="an-assertion")
+            self._call(v2, name, x_goog_iap_jwt_assertion="an-assertion")
         assert exc.value.status_code == 403
 
     def test_an_unresolved_header_default_is_treated_as_no_assertion(
@@ -848,47 +847,41 @@ class TestEveryWriteRouteGoesThroughTheChain:
         dashboard image's deps being absent from the bot CI image — receives the
         `Header(default=None)` object itself for an omitted argument, not None.
         Only FastAPI resolves that default. The object is TRUTHY, so without the
-        coercion in `_require_write_access` every one of the ~40 pre-existing
-        direct-call tests in `test_dashboard_sweeps.py` would take the IAP
-        branch and blow up on `.strip()` — and, far worse, a genuinely
-        assertion-less request that somehow reached the same shape would be
-        treated as authenticated.
+        coercion in `_require_write_access` an omitted argument would look like
+        a PRESENT assertion and be handed to the verifier as one.
+
+        PR-2 makes the consequence louder rather than quieter: the fall-through
+        is now a 401, so the coercion is what separates "no assertion" (401
+        naming IAP) from "an assertion that is a FieldInfo object" (a
+        verification error, also 401, with a misleading log event and a
+        pointless sha256 of a repr).
         """
         from fastapi import Header, HTTPException
 
         configure(monkeypatch)
         verifier_must_not_be_called(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
         unresolved = Header(default=None)
         assert unresolved, "premise: the FieldInfo default is truthy"
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access(unresolved, "Bearer wrong")
+            v2._require_write_access(unresolved)
         assert exc.value.status_code == 401
-        assert exc.value.detail == (
-            "a valid `Authorization: Bearer <token>` is required to submit")
+        assert exc.value.detail == v2.NO_ASSERTION_DETAIL
 
     @pytest.mark.parametrize("name", WRITE_ROUTES)
-    def test_the_signature_still_accepts_a_bare_authorization_call(self, v2,
-                                                                   monkeypatch,
-                                                                   name):
-        """`x_goog_iap_jwt_assertion` is OPTIONAL on every handler.
+    def test_no_write_handler_takes_an_authorization_argument_any_more(
+            self, v2, name):
+        """PR-2: the `Authorization` header is not a parameter of these routes.
 
-        Every pre-existing test in this suite calls these handlers directly with
-        `authorization=` only. A required parameter would have broken them all
-        and, worse, changed the deployed signature.
+        Not "ignored" — ABSENT. A handler that still bound the header would
+        publish it in `/openapi.json` as part of the route's contract and would
+        be one edit away from reading it again. The signature is the check that
+        cannot be satisfied by a comment.
         """
-        from fastapi import HTTPException
+        import inspect
 
-        configure(monkeypatch)
-        verifier_must_not_be_called(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
-        monkeypatch.setattr(
-            v2, "get_bigquery_service",
-            lambda: (_ for _ in ()).throw(
-                AssertionError("the store was touched before the auth gate")))
-        with pytest.raises(HTTPException) as exc:
-            self._call(v2, name, authorization="Bearer wrong")
-        assert exc.value.status_code == 401, name
+        params = inspect.signature(getattr(v2, name)).parameters
+        assert "authorization" not in params, name
+        assert "x_goog_iap_jwt_assertion" in params, name
 
 
 @pytest.mark.skipif(not _HAS_FASTAPI, reason="needs FastAPI (routers.v2)")
@@ -900,46 +893,49 @@ class TestTheGateTranslatesEveryRefusal:
         import routers.v2 as v2
         return v2
 
-    def test_no_assertion_falls_through_to_the_token_gate(self, v2, monkeypatch):
+    def test_no_assertion_is_401_naming_iap(self, v2, monkeypatch):
+        """PR-2's headline change. PR-1 answered this with the token gate."""
+        from fastapi import HTTPException
+
         configure(monkeypatch)
         verifier_must_not_be_called(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
-        assert v2._require_write_access(None, "Bearer the-token") is None
+        with pytest.raises(HTTPException) as exc:
+            v2._require_write_access(None)
+        assert exc.value.status_code == 401
+        assert exc.value.detail == v2.NO_ASSERTION_DETAIL
 
-    def test_an_invalid_assertion_is_401_even_with_a_good_token(self, v2,
-                                                                monkeypatch):
-        """The rule that makes the migration stick: no token fallback.
-
-        A forged pre-flip header must be loud, and a leaked token must not be a
-        second chance once IAP is on.
-        """
+    def test_an_invalid_assertion_is_401(self, v2, monkeypatch):
+        """A forged header must be loud, and there is nothing to fall back to."""
         from fastapi import HTTPException
 
         configure(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
         stub_verifier(monkeypatch, raises=ValueError("bad signature"))
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access("forged", "Bearer the-token")
+            v2._require_write_access("forged")
         assert exc.value.status_code == 401
+        # DISTINCT from the no-assertion 401: one is "sign in", the other is
+        # "what you sent does not verify", and they send an operator to
+        # different places.
+        assert exc.value.detail != v2.NO_ASSERTION_DETAIL
+        assert "could not be verified" in exc.value.detail
 
-    def test_a_viewer_is_403_even_with_a_good_token(self, v2, monkeypatch):
+    def test_a_viewer_is_403(self, v2, monkeypatch):
         from fastapi import HTTPException
 
         configure(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
         stub_verifier(monkeypatch, result=claims(email=VIEWER))
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access("an-assertion", "Bearer the-token")
+            v2._require_write_access("an-assertion")
         assert exc.value.status_code == 403
         assert A.OPERATORS_ENV in exc.value.detail
 
     def test_an_operator_writes_with_no_token_configured_at_all(self, v2,
                                                                 monkeypatch):
-        """Post-flip reality: the token is gone and writes still work."""
+        """Post-retirement reality: no secret anywhere, writes still work."""
         configure(monkeypatch)
         monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
         stub_verifier(monkeypatch, result=claims(email=OPERATOR))
-        identity = v2._require_write_access("an-assertion", None)
+        identity = v2._require_write_access("an-assertion")
         assert identity is not None and identity.email == OPERATOR
 
     def test_the_audience_unset_posture_is_401_through_the_router(self, v2,
@@ -947,9 +943,8 @@ class TestTheGateTranslatesEveryRefusal:
         from fastapi import HTTPException
 
         configure(monkeypatch, audience=None)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access("an-assertion", "Bearer the-token")
+            v2._require_write_access("an-assertion")
         assert exc.value.status_code == 401
         assert A.AUDIENCE_ENV in exc.value.detail
 
@@ -960,103 +955,224 @@ class TestTheGateTranslatesEveryRefusal:
         configure(monkeypatch, operators=None)
         stub_verifier(monkeypatch, result=claims(email=OPERATOR))
         with pytest.raises(HTTPException) as exc:
-            v2._require_write_access("an-assertion", None)
+            v2._require_write_access("an-assertion")
         assert exc.value.status_code == 403
         assert "unset or empty" in exc.value.detail
 
 
 # ============================================================================ #
-# 6. The PR-1 no-op probe — the cutover safety
+# 6. The token is RETIRED (PR-2)
 # ============================================================================ #
 
+TOKEN_ENV = "SWEEP_SUBMIT_TOKEN"
+#: The bearer a caller would still be holding — a leaked one, a stale runbook,
+#: a bookmarked curl. It must buy nothing.
+RETIRED_TOKEN = "s3cret-token-value"
+
+
 @pytest.mark.skipif(not _HAS_FASTAPI, reason="needs FastAPI (routers.v2)")
-class TestThePr1NoOpProbe:
-    """With no IAP assertion, this revision behaves like the one before it.
+class TestTheTokenIsRetired:
+    """A write with no IAP assertion is a 401 naming IAP — never a token gate.
 
-    PR-1 deploys BEFORE the console flip. Until then nothing carries an
-    assertion, so every write must reach the same status with the same detail
-    string it reached on `main`. The two exact strings below are copied from
-    `_require_sweep_token` as it stood before this change: if a refactor edits
-    them, this test says so, because an operator's runbook quotes them.
+    PR-1 shipped three branches on the write routes and the third was "no
+    assertion ⇒ the `SWEEP_SUBMIT_TOKEN` gate, unchanged". PR-2 deletes it. The
+    class below pins the replacement in the two ways that matter:
 
-    Both `IAP_AUDIENCE` and `OPERATORS` are SET throughout — the point is that
-    they are inert without an assertion, not that they are absent.
+    * the **status and the exact detail string** on all four routes, because an
+      operator runbook and the frontend's expiry state both quote it; and
+    * that the old credential buys nothing **even when the environment still
+      offers it**. That is not a hypothetical: the deploy order is PR-2 first,
+      `--remove-secrets` second, delete the secret third (reversing the last two
+      bricks the next revision's startup), so there is a real window in which
+      this revision runs with `SWEEP_SUBMIT_TOKEN` bound.
     """
 
-    TOKEN_UNSET_DETAIL = (
-        "sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
-        "on this service. Create the `sweep-submit-token` secret "
-        "and wire it with `gcloud run services update "
-        "options-wheel-dashboard --update-secrets="
-        "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`.")
-    BAD_TOKEN_DETAIL = (
-        "a valid `Authorization: Bearer <token>` is required to submit")
+    @staticmethod
+    def _run(coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
 
     @pytest.fixture
     def v2(self, monkeypatch):
         import routers.v2 as v2
 
-        # Configured exactly as the deployed revision will be.
+        # Configured exactly as the deployed revision is...
         configure(monkeypatch)
-        # ...and the verifier is a bomb: entering the assertion branch at all
-        # is the failure, not merely returning the wrong status.
+        # ...and the token IS in the environment, which is the point.
+        monkeypatch.setenv(TOKEN_ENV, RETIRED_TOKEN)
+        # The verifier is a bomb: a request carrying no assertion must not
+        # reach it at all.
         verifier_must_not_be_called(monkeypatch)
-        return v2
-
-    def test_an_unset_token_is_still_503_with_the_same_detail(self, v2,
-                                                              monkeypatch):
-        from fastapi import HTTPException
-
-        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
-        with pytest.raises(HTTPException) as exc:
-            v2._require_write_access(None, "Bearer anything")
-        assert exc.value.status_code == 503
-        assert exc.value.detail == self.TOKEN_UNSET_DETAIL
-
-    @pytest.mark.parametrize("authorization", [
-        None, "", "Bearer wrong", "wrong", "Basic dXNlcjpwYXNz",
-        "Bearer ", "bearer the-token-with-wrong-case-scheme-is-fine",
-    ])
-    def test_a_bad_bearer_is_still_401_with_the_same_detail(self, v2, monkeypatch,
-                                                            authorization):
-        from fastapi import HTTPException
-
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
-        with pytest.raises(HTTPException) as exc:
-            v2._require_write_access(None, authorization)
-        assert exc.value.status_code == 401
-        assert exc.value.detail == self.BAD_TOKEN_DETAIL
-
-    def test_the_right_bearer_still_passes(self, v2, monkeypatch):
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
-        assert v2._require_write_access(None, "Bearer the-token") is None
-
-    def test_the_case_insensitive_bearer_scheme_still_passes(self, v2,
-                                                             monkeypatch):
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
-        assert v2._require_write_access(None, "bearer the-token") is None
-
-    @pytest.mark.parametrize("name", WRITE_ROUTES)
-    def test_every_write_route_still_refuses_without_a_token(self, v2,
-                                                             monkeypatch, name):
-        """End-to-end per route, through the real handler signature."""
-        import asyncio
-
-        from fastapi import HTTPException
-
-        monkeypatch.delenv("SWEEP_SUBMIT_TOKEN", raising=False)
         monkeypatch.setattr(
             v2, "get_bigquery_service",
             lambda: (_ for _ in ()).throw(
                 AssertionError("the store was touched before the auth gate")))
-        handler = getattr(v2, name)
+        return v2
+
+    def test_the_gate_401s_with_no_assertion_and_the_token_set(self, v2):
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            v2._require_write_access(None)
+        assert exc.value.status_code == 401
+        assert exc.value.detail == v2.NO_ASSERTION_DETAIL
+
+    @pytest.mark.parametrize("name", WRITE_ROUTES)
+    def test_every_write_route_401s_with_no_assertion(self, v2, name):
+        """End-to-end per route, through the real handler signature."""
+        from fastapi import HTTPException
+
         args = {"run_sim": {"spec": {}}, "create_pin": {"body": {}},
                 "delete_pin": {"pin_id": "p1"}, "submit_sweep": {"spec": {}}}[name]
-        loop = asyncio.new_event_loop()
+        handler = getattr(v2, name)
         with pytest.raises(HTTPException) as exc:
-            loop.run_until_complete(handler(authorization=None, **args))
-        assert exc.value.status_code == 503
-        assert exc.value.detail == self.TOKEN_UNSET_DETAIL
+            self._run(handler(**args))
+        assert exc.value.status_code == 401, name
+        assert exc.value.detail == v2.NO_ASSERTION_DETAIL, name
+
+    def test_the_401_is_not_a_403(self, v2):
+        """401, deliberately, and the distinction is the operator's next step.
+
+        403 means "we know who you are and you may not"; 401 means "nothing on
+        this request says who you are". A browser reading a 403 has no reason to
+        re-authenticate, so the SPA's session-expiry state — the whole point of
+        `X-Requested-With` — would never fire.
+        """
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            v2._require_write_access(None)
+        assert exc.value.status_code != 403
+
+    def test_the_detail_names_iap_and_the_programmatic_recipe(self, v2):
+        """The message is the runbook for the three ways to arrive here."""
+        detail = v2.NO_ASSERTION_DETAIL
+        assert "Identity-Aware Proxy" in detail
+        assert "print-identity-token" in detail
+        # `--include-email` is not decoration: IAP refuses an impersonated
+        # id-token that carries no email claim, and the operator hit exactly
+        # that live during the console session.
+        assert "--include-email" in detail
+        assert "reload the page" in detail
+        # Says out loud that the old credential is dead, so someone holding one
+        # stops trying to make it work.
+        assert TOKEN_ENV in detail and "retired" in detail
+
+    def test_the_router_never_reads_the_token_variable(self):
+        """Grep, not reasoning. The variable may still be bound to the revision.
+
+        A code path that revives itself the moment an env var reappears is not
+        a retired code path, and "we removed the gate" is exactly the claim a
+        later refactor can silently undo.
+        """
+        text = (REPO_ROOT / "dashboard" / "backend" / "routers" / "v2.py").read_text()
+        for forbidden in (f'getenv("{TOKEN_ENV}"', f"getenv('{TOKEN_ENV}'",
+                          f'environ["{TOKEN_ENV}"]', f'environ.get("{TOKEN_ENV}"'):
+            assert forbidden not in text, forbidden
+        # The name survives ONLY in prose: the 401 detail and the comments that
+        # say why it is gone.
+        assert "_require_sweep_token" not in text
+        assert "_sweep_token" not in text
+
+    def test_the_service_layer_has_no_token_helpers_left(self):
+        """`extract_bearer` / `token_matches` are DELETED, not unused.
+
+        Left in place they would be one call site away from a second gate, and
+        `hasattr` is the check a grep of the router cannot make.
+        """
+        import services.sweeps as S
+
+        assert not hasattr(S, "extract_bearer")
+        assert not hasattr(S, "token_matches")
+        # The AST, not a substring: the module still *mentions* the retired
+        # compare in the comment that records why it is gone, and a grep test
+        # that a comment can fail is a test people delete.
+        import ast
+
+        tree = ast.parse((REPO_ROOT / "dashboard" / "backend" / "services"
+                          / "sweeps.py").read_text())
+        imported = {alias.name.split(".")[0]
+                    for node in ast.walk(tree) if isinstance(node, ast.Import)
+                    for alias in node.names}
+        imported |= {(node.module or "").split(".")[0]
+                     for node in ast.walk(tree)
+                     if isinstance(node, ast.ImportFrom)}
+        assert "hmac" not in imported
+
+
+@pytest.mark.skipif(not _HAS_TESTCLIENT,
+                    reason="needs FastAPI AND httpx (fastapi.testclient)")
+class TestTheOldBearerHeaderBuysNothing:
+    """The sharp one, over a REAL request: old header + configured secret ⇒ 401.
+
+    A direct handler call cannot express this any more — the parameter is gone —
+    which is itself the strongest form of the guarantee. So it is asserted on
+    the wire instead: the header is sent, the secret matches, and the answer is
+    the same 401 an unauthenticated stranger gets.
+    """
+
+    @pytest.fixture
+    def client(self, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import routers.v2 as v2
+
+        configure(monkeypatch)
+        monkeypatch.setenv(TOKEN_ENV, RETIRED_TOKEN)
+        verifier_must_not_be_called(monkeypatch)
+        monkeypatch.setattr(
+            v2, "get_bigquery_service",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("the store was touched before the auth gate")))
+        app = FastAPI()
+        app.include_router(v2.router, prefix="/api/v2")
+        return TestClient(app)
+
+    def _writes(self, client, headers):
+        return {
+            "POST /sweeps": client.post("/api/v2/sweeps", headers=headers,
+                                        json={}),
+            "POST /sims/run": client.post("/api/v2/sims/run", headers=headers,
+                                          json={}),
+            "POST /sims/pins": client.post("/api/v2/sims/pins", headers=headers,
+                                           json={"spec": {}}),
+            "DELETE /sims/pins/{id}": client.delete(
+                "/api/v2/sims/pins/p1", headers=headers),
+        }
+
+    def test_the_exact_retired_bearer_is_401_on_every_write(self, client):
+        import routers.v2 as v2
+
+        for route, r in self._writes(
+                client, {"authorization": f"Bearer {RETIRED_TOKEN}"}).items():
+            assert r.status_code == 401, f"{route}: {r.status_code} {r.text}"
+            assert r.json()["detail"] == v2.NO_ASSERTION_DETAIL, route
+
+    def test_nothing_at_all_is_the_same_401(self, client):
+        """The retired token is worth exactly what sending nothing is worth."""
+        import routers.v2 as v2
+
+        for route, r in self._writes(client, {}).items():
+            assert r.status_code == 401, f"{route}: {r.status_code} {r.text}"
+            assert r.json()["detail"] == v2.NO_ASSERTION_DETAIL, route
+
+    def test_the_openapi_schema_no_longer_advertises_authorization(self, client):
+        """The route CONTRACT drops the header, not just the code path.
+
+        `/openapi.json` is the machine-readable statement of what these routes
+        accept. Leaving `authorization` in it would keep telling every generated
+        client to send a credential this service refuses to look at.
+        """
+        schema = client.get("/openapi.json").json()
+        for path, method in (("/api/v2/sweeps", "post"),
+                             ("/api/v2/sims/run", "post"),
+                             ("/api/v2/sims/pins", "post"),
+                             ("/api/v2/sims/pins/{pin_id}", "delete")):
+            params = schema["paths"][path][method].get("parameters", [])
+            names = {p["name"].lower() for p in params}
+            assert "authorization" not in names, (path, method, names)
+            assert "x-goog-iap-jwt-assertion" in names, (path, method, names)
 
 
 # ============================================================================ #
@@ -1226,9 +1342,10 @@ class TestTheHeaderBindsThroughFastapi:
 
     FastAPI maps `x_goog_iap_jwt_assertion` onto `x-goog-iap-jwt-assertion` by
     converting underscores. If that mapping ever broke — a rename, a
-    `convert_underscores=False` — every request would look assertion-less and
-    the roles layer would silently revert to token-only, post-flip, with no
-    error anywhere. This is the only test that can catch that.
+    `convert_underscores=False` — every request would look assertion-less, and
+    since PR-2 that means **every write on the service answers 401** to a
+    correctly signed-in operator, with nothing anywhere saying why. This is the
+    only test that can catch it.
     """
 
     @pytest.fixture
@@ -1239,7 +1356,6 @@ class TestTheHeaderBindsThroughFastapi:
         import routers.v2 as v2
 
         configure(monkeypatch)
-        monkeypatch.setenv("SWEEP_SUBMIT_TOKEN", "the-token")
         monkeypatch.setattr(
             v2, "get_bigquery_service",
             lambda: (_ for _ in ()).throw(
@@ -1248,12 +1364,11 @@ class TestTheHeaderBindsThroughFastapi:
         app.include_router(v2.router, prefix="/api/v2")
         return TestClient(app)
 
-    def test_an_invalid_assertion_header_produces_401_not_a_token_prompt(
-            self, client, monkeypatch):
+    def test_an_invalid_assertion_header_produces_401(self, client,
+                                                      monkeypatch):
         stub_verifier(monkeypatch, raises=ValueError("bad signature"))
         r = client.post("/api/v2/sims/pins",
-                        headers={"x-goog-iap-jwt-assertion": "forged",
-                                 "authorization": "Bearer the-token"},
+                        headers={"x-goog-iap-jwt-assertion": "forged"},
                         json={"spec": {}})
         assert r.status_code == 401, r.text
         assert "could not be verified" in r.json()["detail"]
@@ -1270,21 +1385,37 @@ class TestTheHeaderBindsThroughFastapi:
                                                               monkeypatch):
         stub_verifier(monkeypatch, result=claims(email=VIEWER))
         r = client.post("/api/v2/sims/pins",
-                        headers={"x-goog-iap-jwt-assertion": "valid",
-                                 "authorization": "Bearer the-token"},
+                        headers={"x-goog-iap-jwt-assertion": "valid"},
                         json={"spec": {}})
         assert r.status_code == 403, r.text
         assert "OPERATORS" in r.json()["detail"]
 
-    def test_no_header_at_all_still_reaches_the_token_gate(self, client,
+    def test_no_header_at_all_is_the_iap_401(self, client, monkeypatch):
+        """PR-2: the fall-through is a 401 naming IAP, not a token prompt."""
+        import routers.v2 as v2
+
+        verifier_must_not_be_called(monkeypatch)
+        r = client.post("/api/v2/sims/pins", json={"spec": {}})
+        assert r.status_code == 401, r.text
+        assert r.json()["detail"] == v2.NO_ASSERTION_DETAIL
+
+    def test_a_blank_assertion_header_is_treated_as_absent(self, client,
                                                            monkeypatch):
+        """By design (PR-1 disposition), and PR-2 does not change it.
+
+        IAP never stamps an empty header. A client that sends one gets the
+        "sign in" 401 rather than the "your assertion did not verify" one,
+        which is the more useful of the two answers and reaches the same
+        refusal.
+        """
+        import routers.v2 as v2
+
         verifier_must_not_be_called(monkeypatch)
         r = client.post("/api/v2/sims/pins",
-                        headers={"authorization": "Bearer wrong"},
+                        headers={"x-goog-iap-jwt-assertion": "   "},
                         json={"spec": {}})
         assert r.status_code == 401, r.text
-        assert r.json()["detail"] == (
-            "a valid `Authorization: Bearer <token>` is required to submit")
+        assert r.json()["detail"] == v2.NO_ASSERTION_DETAIL
 
 
 # ============================================================================ #

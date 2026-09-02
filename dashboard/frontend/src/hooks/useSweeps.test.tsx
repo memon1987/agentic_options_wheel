@@ -14,7 +14,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
-import { SWEEP_POLL_MS, submitSweep, useSweepDetail, useSweepList } from './useSweeps';
+import {
+  SESSION_EXPIRED_MESSAGE,
+  SWEEP_POLL_MS,
+  submitSweep,
+  useSweepDetail,
+  useSweepList,
+} from './useSweeps';
 import type { SweepRow, SweepSpec } from '../types/v2';
 import shapedHoldout from '../test/fixtures/sweep_shaped_holdout.json';
 import shapedPending from '../test/fixtures/sweep_shaped_pending.json';
@@ -31,8 +37,33 @@ const jsonResponse = (status: number, body: unknown): Response =>
     ok: status >= 200 && status < 300,
     status,
     statusText: '',
+    type: 'basic',
     text: async () => JSON.stringify(body),
     json: async () => body,
+  }) as unknown as Response;
+
+/** A 200 carrying HTML — what an expired IAP session serves in place of JSON. */
+const htmlResponse = (body = '<html><body>Sign in</body></html>'): Response =>
+  ({
+    ok: true,
+    status: 200,
+    statusText: '',
+    type: 'basic',
+    text: async () => body,
+    json: async () => {
+      throw new SyntaxError('Unexpected token < in JSON at position 0');
+    },
+  }) as unknown as Response;
+
+/** A cross-origin redirect the fetch could not read. */
+const opaqueResponse = (): Response =>
+  ({
+    ok: false,
+    status: 0,
+    statusText: '',
+    type: 'opaqueredirect',
+    text: async () => '',
+    json: async () => null,
   }) as unknown as Response;
 
 const row = (over: Partial<SweepRow> = {}): SweepRow => ({
@@ -101,7 +132,7 @@ afterEach(() => {
 describe('submitSweep — one request, never a retry', () => {
   it('issues exactly one POST on success', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { run_id: 'abc', status: 'submitted' }));
-    const outcome = await submitSweep(SPEC, 'tok');
+    const outcome = await submitSweep(SPEC);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(outcome).toEqual({
       kind: 'accepted',
@@ -110,12 +141,17 @@ describe('submitSweep — one request, never a retry', () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/v2/sweeps');
     expect(init.method).toBe('POST');
-    expect(init.headers.Authorization).toBe('Bearer tok');
     expect(JSON.parse(init.body)).toEqual(SPEC);
+    // FC-096 Phase D PR-2: the `SWEEP_SUBMIT_TOKEN` bearer is retired. Sending
+    // one would be sending a dead credential to a service that ignores it.
+    expect(init.headers.Authorization).toBeUndefined();
+    // ...and this is what makes an expired IAP session answer 401 instead of
+    // redirecting the fetch to Google's sign-in page.
+    expect(init.headers['X-Requested-With']).toBe('XMLHttpRequest');
   });
 
   it.each([
-    [401, 'unauthorized'],
+    [401, 'session_expired'],
     [403, 'unauthorized'],
     [409, 'conflict'],
     [422, 'invalid'],
@@ -124,14 +160,45 @@ describe('submitSweep — one request, never a retry', () => {
     [500, 'error'],
   ])('issues exactly one POST on HTTP %i and classifies it as %s', async (status, kind) => {
     fetchMock.mockResolvedValue(jsonResponse(status, { detail: 'because' }));
-    const outcome = await submitSweep(SPEC, 'tok');
+    const outcome = await submitSweep(SPEC);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(outcome.kind).toBe(kind);
   });
 
+  it('classifies a 401 as a session expiry, not as a rejected credential', async () => {
+    // Post-IAP the only way a write reaches the backend without an assertion is
+    // a session that has ended. Telling the operator their "token" was rejected
+    // would send them looking for a credential that no longer exists.
+    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    expect(await submitSweep(SPEC)).toEqual({
+      kind: 'session_expired',
+      detail: SESSION_EXPIRED_MESSAGE,
+    });
+  });
+
+  it('classifies a 200 carrying HTML as a session expiry', async () => {
+    // IAP without `X-Requested-With` serves the sign-in page; belt and braces
+    // for any hop that strips the header.
+    fetchMock.mockResolvedValue(htmlResponse());
+    expect((await submitSweep(SPEC)).kind).toBe('session_expired');
+  });
+
+  it('classifies an opaque redirect as a session expiry', async () => {
+    fetchMock.mockResolvedValue(opaqueResponse());
+    expect((await submitSweep(SPEC)).kind).toBe('session_expired');
+  });
+
+  it('still reports a 403 as an authorization refusal, in the server’s words', async () => {
+    // 403 is the OTHER thing: signed in, verified, and not on the OPERATORS
+    // allowlist. A reload cannot fix it, so it must not be shown as an expiry.
+    const detail = 'someone@else.com is signed in and may read everything, but writes are limited…';
+    fetchMock.mockResolvedValue(jsonResponse(403, { detail }));
+    expect(await submitSweep(SPEC)).toEqual({ kind: 'unauthorized', status: 403, detail });
+  });
+
   it('issues exactly one POST when the network throws — a retry could duplicate a Job', async () => {
     fetchMock.mockRejectedValue(new Error('network down'));
-    const outcome = await submitSweep(SPEC, 'tok');
+    const outcome = await submitSweep(SPEC);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(outcome).toEqual({ kind: 'error', status: null, detail: 'network down' });
   });
@@ -140,13 +207,13 @@ describe('submitSweep — one request, never a retry', () => {
     const reason =
       'universe.min_open_interest — the engine hardcodes open_interest: 0, so any floor rejects EVERY call.';
     fetchMock.mockResolvedValue(jsonResponse(422, { detail: reason }));
-    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'invalid', detail: reason });
+    expect(await submitSweep(SPEC)).toEqual({ kind: 'invalid', detail: reason });
   });
 
   it('surfaces a 502 grant text VERBATIM', async () => {
     const grant = 'The dashboard SA lacks run.jobs.run. Grant: gcloud run jobs add-iam-policy-binding …';
     fetchMock.mockResolvedValue(jsonResponse(502, { detail: grant }));
-    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'launch_failed', detail: grant });
+    expect(await submitSweep(SPEC)).toEqual({ kind: 'launch_failed', detail: grant });
   });
 
   it('surfaces the 409 detail, which already names the blocking run', async () => {
@@ -155,7 +222,7 @@ describe('submitSweep — one request, never a retry', () => {
     const detail =
       'sweep run-old is running; one sweep runs at a time (the Job is a single vCPU).';
     fetchMock.mockResolvedValue(jsonResponse(409, { detail }));
-    expect(await submitSweep(SPEC, 'tok')).toEqual({ kind: 'conflict', detail });
+    expect(await submitSweep(SPEC)).toEqual({ kind: 'conflict', detail });
   });
 
   it('accepts a 202 and carries the prior_done_run_id hint through', async () => {
@@ -170,7 +237,7 @@ describe('submitSweep — one request, never a retry', () => {
         prior_done_run_id: 'old',
       }),
     );
-    expect(await submitSweep(SPEC, 'tok')).toEqual({
+    expect(await submitSweep(SPEC)).toEqual({
       kind: 'accepted',
       body: {
         run_id: 'new',
@@ -183,7 +250,7 @@ describe('submitSweep — one request, never a retry', () => {
 
   it('defaults prior_done_run_id to null when the 202 omits it', async () => {
     fetchMock.mockResolvedValue(jsonResponse(202, { run_id: 'new', status: 'submitted' }));
-    expect(await submitSweep(SPEC, 'tok')).toMatchObject({
+    expect(await submitSweep(SPEC)).toMatchObject({
       kind: 'accepted',
       body: { run_id: 'new', deduplicated_to: null, prior_done_run_id: null },
     });
@@ -193,7 +260,7 @@ describe('submitSweep — one request, never a retry', () => {
     fetchMock.mockResolvedValue(
       jsonResponse(422, { detail: [{ loc: ['body', 'symbols'], msg: 'field required' }] }),
     );
-    expect(await submitSweep(SPEC, 'tok')).toEqual({
+    expect(await submitSweep(SPEC)).toEqual({
       kind: 'invalid',
       detail: 'body.symbols: field required',
     });
@@ -216,6 +283,70 @@ describe('useSweepList — the endpoint serves a BARE ARRAY', () => {
     const { result } = renderHook(() => useSweepList());
     await settle();
     expect(result.current.data).toHaveLength(1);
+  });
+});
+
+describe('the IAP session expiring is its own state (FC-096 Phase D)', () => {
+  it('sends X-Requested-With on every read', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
+    renderHook(() => useSweepList());
+    await settle();
+    const [, init] = fetchMock.mock.calls[0];
+    // Without this IAP answers an expired session with a 302 to Google, which
+    // this SPA cannot follow or parse — the failure would arrive as a CORS
+    // error indistinguishable from the API being down.
+    expect(init.headers['X-Requested-With']).toBe('XMLHttpRequest');
+  });
+
+  it('flags a 401 as sessionExpired with the reload message', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.sessionExpired).toBe(true);
+    expect(result.current.error).toBe(SESSION_EXPIRED_MESSAGE);
+  });
+
+  it('flags a 200 of HTML as sessionExpired rather than a JSON syntax error', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(htmlResponse());
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.sessionExpired).toBe(true);
+    expect(result.current.error).toBe(SESSION_EXPIRED_MESSAGE);
+  });
+
+  it('flags an opaque redirect as sessionExpired', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(opaqueResponse());
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.sessionExpired).toBe(true);
+  });
+
+  it('STOPS polling once the session is gone', async () => {
+    // Every other error keeps polling, because it may be transient. This one
+    // cannot recover without a reload, so polling on is four failed requests a
+    // minute for as long as the tab stays open.
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await advance(SWEEP_POLL_MS * 5);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.current.sessionExpired).toBe(true);
+  });
+
+  it('an ordinary 500 is NOT a session expiry and keeps polling', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(jsonResponse(500, { detail: 'boom' }));
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.sessionExpired).toBe(false);
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

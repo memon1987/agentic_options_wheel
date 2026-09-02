@@ -4,8 +4,8 @@ Pure functions, no FastAPI and no cloud client, for the reason
 ``services/pause_alert.py`` gives: the bot's CI image has no FastAPI, so anything
 that lives in a router is untested by the only suite that runs. Everything a
 mistake here would cost — accepting an override the Job will refuse, launching a
-second concurrent sweep, comparing a bearer token with ``==``, rendering an
-`insuf` cell as a return — is decided in this file and pinned by
+second concurrent sweep, rendering an `insuf` cell as a return — is decided in
+this file and pinned by
 ``tests/test_dashboard_sweeps.py``. The router is a thin caller.
 
 **The allowlist is IMPORTED, not restated.** ``src/backtesting/scenarios/``'s
@@ -29,7 +29,6 @@ suite (Cloud Build runs that suite as step 1, so drift fails the build):
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import os
@@ -723,39 +722,28 @@ def cell_count(spec: Dict[str, Any]) -> int:
 
 
 # ============================================================================ #
-# Auth (D6)
+# Auth — RETIRED (FC-096 Phase D PR-2)
+#
+# `extract_bearer` and `token_matches` lived here, and with them the whole
+# `SWEEP_SUBMIT_TOKEN` gate: a shared secret pasted into a browser field,
+# compared with `hmac.compare_digest` because the origin was reachable by
+# `allUsers` and a byte-at-a-time compare was a real remote timing oracle.
+#
+# Both are DELETED rather than left unused. Authentication now happens one
+# layer up — Identity-Aware Proxy admits the request and stamps a signed
+# assertion — and authorization in `services/auth.py`, which is FastAPI-free
+# for exactly the reason this module is. A retired credential path that still
+# compiles is a path something can call again; the deletion is what makes
+# "the token is gone" checkable by grep rather than by reading.
+#
+# The secret's own lifecycle is an OPERATOR step, in this order and no other:
+# this revision deploys first, THEN `gcloud run services update
+# --remove-secrets=SWEEP_SUBMIT_TOKEN`, THEN the `sweep-submit-token` secret is
+# deleted. Deleting it first bricks the next revision's startup, because a
+# Cloud Run service whose `--set-secrets` names a secret that no longer exists
+# does not come up — a red build with a smoke failure that reads like anything
+# but its cause.
 # ============================================================================ #
-
-def extract_bearer(authorization: Optional[str]) -> Optional[str]:
-    """The token out of an ``Authorization: Bearer <token>`` header, or None."""
-    if not authorization:
-        return None
-    parts = authorization.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    return parts[1].strip() or None
-
-
-def token_matches(presented: Optional[str], configured: Optional[str]) -> bool:
-    """Constant-time compare of the presented bearer against the configured one.
-
-    ``hmac.compare_digest``, not ``==``. A byte-at-a-time comparison leaks the
-    length of the shared prefix through timing, which turns a 32-character secret
-    into 32 sequential guesses. The dashboard is publicly reachable (FC-094), so
-    this is a remote, unauthenticated attacker's oracle, not a theoretical one.
-
-    An unconfigured token never matches: the endpoint fails CLOSED and reports
-    "sweeps disabled" rather than accepting anything.
-    """
-    if not configured or not presented:
-        return False
-    # BYTES, not str. `hmac.compare_digest` on `str` requires both to be ASCII
-    # and raises `TypeError: comparing strings with non-ASCII characters is not
-    # supported` otherwise — which, from inside a request handler, is an
-    # uncaught 500. A bearer token is attacker-controlled input, so a non-ASCII
-    # one is a trivially reachable crash rather than a hypothetical.
-    return hmac.compare_digest(str(presented).encode("utf-8"),
-                               str(configured).encode("utf-8"))
 
 
 # ============================================================================ #

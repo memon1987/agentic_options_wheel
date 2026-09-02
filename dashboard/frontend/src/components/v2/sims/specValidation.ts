@@ -45,7 +45,7 @@ export const MAX_STARTING_CASH = 1_000_000;
 
 /** A single validation failure, addressed to one region of the form. */
 export interface SpecIssue {
-  field: 'symbols' | 'window' | 'holdout' | 'scenarios' | 'cash' | 'token' | 'caps';
+  field: 'symbols' | 'window' | 'holdout' | 'scenarios' | 'cash' | 'caps';
   message: string;
 }
 
@@ -178,7 +178,6 @@ export interface ValidateArgs {
   spec: Partial<SweepSpec>;
   /** Holdout is ON by default; disabling it is what makes a run in-sample only. */
   holdoutEnabled: boolean;
-  token: string;
   allowlist: SweepAllowlist | null;
   /** A JSON parse error from the editor — surfaced as a scenarios issue. */
   scenarioParseError?: string | null;
@@ -187,11 +186,17 @@ export interface ValidateArgs {
 /**
  * The submit button is enabled IFF this returns `valid`.
  *
- * The four things the plan requires before a submit is even possible: at least
- * one symbol, a well-formed window, at least one declared arm, and a token.
+ * The three things required before a submit is even possible: at least one
+ * symbol, a well-formed window, and at least one declared arm.
+ *
+ * There is no fourth. A submit token used to be one — the operator pasted
+ * `SWEEP_SUBMIT_TOKEN` into the form — and FC-096 Phase D retired it: the
+ * browser's IAP session is the credential now, and the page cannot see whether
+ * it is still valid, so there is nothing here to validate. A signed-out session
+ * surfaces when the submit comes back 401, as its own state.
  */
 export function validateSpec(args: ValidateArgs): SpecValidation {
-  const { spec, holdoutEnabled, token, allowlist, scenarioParseError } = args;
+  const { spec, holdoutEnabled, allowlist, scenarioParseError } = args;
   const caps = allowlist?.caps ?? FALLBACK_CAPS;
   const issues: SpecIssue[] = [];
 
@@ -343,11 +348,6 @@ export function validateSpec(args: ValidateArgs): SpecValidation {
         `${cellCount} cells ((${scenarios.length} arms + base) x ${symbols.length} symbols x ` +
         `${splitCount} split${splitCount === 1 ? '' : 's'}) exceeds the cap of ${caps.max_cells}.`,
     });
-  }
-
-  // --- token ---
-  if (!token.trim()) {
-    issues.push({ field: 'token', message: 'A submit token is required.' });
   }
 
   return { valid: issues.length === 0, issues, cellCount, splitCount };
