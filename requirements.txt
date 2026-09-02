@@ -95,10 +95,37 @@ gunicorn>=21.2.0,<22.0.0
 # dashboard's own requirements.txt pins the same two exactly, and the two
 # images are built and deployed independently.
 #
+# **PINNED, not ranged, and the pins are the DASHBOARD's exact ones** — one ASGI
+# resolution in every environment. Ranges here turned `main` red twice: a fresh
+# CI install of `fastapi>=0.109.0,<1.0.0` resolved **fastapi 0.141.1 with
+# starlette 1.6.0** (a major bump), while every dev and dashboard environment
+# runs 0.109.0/0.35.1. Under starlette 1.x, `app.include_router(...)` appends a
+# single `_IncludedRouter` object with no `.path` instead of flattening the
+# router's routes into `app.routes`, so route enumeration came back EMPTY and a
+# route-registration test failed in CI on a diff that touched none of it.
+#
+# The bot image never runs the code those versions would change — but CI tests
+# the dashboard's routers in this image, so testing them against a FastAPI we do
+# not ship tests something that does not exist. `starlette` is pinned too
+# because `fastapi==0.109.0` only constrains it to `>=0.35.0,<0.36.0`, which is
+# still two possible versions. **`httpx` is pinned for the same reason and it is
+# not optional**: `starlette==0.35.1`'s `TestClient` constructs
+# `httpx.Client(app=...)`, and httpx 0.28 REMOVED that argument. httpx is not
+# declared anywhere in this file's own dependencies — it arrives transitively
+# through `jupyter`, at whatever is newest — so pinning fastapi without it
+# simply swapped one version drift for another (measured: 6 tests failed with
+# `TypeError: Client.__init__() got an unexpected keyword argument 'app'`).
+#
+# Consequence, measured: `streamlit` (an optional analysis dependency) resolves
+# to 1.56.0 rather than 1.63.0, because current streamlit requires
+# `starlette>=0.46`. Nothing in this repo imports streamlit.
+#
 # NOTE: `requirements.txt` is inside `engine_identity`'s digest (FC-096
-# Phase B PR-a fix 3), so adding these two lines MOVES the identity and
+# Phase B PR-a fix 3), so editing these lines MOVES the identity and
 # invalidates every stored dedup key once. That is the documented, accepted
 # cost of any dependency edit; `ENGINE_VERSION` is deliberately NOT bumped,
 # because an ASGI server cannot move a replay's numerics.
-fastapi>=0.109.0,<1.0.0
-uvicorn>=0.27.0,<1.0.0
+fastapi==0.109.0
+uvicorn==0.27.0
+starlette==0.35.1
+httpx==0.26.0

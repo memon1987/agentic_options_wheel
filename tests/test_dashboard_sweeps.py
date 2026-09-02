@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2807,3 +2808,88 @@ class TestTheRouterImportsWithoutHttpx:
         paths = {r.path for r in v2.router.routes}
         assert "/sims/run" in paths
         assert "/sweeps" in paths
+
+
+class TestTheAsgiStackIsPinnedAndMatchesTheDashboard:
+    """One ASGI resolution in every environment, asserted rather than assumed.
+
+    Ranges turned `main` red twice. A fresh CI install of
+    `fastapi>=0.109.0,<1.0.0` resolves to whatever is newest — measured on the
+    failing build: **fastapi 0.141.1 with starlette 1.6.0**, against the
+    0.109.0/0.35.1 that every dev environment and the dashboard image run.
+    Starlette 1.x changed `include_router`: `app.routes` gains a single
+    `_IncludedRouter` with no `.path` instead of the flattened `Route` objects,
+    so route enumeration returns `[]` and a route-registration test fails on a
+    diff that touched none of it.
+
+    The bot image does not SERVE the dashboard's routers, but CI exercises them
+    in it — so an unpinned stack means CI tests a FastAPI the project does not
+    ship. Pinning is what makes the test and the deployment the same thing.
+
+    Read from SOURCE: no import, so this runs in every environment including the
+    one where the versions are wrong.
+    """
+
+    # `httpx` belongs in this set even though it is not an ASGI server:
+    # `starlette==0.35.1`'s TestClient constructs `httpx.Client(app=...)`,
+    # an argument httpx 0.28 removed, and httpx reaches this image only as
+    # an undeclared transitive of `jupyter`. Pinning FastAPI without it just
+    # moves the drift.
+    ASGI = ("fastapi", "uvicorn", "starlette", "httpx")
+
+    @staticmethod
+    def _pins(path):
+        """`{name: version}` for exact `==` pins; ranges are reported as None."""
+        out = {}
+        for raw in path.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            name = re.split(r"[=<>!~\[]", line, 1)[0].strip().lower()
+            if "==" in line:
+                out[name] = line.split("==", 1)[1].strip()
+            else:
+                out[name] = None
+        return out
+
+    def test_the_bot_image_pins_them_exactly(self):
+        bot = self._pins(BACKEND.parent.parent / "requirements.txt")
+        for name in self.ASGI:
+            assert name in bot, (
+                f"{name} is missing from the bot requirements.txt; the sim "
+                f"service runs in that image and needs it"
+            )
+            assert bot[name] is not None, (
+                f"{name} is RANGED in the bot requirements.txt. A fresh CI "
+                f"install then resolves whatever is newest — that is how "
+                f"starlette 1.6.0 reached CI while every other environment ran "
+                f"0.35.1. Pin it."
+            )
+
+    def test_they_match_the_dashboard_image_exactly(self):
+        """The dashboard is what actually SERVES these routers.
+
+        Two images running two FastAPIs means CI's verdict is about neither.
+        `starlette` is not listed in the dashboard's file (it arrives through
+        FastAPI), so it is compared only when both name it.
+        """
+        bot = self._pins(BACKEND.parent.parent / "requirements.txt")
+        dash = self._pins(BACKEND / "requirements.txt")
+        for name in self.ASGI:
+            if name not in dash:
+                continue
+            assert bot[name] == dash[name], (
+                f"{name}: bot pins {bot[name]!r}, dashboard pins "
+                f"{dash[name]!r}. They must be identical — the dashboard image "
+                f"serves the routers and the bot image tests them."
+            )
+
+    def test_the_pinned_starlette_is_inside_the_pinned_fastapis_range(self):
+        """0.109.0 allows `>=0.35.0,<0.36.0`; the pin picks one of the two.
+
+        Stated so a future FastAPI bump that forgets starlette fails here rather
+        than in CI, where it presents as an unrelated route test.
+        """
+        bot = self._pins(BACKEND.parent.parent / "requirements.txt")
+        assert bot["fastapi"] == "0.109.0"
+        assert bot["starlette"].startswith("0.35."), bot["starlette"]
