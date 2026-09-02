@@ -27,6 +27,16 @@ class FrontendErrorReport(BaseModel):
     component: Optional[str] = Field(None, description="React component name")
 
 
+# FC-096 Phase D — **this route is UNGATED behind IAP, by decision.** It is the
+# only POST on this service that a *viewer's browser* makes: the SPA's error
+# boundary posts here on any unhandled frontend exception, and viewers are
+# read-only accounts whose browsers still throw. Putting the OPERATORS chain in
+# front of it would turn every viewer's crash into a silent 403 — losing exactly
+# the reports the sink exists to collect, from exactly the sessions nobody is
+# watching. What Phase D does for this endpoint is remove the ANONYMOUS caller:
+# today it is world-reachable and any stranger can inject arbitrary lines into
+# the log sink (FC-094); after the flip, IAP admission is required to reach it
+# at all, and every report carries an authenticated session behind it.
 @router.post("")
 async def report_frontend_error(body: FrontendErrorReport):
     """
@@ -36,14 +46,21 @@ async def report_frontend_error(body: FrontendErrorReport):
     Cloud Logging sink, tagged with event_category="frontend"
     so it can be queried separately from backend errors.
     """
+    # EVERY caller-controlled field is truncated, not just `stack`. This sink
+    # is reachable by anyone the perimeter admits (anonymous today; every
+    # signed-in viewer after the FC-096 Phase D flip) and it writes straight
+    # through to Cloud Logging and on into BigQuery. An untruncated `error` or
+    # `url` is an unbounded write into log storage — the same exposure the
+    # `stack[:500]` bound already acknowledged, left open on the three fields
+    # beside it.
     logger.error(
         "Frontend error reported",
         event_category="frontend",
         event_type="frontend_error",
-        error=body.error,
+        error=body.error[:500],
         stack=body.stack[:500],
-        url=body.url,
-        component=body.component,
+        url=body.url[:500],
+        component=body.component[:200] if body.component else body.component,
     )
 
     return {"status": "logged"}

@@ -20,3 +20,21 @@ structlog==23.3.0
 
 # Utils
 python-dotenv==1.0.0
+
+# FC-096 Phase D PR-1 — IAP signed-assertion verification
+# (`services/auth.py`). `google-auth` supplies
+# `google.oauth2.id_token.verify_token`, which is what validates the
+# `x-goog-iap-jwt-assertion` header against the IAP public keys.
+#
+# **`cryptography` is NOT optional here, and its absence is SILENT.**
+# IAP signs its assertions with **ES256**, and `google/auth/crypt/__init__.py`
+# does `try: from google.auth.crypt import es256 / except ImportError: es256 =
+# None`. `cryptography` is an extras-only dependency of google-auth
+# (`google-auth[pyopenssl]`), so without it installed `google.auth.crypt.es256`
+# binds to **None** and every ES256 verification fails at request time — with
+# nothing failing at import, at deploy, or in a smoke test. Reproduced in this
+# repo's dev venv before this pin existed (google-auth 2.43.0,
+# `google.auth.crypt.es256` → None). The regression is asserted directly by
+# `tests/test_dashboard_iap_auth.py::...::test_es256_is_bound`.
+google-auth==2.43.0
+cryptography==46.0.7
