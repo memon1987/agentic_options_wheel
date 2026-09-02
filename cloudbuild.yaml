@@ -871,6 +871,87 @@ steps:
     waitFor: ['smoke-test-dashboard']
 
   # ---------------------------------------------------------------------------
+  # FIRST DEPLOY ONLY — create `sim-service` before the canary chain touches it.
+  #
+  # `gcloud run deploy --no-traffic` is REJECTED when the service does not exist:
+  #   ERROR: (gcloud.run.deploy) --no-traffic not supported when creating a new
+  #   service.
+  # ...which is exactly what killed build `2e1b180`'s deploy. The other three
+  # chains never met it because their services were provisioned by hand long
+  # before their steps existed; `sim-service` is the first service this repo
+  # creates from cloudbuild, so it is the first to need a creation path at all.
+  #
+  # Deliberately a SEPARATE step rather than a branch inside `deploy-sim-canary`.
+  # That step's full flag set is frozen in `tests/fixtures/cloudbuild_contract.json`
+  # and `--no-traffic` / `--tag=canary` are the flags that MAKE it a canary; moving
+  # them behind a shell variable so they could be omitted at creation would have
+  # meant deleting them from the freeze, and the freeze is what stops a canary
+  # quietly becoming a live deploy. Here the canary step is byte-identical to what
+  # it was and only gains a `waitFor` edge.
+  #
+  # The bootstrap revision deliberately takes NO `--revision-suffix` and NO
+  # `--tag`: it must not collide with the revision the next step names, and the
+  # smoke reads the canary-tagged URL, which only that next revision has. So the
+  # first build produces two revisions — this one serving 100% for a minute or
+  # two, then the canary, which `promote-sim` moves traffic to. Every later build
+  # is a no-op here (one `describe`, ~1 s).
+  #
+  # `promote-sim` is UNCHANGED and does NOT branch on the marker below: on both
+  # paths the canary revision is created `--no-traffic`, so `--to-latest` is
+  # exactly the right instruction either way. The marker is written for the LOG,
+  # so a first build explains itself, and is asserted by the contract test rather
+  # than consumed by a later step.
+  #
+  # Same flags as the canary deploy minus the three traffic/naming ones — an
+  # `--set-env-vars` drift between the two would leave the bootstrap revision
+  # running a different configuration than everything after it.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        if gcloud run services describe sim-service --region=us-central1 \
+             --format='value(metadata.name)' >/dev/null 2>&1; then
+          echo "exists" > /workspace/sim-service-bootstrap.txt
+          echo "sim-service already exists — the canary chain handles it from here"
+          exit 0
+        fi
+        echo "sim-service does not exist. FIRST DEPLOY: creating it WITHOUT"
+        echo "--no-traffic (Cloud Run rejects that flag at creation) and without"
+        echo "a revision suffix or tag, so the canary step can name its own."
+        if ! gcloud run deploy sim-service \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+          --region=us-central1 \
+          --command=python \
+          --args=deploy/sim_service.py \
+          --no-allow-unauthenticated \
+          --no-cpu-throttling \
+          --memory=2Gi \
+          --cpu=1 \
+          --concurrency=1 \
+          --max-instances=2 \
+          --min-instances=0 \
+          --timeout=120 \
+          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/settings.yaml,GIT_COMMIT=$COMMIT_SHA,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,SIM_ARTIFACT_BUCKET=gen-lang-client-0607444019-options-data \
+          --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
+          > /workspace/create-log-sim-service.txt 2>&1; then
+          cat /workspace/create-log-sim-service.txt
+          if grep -q 'already exists' /workspace/create-log-sim-service.txt; then
+            echo "another build created it first — that is success, not failure"
+            echo "created" > /workspace/sim-service-bootstrap.txt
+            exit 0
+          fi
+          echo "FAIL: could not create sim-service"
+          exit 1
+        fi
+        cat /workspace/create-log-sim-service.txt
+        echo "created" > /workspace/sim-service-bootstrap.txt
+        echo "sim-service CREATED; the canary step now deploys this build's revision"
+    id: 'create-sim-service-if-absent'
+    waitFor: ['promote-dashboard', 'serialize-builds']
+
+  # ---------------------------------------------------------------------------
   # FC-096 Phase B PR-c — the interactive `sim-service` chain (4th canary chain).
   #
   # Same image as the wheel (one image; the COMMAND selects the work — FC-075's
@@ -992,7 +1073,7 @@ steps:
         echo "$${REV}" > /workspace/rev-sim-service.txt
         echo "Deployed canary revision: $${REV}"
     id: 'deploy-sim-canary'
-    waitFor: ['promote-dashboard', 'serialize-builds']
+    waitFor: ['create-sim-service-if-absent', 'promote-dashboard', 'serialize-builds']
 
   # LIGHT smoke, in two parts, and the split is deliberate (plan §B3).
   #

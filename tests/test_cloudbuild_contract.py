@@ -1650,3 +1650,180 @@ def test_gate_ignores_malformed_entries(gate_program):
     """A build row missing id or createTime must not crash the gate or be counted."""
     junk = [ME, {"id": "no-createtime"}, {"createTime": "2026-08-29T00:00:00.0Z"}, {}]
     assert run_gate_decision(gate_program, ME["id"], ME["createTime"], junk) == "PROCEED"
+
+
+# --------------------------------------------------------------------------
+# 5e. The first-deploy bootstrap (FC-096 Phase B PR-c follow-up).
+# --------------------------------------------------------------------------
+SIM_CREATE_STEP = "create-sim-service-if-absent"
+
+
+def run_bootstrap(script, tmp_path, *, exists, superseded=False,
+                  deploy_fails_with=""):
+    """Execute the bootstrap step's real bash with a stub `gcloud`.
+
+    The `gate_decision.py` idiom, applied to a shell step: the SHIPPED script is
+    run, not a paraphrase of it. Two substitutions make that possible —
+    Cloud Build's `$VAR` expansion (`simulate_substitution`, the same one every
+    other test here uses) and `/workspace`, which is absolute in the container
+    and becomes a tmp dir so the test cannot write to a real one.
+
+    Returns `(exit code, stdout+stderr, marker file contents, deploy argv)`.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if superseded:
+        (workspace / "superseded").write_text("")
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = workspace / "gcloud-calls.txt"
+    stub = bindir / "gcloud"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {calls}\n'
+        'case "$1 $2" in\n'
+        '  "run services")\n'
+        f'    exit {0 if exists else 1} ;;\n'
+        '  "run deploy")\n'
+        + (f'    echo {shlex.quote(deploy_fails_with)}; exit 1 ;;\n'
+           if deploy_fails_with else '    echo "Deploying..."; exit 0 ;;\n')
+        + 'esac\n'
+        'exit 0\n'
+    )
+    stub.chmod(0o755)
+
+    body = simulate_substitution(script).replace("/workspace", str(workspace))
+    result = subprocess.run(
+        ["bash", "-c", body], capture_output=True, text=True,
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+    )
+    marker = workspace / "sim-service-bootstrap.txt"
+    return (
+        result.returncode,
+        result.stdout + result.stderr,
+        marker.read_text().strip() if marker.exists() else None,
+        calls.read_text().splitlines() if calls.exists() else [],
+    )
+
+
+def test_the_bootstrap_step_exists_and_is_marker_gated(by_id):
+    assert SIM_CREATE_STEP in by_id, (
+        "`gcloud run deploy --no-traffic` is rejected when the service does not "
+        "exist, so the sim chain needs a creation path; build 2e1b180 died here."
+    )
+    script = script_of(by_id[SIM_CREATE_STEP])
+    assert script.strip().startswith(MARKER_CHECK), (
+        "a superseded build must not create the service either"
+    )
+
+
+def test_the_bootstrap_runs_before_the_canary_and_behind_the_promotes(by_id, steps):
+    wait = set(by_id[SIM_CREATE_STEP].get("waitFor") or [])
+    assert "promote-dashboard" in wait, (
+        "creating a service can fail for reasons unrelated to the trading bot; "
+        "it must land after the production revisions have their traffic"
+    )
+    canary_wait = set(by_id[CHAINS["sim-service"]["deploy"]].get("waitFor") or [])
+    assert SIM_CREATE_STEP in canary_wait, (
+        "the canary deploy must not run before the service it deploys into exists"
+    )
+    ids = [s["id"] for s in steps]
+    assert ids.index(SIM_CREATE_STEP) < ids.index(CHAINS["sim-service"]["deploy"])
+
+
+def test_the_bootstrap_deploy_omits_the_flags_creation_rejects(by_id):
+    """The whole point: no `--no-traffic`, and no name the canary step wants.
+
+    `--revision-suffix` and `--tag` are absent so this revision cannot collide
+    with the canary's, and so the canary keeps sole ownership of the `canary`
+    tag the smoke test reads its URL from.
+    """
+    script = script_of(by_id[SIM_CREATE_STEP])
+    create = script[script.index("gcloud run deploy"):]
+    create = create[:create.index("> ")]
+    for forbidden in ("--no-traffic", "--tag=", "--revision-suffix"):
+        assert forbidden not in create, (
+            f"the creation deploy must not pass {forbidden}: Cloud Run rejects "
+            f"--no-traffic outright at creation, and a tag or suffix here would "
+            f"collide with the canary revision the next step names."
+        )
+
+
+def test_the_bootstrap_and_the_canary_agree_on_configuration(by_id):
+    """Two deploys of one service must not disagree about what it runs.
+
+    An `--set-env-vars` or `--set-secrets` drift would leave the bootstrap
+    revision — which SERVES traffic for a minute or two on the first build —
+    configured differently from everything after it.
+    """
+    create = script_of(by_id[SIM_CREATE_STEP])
+    canary = script_of(by_id[CHAINS["sim-service"]["deploy"]])
+    for shared in ("--command=python", "--args=deploy/sim_service.py",
+                   "--no-allow-unauthenticated", "--no-cpu-throttling",
+                   "--memory=2Gi", "--cpu=1", "--concurrency=1",
+                   "--max-instances=2", "--min-instances=0", "--timeout=120"):
+        assert shared in create and shared in canary, shared
+    for prefix in ("--set-env-vars=", "--set-secrets="):
+        c = create[create.index(prefix):].split("\n", 1)[0].rstrip(" \\")
+        k = canary[canary.index(prefix):].split("\n", 1)[0].rstrip(" \\")
+        assert c == k, f"{prefix} differs:\n  create: {c}\n  canary: {k}"
+
+
+def test_the_promote_does_not_branch_on_the_bootstrap_marker(by_id):
+    """Decided and documented: `--to-latest` is right on BOTH paths.
+
+    The canary revision is created `--no-traffic` whether the service was just
+    created or already existed, so promoting to latest is exactly the required
+    instruction either way. The marker is written for the log — so a first build
+    explains itself — and is asserted here rather than consumed downstream,
+    which is what stops it from silently becoming load-bearing.
+    """
+    promote = script_of(by_id[CHAINS["sim-service"]["promote"]])
+    assert "sim-service-bootstrap.txt" not in promote
+
+
+@pytest.mark.parametrize("exists,expect_deploy,expect_marker", [
+    (False, True, "created"),    # first build: create it
+    (True, False, "exists"),     # every build after: one describe, no-op
+])
+def test_the_branch_behaves(tmp_path, by_id, exists, expect_deploy,
+                            expect_marker):
+    """The SHIPPED script, executed, against a stub `gcloud`."""
+    code, out, marker, calls = run_bootstrap(
+        script_of(by_id[SIM_CREATE_STEP]), tmp_path, exists=exists)
+    assert code == 0, out
+    assert marker == expect_marker
+    deploys = [c for c in calls if c.startswith("run deploy")]
+    assert bool(deploys) is expect_deploy, calls
+    if expect_deploy:
+        assert "--no-traffic" not in deploys[0]
+        assert "--revision-suffix" not in deploys[0]
+
+
+def test_a_superseded_build_creates_nothing(tmp_path, by_id):
+    code, out, marker, calls = run_bootstrap(
+        script_of(by_id[SIM_CREATE_STEP]), tmp_path, exists=False,
+        superseded=True)
+    assert code == 0 and marker is None
+    assert calls == [], "a superseded build touched Cloud Run"
+    assert "skip: superseded" in out
+
+
+def test_a_lost_creation_race_is_success_not_failure(tmp_path, by_id):
+    """Two builds can reach this at once; `already exists` means it worked."""
+    code, out, marker, _calls = run_bootstrap(
+        script_of(by_id[SIM_CREATE_STEP]), tmp_path, exists=False,
+        deploy_fails_with="ERROR: Resource 'sim-service' already exists.")
+    assert code == 0, out
+    assert marker == "created"
+
+
+def test_a_real_creation_failure_fails_the_build(tmp_path, by_id):
+    """...and anything else must not be waved through as a race."""
+    code, out, marker, _calls = run_bootstrap(
+        script_of(by_id[SIM_CREATE_STEP]), tmp_path, exists=False,
+        deploy_fails_with="ERROR: PERMISSION_DENIED on run.services.create")
+    assert code == 1
+    assert "FAIL: could not create sim-service" in out
+    assert marker is None
