@@ -22,14 +22,17 @@ What is actually at risk:
 from __future__ import annotations
 
 import gzip
-import importlib.util
 import json
 
 import pytest
 
 # See tests/_dashboard_path.py: the backend is APPENDED and the repo root kept
 # ahead of it, so `import main` still resolves to the CLI.
-from tests._dashboard_path import add_dashboard_backend_to_path  # noqa: E402
+from tests._dashboard_path import (  # noqa: E402
+    HAS_FASTAPI,
+    HAS_TESTCLIENT,
+    add_dashboard_backend_to_path,
+)
 
 add_dashboard_backend_to_path()
 
@@ -579,7 +582,9 @@ def _spec(**overrides):
 # --------------------------------------------------------------------------- #
 # 5. The endpoint
 # --------------------------------------------------------------------------- #
-_HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+# From `tests/_dashboard_path.py`; see its comment for why FastAPI alone is
+# not a sufficient guard any more.
+_HAS_FASTAPI = HAS_FASTAPI
 
 
 @pytest.mark.skipif(not _HAS_FASTAPI,
@@ -737,6 +742,9 @@ class TestTheArtifactEndpoint:
         assert ("/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}"
                 in paths)
 
+    @pytest.mark.skipif(not HAS_TESTCLIENT,
+                        reason="fastapi.testclient is built on httpx, which the "
+                               "bot CI image does not have")
     def test_it_does_not_shadow_the_sweep_detail_route(self, wired, monkeypatch):
         """`/sweeps/{run_id}` is registered BEFORE the artifact route, and
         Starlette matches routes in order — so assert the longer path still

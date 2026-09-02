@@ -22,6 +22,7 @@ path in this order.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -40,3 +41,31 @@ def add_dashboard_backend_to_path() -> None:
     while root in sys.path:
         sys.path.remove(root)
     sys.path.insert(0, root)
+
+
+# --------------------------------------------------------------------------- #
+# Which optional dependencies this environment actually has.
+# --------------------------------------------------------------------------- #
+# Defined ONCE, here, because the alternative drifted and turned `main` red.
+#
+# FC-096 Phase B PR-c added `fastapi` + `uvicorn` to the repo-root
+# `requirements.txt` (the sim service runs in the bot image on a different
+# command). That changed the BOT CI image: it now has FastAPI, so every test
+# class guarded on FastAPI alone stopped skipping there and started running —
+# including classes that need **httpx**, which lives only in
+# `dashboard/backend/requirements.txt` and reached the CI image before only as a
+# transitive extra of `jupyter`. `starlette.testclient` raises at IMPORT without
+# it, and `httpx.AsyncClient` cannot be monkeypatched if the module will not
+# import. Twenty-four tests that had always been skipped in CI began failing in
+# it, on a build whose diff touched none of them.
+#
+# The lesson, written where the next person will hit it: **a guard on FastAPI is
+# not a guard on the dashboard's dependency set.** Anything reaching for httpx —
+# `fastapi.testclient` included, since that is what it is built on — gates on
+# `HAS_TESTCLIENT`.
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+HAS_HTTPX = importlib.util.find_spec("httpx") is not None
+
+#: FastAPI **and** httpx. Required by `fastapi.testclient.TestClient` and by any
+#: test that monkeypatches `httpx.AsyncClient`.
+HAS_TESTCLIENT = HAS_FASTAPI and HAS_HTTPX

@@ -22,7 +22,6 @@ artifact bucket is switched off, so nothing here constructs a GCS or BigQuery
 client. ``tests/conftest.py`` blocks the ambient paths as well.
 """
 
-import importlib.util
 import json
 import logging
 import signal
@@ -33,6 +32,7 @@ from datetime import date, datetime, timedelta
 import pytest
 
 import deploy.sim_service as sim
+from tests._dashboard_path import HAS_FASTAPI, HAS_TESTCLIENT
 from src.backtesting.data.fetch_guard import (
     ChainFetchRefusingProvider, ColdChainFetchRefused, REFUSAL_EVENT,
 )
@@ -46,13 +46,13 @@ from src.backtesting.scenarios.runner import ScenarioResult, SweepResult
 # gives: a module-level importorskip aborts collection of the whole file and
 # silently skips every pure test above it too, turning CI green while testing
 # nothing.
-_HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
-
-# `fastapi.testclient` needs httpx, which this repo depends on only TRANSITIVELY
-# (jupyterlab pulls it into the bot image today). A guard on FastAPI alone would
-# therefore turn red the day that transitive edge moves — which is the same
-# ambient-environment class three builds have already died of.
-_HAS_TESTCLIENT = _HAS_FASTAPI and importlib.util.find_spec("httpx") is not None
+# Imported from `tests/_dashboard_path.py`, which defines them once for the
+# whole suite. `fastapi.testclient` is built on httpx, and httpx reached the bot
+# CI image only as a TRANSITIVE extra of `jupyter` — an edge that has since
+# moved, which is what turned `main` red once `requirements.txt` gained FastAPI
+# and stopped these classes from skipping there.
+_HAS_FASTAPI = HAS_FASTAPI
+_HAS_TESTCLIENT = HAS_TESTCLIENT
 
 
 # ==========================================================================
