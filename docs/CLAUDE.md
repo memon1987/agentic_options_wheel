@@ -1096,6 +1096,67 @@ because shortening the bound is the dangerous direction.
   `execution_name` is stored so an operator can go and look. A `submitted` row with
   no `running` row after 10 minutes renders as "stuck" — a label, not a cancel.
 
+### The IAP roles layer (FC-096 Phase D PR-1) — shipped, INERT until the flip
+
+`dashboard/backend/services/auth.py` verifies the signed
+`x-goog-iap-jwt-assertion` header and decides who may write. It is deployed but
+**does nothing yet**: until the operator turns IAP on, no request carries an
+assertion, so every write falls through to the `SWEEP_SUBMIT_TOKEN` gate exactly
+as before (`TestThePr1NoOpProbe` pins that byte-for-byte).
+
+| request carries | outcome on the four write routes |
+|---|---|
+| no assertion | the existing bearer-token gate, unchanged (503 unconfigured / 401 mismatch) |
+| an assertion that does not verify | **401**, log event `iap_assertion_invalid`. **Never** a fall-through to the token — a forged header or a broken audience must be loud |
+| a valid assertion, email in `OPERATORS` | allowed; the bearer token is **ignored** |
+| a valid assertion, email NOT in `OPERATORS` | **403** naming the mechanism. No token fallback, or one leaked token defeats the migration |
+
+Exempt from the chain, on the record:
+`POST /api/v2/bot-health/pause-alert-check` (its caller is the daily scheduler's
+service account — a uniform gate would 403 it every evening and take the
+drawdown alert silently offline) and `POST /api/errors` (viewers' browsers post
+it; IAP admission is what removes today's anonymous log-injection exposure).
+
+Two env vars, both in the dashboard's `--set-env-vars` in `cloudbuild.yaml`
+(which REPLACES the whole env set on every deploy, so an out-of-band value
+survives only until the next merge) and frozen in
+`tests/fixtures/cloudbuild_contract.json`:
+
+- **`IAP_AUDIENCE`** — `/projects/799970961417/locations/us-central1/services/options-wheel-dashboard`.
+  Leading slash, project **NUMBER**, not `$PROJECT_ID`. Unset or blank ⇒ every
+  assertion is refused (401, log event `iap_audience_unconfigured`) — fail-closed
+  by design, and post-flip a total write outage.
+- **`OPERATORS`** — **space**-separated emails, casefolded and stripped on both
+  sides, matched against the JWT's **bare** `email` claim (no
+  `accounts.google.com:` prefix — that belongs to the unsigned header, which this
+  code never reads). Space, not comma: a comma is `--set-env-vars`' own separator
+  between variables. Unset/empty ⇒ 403 saying the *revision* has no allowlist,
+  never "you are a viewer".
+
+**Recovery path — no build required, minutes:**
+
+```bash
+# Widen or repair the write allowlist on the running service
+gcloud run services update options-wheel-dashboard --region=us-central1 \
+  --update-env-vars OPERATORS='zeshan@tkzmgroup.com someone@else.com'
+
+# Same shape if the audience is wrong or missing
+gcloud run services update options-wheel-dashboard --region=us-central1 \
+  --update-env-vars IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard
+```
+
+This creates a new revision without rebuilding the image. **It is undone by the
+next merge** (`--set-env-vars` replaces the env set), so any lasting change has
+to land in `cloudbuild.yaml` and be re-frozen in the fixture.
+
+**`cryptography` is load-bearing here and its absence is silent.** IAP signs with
+ES256; google-auth binds `google.auth.crypt.es256 = None` when `cryptography` is
+missing, and every verification then fails at request time with nothing failing
+at import or deploy. It is pinned in `dashboard/backend/requirements.txt` and
+declared in the root `requirements.txt` (so the ES256 round-trip test runs in the
+bot CI image rather than skipping). `tests/test_dashboard_iap_auth.py::test_es256_is_bound`
+is deliberately un-skippable.
+
 ### Verification Steps
 
 After any change:

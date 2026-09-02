@@ -6,6 +6,21 @@ pytz>=2023.3,<2026.0
 # Google Cloud services
 google-cloud-bigquery>=3.0.0,<4.0.0
 google-cloud-storage>=2.10.0,<3.0.0
+# `google-auth` itself arrives transitively (google-cloud-bigquery requires it),
+# but its **ES256** signer does not: `cryptography` is an extras-only dependency
+# of google-auth, and without it `google/auth/crypt/__init__.py` swallows the
+# ImportError and binds `google.auth.crypt.es256 = None`. IAP signs its
+# assertions with ES256 (FC-096 Phase D), so `dashboard/backend/services/auth.py`
+# cannot verify a single one in an environment missing this package — silently,
+# at request time only. It is declared HERE as well as in the dashboard image's
+# own pins because the ES256 round-trip test runs in the bot CI image, and a
+# test that skips in CI is not a regression guard.
+#
+# NOTE: this file is inside `engine_identity`'s digest (FC-096 Phase B PR-a),
+# so this line MOVES the identity and invalidates every stored dedup key once —
+# the documented, accepted cost of any dependency edit here. `ENGINE_VERSION` is
+# deliberately NOT bumped: a JWT library cannot move a replay's numerics.
+cryptography>=42.0.0,<47.0.0
 
 # Data manipulation and analysis
 pandas>=2.0.0,<3.0.0
