@@ -94,6 +94,7 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-060-scenario-store-ui.md](fc-060-scenario-store-ui.md) — FC-060 Layers 3+4 — scenario store, backtest-sweep Job, sweep API, /sims page, status: Done
 - [fc-096-a.md](fc-096-a.md) — FC-096 Phase A — data foundation: candidate universe, weekly backfill Job, DTE-21 lake, status: Done
 - [fc-096-b.md](fc-096-b.md) — FC-096 Phase B — sim service, detail artifacts, engine-identity dedup, pinning + battery, status: Done
+- [fc-096-c.md](fc-096-c.md) — FC-096 Phase C — covered-call selector: profile-aware replay on a synthetic lot, status: Draft
 - [fc-065.md](fc-065.md) — One floor, one path, one decision record — the covered-call gating layer, status: Done
 - [fc-068.md](fc-068.md) — Delete the dead engine call path; repoint the backtest to the real pipeline, status: Done
 - [fc-069.md](fc-069.md) — FC-069 — the decommission sweep. 15 decision cards for operator sign-off, status: DONE
