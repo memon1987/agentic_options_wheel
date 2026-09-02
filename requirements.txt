@@ -87,3 +87,18 @@ schedule>=1.2.0,<2.0.0
 # Web server for Cloud Run
 flask>=3.0.0,<4.0.0
 gunicorn>=21.2.0,<22.0.0
+
+# The FC-096 Phase B sim service (deploy/sim_service.py). It runs in THIS
+# image on a different command, so its web stack has to be here: the plan's
+# non-goal is "no new image", and the bot image had no ASGI stack at all.
+# Ranges rather than pins, like every other entry in this file; the
+# dashboard's own requirements.txt pins the same two exactly, and the two
+# images are built and deployed independently.
+#
+# NOTE: `requirements.txt` is inside `engine_identity`'s digest (FC-096
+# Phase B PR-a fix 3), so adding these two lines MOVES the identity and
+# invalidates every stored dedup key once. That is the documented, accepted
+# cost of any dependency edit; `ENGINE_VERSION` is deliberately NOT bumped,
+# because an ASGI server cannot move a replay's numerics.
+fastapi>=0.109.0,<1.0.0
+uvicorn>=0.27.0,<1.0.0

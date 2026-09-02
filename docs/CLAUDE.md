@@ -992,10 +992,38 @@ After any change:
 
 ## Deploy / CI — `cloudbuild.yaml`
 
-One Cloud Build trigger on `main` builds two images and runs three canary chains
-— `options-wheel-strategy`, `covered-call-engine`, `options-wheel-dashboard` —
-each `deploy → smoke-test → promote`. **Since FC-084 builds of that trigger are
+One Cloud Build trigger on `main` builds two images and runs **four** canary
+chains — `options-wheel-strategy`, `covered-call-engine`,
+`options-wheel-dashboard` and (since FC-096 Phase B PR-c) `sim-service` — each
+`deploy → smoke-test → promote`. **Since FC-084 builds of that trigger are
 serialized, and each build deploys a revision it named itself.**
+
+**The fourth chain, and why it sits where it does.** `sim-service` runs the
+STRATEGY image on a different command (`python deploy/sim_service.py`) and is
+the interactive simulation service: `POST /simulate` validates, guards, dedups
+and returns a `run_id` in seconds, then replays on a worker thread. Its chain
+waits on `promote-dashboard` and is listed AHEAD of the two Job deploys, so a
+failure in it lands only after the three production services have their traffic
+— the rule the Job steps already follow, applied to another measurement tool.
+The Job steps deliberately do NOT wait on `promote-sim`: that would let a broken
+sim chain stop the sweep and backfill Jobs from picking up this build's image,
+which is the same failure from the other direction. Two deploy flags are
+load-bearing and pinned by `tests/test_cloudbuild_contract.py`:
+`--no-cpu-throttling` (instance-based billing — under request-based billing the
+CPU is throttled the moment the 202 returns and the background replay starves,
+because nothing else ever supplies an in-flight request) and `--concurrency=1`
+(the engine mutates process-global state during a replay, so two replays in one
+process corrupt each other's numbers without crashing). Unlike the wheel and
+covered-call steps, this one DOES pass `--set-secrets`: it creates its own
+service, so a first deploy without the bindings produces a container whose
+`Config()` cannot validate. `smoke-test-sim` polls readiness (hard gate), then
+asserts a non-empty `/health` engine identity and a `{200|202}` from
+`/simulate`; it degrades with the named markers `SMOKE_SIM_HTTP_UNAVAILABLE`
+(no OIDC token mintable from Cloud Build — a capability this project has never
+exercised) and `SMOKE_SIM_SPEC_UNCOVERED` (409: the smoke spec names a window
+the chain lake does not hold) rather than reddening every merge, and rollout
+step 3 is required to grep the build log for `PASS: /health` and resolve either
+marker if it appears.
 
 **`serialize-builds` gates the deploys** (`waitFor: ['push-bot-image']`). It must
 be **listed after** `push-bot-image`, not first: Cloud Build resolves `waitFor`
@@ -1022,22 +1050,30 @@ deploy/smoke/promote step begins with**
 build still validates and pushes its image, which is what makes rollback-by-SHA
 possible.
 
-**Timing budget.** Measured single-build runtime is **max 827 s** (2026-08-31;
-the earlier max-798 s figure predates the sweep-Job step), p95 662 s (queue time
-sits on top and does not count against the build timeout: ≤110 s). When one
-build waits for an older one:
+**Timing budget** (redone by FC-096 Phase B PR-c for the fourth chain).
+Measured single-build runtime before that PR is **max 827 s** (2026-08-31; the
+earlier max-798 s figure predates the sweep-Job step), p95 662 s (queue time sits
+on top and does not count against the build timeout: ≤110 s). The sim chain is a
+deploy + a readiness poll + two short HTTP calls + a promote, budgeted at
+**+90–150 s**, so the single-build worst case becomes **~975 s**. When one build
+waits for an older one:
 
 ```
-waiting build total = wait for the older build to finish (≤827 s)
+waiting build total = wait for the older build to finish (≤975 s)
                     + this build's own deploy chain (~360 s)
-                    ≈ 1187 s
+                    ≈ 1335 s
 ```
 
-Under the old 1200 s timeout that left **~42 s** of headroom at the 798 s
-figure — and ~13 s at the measured 827 s — so `timeout:` is raised to **1500 s**
-(~313 s of headroom). Both adversarial reviews called the
-original "don't touch 1200 s" a plan defect. The gate derives its own deadline
-from that number — `BUILD_TIMEOUT_SECONDS` in `serialize-builds`, asserted equal
+against the 1500 s timeout, i.e. **~165 s** of headroom. `timeout:` therefore
+stays 1500 s. **Escalation rule:** if the measured post-merge single-build max
+exceeds **1000 s**, raise `timeout:` to 1800 s AND `BUILD_TIMEOUT_SECONDS` in
+`serialize-builds` in ONE commit — a contract test asserts the two stay equal.
+
+History, for the reasoning: under the old 1200 s timeout the pre-sim figures
+left **~42 s** of headroom at 798 s — and ~13 s at the measured 827 s — which is
+why FC-084 raised `timeout:` to 1500 s. Both of that plan's adversarial reviews
+called the original "don't touch 1200 s" a plan defect. The gate derives its own
+deadline from that number — `BUILD_TIMEOUT_SECONDS` in `serialize-builds`, asserted equal
 to `timeout:` by a contract test — and gives up **90 s early** so its explanation
 of *which* build it was waiting for is what the log shows, instead of an opaque
 `TIMEOUT`. Note the placement of the gate does not change this total: the wait

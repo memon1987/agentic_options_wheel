@@ -452,6 +452,42 @@ class ChainLake:
         raise ChainLakeUnavailable(reason, f"{self.bucket_name}: {detail}")
 
     # ------------------------------- operations -------------------------- #
+    def list_days(self, underlying: str) -> "set[date]":
+        """Every session this lake holds a chain object for, for one symbol.
+
+        ONE ``list_blobs`` per symbol (measured ~0.55 s against the production
+        lake), which is what makes an up-front coverage check affordable —
+        ``stat`` per day would be one RPC per session and would cost more than
+        the sweep it is protecting.
+
+        Used by the sim service's pre-flight guard (FC-096 Phase B B3): a
+        service that may not reach the options vendor has to know BEFORE it
+        accepts a spec whether the lake can answer it, or the operator gets a
+        mid-replay failure minutes later instead of a 409 with a remedy.
+
+        An object whose name does not end in a parseable ``YYYY-MM-DD.parquet``
+        is SKIPPED rather than raising: a stray object in the prefix must not
+        take the guard down, and a day it cannot parse is simply a day it does
+        not claim to have. Ordinary lake failures (``ChainLakeUnavailable``,
+        a 403, a timeout) propagate — "we could not tell" must never be
+        rendered as "there is nothing there", which would refuse every spec.
+        """
+        bucket = self._bucket()
+        prefix = f"{self.prefix}/{underlying.upper()}/"
+        days: "set[date]" = set()
+        for blob in self._client.list_blobs(
+            bucket, prefix=prefix, timeout=LAKE_TIMEOUT_S, retry=_retry(),
+        ):
+            name = getattr(blob, "name", "") or ""
+            stem = name[len(prefix):]
+            if not stem.endswith(".parquet") or "/" in stem:
+                continue
+            try:
+                days.add(date.fromisoformat(stem[: -len(".parquet")]))
+            except ValueError:
+                continue
+        return days
+
     def stat(self, underlying: str, as_of: date) -> Optional[LakeObject]:
         """One metadata RPC. None when the object does not exist.
 

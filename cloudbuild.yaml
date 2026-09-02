@@ -738,7 +738,7 @@ steps:
             --max-instances=2 \
             --min-instances=0 \
             --timeout=300 \
-            --set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA,SWEEP_JOB_NAME=backtest-sweep \
+            --set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7,GIT_COMMIT=$COMMIT_SHA,SWEEP_JOB_NAME=backtest-sweep,SIM_SERVICE_URL=https://sim-service-799970961417.us-central1.run.app \
             --no-traffic \
             --tag=canary \
             --revision-suffix=$${SUFFIX} \
@@ -870,6 +870,280 @@ steps:
     id: 'promote-dashboard'
     waitFor: ['smoke-test-dashboard']
 
+  # ---------------------------------------------------------------------------
+  # FC-096 Phase B PR-c — the interactive `sim-service` chain (4th canary chain).
+  #
+  # Same image as the wheel (one image; the COMMAND selects the work — FC-075's
+  # rule), running `deploy/sim_service.py` instead of `deploy/cloud_run_server.py`.
+  # It answers an operator's ad-hoc simulation in seconds where the
+  # `backtest-sweep` Job pays a ~3-minute container start, and it scales to zero
+  # between requests.
+  #
+  # POSITION: behind `promote-dashboard`, ahead of the two Job deploys, and the
+  # placement is load-bearing for the same reason theirs is. This service is a
+  # measurement tool. It is brand new, it is the first thing in this project to
+  # use `--no-cpu-throttling`, and its smoke test makes an authenticated HTTP
+  # call — three ways to fail that have nothing to do with the trading bot. Any
+  # of them must fail the build LOUDLY and only AFTER the wheel, covered-call and
+  # dashboard revisions have their traffic.
+  #
+  # THE DEPLOY FLAGS, each because of something:
+  #   --no-cpu-throttling  Instance-based billing. `/simulate` returns 202 and the
+  #                        replay continues on a worker thread; under Cloud Run's
+  #                        default request-based billing the CPU is throttled the
+  #                        moment that response returns and the replay starves —
+  #                        nothing ever supplies an in-flight request, because the
+  #                        console polls BigQuery through the dashboard and never
+  #                        touches this service. ~$0.09/hr while an instance is
+  #                        ALIVE, $0 when fully idle.
+  #   --concurrency=1      The engine mutates process-global state during a replay
+  #                        (`ExecutionEngine._failed_symbols`, the frozen clock,
+  #                        stdlib logger levels, the analytics singleton). Two
+  #                        replays in one process would not crash; they would
+  #                        corrupt each other's numbers silently. The service also
+  #                        refuses a second request itself; this flag is what stops
+  #                        one queueing invisibly behind the first.
+  #   --memory=2Gi         The tmpfs bar and chain caches count against memory.
+  #                        512Mi (the wheel's) OOMs on a multi-symbol window.
+  #   --cpu=1              Materialisation is single-threaded; a second vCPU buys
+  #                        nothing and doubles the instance-billed rate.
+  #   --timeout=120        Requests are SHORT by design now — validate, guard,
+  #                        dedup, hand back a run_id. A long request timeout would
+  #                        only mask a design regression back to the synchronous
+  #                        shape the plan's round-1 review killed.
+  #   --max-instances=2    A second instance is a second concurrent simulation in a
+  #                        separate PROCESS, which is safe. Two is enough for an
+  #                        operator plus a retry and bounds the bill.
+  #   --min-instances=0    D1: scale to zero, pay nothing idle. Scheduled
+  #                        market-hours warmth stays a documented one-flag option.
+  #
+  # `--set-secrets` IS passed here, unlike the wheel and covered-call steps whose
+  # comments say not to. Those services were provisioned by hand and their secret
+  # bindings persist from that provisioning; `sim-service` does not exist yet and
+  # this step CREATES it, so a first deploy without the bindings would produce a
+  # service whose `Config()` cannot validate — it fails at startup, the smoke test
+  # fails, and the build goes red for a reason no log explains. The names are the
+  # `backtest-sweep` Job's, verbatim.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    env:
+      - 'BUILD_ID=$BUILD_ID'
+      - 'SHORT_SHA=$SHORT_SHA'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        SUFFIX="$${SHORT_SHA}-$${BUILD_ID:0:8}"
+        if [ -z "$${SHORT_SHA}" ]; then SUFFIX="b$${BUILD_ID:0:8}"; fi
+        REV="sim-service-$${SUFFIX}"
+        echo "Deploying revision $${REV}"
+        DEPLOYED=""
+        for attempt in 1 2 3; do
+          if gcloud run deploy sim-service \
+            --image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA \
+            --region=us-central1 \
+            --command=python \
+            --args=deploy/sim_service.py \
+            --no-allow-unauthenticated \
+            --no-cpu-throttling \
+            --memory=2Gi \
+            --cpu=1 \
+            --concurrency=1 \
+            --max-instances=2 \
+            --min-instances=0 \
+            --timeout=120 \
+            --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/settings.yaml,GIT_COMMIT=$COMMIT_SHA,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,SIM_ARTIFACT_BUCKET=gen-lang-client-0607444019-options-data \
+            --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
+            --no-traffic \
+            --tag=canary \
+            --revision-suffix=$${SUFFIX} \
+            > /workspace/deploy-log-sim-service.txt 2>&1; then
+            cat /workspace/deploy-log-sim-service.txt
+            DEPLOYED="yes"
+            break
+          fi
+          cat /workspace/deploy-log-sim-service.txt
+          if grep -q 'already exists' /workspace/deploy-log-sim-service.txt; then
+            echo "revision $${REV} already exists — an earlier attempt created it; verifying below"
+            DEPLOYED="yes"
+            break
+          fi
+          if grep -q 'Conflict for resource' /workspace/deploy-log-sim-service.txt; then
+            if [ "$${attempt}" = "3" ]; then
+              echo "attempt 3/3 — Cloud Run version conflict, no retries left"
+              break
+            fi
+            echo "attempt $${attempt}/3 — Cloud Run version conflict (out-of-band write); retrying in 20s"
+            sleep 20
+            continue
+          fi
+          echo "FAIL: deploy of sim-service failed"
+          exit 1
+        done
+        if [ -z "$${DEPLOYED}" ]; then
+          echo "FAIL: deploy of sim-service did not succeed after 3 attempts"
+          exit 1
+        fi
+        if ! gcloud run revisions describe "$${REV}" --region=us-central1 \
+             --format='value(metadata.name)'; then
+          echo "FAIL: revision $${REV} does not exist after a successful deploy"
+          exit 1
+        fi
+        echo "$${REV}" > /workspace/rev-sim-service.txt
+        echo "Deployed canary revision: $${REV}"
+    id: 'deploy-sim-canary'
+    waitFor: ['promote-dashboard', 'serialize-builds']
+
+  # LIGHT smoke, in two parts, and the split is deliberate (plan §B3).
+  #
+  # Part 1 — the readiness poll every other chain does, pinned to THIS build's
+  # revision. It is the hard gate: for an ASGI service, "Ready" means uvicorn
+  # bound the port and `create_app()` imported, which is where a broken
+  # dependency, a syntax error or a missing secret actually shows up.
+  #
+  # Part 2 — one `GET /health` and one `POST /simulate` against the canary tag's
+  # URL. `/health` must return a NON-EMPTY engine identity (an empty one means
+  # the service cannot hash its own tree, and the dashboard's baked value would
+  # then key against nothing). `/simulate` accepts {200 dedup-hit | 202 accepted}
+  # — BOTH, on purpose: the first deploy and a fresh project have no seeded spec
+  # to hit, so demanding the 200 here would make the very first build red. The
+  # strict dedup-hit assertion is ROLLOUT verification (plan §3), after the spec
+  # is seeded, not a deploy gate.
+  #
+  # Part 2 needs an OIDC identity token for a private service, and minting one
+  # from inside Cloud Build is NOT a capability this project has ever exercised.
+  # If it cannot be minted, the step prints SMOKE_SIM_HTTP_UNAVAILABLE and exits
+  # 0 rather than turning every merge red over an unproven capability — the
+  # readiness gate above has already run. That degrade is the ONE thing rollout
+  # step 3 must check: grep this step's log for `PASS: /health` and, if it says
+  # SMOKE_SIM_HTTP_UNAVAILABLE instead, the HTTP half is a control that is
+  # watching nothing and needs its own follow-up.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        REV=$(cat /workspace/rev-sim-service.txt)
+        echo "Verifying sim-service canary revision $${REV} is ready..."
+        READY=""
+        for i in $(seq 1 30); do
+          STATUS=$(gcloud run revisions describe "$${REV}" --region=us-central1 --format=json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin).get('status') or {};print(next((c.get('status','') for c in (d.get('conditions') or []) if c.get('type')=='Ready'),''))")
+          echo "attempt $${i}/30 — sim canary $${REV} status: $${STATUS}"
+          if [ "$${STATUS}" = "True" ]; then
+            READY="yes"
+            break
+          fi
+          if [ "$${STATUS}" = "False" ]; then
+            echo "FAIL: sim canary revision $${REV} failed to become ready"
+            exit 1
+          fi
+          sleep 5
+        done
+        if [ -z "$${READY}" ]; then
+          echo "FAIL: timed out after 150s waiting for sim canary revision $${REV}"
+          exit 1
+        fi
+        echo "PASS: sim canary revision $${REV} is ready"
+
+        URL=$(gcloud run services describe sim-service --region=us-central1 --format=json \
+          | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];print(next((x.get('url','') for x in t if x.get('tag')=='canary'),''))")
+        if [ -z "$${URL}" ]; then
+          echo "SMOKE_SIM_HTTP_UNAVAILABLE: no canary-tagged URL on sim-service; skipping the HTTP half"
+          exit 0
+        fi
+        TOKEN=$(gcloud auth print-identity-token --audiences="$${URL}" 2>/dev/null || true)
+        if [ -z "$${TOKEN}" ]; then
+          TOKEN=$(curl -s -H 'Metadata-Flavor: Google' \
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=$${URL}" 2>/dev/null || true)
+        fi
+        case "$${TOKEN}" in
+          ey*) ;;
+          *) echo "SMOKE_SIM_HTTP_UNAVAILABLE: could not mint an identity token for $${URL} from Cloud Build; the readiness gate above passed, the HTTP half did not run. See rollout step 3."
+             exit 0 ;;
+        esac
+
+        HEALTH=$(curl -s --max-time 300 -H "Authorization: Bearer $${TOKEN}" "$${URL}/health" || true)
+        echo "health: $${HEALTH}"
+        IDENTITY=$(printf '%s' "$${HEALTH}" \
+          | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('engine_identity') or '')" \
+          2>/dev/null || true)
+        if [ -z "$${IDENTITY}" ]; then
+          echo "FAIL: /health returned no engine_identity — the service cannot hash its own tree, so the dashboard's baked value keys against nothing"
+          exit 1
+        fi
+        echo "PASS: /health engine_identity=$${IDENTITY}"
+
+        CODE=$(curl -s -o /workspace/smoke-sim-body.txt -w '%{http_code}' \
+          --max-time 300 -X POST -H "Authorization: Bearer $${TOKEN}" \
+          -H 'Content-Type: application/json' \
+          -d @deploy/smoke_sim_spec.json "$${URL}/simulate" || echo "000")
+        cat /workspace/smoke-sim-body.txt
+        echo ""
+        case "$${CODE}" in
+          200) echo "PASS: /simulate deduplicated (200) — the seeded spec is present" ;;
+          202) echo "PASS: /simulate accepted (202) — no seeded spec yet; see rollout step 3" ;;
+          409) echo "SMOKE_SIM_SPEC_UNCOVERED: /simulate refused the smoke spec (409) — the service answered correctly, but deploy/smoke_sim_spec.json names a window the chain lake does not cover. Re-point it at a covered window (rollout step 3). Not failing the build over a data fact." ;;
+          *) echo "FAIL: /simulate returned $${CODE}; expected 200 (dedup hit) or 202 (accepted)"
+             exit 1 ;;
+        esac
+    id: 'smoke-test-sim'
+    waitFor: ['deploy-sim-canary']
+
+  # Shift traffic to the new sim-service revision (--to-latest; see promote-bot)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        [ -f /workspace/superseded ] && { echo "skip: superseded"; exit 0; }
+        REV=$(cat /workspace/rev-sim-service.txt)
+        MY_IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA"
+        for attempt in 1 2 3; do
+          # Re-evaluated on EVERY attempt, never retried blind: see promote-bot.
+          LATEST=$(gcloud run services describe sim-service --region=us-central1 \
+            --format='value(status.latestReadyRevisionName)')
+          echo "latestReadyRevisionName=$${LATEST}; this build=$${REV}"
+          if [ "$${LATEST}" != "$${REV}" ]; then
+            LATEST_IMAGE=$(gcloud run revisions describe "$${LATEST}" --region=us-central1 \
+              --format='value(spec.containers[0].image)')
+            if [ "$${LATEST_IMAGE}" = "$${MY_IMAGE}" ]; then
+              echo "PROMOTING latest ready $${LATEST} (env-only change on this build's image)"
+            else
+              SERVING=$(gcloud run services describe sim-service --region=us-central1 --format=json \
+                | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];t=[x for x in t if (x.get('percent') or 0) > 0];t.sort(key=lambda x: -(x.get('percent') or 0));print(t[0].get('revisionName','') if t else '')")
+              echo "FAIL: refusing to promote sim-service."
+              echo "  serving now       : $${SERVING}"
+              echo "  latest ready      : $${LATEST} (image $${LATEST_IMAGE})"
+              echo "  this build's rev  : $${REV} (image $${MY_IMAGE})"
+              echo "An out-of-band deploy of a DIFFERENT image landed during this build, so"
+              echo "promoting would ship code this build never tested. Decide which one wins,"
+              echo "then run:  gcloud run services update-traffic sim-service --to-latest"
+              exit 1
+            fi
+          fi
+          if gcloud run services update-traffic sim-service \
+            --to-latest \
+            --region=us-central1 \
+            > /workspace/promote-log-sim-service.txt 2>&1; then
+            cat /workspace/promote-log-sim-service.txt
+            echo "PROMOTED: 100% traffic to latest"
+            exit 0
+          fi
+          cat /workspace/promote-log-sim-service.txt
+          if grep -q 'Conflict for resource' /workspace/promote-log-sim-service.txt \
+             && [ "$${attempt}" != "3" ]; then
+            echo "attempt $${attempt}/3 — Cloud Run version conflict (out-of-band write); retrying in 20s"
+            sleep 20
+            continue
+          fi
+          echo "FAIL: update-traffic for sim-service failed"
+          exit 1
+        done
+    id: 'promote-sim'
+    waitFor: ['smoke-test-sim']
+
   # Step 12: Deploy the ad-hoc scenario-sweep Cloud Run JOB (FC-060 Layer 3, D9).
   #
   # `gcloud run jobs deploy` is create-or-update, so this step both creates the
@@ -997,14 +1271,20 @@ options:
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
 
 # Timeout for the entire build
-# Raised from 1200s by FC-084. Measured single-build runtime: max 798s, p95 662s
-# (queue time is on top of this and does not count against the timeout: <=110s).
-# When one build has to wait for an older one, worst case is
-#   wait for the older build to finish (<=798s) + this build's own deploy chain (~360s)
-#   = ~1158s,
-# which left only ~42s of headroom under 1200s. 1500s restores ~342s. The gate's own
-# deadline is derived from this number (BUILD_TIMEOUT_SECONDS in serialize-builds) and
-# a contract test asserts the two stay equal.
+# Raised from 1200s by FC-084; REDONE ON THE RECORD by FC-096 Phase B PR-c, which
+# adds the fourth canary chain (deploy-sim-canary -> smoke-test-sim -> promote-sim).
+# Measured single-build runtime before this PR: max 827s (2026-08-31), p95 662s
+# (queue time sits on top and does not count against the timeout: <=110s). The new
+# chain is a deploy + a readiness poll + two short HTTP calls + a promote, budgeted
+# at +90-150s, so:
+#   single build worst case  = 827s + ~150s          = ~975s
+#   waiting-pair worst case  = wait for the older build (<=975s)
+#                            + this build's own deploy chain (~360s)          = ~1335s
+# against 1500s, i.e. ~165s of headroom. `timeout:` therefore STAYS 1500s.
+# **The escalation rule, per the plan:** if the measured post-merge single-build max
+# exceeds 1000s, raise this to 1800s AND BUILD_TIMEOUT_SECONDS in serialize-builds in
+# ONE commit — a contract test asserts the two stay equal, and the gate gives up 90s
+# early so its explanation is what the log shows instead of an opaque TIMEOUT.
 timeout: '1500s'
 
 # Substitutions for build variables

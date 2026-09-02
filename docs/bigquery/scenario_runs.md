@@ -66,7 +66,8 @@ ORDER BY submitted_at DESC
 | `submitted_at` | TIMESTAMP REQ | **partition key**; identical on every row of one run |
 | `written_at` | TIMESTAMP REQ | per-row insert time; **this is what orders the sequence** |
 | `started_at` / `finished_at` | TIMESTAMP | the Job's own clock |
-| `submitted_via` | STRING | `dashboard` \| `cli` |
+| `submitted_via` | STRING | `dashboard` \| `cli` \| `sim-service` (FC-096 Phase B PR-c) \| `smoke` (the deploy smoke's seeded spec, excluded from battery/trend queries). Free-form by schema |
+| `liveness_seconds` | INTEGER | FC-096 Phase B PR-c. How long a **non-terminal** row of this run may go without an update before a reader may declare it dead. **NULL means "use the Job's clock"** — `JOB_TASK_TIMEOUT_SECONDS` (3 h) plus the reader's 10-minute grace — which is what every row written before this column existed means and what every sweep-Job row still means. The sim service stamps **900**, so a scaled-in service instance releases the one-at-a-time submit lock in **~25 minutes** instead of 3 h 10 m. Read by `services/sweeps.row_liveness_seconds`, which treats junk and non-positive values as absence: shortening the bound is the dangerous direction (it would release the lock under a run that is still going, and two replays would contend for one chain cache) |
 | `execution_name` | STRING | `CLOUD_RUN_EXECUTION`. Stored for operator debugging only — status is BigQuery-based (D3), because `run.executions.get` is unproven for this service account and grantable only in the console |
 | `git_commit` | STRING | the commit the run was launched from. **Provenance only since FC-096 Phase B** — it used to be half of `sweep_key` and no longer is |
 | `engine_version` | STRING | `screen.ENGINE_VERSION`; an input to `sweep_key` |

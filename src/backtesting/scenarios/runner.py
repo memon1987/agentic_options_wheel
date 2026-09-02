@@ -111,24 +111,37 @@ _QUIET_LOGGERS = ("src", "deploy")
 
 
 @contextmanager
-def quiet_strategy_logs(enabled: bool = True):
+def quiet_strategy_logs(enabled: bool = True,
+                        exempt: Sequence[str] = ()):
     """Raise the strategy loggers to WARNING for the duration of a replay.
 
     The runner's own logger is exempted explicitly — it is a child of ``src`` and
     would otherwise silence its own phase and timing lines, which are the only
     output an operator watches during a sweep.
+
+    ``exempt`` names further loggers to hold at INFO (FC-096 Phase B B3, L14).
+    The sim service's own logger is a child of ``deploy`` and would otherwise be
+    silenced for the whole replay — which is the only stretch of a sim request
+    during which anything interesting happens, and the only log an operator has
+    while waiting on a 202. Passed in rather than registered in a module global:
+    a process-wide "also keep this one" list is exactly the ambient state the
+    two entry points already have too much of.
     """
     if not enabled:
         yield
         return
+    keep = tuple(dict.fromkeys((__name__,) + tuple(n for n in exempt if n)))
     saved = {}
-    for name in _QUIET_LOGGERS + (__name__,):
+    for name in _QUIET_LOGGERS + keep:
         lg = logging.getLogger(name)
         saved[name] = lg.level
     try:
         for name in _QUIET_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
-        logging.getLogger(__name__).setLevel(logging.INFO)
+        # AFTER the silencing, so an exempt logger that is itself a child of a
+        # quieted one (`deploy.sim_service` under `deploy`) wins.
+        for name in keep:
+            logging.getLogger(name).setLevel(logging.INFO)
         yield
     finally:
         for name, level in saved.items():
@@ -553,6 +566,8 @@ def run_sweep(
     artifact_sink: Optional[Callable[[dict], None]] = None,
     run_id: Optional[str] = None,
     engine_identity: Optional[str] = None,
+    vendor_guard: Optional[Callable[[Any], Any]] = None,
+    quiet_exempt: Sequence[str] = (),
 ) -> SweepResult:
     """Replay every scenario over every symbol, materialising each window once.
 
@@ -570,7 +585,18 @@ def run_sweep(
             replay count; off by default because a sweep is a ranking exercise
             and the flip flag matters most on the arm you finally choose.
         chain_store / bar_provider: injected by tests and by the CLI.
+        vendor_guard: optional wrapper applied to the vendor client BEFORE the
+            fetch counter and the bar cache (FC-096 Phase B B3). The sim service
+            passes ``ChainFetchRefusingProvider`` so a lake miss fails the run
+            loudly instead of reaching the options vendor from a scale-to-zero
+            HTTP service. It sits INNERMOST — a refused call is not a network
+            round-trip and must not be counted as one — and the standard
+            ``CachedBarProvider``/``BarStore`` layering above it is untouched,
+            so a guarded sweep's ``provider_fetches`` and ``bar_cache_hits``
+            still mean what they mean everywhere else.
         quiet_logs: silence the strategy loggers below WARNING during replays.
+        quiet_exempt: logger names to hold at INFO through that silencing. See
+            ``quiet_strategy_logs``; the sim service passes its own.
         artifact_sink: optional callable handed one ``cell_artifact`` dict per
             successfully-replayed cell (FC-096 Phase B B2). It is called LAST —
             after the row is fully built, the bid-sensitivity pass included — in
@@ -610,10 +636,14 @@ def run_sweep(
     # then wraps it, and its `hits` are reported separately. Counting at the
     # outer edge (the first cut) described a fully-offline sweep as having made
     # six provider calls.
-    fetch_counter = _CountingProvider(
-        bar_provider if bar_provider is not None
-        else AlpacaDataProvider.from_config(base_config)
-    )
+    vendor = (bar_provider if bar_provider is not None
+              else AlpacaDataProvider.from_config(base_config))
+    if vendor_guard is not None:
+        # Between the vendor and the counter, so a REFUSAL is not counted as a
+        # fetch (it never reached the network) and so the guard cannot be
+        # bypassed by anything above it — the bar cache included.
+        vendor = vendor_guard(vendor)
+    fetch_counter = _CountingProvider(vendor)
     # An injected provider is used as given — the caller owns its caching, and
     # the sweep must not silently wrap a test double in a real disk cache.
     provider = (
@@ -712,7 +742,7 @@ def run_sweep(
             # sweep-wide reach share one object (which `narrow_to_dte` returns
             # as the input itself), and a mixed spec pays for the mask once.
             views: Dict[int, Materialised] = {}
-            with quiet_strategy_logs(quiet_logs):
+            with quiet_strategy_logs(quiet_logs, exempt=quiet_exempt):
                 for scenario in scenarios:
                     row = _replay_one(
                         scenario=scenario,

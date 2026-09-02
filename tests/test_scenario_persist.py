@@ -386,6 +386,45 @@ class TestBigQueryLegacyTypeNames:
         assert "error_cells" in updated["names"]
 
 
+class TestTheLivenessColumn:
+    """FC-096 Phase B PR-c. The schema half of the ~25-minute lock release.
+
+    `persist.py` OWNS this column (it owns both sweep tables' schemas); the
+    reader is `dashboard/backend/services/sweeps.row_liveness_seconds`. It exists
+    because the sim service is not the Job: a Cloud Run service instance scaled
+    in mid-replay writes no terminal row, and the Job's 3 h clock would hold the
+    one-at-a-time submit lock for 3 h 10 m on a process that died in seconds.
+    """
+
+    def test_it_is_an_additive_nullable_integer(self):
+        pytest.importorskip("google.cloud.bigquery")
+        field = next(f for f in store._sweeps_schema()
+                     if f.name == "liveness_seconds")
+        assert store._canonical_type(field.field_type) == "INT64"
+        # NULLABLE: every pre-existing row has no value, and the additive
+        # reconcile can only add a nullable column to a live table.
+        assert (field.mode or "NULLABLE").upper() == "NULLABLE"
+
+    def test_every_row_carries_the_key_even_when_it_has_no_value(self):
+        """The two writers must not diverge by whichever one knew a field.
+
+        `TestTheSubmittedRowMatchesTheJobsRowShape` compares the API's column
+        set against this one; a key present on only one side makes that test
+        meaningless and renders blank for half the sweeps in the results view.
+        """
+        row = store.status_row(run_id="r", status=store.STATUS_RUNNING,
+                               submitted_at="2026-09-01T12:00:00+00:00")
+        assert "liveness_seconds" in row
+        assert row["liveness_seconds"] is None
+
+    def test_the_stamp_survives_as_an_int(self):
+        row = store.status_row(run_id="r", status=store.STATUS_RUNNING,
+                               submitted_at="2026-09-01T12:00:00+00:00",
+                               liveness_seconds=900)
+        assert row["liveness_seconds"] == 900
+        assert isinstance(row["liveness_seconds"], int)
+
+
 class TestTheSchemaTypeNamesAreCovered:
     """Every type the schemas declare must be one the canonical map knows.
 

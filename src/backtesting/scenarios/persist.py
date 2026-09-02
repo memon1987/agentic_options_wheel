@@ -172,8 +172,27 @@ def _sweeps_schema():
         f("started_at", "TIMESTAMP"),
         f("finished_at", "TIMESTAMP"),
         # Provenance
-        f("submitted_via", "STRING"),      # 'dashboard' | 'cli'
+        f("submitted_via", "STRING"),      # 'dashboard' | 'cli' | 'sim-service'
         f("execution_name", "STRING"),     # CLOUD_RUN_EXECUTION, for debugging
+        # FC-096 Phase B B3. How long a NON-TERMINAL row of this run may go
+        # without an update before a reader may declare it dead, in seconds.
+        # Additive and NULLABLE; NULL means "use the Job's clock"
+        # (`services/sweeps.JOB_TASK_TIMEOUT_SECONDS`, 3 h), which is what every
+        # row written before this column existed means and what every Job row
+        # still means.
+        #
+        # It exists because the sim service is NOT the Job. A Cloud Run service
+        # instance that is scaled in mid-replay writes no terminal row, and the
+        # Job's 3 h clock would hold the one-at-a-time submit lock for three
+        # hours and ten minutes on a run whose process died in seconds. The
+        # service stamps 900 s, so the lock releases in ~25 min
+        # (900 s + the reader's existing 10-minute grace).
+        #
+        # Stamped on the row rather than inferred from `submitted_via` on
+        # purpose: the reader must not have to know the deployment topology of
+        # every writer, and a future writer with a different lifetime says so
+        # in its rows instead of teaching the reader a fourth special case.
+        f("liveness_seconds", "INTEGER"),
         f("git_commit", "STRING"),
         f("engine_version", "STRING"),
         # FC-096 Phase B: the content hash of `src/**` (`engine_identity.py`),
@@ -591,6 +610,7 @@ def status_row(
     rows_persisted: Optional[int] = None,
     engine_config_hash: Optional[str] = None,
     artifacts_complete: Optional[bool] = None,
+    liveness_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One ``scenario_sweeps`` row.
 
@@ -620,6 +640,12 @@ def status_row(
         "finished_at": finished_at,
         "submitted_via": submitted_via,
         "execution_name": execution_name,
+        # FC-096 Phase B B3. NULL means "this writer runs under the Job's
+        # clock"; the sim service stamps 900. Present on EVERY row, like every
+        # other column here, so the two writers cannot diverge by whichever one
+        # happened to know a field.
+        "liveness_seconds": (None if liveness_seconds is None
+                             else int(liveness_seconds)),
         "git_commit": git_commit,
         "engine_version": engine_version,
         "engine_identity": engine_identity,

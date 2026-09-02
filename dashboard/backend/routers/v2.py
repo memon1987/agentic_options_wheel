@@ -687,6 +687,129 @@ def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
                     headers=artifacts.artifact_headers(name))
 
 
+# ----------------------------------------------------------------------
+# FC-096 Phase B PR-c — the interactive sim service proxy.
+#
+# `POST /api/v2/sims/run` forwards a spec to the private `sim-service` Cloud Run
+# service and passes its answer back VERBATIM. It is a proxy, not a second API:
+# every rule about what a spec may contain, what it costs, and whether the chain
+# lake can cover it lives in the service, which holds a real `Config` and can
+# see the lake. Duplicating any of it here would be the two-parsers failure
+# FC-060 D7 exists to prevent, one layer up.
+# ----------------------------------------------------------------------
+
+SIM_SERVICE_URL = os.getenv("SIM_SERVICE_URL") or None
+
+
+def _sim_identity_token(audience: str) -> str:
+    """An OIDC IDENTITY token for the sim service.
+
+    **`routers/live.py`'s pattern, NOT `_access_token`'s.** The two are easy to
+    confuse because the same service account issues both, and this repo has one
+    of each for good reason: `run.googleapis.com` is the Cloud Run CONTROL plane
+    and takes an OAuth access token with the cloud-platform scope, while a
+    private Cloud Run SERVICE authenticates its callers with an ID token whose
+    `aud` is the service's own URL. An access token presented to the sim service
+    is a 401; an ID token presented to the control plane is a 401. This is the
+    service call, so it is the ID token.
+
+    Synchronous on purpose — called through `run_in_threadpool`. Minting hits
+    the metadata server, and awaiting that inline in an `async def` stalls the
+    whole event loop rather than just this request.
+    """
+    import google.auth.transport.requests
+    import google.oauth2.id_token
+
+    request = google.auth.transport.requests.Request()
+    return google.oauth2.id_token.fetch_id_token(request, audience)
+
+
+@router.post("/sims/run")
+async def run_sim(
+    spec: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+) -> Response:
+    """Forward a spec to the sim service; return its answer unchanged.
+
+    * **503** when `SWEEP_SUBMIT_TOKEN` is unset — submissions disabled, fail
+      closed, exactly as `POST /sweeps` does. The token stays the auth boundary
+      until Phase D brings IAP.
+    * **401** when the bearer does not match (constant-time compare).
+    * **503** when `SIM_SERVICE_URL` is unset — the service is not deployed, or
+      this revision predates it. Said plainly rather than guessed at: without
+      the URL there is no audience to mint a token for, and a hardcoded default
+      would point at a service that may not exist.
+    * **502** when the token cannot be minted or the service cannot be reached.
+    * otherwise **the service's own status code and body, verbatim** — 200 for a
+      dedup hit, 202 for an accepted run, 409/422/503 for a refusal. Those
+      refusal bodies carry the estimate, the missing symbol-days and the
+      backfill command; re-wrapping them would lose the part an operator acts on.
+    """
+    import httpx
+    from starlette.concurrency import run_in_threadpool
+
+    configured = _sweep_token()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
+                    "on this service. Create the `sweep-submit-token` secret "
+                    "and wire it with `gcloud run services update "
+                    "options-wheel-dashboard --update-secrets="
+                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
+    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
+        raise HTTPException(
+            status_code=401,
+            detail="a valid `Authorization: Bearer <token>` is required to submit")
+
+    # Re-read the env rather than trusting only the import-time constant: the
+    # module-level value is what production uses, and the re-read is what lets a
+    # deploy that sets the variable out of band take effect without a rebuild.
+    url = SIM_SERVICE_URL or os.getenv("SIM_SERVICE_URL") or None
+    if not url:
+        raise HTTPException(
+            status_code=503,
+            detail=("sim service not configured: SIM_SERVICE_URL is unset on "
+                    "this revision, so there is no audience to mint an identity "
+                    "token for. It is set by cloudbuild.yaml's "
+                    "`deploy-dashboard-canary` step; a revision without it "
+                    "predates the sim service or was deployed out of band. Use "
+                    "POST /api/v2/sweeps (the batch Job) meanwhile."))
+    url = url.rstrip("/")
+
+    try:
+        token = await run_in_threadpool(_sim_identity_token, url)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=(f"could not obtain an identity token for the sim service: "
+                    f"{type(exc).__name__}: {exc}. The dashboard's service "
+                    f"account needs roles/run.invoker on `sim-service`."))
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{url}/simulate", json=spec,
+                headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"could not reach the sim service ({type(exc).__name__}: "
+                    f"{exc}). It is scale-to-zero and its cold start has a "
+                    f"measured tail of up to ~4 minutes; retry, or use "
+                    f"POST /api/v2/sweeps."))
+    except Exception as exc:  # noqa: BLE001 - nothing may escape as a 500
+        raise HTTPException(
+            status_code=502,
+            detail=(f"the sim service call failed unexpectedly: "
+                    f"{type(exc).__name__}: {exc}"))
+
+    return Response(content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type",
+                                                    "application/json"))
+
+
 @router.post("/sweeps", status_code=202)
 async def submit_sweep(
     spec: Dict[str, Any] = Body(...),
@@ -789,11 +912,19 @@ async def submit_sweep(
                        f"after that run's last update — a launch that has "
                        f"produced no `running` row by then is not running")
         else:
-            release = (f"it releases once that run is older than the Job's task "
-                       f"timeout ({sweeps.JOB_TASK_TIMEOUT_SECONDS // 3600}h + "
-                       f"{sweeps.STALE_GRACE_MINUTES}m), because Cloud Run has "
-                       f"killed the task by then; a cold sweep can legitimately "
-                       f"replay for that long")
+            # The BLOCKING ROW's own liveness bound, not the Job's constant
+            # (FC-096 Phase B PR-c). A sim-service run stamps 900 s, so its lock
+            # frees in ~25 minutes — telling that operator to wait three hours
+            # is the same "advice that gets a feature abandoned" the `submitted`
+            # branch above exists to avoid.
+            bound = sweeps.row_liveness_seconds(blocking)
+            window = (f"{bound // 3600}h" if bound >= 3600
+                      else f"{bound // 60}m")
+            release = (f"it releases once that run is older than its liveness "
+                       f"bound ({window} + {sweeps.STALE_GRACE_MINUTES}m), "
+                       f"because whatever was running it has been killed by "
+                       f"then; a cold sweep can legitimately replay for that "
+                       f"long")
         raise HTTPException(
             status_code=409,
             detail=(f"sweep {blocking.get('run_id')} is {status}; "
