@@ -15,7 +15,6 @@ Same import trick as `tests/test_dashboard_pause_alert.py`: put
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -29,6 +28,9 @@ import pytest
 # to dashboard/backend/main.py for every module collected after this one.
 from tests._dashboard_path import (  # noqa: E402
     BACKEND,
+    HAS_FASTAPI,
+    HAS_HTTPX,
+    HAS_TESTCLIENT,
     add_dashboard_backend_to_path,
 )
 
@@ -1627,7 +1629,14 @@ print(json.dumps({"key": S.compute_sweep_key(spec, "abc123"),
 # module-level importorskip would abort collection of the whole file and
 # silently skip every pure test above it too, turning CI green while testing
 # nothing.
-_HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+# Imported from `tests/_dashboard_path.py`, which defines them ONCE and explains
+# the drift that made this necessary: `requirements.txt` gaining FastAPI (FC-096
+# Phase B PR-c, for the sim service) un-skipped every FastAPI-guarded class in
+# the BOT CI image — including the ones that need httpx, which that image does
+# not have. A class that monkeypatches `httpx.AsyncClient`, or reaches for
+# `fastapi.testclient`, gates on `_HAS_TESTCLIENT`.
+_HAS_FASTAPI = HAS_FASTAPI
+_HAS_TESTCLIENT = HAS_TESTCLIENT
 
 
 class FakeBQ:
@@ -1664,8 +1673,9 @@ class FakeBQ:
         self.rows.append(row)
 
 
-@pytest.mark.skipif(not _HAS_FASTAPI,
-                    reason="FastAPI only present in the dashboard image")
+@pytest.mark.skipif(not _HAS_TESTCLIENT,
+                    reason="needs FastAPI AND httpx (the launch path is "
+                           "exercised by monkeypatching httpx.AsyncClient)")
 class TestTheSubmitEndpoint:
     """The one route that CAUSES something, and every way its launch can fail.
 
@@ -2563,8 +2573,9 @@ class TestTheSimProxyIsAProxy:
         assert "blocking_sweep" not in body
 
 
-@pytest.mark.skipif(not _HAS_FASTAPI,
-                    reason="FastAPI only present in the dashboard image")
+@pytest.mark.skipif(not _HAS_TESTCLIENT,
+                    reason="needs FastAPI AND httpx (the proxy is exercised by "
+                           "monkeypatching httpx.AsyncClient)")
 class TestTheSimProxyEndpoint:
     """Auth, configuration, and verbatim pass-through."""
 
@@ -2721,3 +2732,78 @@ class TestTheSimProxyEndpoint:
             "a cold start of up to ~4 minutes is the expected cause here; a "
             "bare transport error sends the operator looking for an outage"
         )
+
+
+# ==========================================================================
+# (16) The dependency boundary the CI image actually has
+# ==========================================================================
+class TestTheRouterImportsWithoutHttpx:
+    """`routers/v2.py` must import in an env with FastAPI and NO httpx.
+
+    That combination is not hypothetical: it is the BOT CI image as of FC-096
+    Phase B PR-c, which added `fastapi` + `uvicorn` to the repo-root
+    `requirements.txt` so the sim service can run in that image. httpx is
+    declared only in `dashboard/backend/requirements.txt` and reached the bot
+    image before purely as a transitive extra of `jupyter` — an edge that has
+    since moved.
+
+    The router survives that today because both of its httpx uses are
+    FUNCTION-LOCAL (`_launch_job` and the sim proxy). This pins it: a future
+    `import httpx` at module scope would import fine in the dashboard image, be
+    invisible in review, and break every FastAPI-guarded test in CI — the
+    failure this test exists to make impossible rather than merely unlikely.
+
+    Read from SOURCE, so it runs everywhere and needs no import of its own.
+    """
+
+    def test_no_module_level_httpx_import(self):
+        import ast
+
+        tree = ast.parse((BACKEND / "routers" / "v2.py").read_text())
+        offenders = []
+        for node in tree.body:            # MODULE level only, deliberately
+            if isinstance(node, ast.Import):
+                offenders += [a.name for a in node.names
+                              if a.name.split(".")[0] == "httpx"]
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".")[0] == "httpx":
+                    offenders.append(node.module)
+        assert offenders == [], (
+            f"routers/v2.py imports {offenders} at module level. The bot CI "
+            f"image has FastAPI and no httpx, so this makes the router "
+            f"unimportable there and every FastAPI-guarded test in the suite "
+            f"fails on a diff that touched none of them. Import it inside the "
+            f"handler, as `_launch_job` and `run_sim` do."
+        )
+
+    def test_the_httpx_uses_are_inside_functions(self):
+        """...and the imports that DO exist are where they are claimed to be."""
+        import ast
+
+        tree = ast.parse((BACKEND / "routers" / "v2.py").read_text())
+        inside = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import) and any(
+                        a.name == "httpx" for a in child.names):
+                    inside.add(node.name)
+        assert {"_launch_job", "run_sim"} <= inside, (
+            f"expected the httpx imports inside `_launch_job` and `run_sim`; "
+            f"found them in {sorted(inside)}"
+        )
+
+    @pytest.mark.skipif(HAS_HTTPX,
+                        reason="only meaningful where httpx is genuinely absent")
+    def test_it_really_does_import_here(self):
+        """The executable half, in the environment the claim is about.
+
+        Skipped where httpx exists — there the assertion is vacuous — so this
+        runs exactly in the bot CI image.
+        """
+        import routers.v2 as v2
+
+        paths = {r.path for r in v2.router.routes}
+        assert "/sims/run" in paths
+        assert "/sweeps" in paths
