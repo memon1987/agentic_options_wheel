@@ -958,7 +958,9 @@ def row_liveness_seconds(row: Dict[str, Any]) -> int:
     terminalises normally.
     """
     raw = row.get("liveness_seconds")
-    if raw is None:
+    # `bool` is an `int` in Python, so `True` would become a ONE-SECOND bound
+    # and release the lock under every live run. Treated as absence.
+    if raw is None or isinstance(raw, bool):
         return JOB_TASK_TIMEOUT_SECONDS
     try:
         seconds = int(raw)

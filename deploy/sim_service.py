@@ -47,6 +47,23 @@ dashboard and never touches this service. ~$0.09/hr while an instance is alive,
 $0 when fully idle. The residual is accepted and documented: an idle instance
 can be scaled in mid-replay, in which case SIGTERM terminalises the run as
 ``failed`` (see ``_on_sigterm``) and the console's posture is resubmit.
+**Corrected after the review's live probe:** "SIGTERM terminalises the run" was
+only true when the handler won the race. A run that had just COMPLETED lost its
+`done` row, because the worker had already claimed the write and the process
+died with the insert in flight. ``_on_sigterm`` now waits for the worker
+(``TERMINAL_WRITE_JOIN_SECONDS``) whenever the worker owns the write, so the
+guarantee is what it says: a terminal row lands, whichever side produces it,
+inside Cloud Run's ten-second grace.
+
+**ONE REPLAY PER PROCESS IS NOT ONE PER SPEC.** ``--max-instances=2`` means a
+second container can accept the same spec a second later; the per-process lock
+cannot see it. So a miss also asks the store for a live, non-stale ``running``
+row under the same ``sweep_key`` and refuses with a 409 naming it. That check is
+advisory by construction — two requests inside one query round-trip still race —
+and the plan's justification for one-at-a-time ("they would contend on one chain
+cache") is **false across containers**, each having its own tmpfs. What is true
+is the waste and the confusion: two `running` rows for one question and two sets
+of cells the dedup can serve either of.
 
 **IT CAN NEVER REACH THE OPTIONS VENDOR.** Both halves of the guard the plan
 requires are here: a pre-flight that lists the chain lake and refuses a spec it
@@ -135,9 +152,40 @@ SIM_MAX_CELLS = 240
 # for the rest of the afternoon.
 LIVENESS_SECONDS = 900
 
-#: ``submitted_via`` for every row this service writes. Free-form by schema; the
-#: battery and trend queries filter on it.
+#: The grace a reader adds on top of `liveness_seconds` before it calls a
+#: non-terminal row dead. Mirrors `services/sweeps.STALE_GRACE_MINUTES` (10),
+#: and the two must agree: this service uses the sum as the age bound for its
+#: cross-instance duplicate check, so a `running` row stops blocking a new
+#: submission at exactly the moment the dashboard stops counting it.
+STALE_GRACE_SECONDS = 600
+
+#: ``submitted_via`` for every row this service writes by default. Free-form by
+#: schema; the battery and trend queries filter on it.
 SUBMITTED_VIA = "sim-service"
+
+#: The ONLY other value a caller may ask for, via the `X-Sim-Provenance` header.
+#: A CLOSED allowlist, not a free-form passthrough: `submitted_via` is what the
+#: battery and trend queries filter on, so an arbitrary string from a caller
+#: would let anything hide from — or contaminate — those queries. `smoke` exists
+#: because the deploy smoke's `POST /simulate` becomes a REAL replay on every
+#: build whose engine identity moved (there is no prior run to dedup against),
+#: and a build artifact must not read as an operator's experiment.
+PROVENANCE_ALLOWLIST = frozenset({"smoke"})
+
+#: Per-symbol capital bounds, mirroring the dashboard's `validate_spec`. The
+#: Job's parser does not check them, so without this the service accepts a spec
+#: the dashboard would refuse — and 0 or a negative value produces a replay
+#: whose every position is rejected for want of collateral and whose verdict
+#: reads as a strategy result.
+MIN_STARTING_CASH = 10_000.0
+MAX_STARTING_CASH = 1_000_000.0
+
+#: How long the SIGTERM handler waits for the WORKER's terminal write when the
+#: worker got there first. Inside Cloud Run's ten-second SIGKILL grace with
+#: margin. See ``_on_sigterm``: without this wait a run that had just completed
+#: lost its `done` row to the SIGKILL and read as `running` until its liveness
+#: bound expired.
+TERMINAL_WRITE_JOIN_SECONDS = 8
 
 # --------------------------------------------------------------------------- #
 # Process state. One replay at a time; see the module docstring.
@@ -151,6 +199,8 @@ _CONFIG: Any = None
 _CONFIG_LOCK = threading.Lock()
 _WRITER: Any = None
 _WRITER_LOCK = threading.Lock()
+_BARS: Any = None
+_BARS_LOCK = threading.Lock()
 
 
 class SpecRefused(Exception):
@@ -203,13 +253,35 @@ def get_writer():
         return _WRITER
 
 
+def get_bar_provider():
+    """The bar reader the coverage pre-flight uses, built once.
+
+    A ``CachedBarProvider`` over ``BarStore``, so the first request for a window
+    pays a vendor round-trip and every later one pays a disk read. Bars are
+    PERMITTED through the fetch guard by design (see ``fetch_guard``): they are
+    small, cached, rate-benign next to a chain, and they are the only way to
+    know which sessions a symbol actually traded — which is the calendar the
+    coverage check has to compare the lake against.
+    """
+    global _BARS
+    with _BARS_LOCK:
+        if _BARS is None:
+            from src.backtesting.data.alpaca_provider import AlpacaDataProvider
+            from src.backtesting.data.bar_store import BarStore, CachedBarProvider
+            _BARS = CachedBarProvider(
+                AlpacaDataProvider.from_config(get_config()), BarStore())
+        return _BARS
+
+
 def reset_for_tests() -> None:
     """Drop the process singletons and the run slot. Never called in production."""
-    global _CONFIG, _WRITER, _CURRENT, _WORKER
+    global _CONFIG, _WRITER, _BARS, _CURRENT, _WORKER
     with _CONFIG_LOCK:
         _CONFIG = None
     with _WRITER_LOCK:
         _WRITER = None
+    with _BARS_LOCK:
+        _BARS = None
     with _STATE_LOCK:
         _CURRENT = None
     _WORKER = None
@@ -323,7 +395,7 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
     # unspecified spec key differently from the same spec submitted through the
     # dashboard, and the two would never dedup against each other.
     raw_cash = spec.get("starting_cash")
-    if raw_cash in (None, ""):
+    if raw_cash is None or raw_cash == "":
         starting_cash = float(DEFAULT_STARTING_CASH)
     else:
         try:
@@ -331,6 +403,16 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
         except (TypeError, ValueError):
             raise SpecRefused(
                 422, f"'starting_cash' must be a number; got {raw_cash!r}")
+    # The dashboard's bounds, applied here too. The Job's parser does not check
+    # them, so without this the service accepts a spec the dashboard refuses —
+    # and 0 (or a negative) is the one that matters: every position is then
+    # rejected for want of collateral and the run reports `insufficient` on
+    # symbols that traded perfectly well, which reads as a verdict on the arm.
+    if not MIN_STARTING_CASH <= starting_cash <= MAX_STARTING_CASH:
+        raise SpecRefused(
+            422,
+            f"'starting_cash' {starting_cash:,.0f} is outside "
+            f"[{MIN_STARTING_CASH:,.0f}, {MAX_STARTING_CASH:,.0f}]")
 
     run_sensitivity = spec.get("run_sensitivity", False)
     if not isinstance(run_sensitivity, bool):
@@ -368,6 +450,42 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
     }
     return {"spec": normalised, "scenarios": scenarios, "start": start,
             "end": end, "holdout_start": holdout_start, "force": force}
+
+
+def normalise_provenance(header: Optional[str]) -> str:
+    """``submitted_via`` for this request, from the ``X-Sim-Provenance`` header.
+
+    A CLOSED allowlist (``PROVENANCE_ALLOWLIST``), not a passthrough. This column
+    is what the battery and trend queries filter on, so a free-form caller-set
+    value would let a run hide from those queries — or contaminate them — with no
+    way to tell afterwards which happened.
+
+    It exists because the deploy smoke needs it. `POST /simulate` in
+    `smoke-test-sim` is a dedup HIT only while the engine identity has not moved;
+    **every build that changes `src/**` or `requirements.txt` gives the smoke a
+    brand-new key, and the smoke then runs a real ~45 s replay** and writes real
+    rows. Those rows are a build artifact, not an operator's experiment, and
+    `submitted_via='smoke'` is what lets the battery and the trend view exclude
+    them. Without it they are indistinguishable from a human's submission.
+
+    An unrecognised value is a 422, not a silent downgrade to the default: a
+    caller that asked for a label and got another one would be told nothing, and
+    the rows would be mislabelled for ever.
+    """
+    if header is None:
+        return SUBMITTED_VIA
+    value = header.strip()
+    if not value:
+        return SUBMITTED_VIA
+    if value not in PROVENANCE_ALLOWLIST:
+        raise SpecRefused(
+            422,
+            f"X-Sim-Provenance {value!r} is not allowed. This header sets the "
+            f"row's `submitted_via`, which the battery and trend queries filter "
+            f"on, so it is a closed set: "
+            f"{sorted(PROVENANCE_ALLOWLIST)}. Omit the header for an ordinary "
+            f"submission (`{SUBMITTED_VIA}`).")
+    return value
 
 
 def cell_count(spec: Dict[str, Any]) -> int:
@@ -428,16 +546,24 @@ def check_budget(spec: Dict[str, Any]) -> Dict[str, float]:
 
 def check_coverage(chain_store, spec: Dict[str, Any], start: date,
                    end: date) -> None:
-    """Refuse a spec the chain lake cannot answer without a vendor fetch."""
+    """Refuse a spec the chain lake cannot answer without a vendor fetch.
+
+    The expected sessions come from BARS, per symbol — the engine's own calendar
+    — not from the union of what the lake happens to hold. See
+    ``lake_coverage``'s docstring for the three shapes the union missed.
+    """
     from src.backtesting.data.lake_coverage import check_coverage as _check
 
     report = _check(getattr(chain_store, "lake", None),
-                    spec.get("symbols") or [], start, end)
+                    spec.get("symbols") or [], start, end,
+                    bar_provider=get_bar_provider())
     if not report.complete:
         raise SpecRefused(
             409, report.describe(),
             sessions=report.sessions, weekdays=report.weekdays,
             missing_symbol_days=report.missing_symbol_days,
+            boundary=report.boundary,
+            no_sessions=list(report.no_sessions),
             missing={sym: [d.isoformat() for d in days]
                      for sym, days in report.missing.items()})
 
@@ -477,12 +603,17 @@ class _Run:
         self.git_commit = git_commit
         self.result = None
         self.chain_store = None
+        self.guard = None
         self.failure: Optional[str] = None
         self._terminal_lock = threading.Lock()
         self.terminalised = False
 
-    def finalise(self, *, failure: Optional[str] = None) -> None:
+    def finalise(self, *, failure: Optional[str] = None) -> bool:
         """Write the cells and the terminal status row. At most once.
+
+        Returns whether THIS call did the write. ``False`` means somebody else
+        already claimed it — which is what the SIGTERM handler needs to know:
+        the worker is mid-write and the process must not die under it.
 
         Delegates to ``main._finalise_sweep_status`` — the Job's own terminal
         writer, SIG_IGN window included — rather than restating its rules. Those
@@ -496,7 +627,7 @@ class _Run:
 
         with self._terminal_lock:
             if self.terminalised:
-                return
+                return False
             self.terminalised = True
         cli._finalise_sweep_status(
             writer=self.writer, logger=logger, result=self.result,
@@ -507,6 +638,7 @@ class _Run:
             provenance=self.provenance, deduplicated_to=None,
             artifact_writer=self.artifact_writer,
         )
+        return True
 
 
 def _replay(run: "_Run") -> None:
@@ -523,6 +655,14 @@ def _replay(run: "_Run") -> None:
     from src.backtesting.data.fetch_guard import ChainFetchRefusingProvider
     from src.backtesting.scenarios import run_sweep
 
+    def _guard(provider):
+        # Kept on the run so the outcome can be READ afterwards. A refusal
+        # arrives as a per-window materialisation error inside `run_sweep`,
+        # which would otherwise leave the run `done` with error cells — see
+        # below for why that is the wrong terminal status here.
+        run.guard = ChainFetchRefusingProvider(provider, run_id=run.run_id)
+        return run.guard
+
     began = time.perf_counter()
     try:
         run.chain_store = ChainStore.from_env()
@@ -538,10 +678,36 @@ def _replay(run: "_Run") -> None:
                            and run.artifact_writer.enabled else None),
             run_id=run.run_id,
             engine_identity=run.identity,
-            vendor_guard=lambda provider: ChainFetchRefusingProvider(
-                provider, run_id=run.run_id),
+            vendor_guard=_guard,
             quiet_exempt=(__name__,),
         )
+        refusals = int(getattr(run.guard, "refusals", 0) or 0)
+        if refusals:
+            # RUN-LEVEL failure, not `done` with error cells. `run_sweep`
+            # records a materialisation failure on that window's rows and
+            # carries on, which is right for a bad arm and WRONG for this: a
+            # refused chain fetch means the lake did not cover the window the
+            # pre-flight said it did, so the run's grid is missing whole
+            # symbol-windows for an infrastructure reason. `done` would put it
+            # in front of an operator as a result with some blanks — and the
+            # `fetch_guard` docstring already promised "fails the run loudly",
+            # so this is the code catching up with the contract.
+            #
+            # The dedup already refuses to serve it (`error_cells = 0` is one of
+            # `find_done_sweep`'s five conditions); this is about what the
+            # operator sees, and about the run not being mistaken for a
+            # measurement.
+            run.failure = (
+                f"chain coverage gap: {refusals} vendor chain fetch(es) were "
+                f"refused during the replay, so at least one symbol-window has "
+                f"no result. The pre-flight passed but the lake did not in fact "
+                f"cover this window — backfill it, or run this spec through the "
+                f"`backtest-sweep` Job, which is allowed to fetch.")
+            logger.error(
+                "Simulation hit the chain fetch guard — recording it as FAILED "
+                "rather than as a result with holes",
+                event_category="backtest", event_type="sim_run_uncovered",
+                run_id=run.run_id, refusals=refusals)
     except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
         # Nothing above this frame can report it: the request that started this
         # replay returned its 202 long ago, and an exception escaping a worker
@@ -604,23 +770,33 @@ def _on_sigterm(signum, frame):
     Then it chains to whatever handler was installed before it — uvicorn's, in
     production — so the graceful shutdown this replaces none of still runs.
 
-    ``_Run.finalise`` is idempotent, so the worker's own ``finally`` losing this
-    race writes nothing further. The row says ``failed``, which is the truth: the
-    replay did not finish and its cells are not in the table.
-    """
-    import main as cli
+    ``_Run.finalise`` is idempotent, so only one side writes. **Which side wins
+    changes what this handler has to do**, and the review's live probe found the
+    case that was being lost: when the WORKER has already claimed the terminal
+    write — a run that had just COMPLETED — this handler used to do nothing and
+    chain straight on, and the process died with that insert in flight. So when
+    ``finalise`` reports that somebody else claimed it, the handler WAITS for the
+    worker, inside the SIG_IGN window. Cloud Run's ten-second grace exists for
+    exactly this; ``TERMINAL_WRITE_JOIN_SECONDS`` leaves margin inside it.
 
+    The row says ``failed`` when this handler wrote it, which is the truth: the
+    replay did not finish and its cells are not in the table. When the worker
+    wrote it, the row says whatever the run actually was.
+    """
     with _STATE_LOCK:
         run = _CURRENT
     if run is not None:
+        import main as cli
+
         logger.warning(
             "SIGTERM received — recording a terminal sim status before the "
             "instance is killed",
             event_category="backtest", event_type="sim_sigterm",
             signal=signum, run_id=run.run_id)
         with cli.ignore_sigterm_while_finalising(logger, what="sim"):
+            wrote = False
             try:
-                run.finalise(failure=(
+                wrote = run.finalise(failure=(
                     f"the instance received signal {signum} (Cloud Run sends "
                     f"SIGTERM then SIGKILL 10s later): scale-in, a new revision "
                     f"taking traffic, or an eviction. The replay did not "
@@ -631,6 +807,21 @@ def _on_sigterm(signum, frame):
                     event_category="backtest",
                     event_type="sim_status_write_failed",
                     run_id=run.run_id, exc_info=True)
+            if not wrote:
+                # The worker owns the write and may be mid-insert. Waiting here
+                # is the whole fix: without it a COMPLETED run loses its `done`
+                # row to the SIGKILL and reads as `running` until its liveness
+                # bound expires.
+                worker = _WORKER
+                if worker is not None and worker.is_alive():
+                    logger.info(
+                        "Waiting for the worker's terminal write before "
+                        "shutdown",
+                        event_category="backtest",
+                        event_type="sim_sigterm_join",
+                        run_id=run.run_id,
+                        seconds=TERMINAL_WRITE_JOIN_SECONDS)
+                    worker.join(timeout=TERMINAL_WRITE_JOIN_SECONDS)
     previous = _PREVIOUS_SIGTERM
     if callable(previous):
         previous(signum, frame)
@@ -674,7 +865,7 @@ def restore_sigterm_handler() -> None:
 # --------------------------------------------------------------------------- #
 def create_app():
     """Build the FastAPI app. A function, so importing this module is cheap."""
-    from fastapi import Body, FastAPI, HTTPException
+    from fastapi import Body, FastAPI, Header, HTTPException
     from fastapi.responses import JSONResponse
 
     app = FastAPI(title="options-wheel sim service", docs_url=None,
@@ -715,12 +906,17 @@ def create_app():
         }
 
     @app.post("/simulate")
-    def simulate(spec: Dict[str, Any] = Body(...)) -> JSONResponse:
-        """Validate, guard, dedup, and either answer or accept.
+    def simulate(
+        spec: Dict[str, Any] = Body(...),
+        x_sim_provenance: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """Validate, dedup, guard, and either answer or accept.
 
-        * **422** — a spec the engine would refuse, with the engine's own reason.
+        * **422** — a spec the engine would refuse, with the engine's own reason
+          (or an `X-Sim-Provenance` outside the allowlist).
         * **409** — over the interactive budget, or the chain lake cannot cover
-          the window, or this instance is already replaying.
+          the window, or this exact spec is already running (here or on the
+          other instance).
         * **503** — the sweep store is unavailable, so there is nowhere to put
           the answer this endpoint promises to persist.
         * **200** ``{run_id, deduplicated: true}`` — an identical spec already
@@ -730,12 +926,17 @@ def create_app():
         * **202** ``{run_id}`` — accepted. The replay is running on this
           instance's worker thread; poll ``GET /api/v2/sweeps/{run_id}``.
 
-        The order is deliberate: everything that can refuse runs BEFORE any row
-        is written, so a refused spec leaves nothing behind to terminalise and
-        nothing holding a lock.
+        **The dedup lookup runs before the budget and the coverage guard** — a
+        stored answer must come back regardless of what recomputing it would
+        cost. Everything that can refuse still runs before any row is written,
+        so a refused spec leaves nothing behind to terminalise and nothing
+        holding a lock.
+
+        ``X-Sim-Provenance`` sets the rows' ``submitted_via`` from a closed
+        allowlist; the deploy smoke sends ``smoke``.
         """
         try:
-            return _simulate(spec)
+            return _simulate(spec, x_sim_provenance)
         except SpecRefused as exc:
             return JSONResponse(status_code=exc.status,
                                 content={"detail": exc.detail, **exc.extra})
@@ -753,8 +954,24 @@ def create_app():
     return app
 
 
-def _simulate(raw_spec: Dict[str, Any]):
-    """``POST /simulate``'s body, outside the app so it is directly testable."""
+def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None):
+    """``POST /simulate``'s body, outside the app so it is directly testable.
+
+    **THE DEDUP LOOKUP COMES BEFORE THE BUDGET AND THE COVERAGE GUARD**, and the
+    order is the feature. Dedup-as-cache is the headline of this whole phase —
+    the plan's behaviour contract says "answer < 2 s, zero replays" — and a
+    stored answer is a stored answer whatever it would cost to recompute or
+    whether the lake still holds the window. Checking the budget first meant a
+    spec whose result was already in the table came back as a 409 telling the
+    operator to use the batch path, which would have deduplicated to the very
+    row this service was refusing to hand over. Ditto coverage: a run produced
+    weeks ago by the Job is not less valid because the interactive path could
+    not reproduce it today.
+
+    ``force`` skips the lookup, so a forced huge spec is still budget-refused —
+    which is right: forcing means "replay it", and that is the expensive thing
+    the budget bounds.
+    """
     from fastapi.responses import JSONResponse
 
     from src.backtesting.data.chain_store import ChainStore
@@ -767,16 +984,9 @@ def _simulate(raw_spec: Dict[str, Any]):
 
     global _CURRENT, _WORKER
 
+    submitted_via = normalise_provenance(provenance_header)
     parsed = normalise_spec(raw_spec)
     spec = parsed["spec"]
-    check_budget(spec)
-
-    # The lake, for the pre-flight only. `ChainStore.from_env()` builds a GCS
-    # client and probes the bucket, so it is inside the request rather than at
-    # import time: a broken lake must be a 409 with a reason, not a service that
-    # fails to start.
-    store = ChainStore.from_env()
-    check_coverage(store, spec, parsed["start"], parsed["end"])
 
     writer = get_writer()
     if not writer.enabled:
@@ -811,6 +1021,34 @@ def _simulate(raw_spec: Dict[str, Any]):
                 content={"run_id": prior["run_id"], "deduplicated": True,
                          "sweep_key": key})
 
+    # A MISS. Only now does what it would cost to run matter.
+    check_budget(spec)
+
+    # The lake, for the pre-flight only. `ChainStore.from_env()` builds a GCS
+    # client and probes the bucket, so it is inside the request rather than at
+    # import time: a broken lake must be a 409 with a reason, not a service that
+    # fails to start.
+    store = ChainStore.from_env()
+    check_coverage(store, spec, parsed["start"], parsed["end"])
+
+    # CROSS-INSTANCE. `--max-instances=2`, so the per-process lock below cannot
+    # see a replay of this same spec running in another container. Advisory (two
+    # requests inside one query round-trip still race) and bounded by the same
+    # liveness clock the dashboard's readers use, so an orphaned `running` row
+    # from a killed instance stops blocking at ~25 minutes rather than for ever.
+    live = writer.find_running_sweep(
+        key, max_age_seconds=LIVENESS_SECONDS + STALE_GRACE_SECONDS)
+    if live is not None:
+        raise SpecRefused(
+            409,
+            f"this exact spec is already running as {live['run_id']} "
+            f"(submitted via {live.get('submitted_via') or 'unknown'}). Poll "
+            f"GET /api/v2/sweeps/{live['run_id']} rather than replaying it "
+            f"twice; if that run turns out to be dead, it stops blocking "
+            f"{(LIVENESS_SECONDS + STALE_GRACE_SECONDS) // 60} minutes after "
+            f"its last update.",
+            run_id=live["run_id"])
+
     # THE SLOT, taken before any row is written so a `running` row can never
     # exist for a replay that was refused for being second. Released by
     # `_replay`'s `finally`, whatever happens inside it.
@@ -837,7 +1075,7 @@ def _simulate(raw_spec: Dict[str, Any]):
             run_id=run_id,
             submitted_at=submitted_at,
             sweep_key=key,
-            submitted_via=SUBMITTED_VIA,
+            submitted_via=submitted_via,
             engine_version=ENGINE_VERSION,
             git_commit=git_commit,
             engine_identity=identity,

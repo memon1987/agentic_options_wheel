@@ -1056,7 +1056,8 @@ class TestThePerRowLivenessBound:
         blocking = S.blocking_sweep([sim_row, job_row], now=self.now())
         assert blocking is not None and blocking["run_id"] == "job1"
 
-    @pytest.mark.parametrize("value", [None, 0, -1, "", "abc", object()])
+    @pytest.mark.parametrize("value", [None, 0, -1, "", "abc", object(),
+                                       True, False])
     def test_junk_and_absence_both_fall_back_to_the_conservative_clock(self,
                                                                       value):
         """Shortening the bound is the dangerous direction.
@@ -1065,6 +1066,10 @@ class TestThePerRowLivenessBound:
         release the lock under a run that is still going, and two replays would
         contend for one chain cache. Absence and junk therefore both mean "use
         the Job's clock" — the row is still visible and still terminalises.
+
+        ``True`` is in the list because `bool` IS an `int` in Python: without an
+        explicit guard it becomes a ONE-SECOND bound and releases the lock under
+        every live run.
         """
         assert S.row_liveness_seconds({"liveness_seconds": value}) == \
             S.JOB_TASK_TIMEOUT_SECONDS
@@ -1084,6 +1089,21 @@ class TestThePerRowLivenessBound:
         assert ("liveness_seconds", "INT64") in S.ADDITIVE_OPTIONAL_COLUMNS
         assert S.missing_optional_column(
             "Unrecognized name: liveness_seconds") == "liveness_seconds"
+
+    def test_the_proxy_timeout_outlasts_the_services_own(self):
+        """A client timeout on a submit that in fact landed is the worst case.
+
+        The operator resubmits, and the second attempt 409s against the first.
+        150 s sits above the service's `--timeout=120` and deliberately BELOW
+        the measured ~240 s cold-start tail, which the 502 message says out
+        loud rather than pretending a bigger number would fix.
+        """
+        src = (BACKEND / "routers" / "v2.py").read_text()
+        body = src[src.index("async def run_sim"):src.index("@router.post(\"/sweeps\"")]
+        assert "AsyncClient(timeout=150.0)" in body
+        assert "150 s timeout" in body, (
+            "the 502 must admit that a genuinely cold start can still land here"
+        )
 
     def test_the_api_writes_it_as_null_because_it_launches_the_job(self):
         row = S.submitted_row(

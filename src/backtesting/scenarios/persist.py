@@ -546,6 +546,74 @@ class ScenarioRunWriter:
             return None
         return dict(rows[0].items()) if rows else None
 
+    def find_running_sweep(self, sweep_key: str, *, max_age_seconds: int,
+                           exclude_run_id: Optional[str] = None
+                           ) -> Optional[Dict[str, Any]]:
+        """A live, non-stale ``running`` run under ``sweep_key``, or None.
+
+        FC-096 Phase B PR-c, from the service review. The sim service holds a
+        per-PROCESS lock so one instance never replays two specs at once — and
+        ``--max-instances=2`` means a second CONTAINER can accept the same spec
+        a second later and replay it in parallel. The plan's "they would contend
+        on one chain cache" rationale is false across containers (each has its
+        own tmpfs), but the waste is real and so is the confusion: two `running`
+        rows for one question, two sets of cells, and a dedup that can serve
+        either.
+
+        So this is the cross-instance half of the same gate. It is advisory by
+        construction — two requests inside one query round-trip still race — and
+        that is acceptable: the cost of losing the race is a duplicate replay,
+        which is what happens today, while the cost of being wrong in the other
+        direction would be refusing a legitimate submission for ever.
+
+        ``max_age_seconds`` is the caller's liveness bound plus its grace, so a
+        killed instance's orphaned `running` row stops blocking at exactly the
+        moment the dashboard's readers stop counting it (~25 min for the sim
+        service). Without that bound this would be a permanent lock on a dead
+        run, which is the failure ``blocking_sweep``'s expiry exists to prevent.
+
+        A query failure returns None: "we could not tell" must mean "run it".
+        """
+        if not self._enabled or not sweep_key:
+            return None
+        table = f"{self._project_id}.{self._dataset_id}.{SWEEPS_TABLE}"
+        query = f"""
+        WITH latest AS (
+          SELECT run_id, status, submitted_at, written_at, submitted_via,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY run_id ORDER BY {LATEST_STATUS_ORDER_BY}) AS rn
+          FROM `{table}`
+          WHERE sweep_key = @sweep_key
+        )
+        SELECT run_id, submitted_at, written_at, submitted_via
+        FROM latest
+        WHERE rn = 1
+          AND status = '{STATUS_RUNNING}'
+          AND written_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
+                                         INTERVAL @max_age SECOND)
+          AND (@exclude IS NULL OR run_id != @exclude)
+        ORDER BY written_at DESC
+        LIMIT 1
+        """
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("sweep_key", "STRING", sweep_key),
+                bigquery.ScalarQueryParameter("max_age", "INT64",
+                                              int(max_age_seconds)),
+                bigquery.ScalarQueryParameter("exclude", "STRING",
+                                              exclude_run_id),
+            ])
+            rows = list(self._client.query(query, job_config=job_config).result(
+                timeout=30))
+        except Exception as exc:  # noqa: BLE001 - a failed lookup must not block
+            logger.warning("Live-sweep lookup failed — accepting rather than "
+                           "assuming a duplicate is in flight",
+                           event_category="backtest",
+                           event_type="sweep_running_lookup_failed",
+                           sweep_key=sweep_key, error=str(exc)[:200])
+            return None
+        return dict(rows[0].items()) if rows else None
+
     def write_status(self, row: Dict[str, Any]) -> bool:
         """Insert one ``scenario_sweeps`` row."""
         return self._insert(self._sweeps, SWEEPS_TABLE, [row])

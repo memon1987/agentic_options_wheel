@@ -1050,9 +1050,32 @@ steps:
         URL=$(gcloud run services describe sim-service --region=us-central1 --format=json \
           | python3 -c "import json,sys;t=(json.load(sys.stdin).get('status') or {}).get('traffic') or [];print(next((x.get('url','') for x in t if x.get('tag')=='canary'),''))")
         if [ -z "$${URL}" ]; then
-          echo "SMOKE_SIM_HTTP_UNAVAILABLE: no canary-tagged URL on sim-service; skipping the HTTP half"
-          exit 0
+          echo "FAIL: sim-service has no canary-tagged URL after a successful --tag=canary deploy"
+          exit 1
         fi
+
+        # UNAUTHENTICATED probe FIRST, and it is a HARD gate. It separates the
+        # two states the authed call cannot tell apart:
+        #   000  -> connection refused / DNS / timeout: the service is NOT up.
+        #   401/403 -> the service IS up and IAM is enforcing. Proceed.
+        #   200  -> the service is answering ANONYMOUS callers. That is a
+        #           security defect on a service holding Alpaca credentials and
+        #           writing to the sweep store; --no-allow-unauthenticated is in
+        #           the deploy flags and something has overridden it.
+        # Without this, a 403 on the authed call reads as "no engine identity"
+        # and the build fails with a message about hashing, which is a lie.
+        ANON=$(curl -s -o /dev/null -w '%{http_code}' --max-time 300 "$${URL}/health" || echo "000")
+        echo "unauthenticated /health -> $${ANON}"
+        case "$${ANON}" in
+          401|403) echo "PASS: sim-service is up and refusing anonymous callers" ;;
+          200) echo "FAIL: sim-service answered an UNAUTHENTICATED /health. It is deployed --no-allow-unauthenticated and holds broker credentials; something has made it public."
+               exit 1 ;;
+          000) echo "FAIL: could not reach $${URL} at all (connection refused, DNS or timeout). The revision reported Ready but the service is not serving."
+               exit 1 ;;
+          *) echo "FAIL: unauthenticated /health returned $${ANON}; expected 401/403 from a private service"
+             exit 1 ;;
+        esac
+
         TOKEN=$(gcloud auth print-identity-token --audiences="$${URL}" 2>/dev/null || true)
         if [ -z "$${TOKEN}" ]; then
           TOKEN=$(curl -s -H 'Metadata-Flavor: Google' \
@@ -1060,12 +1083,24 @@ steps:
         fi
         case "$${TOKEN}" in
           ey*) ;;
-          *) echo "SMOKE_SIM_HTTP_UNAVAILABLE: could not mint an identity token for $${URL} from Cloud Build; the readiness gate above passed, the HTTP half did not run. See rollout step 3."
+          *) echo "SMOKE_SIM_HTTP_UNAVAILABLE: could not mint an identity token for $${URL} from Cloud Build; the readiness and reachability gates above passed, the authenticated half did not run. See rollout step 3."
              exit 0 ;;
         esac
 
-        HEALTH=$(curl -s --max-time 300 -H "Authorization: Bearer $${TOKEN}" "$${URL}/health" || true)
-        echo "health: $${HEALTH}"
+        HCODE=$(curl -s -o /workspace/smoke-sim-health.txt -w '%{http_code}' \
+          --max-time 300 -H "Authorization: Bearer $${TOKEN}" "$${URL}/health" || echo "000")
+        HEALTH=$(cat /workspace/smoke-sim-health.txt)
+        echo "authenticated /health -> $${HCODE}: $${HEALTH}"
+        if [ "$${HCODE}" = "403" ] || [ "$${HCODE}" = "401" ]; then
+          echo "FAIL: the BUILD service account is not an invoker on sim-service."
+          echo "The service is up (the unauthenticated probe above proved it) and this"
+          echo "token was rejected — this is an IAM grant, NOT a missing engine identity."
+          echo "Fix:  gcloud run services add-iam-policy-binding sim-service \\"
+          echo "        --region=us-central1 --role=roles/run.invoker \\"
+          echo "        --member=serviceAccount:799970961417@cloudbuild.gserviceaccount.com"
+          echo "(and the same for the dashboard's service account, which the proxy needs)"
+          exit 1
+        fi
         IDENTITY=$(printf '%s' "$${HEALTH}" \
           | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('engine_identity') or '')" \
           2>/dev/null || true)
@@ -1075,16 +1110,34 @@ steps:
         fi
         echo "PASS: /health engine_identity=$${IDENTITY}"
 
+        # `X-Sim-Provenance: smoke` stamps `submitted_via='smoke'` on any rows
+        # this writes, so the battery and trend queries exclude them. It matters
+        # on every build whose engine identity moved: there is no prior run to
+        # dedup against, so this POST is a REAL ~45 s replay.
         CODE=$(curl -s -o /workspace/smoke-sim-body.txt -w '%{http_code}' \
           --max-time 300 -X POST -H "Authorization: Bearer $${TOKEN}" \
           -H 'Content-Type: application/json' \
+          -H 'X-Sim-Provenance: smoke' \
           -d @deploy/smoke_sim_spec.json "$${URL}/simulate" || echo "000")
         cat /workspace/smoke-sim-body.txt
         echo ""
         case "$${CODE}" in
           200) echo "PASS: /simulate deduplicated (200) — the seeded spec is present" ;;
-          202) echo "PASS: /simulate accepted (202) — no seeded spec yet; see rollout step 3" ;;
-          409) echo "SMOKE_SIM_SPEC_UNCOVERED: /simulate refused the smoke spec (409) — the service answered correctly, but deploy/smoke_sim_spec.json names a window the chain lake does not cover. Re-point it at a covered window (rollout step 3). Not failing the build over a data fact." ;;
+          202) echo "PASS: /simulate accepted (202) — engine identity moved, so this ran a real replay; its rows are submitted_via='smoke'" ;;
+          409)
+            # THREE different 409s, and conflating them misdiagnoses the exact
+            # log line rollout step 3 greps. A busy-409 names a run_id; a
+            # coverage-409 carries missing_symbol_days; anything else (the
+            # budget) means the smoke spec itself has grown too big.
+            if grep -q 'missing_symbol_days' /workspace/smoke-sim-body.txt; then
+              echo "SMOKE_SIM_SPEC_UNCOVERED: /simulate refused the smoke spec (409) — the service answered correctly, but deploy/smoke_sim_spec.json names a window the chain lake does not cover. Re-point it at a covered window (rollout step 3). Not failing the build over a data fact."
+            elif grep -q '"run_id"' /workspace/smoke-sim-body.txt; then
+              echo "SMOKE_SIM_BUSY: /simulate refused (409) because a replay of this spec is already in flight — an operator's run, or a previous build's smoke. The service answered correctly; nothing is wrong with the lake."
+            else
+              echo "FAIL: /simulate returned 409 for neither coverage nor busy — the smoke spec is over the service's own budget, which makes it not a smoke."
+              exit 1
+            fi
+            ;;
           *) echo "FAIL: /simulate returned $${CODE}; expected 200 (dedup hit) or 202 (accepted)"
              exit 1 ;;
         esac
@@ -1275,8 +1328,16 @@ serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/79997096141
 # adds the fourth canary chain (deploy-sim-canary -> smoke-test-sim -> promote-sim).
 # Measured single-build runtime before this PR: max 827s (2026-08-31), p95 662s
 # (queue time sits on top and does not count against the timeout: <=110s). The new
-# chain is a deploy + a readiness poll + two short HTTP calls + a promote, budgeted
-# at +90-150s, so:
+# chain is a deploy + a readiness poll + three HTTP calls + a promote, budgeted
+# at +90-150s.
+#
+# **The honest caveat:** those curls carry `--max-time 300` each, so a genuinely
+# cold instance (the measured 240s+ startup tail) can blow straight through the
+# 150s budget on the unauthenticated probe alone, and a 202 that triggers a real
+# ~45s replay adds more. The budget below describes the WARM case, which is
+# every build after the first of a session; the cold worst case is bounded by
+# the curls' own timeouts at ~+10 min and would hit the 1500s ceiling. That is
+# the escalation rule's trigger, not a surprise:
 #   single build worst case  = 827s + ~150s          = ~975s
 #   waiting-pair worst case  = wait for the older build (<=975s)
 #                            + this build's own deploy chain (~360s)          = ~1335s

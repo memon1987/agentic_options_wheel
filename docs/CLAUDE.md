@@ -932,6 +932,25 @@ Five routes, and the asymmetry between them is deliberate:
 | `GET /api/v2/sweeps/{run_id}` | none | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
 | `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` | none | one cell's **detail artifact** — equity curve, full ledger, cycles, rolls, rejection tally (FC-096 Phase B) |
 | `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → 409 gate → write `submitted` → launch the Job → **202** |
+| `POST /api/v2/sims/run` | **the same bearer token** | proxy to the private `sim-service` with an **OIDC ID token** (`routers/live.py`'s pattern, NOT `_launch_job`'s control-plane OAuth token — each is a 401 at the other end); returns the service's status code and body **verbatim**, because its 409/422 bodies carry the estimate, the missing symbol-days and the remedy |
+
+**The sim proxy is a proxy, not a second API** (FC-096 Phase B PR-c). Every rule
+about what a spec may contain, what it costs and whether the chain lake covers
+it lives in the service, which holds a real `Config` and can see the lake;
+duplicating any of it here is the two-parsers failure D7 exists to prevent, one
+layer up. `SIM_SERVICE_URL` unset ⇒ **503 naming the variable**, never a
+hardcoded default pointed at a service that may not exist. The httpx timeout is
+**150 s** — above the service's own `--timeout=120`, so the proxy never abandons
+a request the service is still serving, and deliberately below the ~240 s
+cold-start tail, which the 502 says out loud rather than pretending a bigger
+number would fix.
+
+**A sim run's rows carry `liveness_seconds = 900`**, so a scaled-in instance
+releases the one-at-a-time submit lock in **~25 min** (900 s + the readers'
+existing 10-minute grace) instead of the Job's 3 h 10 m. NULL means "use the
+Job's clock" and is what every pre-PR-c row and every Job row means;
+`services/sweeps.row_liveness_seconds` treats junk, zero and `bool` as absence,
+because shortening the bound is the dangerous direction.
 
 - **The artifact route reads GCS, not BigQuery.** The engine gzips one JSON
   object per non-errored cell to
@@ -1016,14 +1035,28 @@ because nothing else ever supplies an in-flight request) and `--concurrency=1`
 process corrupt each other's numbers without crashing). Unlike the wheel and
 covered-call steps, this one DOES pass `--set-secrets`: it creates its own
 service, so a first deploy without the bindings produces a container whose
-`Config()` cannot validate. `smoke-test-sim` polls readiness (hard gate), then
-asserts a non-empty `/health` engine identity and a `{200|202}` from
-`/simulate`; it degrades with the named markers `SMOKE_SIM_HTTP_UNAVAILABLE`
-(no OIDC token mintable from Cloud Build — a capability this project has never
-exercised) and `SMOKE_SIM_SPEC_UNCOVERED` (409: the smoke spec names a window
-the chain lake does not hold) rather than reddening every merge, and rollout
-step 3 is required to grep the build log for `PASS: /health` and resolve either
-marker if it appears.
+`Config()` cannot validate. `smoke-test-sim` has three hard gates and two named
+degrades. Hard: the revision reaches Ready; an **unauthenticated** `GET /health`
+returns 401/403 (`000` = not serving, and a **200** means the private service is
+answering anonymous callers — a security failure, not a curiosity); the
+authenticated `/health` returns a non-empty engine identity. That
+unauthenticated probe exists to keep a 403 from reading as "no engine identity":
+a rejected token is an **invoker grant**, and the failure names
+`roles/run.invoker` and the exact member instead of talking about hashing. Then
+`POST /simulate` (carrying `X-Sim-Provenance: smoke`, so any rows it writes are
+excludable) must answer `{200|202}`; its three possible 409s are separated —
+BUSY names a `run_id`, COVERAGE carries `missing_symbol_days`, and anything else
+fails, because a smoke spec that outgrew the service's own budget is a real
+defect. It degrades under `SMOKE_SIM_HTTP_UNAVAILABLE` (no OIDC token mintable
+from Cloud Build — a capability this project has never exercised) and
+`SMOKE_SIM_SPEC_UNCOVERED` rather than reddening every merge; **rollout step 3
+greps the build log for `PASS: /health`** and resolves either marker if it
+appears.
+
+**The build SA and the dashboard SA both need `roles/run.invoker` on
+`sim-service`, granted AFTER the first deploy creates it** — the build's own
+authenticated smoke half and the dashboard's `POST /api/v2/sims/run` proxy are
+each blocked until then, and both say so by name rather than failing obscurely.
 
 **`serialize-builds` gates the deploys** (`waitFor: ['push-bot-image']`). It must
 be **listed after** `push-bot-image`, not first: Cloud Build resolves `waitFor`
@@ -1054,8 +1087,12 @@ possible.
 Measured single-build runtime before that PR is **max 827 s** (2026-08-31; the
 earlier max-798 s figure predates the sweep-Job step), p95 662 s (queue time sits
 on top and does not count against the build timeout: ≤110 s). The sim chain is a
-deploy + a readiness poll + two short HTTP calls + a promote, budgeted at
-**+90–150 s**, so the single-build worst case becomes **~975 s**. When one build
+deploy + a readiness poll + three HTTP calls + a promote, budgeted at
+**+90–150 s**, so the single-build worst case becomes **~975 s**. That budget
+describes the WARM case: those curls carry `--max-time 300` each, so a genuinely
+cold instance (the 240 s+ startup tail) can blow through it, and a `202` that
+triggers a real ~45 s replay adds more. The cold worst case is bounded by the
+curls' own timeouts and is what the escalation rule below exists to catch. When one build
 waits for an older one:
 
 ```

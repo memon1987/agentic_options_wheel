@@ -1084,6 +1084,75 @@ def test_sim_smoke_polls_readiness_then_probes_health_and_simulate(by_id):
         "log can be grepped for a control that ran nothing."
     )
     assert "SMOKE_SIM_SPEC_UNCOVERED" in script
+    assert "-H 'X-Sim-Provenance: smoke'" in script, (
+        f"{SIM_SMOKE_STEP} must label its rows. Its POST is a dedup hit only "
+        "while the engine identity has not moved, so every build touching "
+        "`src/**` or `requirements.txt` makes it a REAL replay writing real "
+        "rows — and an unlabelled build artifact reads as an operator's "
+        "experiment in the battery and the trend view."
+    )
+
+
+def test_sim_smoke_probes_unauthenticated_before_it_blames_the_identity(by_id):
+    """The IAM/identity confusion the review caught, closed.
+
+    A 403 on the authenticated `/health` used to fall through to "no
+    engine_identity" — a message about hashing, for what is an invoker grant.
+    The unauthenticated probe runs FIRST and is a HARD gate that separates the
+    two states the authed call cannot:
+
+    * ``000`` (refused/DNS/timeout) -> the service is not serving. FAIL.
+    * ``401``/``403``               -> up, and IAM is enforcing. Proceed.
+    * ``200``                       -> the service is answering ANONYMOUS
+      callers, on a container holding broker credentials and writing to the
+      sweep store. FAIL, loudly — `--no-allow-unauthenticated` is in the deploy
+      flags and something has overridden it.
+
+    Only then, if the authed call 403s, the failure names the missing grant and
+    the command that fixes it.
+    """
+    script = script_of(by_id[SIM_SMOKE_STEP])
+    # The ASSIGNMENT must be the curl itself. Asserting only that the block
+    # mentions curl lets `ANON="401"` sit above a commented-out request and the
+    # gate becomes a constant — which is a control that watches nothing.
+    assert re.search(r"^\s*ANON=\$\(curl\b", script, re.M), (
+        "smoke-test-sim's unauthenticated probe must actually issue the request "
+        "it gates on"
+    )
+    anon = script[script.index("ANON="):script.index("TOKEN=")]
+    assert "Authorization" not in anon, (
+        "the first probe must be UNAUTHENTICATED; that is the whole point"
+    )
+    for state in ("401|403)", "200)", "000)"):
+        assert state in anon, f"the probe must distinguish {state}"
+    assert "not serving" in anon or "not up" in anon.lower()
+    assert "made it public" in anon, (
+        "a private service answering anonymously is a security defect, not a "
+        "curiosity"
+    )
+    assert "BUILD service account is not an invoker" in script
+    assert "roles/run.invoker" in script
+    assert "799970961417@cloudbuild.gserviceaccount.com" in script, (
+        "the failure has to name the exact member an operator must grant"
+    )
+    assert "NOT a missing engine identity" in script
+
+
+def test_sim_smoke_separates_the_three_409s(by_id):
+    """Busy is not a lake gap, and the log line rollout greps must not say it is.
+
+    Three different 409s reach this step: BUSY (a replay of this spec is in
+    flight — names a run_id), COVERAGE (the smoke spec's window is not in the
+    lake — carries `missing_symbol_days`), and BUDGET (the smoke spec has grown
+    too big to be a smoke, which is a real defect and fails).
+    """
+    script = script_of(by_id[SIM_SMOKE_STEP])
+    assert "missing_symbol_days" in script
+    assert "SMOKE_SIM_BUSY" in script
+    assert "not a smoke" in script, (
+        "an unexplained 409 must FAIL — otherwise a smoke spec that outgrew the "
+        "service's own budget would report for ever as a lake gap"
+    )
 
 
 def test_the_smoke_spec_exists_and_is_small_enough_to_be_a_smoke():

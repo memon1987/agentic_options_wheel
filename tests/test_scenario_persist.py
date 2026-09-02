@@ -425,6 +425,66 @@ class TestTheLivenessColumn:
         assert isinstance(row["liveness_seconds"], int)
 
 
+class TestTheLiveSweepLookup:
+    """FC-096 Phase B PR-c: the cross-instance half of one-replay-per-spec.
+
+    `--max-instances=2` means a second CONTAINER can accept the same spec a
+    second later, and the sim service's per-process lock cannot see it. This is
+    the store-side question that closes it — deliberately advisory (two requests
+    inside one query round-trip still race) and deliberately bounded, so an
+    orphaned `running` row from a killed instance stops blocking at the same
+    moment the dashboard's readers stop counting it.
+    """
+
+    def test_the_query_requires_running_and_bounds_its_age(self):
+        pytest.importorskip("google.cloud.bigquery")
+        captured = {}
+
+        class Client:
+            def query(self, sql, job_config=None):
+                captured["sql"] = sql
+                captured["params"] = {p.name: p.value
+                                      for p in job_config.query_parameters}
+                raise RuntimeError("stop after the query is built")
+
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._enabled = True
+        writer._client = Client()
+        writer._project_id = "p"
+        writer._dataset_id = "options_wheel"
+        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
+        assert f"status = '{store.STATUS_RUNNING}'" in captured["sql"]
+        assert "TIMESTAMP_SUB" in captured["sql"]
+        assert captured["params"]["max_age"] == 1500
+        assert captured["params"]["sweep_key"] == "k"
+
+    def test_a_query_failure_accepts_rather_than_blocks(self):
+        """"We could not tell" must mean "run it".
+
+        The opposite posture would let one BigQuery blip refuse every
+        submission, which is worse than the duplicate replay it is preventing.
+        """
+        pytest.importorskip("google.cloud.bigquery")
+
+        class Angry:
+            def query(self, *a, **k):
+                raise RuntimeError("bq down")
+
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._enabled = True
+        writer._client = Angry()
+        writer._project_id = "p"
+        writer._dataset_id = "options_wheel"
+        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
+
+    def test_a_disabled_writer_or_an_empty_key_never_queries(self):
+        writer = store.ScenarioRunWriter.__new__(store.ScenarioRunWriter)
+        writer._enabled = False
+        assert writer.find_running_sweep("k", max_age_seconds=1500) is None
+        writer._enabled = True
+        assert writer.find_running_sweep("", max_age_seconds=1500) is None
+
+
 class TestTheSchemaTypeNamesAreCovered:
     """Every type the schemas declare must be one the canonical map knows.
 

@@ -787,7 +787,16 @@ async def run_sim(
                     f"account needs roles/run.invoker on `sim-service`."))
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # 150 s, comfortably above the service's own `--timeout=120`, so a
+        # request the service is still working on is never abandoned by the
+        # proxy first — a client timeout on a submit that in fact landed is the
+        # worst outcome here, because the operator resubmits and the second one
+        # 409s against the first. It is deliberately NOT above the measured
+        # ~240 s cold-start tail: a request that has to wait for a cold instance
+        # can still 502, and the message below says so rather than pretending a
+        # bigger number would fix it. Retrying is the right move — the instance
+        # the first attempt woke is warm by then.
+        async with httpx.AsyncClient(timeout=150.0) as client:
             response = await client.post(
                 f"{url}/simulate", json=spec,
                 headers={"Authorization": f"Bearer {token}"})
@@ -796,7 +805,10 @@ async def run_sim(
             status_code=502,
             detail=(f"could not reach the sim service ({type(exc).__name__}: "
                     f"{exc}). It is scale-to-zero and its cold start has a "
-                    f"measured tail of up to ~4 minutes; retry, or use "
+                    f"measured tail of up to ~4 minutes, which is longer than "
+                    f"this proxy's 150 s timeout — so a FIRST request after an "
+                    f"idle period can legitimately land here. Retry: the "
+                    f"instance that attempt woke is warm now. Otherwise use "
                     f"POST /api/v2/sweeps."))
     except Exception as exc:  # noqa: BLE001 - nothing may escape as a 500
         raise HTTPException(

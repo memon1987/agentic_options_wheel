@@ -585,15 +585,16 @@ def run_sweep(
             replay count; off by default because a sweep is a ranking exercise
             and the flip flag matters most on the arm you finally choose.
         chain_store / bar_provider: injected by tests and by the CLI.
-        vendor_guard: optional wrapper applied to the vendor client BEFORE the
-            fetch counter and the bar cache (FC-096 Phase B B3). The sim service
-            passes ``ChainFetchRefusingProvider`` so a lake miss fails the run
-            loudly instead of reaching the options vendor from a scale-to-zero
-            HTTP service. It sits INNERMOST — a refused call is not a network
-            round-trip and must not be counted as one — and the standard
-            ``CachedBarProvider``/``BarStore`` layering above it is untouched,
-            so a guarded sweep's ``provider_fetches`` and ``bar_cache_hits``
-            still mean what they mean everywhere else.
+        vendor_guard: optional wrapper inserted between the fetch counter and
+            the bar cache (FC-096 Phase B B3). The sim service passes
+            ``ChainFetchRefusingProvider`` so a lake miss fails the run loudly
+            instead of reaching the options vendor from a scale-to-zero HTTP
+            service. Above the counter, so a REFUSED call — which never left the
+            process — is not counted as a network fetch; below the cache, so
+            nothing can route around it. The ``CachedBarProvider``/``BarStore``
+            layering is otherwise untouched, and a guarded sweep's
+            ``provider_fetches`` and ``bar_cache_hits`` still mean what they
+            mean everywhere else.
         quiet_logs: silence the strategy loggers below WARNING during replays.
         quiet_exempt: logger names to hold at INFO through that silencing. See
             ``quiet_strategy_logs``; the sim service passes its own.
@@ -636,19 +637,23 @@ def run_sweep(
     # then wraps it, and its `hits` are reported separately. Counting at the
     # outer edge (the first cut) described a fully-offline sweep as having made
     # six provider calls.
-    vendor = (bar_provider if bar_provider is not None
-              else AlpacaDataProvider.from_config(base_config))
-    if vendor_guard is not None:
-        # Between the vendor and the counter, so a REFUSAL is not counted as a
-        # fetch (it never reached the network) and so the guard cannot be
-        # bypassed by anything above it — the bar cache included.
-        vendor = vendor_guard(vendor)
-    fetch_counter = _CountingProvider(vendor)
+    fetch_counter = _CountingProvider(
+        bar_provider if bar_provider is not None
+        else AlpacaDataProvider.from_config(base_config)
+    )
+    # The guard sits JUST ABOVE the counter and BELOW the bar cache. Above the
+    # counter because a refusal is not a network round-trip and must not be
+    # counted as one — the counter is what the "zero I/O during replays"
+    # assertion reads, and inflating it with calls that never left the process
+    # would make that number mean something else. Below the cache because
+    # nothing may route around the guard: a cached bar read still passes
+    # through it, and a chain call cannot reach the vendor by any path.
+    guarded = fetch_counter if vendor_guard is None else vendor_guard(fetch_counter)
     # An injected provider is used as given — the caller owns its caching, and
     # the sweep must not silently wrap a test double in a real disk cache.
     provider = (
-        fetch_counter if bar_provider is not None
-        else CachedBarProvider(fetch_counter, BarStore())
+        guarded if bar_provider is not None
+        else CachedBarProvider(guarded, BarStore())
     )
     if chain_store is None:
         chain_store = ChainStore.from_env()
