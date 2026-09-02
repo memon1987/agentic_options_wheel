@@ -861,6 +861,58 @@ def test_backfill_job_never_retries_and_gets_a_six_hour_task_timeout(by_id):
     )
 
 
+def test_the_backfill_job_composes_the_weekly_battery(by_id):
+    """`BACKFILL_THEN_BATTERY=true` is what makes the Saturday do both things.
+
+    FC-096 Phase B B4. It lives on the Job DEFINITION rather than on the
+    `backfill-weekly` scheduler on purpose — the scheduler needed no change at
+    all, and a per-execution override would make what Saturday does a property
+    of whoever last ran a chunked widening.
+
+    Pinned HERE, on the literal `--set-env-vars` string, for the reason
+    `CHAIN_LAKE_BUCKET` is: `--set-env-vars` REPLACES the whole env set, so an
+    out-of-band `gcloud run jobs update` survives exactly until the next merge.
+    Dropping it is silent in the worst way — the backfill still succeeds, the
+    Job still exits 0, and the trend series simply stop gaining points.
+    """
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    assert "BACKFILL_THEN_BATTERY=true" in script, (
+        f"{BACKFILL_JOB_STEP} must set BACKFILL_THEN_BATTERY=true; without it "
+        "the Saturday execution backfills and measures nothing, and nothing "
+        "fails."
+    )
+    # It rides the backfill; it is NOT a second `--args` command.
+    assert "--args=main.py,--command,backfill" in script, (
+        "the Job's command stays `backfill` — the battery is composed inside "
+        "main.py after a SUCCESSFUL backfill, which is what keeps the two exit "
+        "classes apart (data failure pages; measurement failure nags)."
+    )
+    assert "--command,battery" not in script, (
+        "a Job whose args said `battery` would run the battery INSTEAD of the "
+        "backfill, against a lake nothing refreshed."
+    )
+
+
+def test_the_battery_wall_cap_fits_inside_the_backfill_jobs_timeout(by_id):
+    """The sizing claim, pinned against the Job it actually shares.
+
+    `main.BATTERY_MAX_SECONDS` bounds when a new sweep may START; the execution
+    is killed at `--task-timeout`. If the cap ever met or exceeded the timeout,
+    a long measurement week could take the BACKFILL's exit code with it — a
+    successful data run reported as a Job failure, which is a page.
+    """
+    import main as cli
+
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    timeout = int(re.search(r"--task-timeout=(\d+)", script).group(1))
+    assert cli.BATTERY_MAX_SECONDS < timeout
+    assert timeout - cli.BATTERY_MAX_SECONDS >= 3600, (
+        f"a {cli.BATTERY_MAX_SECONDS}s battery cap inside a {timeout}s "
+        "execution leaves less than an hour for the backfill itself plus the "
+        "longest single sweep"
+    )
+
+
 def test_the_wheel_service_carries_the_chain_lake_bucket(by_id):
     """`/regression`'s lake_freshness check cannot watch a bucket it is not told about.
 

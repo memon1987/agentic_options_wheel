@@ -60,7 +60,7 @@ from services.sweep_report_text import (
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
         DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
-        sweep_key, validate_scenario_name,
+        canonical_spec, sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -69,7 +69,7 @@ try:  # repo / test environment
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
         DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
-        sweep_key, validate_scenario_name,
+        canonical_spec, sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -195,6 +195,11 @@ ADDITIVE_OPTIONAL_COLUMNS = (
     # — so an un-migrated table rejects the whole request over it exactly as it
     # would over the other two.
     ("liveness_seconds", "INT64"),
+    # FC-096 Phase B B4. The pin a battery run re-measured. This API never SETS
+    # it either (it runs nothing), but `submitted_row` carries the key as NULL
+    # for the same one-column-set rule, so an un-migrated table rejects the
+    # whole request over it exactly as it would over the other three.
+    ("pin_id", "STRING"),
 )
 
 _identity_query_degraded_logged = False
@@ -913,6 +918,11 @@ def submitted_row(*, run_id: str, spec: Dict[str, Any],
         # carry the same column set or the two writers diverge by whichever one
         # happened to know a field.
         "earnings_symbols_without_data": None,
+        # FC-096 Phase B B4. A dashboard submission is never a pin's weekly
+        # re-measurement — only `main.run_battery_cmd` stamps this — so it is
+        # NULL here by MEANING, not by omission. Present for the column-set
+        # rule above.
+        "pin_id": None,
     }
 
 
@@ -1125,6 +1135,331 @@ def _as_datetime(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# ============================================================================ #
+# Pins (FC-096 Phase B B4)
+#
+# A pin is a spec the weekly battery re-measures for ever, until somebody
+# un-pins it. Everything about one that could be got wrong is decided here, in
+# the file the bot CI image can actually run, for this module's stated reason:
+# `routers/v2.py` is a thin caller.
+#
+# The table is `persist.py`'s (one schema owner, and it is the side that knows
+# every column); this file writes rows into it and reads them back, exactly as
+# it does for `scenario_sweeps`.
+# ============================================================================ #
+
+PINS_TABLE = "scenario_pins"
+
+# ROLLING PINS (FC-096 D1: "pinned combos re-measured weekly").
+#
+# A pin stores the SHAPE of its window — how many calendar days it spans and
+# how many of those are holdout — and the battery re-anchors both to
+# `last_settled_day()` every Saturday. The absolute dates the operator
+# submitted are kept in `spec_json` as the record of what they typed; they are
+# not what gets replayed.
+#
+# The alternative, which this PR's first build shipped by reusing
+# `validate_spec` unchanged, is a pin frozen to a historical window. Its answer
+# cannot change, so the engine-identity dedup hits on the SECOND Saturday and
+# every one after it, and the pin's trend series holds exactly one point
+# forever. That is not an inefficiency; it is the feature silently not
+# existing, and nothing in the UI would have said so.
+
+# `persist.MAX_ACTIVE_PINS` — FC-096 D1's "capped ~20". Pinned equal by a test.
+#
+# The cap is a WRITE-time rule and it is enforced here, because this is the only
+# side that can say what to do about it ("un-pin one first" needs the list). The
+# battery deliberately does NOT truncate to it: silently dropping measurement is
+# worse than a long Saturday, and its wall cap is what bounds the execution.
+MAX_ACTIVE_PINS = 20
+
+# `persist.PIN_NOTE_MAX_CHARS`. A note is a reminder to its author, not a
+# document, and it is operator-typed text that a public dashboard renders.
+PIN_NOTE_MAX_CHARS = 200
+
+# `persist.PINS_LATEST_ORDER_BY`. "Latest row wins" for one `pin_id`, with
+# INACTIVE winning a same-microsecond tie — a create and a delete landing
+# together must resolve to deleted, because the other direction leaves a pin the
+# operator removed running every Saturday for ever. Pinned equal by a test for
+# `LATEST_STATUS_ORDER_BY`'s reason: two sides disagreeing about which row is
+# current would show a pin the battery does not run, or hide one it does.
+PINS_LATEST_ORDER_BY = "written_at DESC, active ASC"
+
+# The pin body's top-level fields. A closed set, like `SPEC_FIELDS`, and for the
+# same reason: a misspelled `notes` would be silently dropped and the operator
+# would find their reminder missing weeks later.
+PIN_BODY_FIELDS = frozenset({"spec", "note"})
+
+
+def new_pin_id() -> str:
+    """16 hex characters, the same shape as a ``run_id`` (``persist.new_pin_id``).
+
+    Deliberately not derived from the spec: two operators may pin the same
+    question for different reasons, and un-pinning one must not un-pin the
+    other. "No two ACTIVE pins with the same spec" is enforced below, where the
+    refusal can name the pin that already asks it.
+    """
+    return uuid.uuid4().hex[:16]
+
+
+def validate_pin_body(body: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+    """``(normalised_spec, note)`` for a pin request, or raise.
+
+    The body is ``{"spec": {...}, "note": "..."}`` rather than a spec with a
+    ``note`` beside its own fields, and the wrapper is deliberate:
+    ``validate_spec`` refuses unknown top-level keys — that rule is what stops a
+    typo'd ``holdout`` from silently running in-sample — so a note at the spec's
+    level would either be refused or have to be stripped before validation, and
+    stripping is how ``holdout`` becomes a note.
+
+    The spec itself goes through ``validate_spec`` unchanged: a pin that the
+    submit endpoint would refuse must be refused at pin time, not discovered by
+    the battery three Saturdays later.
+
+    ``force`` is refused ON A PIN specifically. It is an instruction about one
+    submission ("replay this even though the answer is stored"), and a standing
+    weekly instruction to ignore the dedup would make every battery re-replay
+    that spec for ever — turning the cheap week the dedup exists to give into
+    the expensive one, silently, until somebody read the bill.
+    """
+    if not isinstance(body, dict):
+        raise SweepValidationError(
+            f"expected a JSON object with a 'spec'; got {type(body).__name__}")
+    unknown = set(body) - PIN_BODY_FIELDS
+    if unknown:
+        raise SweepValidationError(
+            f"unknown field(s) {sorted(unknown)}. A pin is "
+            f"{{\"spec\": {{...}}, \"note\": \"optional\"}} — the spec is "
+            f"wrapped rather than spread so a misspelled spec field is still "
+            f"refused as one. Known fields: {sorted(PIN_BODY_FIELDS)}.")
+    if "spec" not in body:
+        raise SweepValidationError(
+            "a pin needs a 'spec': the body is "
+            "{\"spec\": {...}, \"note\": \"optional\"}")
+    spec = validate_spec(body["spec"])
+    if spec.get("force"):
+        raise SweepValidationError(
+            "'force' cannot be pinned: it means 'replay this even though the "
+            "answer is stored', and as a STANDING weekly instruction it would "
+            "make the battery re-replay this spec every Saturday for ever. Pin "
+            "the spec without it; submit a one-off forced run through POST "
+            "/api/v2/sweeps when you actually want to bypass the dedup.")
+    note = body.get("note")
+    if note is not None:
+        if not isinstance(note, str):
+            raise SweepValidationError(
+                f"'note' must be a string; got {type(note).__name__}")
+        note = note.strip() or None
+        if note is not None and len(note) > PIN_NOTE_MAX_CHARS:
+            raise SweepValidationError(
+                f"'note' is {len(note)} characters, over the "
+                f"{PIN_NOTE_MAX_CHARS}-character limit. It is a reminder, not a "
+                f"document.")
+    return spec, note
+
+
+def pin_window_shape(spec: Dict[str, Any]) -> Tuple[int, Optional[int]]:
+    """``(window_days, holdout_days)`` — the ROLLING shape of a pinned spec.
+
+    Derived from the absolute window the operator submitted, so the API keeps
+    exactly the shape it had before pins were rolling: they post a spec with
+    dates, and the conversion to a moving window happens here, once, at create
+    time. Requiring them to post day-counts instead would have made a pin a
+    different object from a sweep, for no gain.
+
+    ``holdout_days`` is measured from the END, like ``window_days``, because
+    that is the edge both of them are re-anchored to. Measuring it from the
+    start would move the holdout boundary every time the window slid.
+    """
+    start = datetime.strptime(spec["start"], "%Y-%m-%d").date()
+    end = datetime.strptime(spec["end"], "%Y-%m-%d").date()
+    window_days = (end - start).days
+    holdout = spec.get("holdout_start")
+    holdout_days = None
+    if holdout:
+        holdout_days = (end - datetime.strptime(holdout, "%Y-%m-%d").date()).days
+    return window_days, holdout_days
+
+
+def pin_spec_json(spec: Dict[str, Any]) -> str:
+    """The canonical text a pin stores and the duplicate check compares.
+
+    ``sort_keys=True`` over the OUTPUT of ``validate_spec``, which is the one
+    canonical form in this system — so a pin submitted with its symbols in a
+    different order is the same string here and is correctly refused as a
+    duplicate. Comparing the raw request bodies instead would let the same
+    question be pinned five times.
+    """
+    return json.dumps(spec, sort_keys=True)
+
+
+def pin_row(*, pin_id: str, spec_json: str, active: bool,
+            window_days: Optional[int] = None,
+            holdout_days: Optional[int] = None,
+            note: Optional[str] = None) -> Dict[str, Any]:
+    """The ``scenario_pins`` row this API writes (``persist.pin_row``'s shape).
+
+    Pinned equal to the engine's builder by a test, for the reason
+    ``submitted_row`` is: a column one side omits is a column the other side's
+    reader renders as blank while looking correct.
+
+    A deactivation carries the SAME payload as the create it retires — spec,
+    window shape and note — because the row is a state transition, not a
+    tombstone, so a reader taking the latest row can see what was un-pinned
+    without walking the history.
+    """
+    return {
+        "pin_id": pin_id,
+        "spec_json": spec_json,
+        "active": bool(active),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "note": (note[:PIN_NOTE_MAX_CHARS] if note else None),
+        # The ROLLING shape. A deactivation carries it too — the row is a state
+        # transition, not a tombstone.
+        "window_days": (None if window_days is None else int(window_days)),
+        "holdout_days": (None if holdout_days is None else int(holdout_days)),
+    }
+
+
+def pin_identity(spec: Dict[str, Any], *, window_days: int,
+                 holdout_days: Optional[int]) -> str:
+    """What makes two pins THE SAME QUESTION, as comparable text.
+
+    Two things are deliberate here, and each was a defect in an earlier build.
+
+    **It is `identity.canonical_spec`, not byte equality on `spec_json`.**
+    ``validate_spec`` deliberately does NOT sort ``symbols`` (the grid's
+    columns are read in the order the operator typed their universe), so
+    ``["AAPL","NVDA"]`` and ``["NVDA","AAPL"]`` are two strings and ONE sweep.
+    Comparing the stored text would have accepted both pins, and the battery
+    would replay one and deduplicate the other every Saturday for ever.
+    ``canonical_spec`` collapses scenario order too, and drops ``force``.
+
+    **And it is taken over the RELATIVE window**: the absolute ``start`` /
+    ``end`` / ``holdout_start`` are removed and replaced by the two day-counts.
+    A rolling pin's dates are re-anchored every week, so an identity that
+    included them would make the same pin a different question on every
+    Saturday — and would let the same question be pinned once a week for ever,
+    each copy looking new.
+    """
+    canon = dict(canonical_spec(spec))
+    for absolute in ("start", "end", "holdout_start"):
+        canon.pop(absolute, None)
+    canon["window_days"] = int(window_days)
+    canon["holdout_days"] = (None if holdout_days is None else int(holdout_days))
+    return json.dumps(canon, sort_keys=True)
+
+
+def duplicate_active_pin(spec: Dict[str, Any], *, window_days: int,
+                         holdout_days: Optional[int],
+                         pins: Iterable[Dict[str, Any]]
+                         ) -> Optional[Dict[str, Any]]:
+    """The ACTIVE pin already asking this same question, or None.
+
+    Compared on ``pin_identity`` — the relative window — not on the stored
+    text. A pin whose ``spec_json`` will not decode, or which carries no
+    ``window_days``, is SKIPPED rather than treated as a match: it is not
+    comparable to anything, the battery refuses it every week and says so, and
+    blocking a good pin behind a broken one would be the wrong direction.
+
+    Inactive pins are ignored on purpose: re-pinning something you un-pinned
+    last month is a perfectly ordinary thing to do, and refusing it would make
+    un-pinning a one-way door.
+    """
+    identity = pin_identity(spec, window_days=window_days,
+                            holdout_days=holdout_days)
+    for pin in pins:
+        if not pin.get("active"):
+            continue
+        stored_window = pin.get("window_days")
+        if stored_window is None:
+            continue
+        try:
+            stored = json.loads(pin.get("spec_json") or "")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(stored, dict):
+            continue
+        try:
+            other = pin_identity(stored, window_days=stored_window,
+                                 holdout_days=pin.get("holdout_days"))
+        except (TypeError, ValueError):
+            continue
+        if other == identity:
+            return pin
+    return None
+
+
+def active_pin_count(pins: Iterable[Dict[str, Any]]) -> int:
+    return sum(1 for pin in pins if pin.get("active"))
+
+
+def shape_pin(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One pin as the API returns it: the spec DECODED, never the raw text.
+
+    The stored column is text; handing it back as text would make every caller
+    parse it, and the one that forgot would render JSON in a table cell. A row
+    whose ``spec_json`` will not decode is returned with ``spec: null`` and the
+    text on ``spec_json`` rather than dropped — it is exactly the row an
+    operator needs to see, because the battery refuses it every week.
+    """
+    raw = row.get("spec_json")
+    try:
+        spec = json.loads(raw) if raw else None
+        if not isinstance(spec, dict):
+            spec = None
+    except (TypeError, ValueError):
+        spec = None
+    written = row.get("written_at")
+    return {
+        "pin_id": row.get("pin_id"),
+        "active": bool(row.get("active")),
+        "note": row.get("note"),
+        "spec": spec,
+        "spec_json": raw if spec is None else None,
+        "written_at": (written.isoformat() if hasattr(written, "isoformat")
+                       else written),
+        # The rolling shape, surfaced because it — not the dates inside `spec`
+        # — is what the battery will actually replay every Saturday. A console
+        # that showed only the stored dates would describe a window the pin
+        # stopped using the week after it was created.
+        "window_days": row.get("window_days"),
+        "holdout_days": row.get("holdout_days"),
+    }
+
+
+def pins_sql(dataset: str) -> str:
+    """The CURRENT state of every pin: latest row per ``pin_id``.
+
+    ``@active_only`` is a parameter rather than two queries so the battery's
+    question and the console's are demonstrably the same one with a filter.
+    """
+    return f"""
+    SELECT * EXCEPT(rn) FROM (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY pin_id ORDER BY {PINS_LATEST_ORDER_BY}) AS rn
+      FROM `{dataset}.{PINS_TABLE}`
+    )
+    WHERE rn = 1
+      AND (@active_only = FALSE OR active = TRUE)
+    ORDER BY written_at DESC
+    """
+
+
+def one_pin_sql(dataset: str) -> str:
+    """The current state of ONE pin, or nothing. Used by the delete path."""
+    return f"""
+    SELECT * EXCEPT(rn) FROM (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY pin_id ORDER BY {PINS_LATEST_ORDER_BY}) AS rn
+      FROM `{dataset}.{PINS_TABLE}`
+      WHERE pin_id = @pin_id
+    )
+    WHERE rn = 1
+    """
+
 
 
 # ============================================================================ #

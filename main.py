@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 import json
@@ -23,7 +24,7 @@ def main():
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
                        choices=['scan', 'status', 'report', 'backtest', 'screen',
-                                'sweep', 'backfill'],
+                                'sweep', 'backfill', 'battery'],
                        help='Command to execute')
 
     # backtest (FC-032 evaluate mode)
@@ -110,7 +111,67 @@ def main():
             return
 
         if args.command == 'backfill':
+            # FC-096 Phase B B4 — the composed Saturday: backfill, then measure
+            # against the lake it just refreshed, in ONE execution.
+            #
+            # **The exit-code boundary is STRUCTURAL here, not conventional.**
+            # This branch exits with the BACKFILL's code and nothing else can
+            # move it: the battery's own return value is discarded, and every
+            # way it can fail — including a crash, and including a `SystemExit`
+            # from one of its own argument checks — is caught below and turned
+            # into a `battery_degraded` log. A stale trend chart must never
+            # fire the `data-backfill` Job-failure page, and "we were careful
+            # to return 0" is not a guarantee; a `try` is.
+            battery_requested = battery_after_backfill_requested()
+            if battery_requested:
+                # Resolve the wall cap BEFORE any data work. A typo'd
+                # `BATTERY_MAX_SECONDS` is a configuration error, and the
+                # honest place to fail on one is immediately, non-zero, with
+                # nothing half-done — not six hours later, where the guard
+                # above would (correctly) swallow it and the operator would
+                # see a degraded battery rather than the typo they made.
+                battery_max_seconds()
+
+            backfill_started = time.monotonic()
             rc = run_backfill_cmd(args, config, logger)
+            backfill_seconds = time.monotonic() - backfill_started
+
+            if battery_requested and rc == 0:
+                try:
+                    # The backfill's wall time goes IN: the cap is a budget for
+                    # the execution, which the two of them share.
+                    run_battery_cmd(args, config, logger,
+                                    elapsed_seconds=backfill_seconds)
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as exc:  # noqa: BLE001 - see the comment above
+                    logger.error(
+                        f"Weekly battery CRASHED after a successful backfill "
+                        f"({type(exc).__name__}: {exc}). The data is fine and "
+                        f"this execution still succeeds; no trend points were "
+                        f"recorded.",
+                        event_category="backtest",
+                        event_type="battery_degraded",
+                        reason="battery_crashed",
+                        error=f"{type(exc).__name__}: {exc}"[:500],
+                        measured=0, failed=0, skipped=0)
+            elif battery_requested:
+                logger.error(
+                    "Weekly battery SKIPPED: the backfill it rides did not "
+                    "complete, so the lake is not what a measurement would be "
+                    "taken against. Fix the backfill; the battery runs with "
+                    "the next execution.",
+                    event_category="backtest",
+                    event_type="battery_skipped_backfill_failed",
+                    backfill_exit_code=rc)
+            logger.info("Command completed",
+                        event_category="system", event_type="command_completed")
+            if rc:
+                sys.exit(rc)
+            return
+
+        if args.command == 'battery':
+            rc = run_battery_cmd(args, config, logger)
             logger.info("Command completed",
                         event_category="system", event_type="command_completed")
             if rc:
@@ -555,6 +616,673 @@ def run_backfill_cmd(args, config: Config, logger) -> int:
     return 1 if summary.failed() else 0
 
 
+# --------------------------------------------------------------------------- #
+# FC-096 Phase B B4 — the weekly battery.
+#
+# One command that re-measures the standing set and every ACTIVE pin, riding the
+# Saturday `data-backfill` execution so the numbers are taken against a lake
+# that was refreshed minutes earlier.
+#
+# Three postures are load-bearing and each of them exists because of a way this
+# could otherwise fail quietly:
+#
+# * **Per-pin isolation.** One bad pin must cost its own row and nothing else.
+#   A loop that let a refusal escape would end the battery at whichever pin
+#   happened to be first, and the standing set would go unmeasured for a week
+#   with a Job that exited 0.
+# * **Exit-code classes.** DATA failure (the backfill) is a page: the lake is
+#   the substrate everything else reads. MEASUREMENT failure (the battery) is a
+#   nag: a stale trend chart is not an outage, and paging for one is how the
+#   channel gets filtered. So the battery exits 0 and says `battery_degraded`.
+# * **A wall cap.** The battery shares a 6 h Job execution with the backfill.
+#   Without a cap, an engine-change week (every stored key invalidated, so every
+#   sweep genuinely replays) could run the execution into its task timeout —
+#   and a SIGKILL at the timeout would take the BACKFILL's exit code with it,
+#   turning a successful data run into a page.
+# --------------------------------------------------------------------------- #
+
+# Wall-clock budget for the battery, in seconds, measured across the whole
+# EXECUTION rather than from this command's own start — the composed Saturday
+# runs the backfill first and hands its elapsed time in (`elapsed_seconds`).
+# Measuring only from here would let a 5-hour widening chunk give the battery a
+# fresh 4 hours inside a 6-hour task timeout, and the SIGKILL at that timeout
+# would take the BACKFILL's exit code with it: a successful data run reported
+# as a Job failure, which is the exact cross-contamination the exit classes
+# exist to prevent.
+#
+# 4 h against the Job's 6 h `--task-timeout`. The budget it has to fit:
+#   longest supervised backfill chunk (measured ~66 min)
+#   + this cap (14400 s)
+#   + the ONE sweep that may be in flight when the cap passes
+# The last term is bounded by `BATTERY_MAX_PIN_CELLS` and the lake being warm
+# (the backfill just ran): a 12-symbol, 2-split pin is 24 materialisations at
+# the measured ~40 s warm = ~16 min. 66 + 240 + 16 = ~322 min against 360.
+# `test_the_execution_budget_fits_the_job_timeout` holds that arithmetic.
+#
+# It bounds when a NEW sweep may START; the one in flight is never interrupted.
+# Killing it would leave a `running` row to age out and throw away a replay
+# that was nearly done.
+BATTERY_MAX_SECONDS = 14_400
+
+# The most cells one PIN may ask for. Deliberately far below the API's
+# per-submission ceiling (`services/sweeps.MAX_CELLS` = 240), because a pin is
+# not a submission: it runs every Saturday for ever. Two 240-cell pins would
+# consume the wall cap between them and everything after them would be skipped
+# week after week, with nothing but the skip list to say so.
+#
+# 60 = e.g. 5 arms x 6 symbols x 2 splits, or a 12-symbol base pin with a
+# holdout — comfortably more than the standing set asks per symbol, and small
+# enough that the in-flight bound above stays true.
+BATTERY_MAX_PIN_CELLS = 60
+
+# The trailing window's holdout, in calendar days. 90 rather than the API's
+# 60-day floor (`services/sweeps.MIN_HOLDOUT_DAYS`): the holdout has to contain
+# enough complete wheel cycles that a symbol which traded normally is not
+# reported `insuf`, and a quarter is the smallest window that reliably does at
+# 7-DTE puts. The fit window is then ~9 months of the trailing year.
+BATTERY_HOLDOUT_DAYS = 90
+
+# `submitted_via` on every row the battery writes. Free-form on the column, and
+# distinct on purpose: the trend queries this phase exists to feed must be able
+# to select the weekly re-measurements without picking up an operator's ad-hoc
+# runs, a smoke row, or vice versa.
+BATTERY_SUBMITTED_VIA = 'battery'
+
+# How many CONSECUTIVE battery attempts must have refused a pin before it earns
+# a nag. Three, i.e. three weeks: one refusal is a rule that moved under a pin
+# nobody has looked at yet, and nagging on the first would make the event
+# meaningless by the second.
+BATTERY_NAG_RUNS = 3
+
+# The `error` prefix that marks a row as "this pin was REFUSED", as opposed to
+# "this pin ran and something broke". Both are `failed` rows; only the first
+# counts towards the nag, because the nag's message is "come and fix your pin"
+# and a vendor outage is not something the operator can fix by editing it.
+BATTERY_PIN_INVALID_PREFIX = 'pin invalid: '
+
+
+def battery_max_seconds() -> int:
+    """The wall cap, with the `BATTERY_MAX_SECONDS` env override applied.
+
+    An override is how an operator runs a deliberately long catch-up battery
+    (the first Saturday after an engine change replays everything) without a
+    deploy. Refused rather than silently defaulted when it is not a positive
+    integer: a typo that fell back to 4 h would be indistinguishable from the
+    override having worked.
+    """
+    raw = _backfill_env('BATTERY_MAX_SECONDS')
+    if not raw:
+        return BATTERY_MAX_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"battery: BATTERY_MAX_SECONDS must be an integer number of "
+            f"seconds, got {raw!r}")
+    if seconds < 1:
+        raise SystemExit(
+            f"battery: BATTERY_MAX_SECONDS must be >= 1, got {seconds}")
+    return seconds
+
+
+def battery_after_backfill_requested() -> bool:
+    """Whether this backfill execution should run the battery after itself.
+
+    `BACKFILL_THEN_BATTERY` is set on the Job DEFINITION (`cloudbuild.yaml`), not
+    per execution, so the Saturday scheduler needs no change: a bare execution
+    backfills and then measures. An operator's chunked historical widening —
+    which passes per-execution `BACKFILL_*` overrides — gets the battery too,
+    and that is correct: it is the same freshly-widened lake.
+
+    A closed set of true-ish spellings. Anything else, including `"1.0"` or a
+    stray character, is FALSE and the run simply backfills, because the
+    alternative — treating an unrecognised value as true — would start a
+    four-hour measurement pass off a typo.
+    """
+    return _backfill_env('BACKFILL_THEN_BATTERY').lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def battery_standing_specs(config: Config, *, today=None) -> list:
+    """The standing set: base config, one spec per live symbol, trailing year.
+
+    One sweep PER SYMBOL rather than one sweep over all fourteen, which is the
+    non-obvious half. Per symbol, a materialisation that fails (a corporate
+    action the engine will not model, a symbol whose lake day is missing) costs
+    that symbol's row and leaves the other thirteen measured; in one sweep it
+    is one `failed` run and a week with no trend point at all. The dedup is
+    also per key, so a symbol whose window did not move is free either way.
+
+    `end` is `last_settled_day` — the SAME function the backfill resolves its
+    own window with, so the battery never asks for a session the run that just
+    preceded it could not have written. `end = date.today()` would ask for a
+    day the lake is structurally incapable of holding (today's chain is still
+    forming), which is the trailing-gap shape PR-c's coverage review found.
+
+    Wheel-only until Phase C: the replay has no profile awareness yet, so a
+    covered-call standing set would be the wheel's numbers under another name.
+    """
+    from datetime import timedelta
+
+    from src.backtesting.data.bar_store import last_settled_day
+    from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH
+    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+
+    end = last_settled_day(today)
+    start = end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+    holdout_start = end - timedelta(days=BATTERY_HOLDOUT_DAYS)
+    specs = []
+    for symbol in config.stock_symbols:
+        name = str(symbol).strip().upper()
+        if not name:
+            continue
+        specs.append({
+            'symbols': [name],
+            'start': start.isoformat(),
+            'end': end.isoformat(),
+            # Holdout ON. An in-sample-only trend line is a record of what the
+            # engine fitted, and the whole point of a weekly series is to watch
+            # a config hold up out of sample.
+            'holdout_start': holdout_start.isoformat(),
+            'starting_cash': float(DEFAULT_STARTING_CASH),
+            # OFF. The bid-fill replay doubles every cell for a scalar that
+            # matters on the arm you finally choose; fourteen symbols a week is
+            # the wrong place to pay for it.
+            'run_sensitivity': False,
+            'scenarios': [],
+        })
+    return specs
+
+
+def battery_cell_count(spec: dict) -> int:
+    """Cells a battery spec will produce: arms (incl. base) x symbols x splits.
+
+    The same arithmetic ``services/sweeps.cell_count`` does. Duplicated rather
+    than imported because the engine image ships no dashboard module, and it is
+    four lines whose two consumers are pinned equal by a test.
+    """
+    arms = len(spec.get('scenarios') or []) + 1
+    splits = 2 if spec.get('holdout_start') else 1
+    return arms * len(spec.get('symbols') or []) * splits
+
+
+def battery_pin_spec(pin: dict, *, today=None):
+    """``(spec, dropped)`` for one pin — RE-ANCHORED to this week's window.
+
+    This is where a pin stops being the historical window an operator typed and
+    becomes the rolling one FC-096 D1 signed off. The stored ``spec_json`` is
+    the record of what they asked for; ``window_days`` / ``holdout_days`` are
+    the SHAPE, and both are re-anchored here to ``last_settled_day()`` — the
+    same edge the backfill that just ran resolved its own window to.
+
+    Without this the pin is frozen: its answer cannot change, the
+    engine-identity dedup hits on the second Saturday and every one after it,
+    and its "trend series" holds exactly one point for ever. Nothing in the UI
+    would say so, which is why it is worth this much prose.
+
+    ``dropped`` names fields removed from the stored spec — today only
+    ``force``. A hand-written pin row carrying it would bypass the dedup every
+    single week, for ever, on a spec whose answer the store already has; the
+    API refuses it at create time and this is the belt for a row that arrived
+    another way. Stripped rather than refused: the QUESTION is legitimate and
+    measuring it correctly is free, whereas refusing would cost a real trend
+    point over a field that only ever wasted money.
+
+    Every failure here raises ``ValueError`` naming the problem, and the caller
+    turns that into the pin's own ``failed`` row. A corrupted or hand-written
+    row must not be able to end the battery for the other pins.
+    """
+    from datetime import timedelta
+
+    from src.backtesting.data.bar_store import last_settled_day
+
+    raw = pin.get('spec_json')
+    if not raw:
+        raise ValueError("the pin row carries no spec_json")
+    try:
+        spec = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"spec_json is not valid JSON ({exc})")
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"spec_json is a {type(spec).__name__}, not a JSON object")
+
+    window_days = pin.get('window_days')
+    if window_days is None:
+        raise ValueError(
+            "the pin carries no window_days, so its window cannot be "
+            "re-anchored. A pin without one can only have been written by "
+            "hand; running it as a FIXED window would deduplicate against "
+            "itself every week and record one trend point for ever, which is "
+            "the failure rolling pins exist to prevent. Re-create it through "
+            "POST /api/v2/sims/pins.")
+    try:
+        window_days = int(window_days)
+    except (TypeError, ValueError):
+        raise ValueError(f"window_days is not a number ({window_days!r})")
+    if window_days < 1:
+        raise ValueError(f"window_days must be >= 1, got {window_days}")
+
+    holdout_days = pin.get('holdout_days')
+    if holdout_days is not None:
+        try:
+            holdout_days = int(holdout_days)
+        except (TypeError, ValueError):
+            raise ValueError(f"holdout_days is not a number ({holdout_days!r})")
+        if not 0 < holdout_days < window_days:
+            raise ValueError(
+                f"holdout_days must fall inside (0, window_days) — got "
+                f"{holdout_days} against a {window_days}-day window; one of "
+                f"the two splits would be empty")
+
+    end = last_settled_day(today)
+    spec['start'] = (end - timedelta(days=window_days)).isoformat()
+    spec['end'] = end.isoformat()
+    spec['holdout_start'] = (
+        None if holdout_days is None
+        else (end - timedelta(days=holdout_days)).isoformat())
+
+    dropped = tuple(field for field in ('force',) if spec.pop(field, None))
+    return spec, dropped
+
+
+class BatteryItem:
+    """One thing the battery measures: a spec, and what to call it in a log."""
+
+    __slots__ = ('label', 'spec', 'pin_id', 'note')
+
+    def __init__(self, *, label: str, spec, pin_id=None, note=None):
+        self.label = label
+        self.spec = spec
+        self.pin_id = pin_id
+        self.note = note
+
+    @property
+    def is_pin(self) -> bool:
+        return self.pin_id is not None
+
+
+class BatteryWriter:
+    """The store, plus a memory of which ``run_id``s already have a status row.
+
+    A thin delegate rather than a change to ``ScenarioRunWriter``, because the
+    question is the BATTERY's: after an item raises, did the sweep get far
+    enough to record itself? `run_sweep_cmd` writes its `running` row before it
+    can fail in any way that leaves a replay behind, so "no row for this
+    run_id" means the attempt failed BEFORE the store — and the battery owes
+    that attempt a row of its own, or the pin's week vanishes without trace and
+    the nag never counts it.
+
+    Asking BigQuery instead would make that decision depend on how quickly a
+    streamed row becomes visible to a query, which is not a property anything
+    here should be sensitive to.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.recorded = set()
+
+    def write_status(self, row) -> bool:
+        run_id = row.get('run_id')
+        if run_id:
+            self.recorded.add(run_id)
+        return self._inner.write_status(row)
+
+    def wrote_status(self, run_id) -> bool:
+        return run_id in self.recorded
+
+    def __getattr__(self, name):
+        # Everything else — `enabled`, `pins_enabled`, `write_runs`,
+        # `find_done_sweep`, `list_pins`, `recent_pin_statuses` — is the real
+        # writer's, unwrapped. Only `write_status` is observed.
+        return getattr(self._inner, name)
+
+
+def _battery_failed_row(sweep_store, *, run_id, submitted_at, item, reason,
+                        engine_version, git_commit, engine_identity, logger):
+    """The `failed` status row for an item that never reached the store.
+
+    Built with the offending spec on it where that is possible, and WITHOUT it
+    where it is not: `status_row` reads `spec['scenarios'][i]['name']` to count
+    arms, and a pin whose stored spec is malformed enough to be refused is
+    exactly the pin most likely to make that read raise. A row with no spec is
+    still a row an operator can find by `pin_id`; an exception here would cost
+    the pin its only record of having been refused.
+    """
+    common = dict(
+        run_id=run_id, status=sweep_store.STATUS_FAILED,
+        submitted_at=submitted_at, sweep_key=None,
+        submitted_via=BATTERY_SUBMITTED_VIA,
+        engine_version=engine_version, git_commit=git_commit,
+        engine_identity=engine_identity,
+        execution_name=os.environ.get('CLOUD_RUN_EXECUTION'),
+        started_at=submitted_at, finished_at=submitted_at,
+        error=f"{BATTERY_PIN_INVALID_PREFIX}{reason}",
+        pin_id=item.pin_id,
+    )
+    try:
+        return sweep_store.status_row(
+            spec=item.spec if isinstance(item.spec, dict) else None, **common)
+    except Exception:  # noqa: BLE001 - a malformed spec must not cost the row
+        logger.warning(
+            "Could not derive the scope columns from a refused pin's spec; "
+            "writing the failed row without them",
+            event_category="backtest", event_type="battery_pin_row_degraded",
+            pin_id=item.pin_id, run_id=run_id, exc_info=True)
+        return sweep_store.status_row(spec=None, **common)
+
+
+def _battery_nag(writer, logger, *, item, run_id) -> bool:
+    """Emit ``battery_pin_nag`` when this refusal is the third in a row.
+
+    The current attempt is counted HERE rather than read back: the row was
+    inserted a moment ago and asking BigQuery for it would make the nag depend
+    on streaming-buffer visibility, which is not a property anything should be
+    sensitive to. So the query asks for the previous ``BATTERY_NAG_RUNS - 1``
+    attempts and every one of them must also have been a refusal.
+
+    A short history does NOT nag: a pin created last week and refused once has
+    one prior attempt, and "three consecutive weeks" is the promise this event
+    makes.
+    """
+    if not item.is_pin:
+        return False
+    history = writer.recent_pin_statuses(
+        item.pin_id, limit=BATTERY_NAG_RUNS - 1, exclude_run_id=run_id)
+    if len(history) < BATTERY_NAG_RUNS - 1:
+        return False
+    if not all((row.get('error') or '').startswith(BATTERY_PIN_INVALID_PREFIX)
+               for row in history):
+        return False
+    logger.error(
+        f"Pin {item.pin_id} has been refused {BATTERY_NAG_RUNS} weeks running "
+        f"— it will never be measured again until it is edited or removed",
+        event_category="backtest", event_type="battery_pin_nag",
+        pin_id=item.pin_id, note=item.note, weeks=BATTERY_NAG_RUNS,
+        prior_run_ids=[row.get('run_id') for row in history])
+    return True
+
+
+def run_battery_cmd(args, config: Config, logger, *,
+                    elapsed_seconds: float = 0.0) -> int:
+    """Re-measure the standing set and every active pin (FC-096 Phase B B4).
+
+    **Always returns 0.** A battery that measured nothing is a stale trend
+    chart, and on the composed path this process shares its execution with the
+    backfill, whose non-zero exit is a real page (the `data-backfill`
+    Job-failure policy). The two failure classes are kept apart deliberately:
+    the loud half of a degraded battery is the `battery_degraded` ERROR log and
+    the 24 h nag policy watching it, not the exit code. See this section's
+    header.
+
+    Every submission goes through `run_sweep_cmd` — the same validators, the
+    same dedup, the same store, the same artifacts. That reuse IS the
+    revalidation the plan asks for: `run_sweep_cmd` refuses a spec whose
+    overrides are no longer allowlisted, and it does so BEFORE it writes
+    anything. A refusal therefore costs one deliberate `failed` row here and no
+    orphaned `running` row — and the battery knows WHICH case it is in from
+    `BatteryWriter.wrote_status`, rather than from the exception's class, so a
+    pre-store failure that is not a `SystemExit` (a `ValueError` out of the
+    spec parse, say) still leaves the attempt on the record.
+
+    ``elapsed_seconds`` is time already spent by this EXECUTION before the
+    battery started — the backfill's, on the composed path. The wall cap is a
+    budget for the execution, not for this function: measuring only from here
+    would let a 5-hour backfill hand the battery a fresh 4 hours inside a 6-hour
+    task timeout, and the SIGKILL at that timeout would take the BACKFILL's
+    exit code with it.
+    """
+    import copy
+    import time
+    import uuid
+    from datetime import datetime, timezone
+
+    from src.backtesting.scenarios import persist as sweep_store
+    from src.backtesting.scenarios.engine_identity import engine_identity
+    from src.backtesting.screen import ENGINE_VERSION
+
+    # `--out` / `--json-out` are neutralised for the whole battery. They name
+    # ONE file, and thirty sweeps writing to it in turn would leave the last
+    # one's report there looking like the battery's — a silent overwrite of
+    # twenty-nine results. The store is the battery's record; the files are the
+    # single-sweep CLI's.
+    sweep_args = copy.copy(args)
+    sweep_args.out = None
+    sweep_args.json_out = None
+
+    cap_seconds = battery_max_seconds()
+    started = time.monotonic() - max(float(elapsed_seconds or 0.0), 0.0)
+    identity = engine_identity()
+    git_commit = os.environ.get('GIT_COMMIT') or None
+
+    inner = sweep_store.ScenarioRunWriter(dataset_id=config.bigquery_dataset)
+    if not inner.enabled:
+        # Nothing else is worth attempting: every sweep below would refuse to
+        # replay for want of somewhere to put its rows (`run_sweep_cmd` returns
+        # 2 in Job mode), and fourteen identical refusals is a worse log than
+        # one explanation.
+        logger.error(
+            "Weekly battery could not run: the scenario store is unavailable "
+            "(no BigQuery client, no GCP project, or the tables could not be "
+            "reconciled). No trend points were recorded this week.",
+            event_category="backtest", event_type="battery_degraded",
+            reason="store_unavailable", dataset=config.bigquery_dataset,
+            measured=0, failed=0, skipped=0)
+        print("\nBATTERY DEGRADED: the scenario store is unavailable; nothing "
+              "was measured.")
+        return 0
+    writer = BatteryWriter(inner)
+
+    standing = battery_standing_specs(config)
+    items = [BatteryItem(label=f"standing:{spec['symbols'][0]}", spec=spec)
+             for spec in standing]
+    pins = writer.list_pins(active_only=True)
+    if len(pins) > sweep_store.MAX_ACTIVE_PINS:
+        # NOT truncated. The cap is a write-time rule the API enforces, and a
+        # store that somehow holds more active pins than that is a bug in the
+        # API, not a licence to stop measuring some of them silently. The wall
+        # cap is what bounds the execution.
+        logger.warning(
+            f"{len(pins)} active pins exceeds the cap of "
+            f"{sweep_store.MAX_ACTIVE_PINS}; running all of them (the wall cap "
+            f"bounds this execution) — the API should have refused the extras",
+            event_category="backtest", event_type="battery_pin_cap_exceeded",
+            active_pins=len(pins), cap=sweep_store.MAX_ACTIVE_PINS)
+    for pin in pins:
+        pin_id = pin.get('pin_id')
+        try:
+            spec, dropped = battery_pin_spec(pin)
+        except ValueError as exc:
+            # Kept as an item with a non-dict spec so it takes the ordinary
+            # refusal path below: one place writes the `failed` row, counts the
+            # nag and logs the event, whether the spec was unreadable, could
+            # not be re-anchored, or is merely no longer legal.
+            spec, dropped = str(exc), ()
+        if dropped:
+            logger.warning(
+                f"Pin {pin_id} carried {list(dropped)}, which a pin may not: "
+                f"stripped for this run. `force` on a standing weekly question "
+                f"would bypass the dedup every week for ever.",
+                event_category="backtest",
+                event_type="battery_pin_field_stripped",
+                pin_id=pin_id, dropped=list(dropped))
+        items.append(BatteryItem(label=f"pin:{pin_id}", spec=spec,
+                                 pin_id=pin_id, note=pin.get('note')))
+
+    print(f"\nWeekly battery: {len(standing)} standing + {len(pins)} pinned "
+          f"spec(s), wall cap {cap_seconds}s"
+          f"{f' ({elapsed_seconds:.0f}s already spent this execution)' if elapsed_seconds else ''}"
+          f"...\n")
+    logger.info(
+        "Weekly battery starting",
+        event_category="backtest", event_type="battery_started",
+        standing=len(standing), pins=len(pins), max_seconds=cap_seconds,
+        elapsed_seconds=round(float(elapsed_seconds or 0.0), 1),
+        engine_identity=identity)
+
+    measured, failures, skipped, oversized, nags = 0, [], [], [], 0
+    terminated = False
+
+    def _refuse(item, run_id, reason):
+        """One `failed` row, one loud event, and the nag — the single path."""
+        nonlocal nags
+        writer.write_status(_battery_failed_row(
+            sweep_store, run_id=run_id,
+            submitted_at=datetime.now(timezone.utc).isoformat(), item=item,
+            reason=reason, engine_version=ENGINE_VERSION,
+            git_commit=git_commit, engine_identity=identity, logger=logger))
+        logger.error(
+            f"Battery item {item.label} was REFUSED: {reason}",
+            event_category="backtest", event_type="battery_pin_failed",
+            label=item.label, pin_id=item.pin_id, run_id=run_id,
+            reason=reason, invalid=True)
+        failures.append(item.label)
+        if _battery_nag(writer, logger, item=item, run_id=run_id):
+            nags += 1
+
+    try:
+        # SIGTERM between items is Cloud Run reclaiming the container, and on
+        # the composed path the BACKFILL has already succeeded. Converting it
+        # here and summarising is what stops that reclaim from reading as a
+        # data failure: without this the exception escapes `main()` and the
+        # execution exits non-zero, firing the Job-failure page for a
+        # measurement pass that was simply cut short. `run_sweep_cmd` installs
+        # its own handler INSIDE this one for the duration of each sweep (and
+        # restores this one after), so an item in flight still writes its
+        # terminal row first.
+        with terminate_on_sigterm(logger, what="battery"):
+            for item in items:
+                elapsed = time.monotonic() - started
+                if elapsed >= cap_seconds:
+                    # REFUSE TO START, never interrupt. The sweep in flight
+                    # finishes; everything after it is skipped and named,
+                    # because a battery that silently measured nine of thirty
+                    # would look exactly like one that measured thirty.
+                    skipped.append(item.label)
+                    continue
+
+                run_id = uuid.uuid4().hex[:16]
+                if not isinstance(item.spec, dict):
+                    _refuse(item, run_id, item.spec)
+                    continue
+
+                cells = battery_cell_count(item.spec)
+                if cells > BATTERY_MAX_PIN_CELLS:
+                    # A pin runs EVERY WEEK for ever, so its size is a standing
+                    # commitment rather than one submission's cost. The API's
+                    # own ceiling (240 cells) is sized for a one-off; at that
+                    # size two pins would fill the wall cap on their own and
+                    # everything after them would be skipped week after week,
+                    # with only the skip list to say so.
+                    _refuse(item, run_id,
+                            f"{cells} cells exceeds the per-pin battery cap of "
+                            f"{BATTERY_MAX_PIN_CELLS}. A pin is a weekly "
+                            f"commitment, not one submission: split it into "
+                            f"narrower pins, or run it once through POST "
+                            f"/api/v2/sweeps.")
+                    oversized.append(item.label)
+                    continue
+
+                try:
+                    rc = run_sweep_cmd(sweep_args, config, logger,
+                                       spec_override=item.spec,
+                                       submitted_via=BATTERY_SUBMITTED_VIA,
+                                       run_id=run_id, pin_id=item.pin_id,
+                                       writer_override=writer)
+                except (SweepTerminated, KeyboardInterrupt):
+                    # Not this item's failure. The container is going away, and
+                    # the outer handler summarises.
+                    raise
+                except BaseException as exc:  # noqa: BLE001 - one item, not the battery
+                    reason = str(exc) or type(exc).__name__
+                    if writer.wrote_status(run_id):
+                        # It reached the store, so `run_sweep_cmd`'s `finally`
+                        # already wrote this run's terminal row with the reason
+                        # on it. A second row would be a duplicate record of one
+                        # attempt.
+                        logger.error(
+                            f"Battery item {item.label} FAILED: "
+                            f"{type(exc).__name__}: {exc}",
+                            event_category="backtest",
+                            event_type="battery_pin_failed",
+                            label=item.label, pin_id=item.pin_id,
+                            run_id=run_id,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            invalid=False)
+                        failures.append(item.label)
+                    else:
+                        # Nothing was written, so the failure happened before
+                        # the store section — which is, by construction, a
+                        # refusal to accept the spec, whatever class it arrived
+                        # as. `SystemExit` from a validator and `ValueError`
+                        # from the spec parse are the same event to an operator
+                        # and must count towards the same nag.
+                        _refuse(item, run_id, reason)
+                    continue
+
+                if rc:
+                    # A non-zero exit means the run is not trustworthy as a
+                    # record — errored cells, or nothing persisted. Its row is
+                    # already in the store saying so; this counts it so the
+                    # summary is honest.
+                    logger.error(
+                        f"Battery item {item.label} completed with exit code {rc}",
+                        event_category="backtest",
+                        event_type="battery_pin_failed",
+                        label=item.label, pin_id=item.pin_id, run_id=run_id,
+                        reason=f"exit code {rc}", invalid=False)
+                    failures.append(item.label)
+                else:
+                    measured += 1
+    except (SweepTerminated, KeyboardInterrupt) as exc:
+        terminated = True
+        remaining = [i.label for i in items
+                     if i.label not in failures and i.label not in skipped]
+        logger.warning(
+            f"Weekly battery TERMINATED mid-run ({exc}); {measured} item(s) "
+            f"were measured before the container was reclaimed",
+            event_category="backtest", event_type="battery_terminated",
+            measured=measured, failed=len(failures),
+            not_started=max(len(remaining) - measured, 0))
+
+    wall = round(time.monotonic() - started, 1)
+    summary = (f"battery: {measured} measured, {len(failures)} failed, "
+               f"{len(skipped)} skipped in {wall}s")
+    print(f"\n{summary}")
+    if failures or skipped or terminated:
+        if terminated:
+            reason = "terminated"
+        elif oversized and not skipped and len(oversized) == len(failures):
+            reason = "pin_too_large"
+        elif skipped and not failures:
+            reason = "wall_cap"
+        else:
+            reason = "items_failed"
+        logger.error(
+            f"Weekly battery DEGRADED — {summary}. Trend series for the "
+            f"affected specs have no point this week; the data backfill that "
+            f"preceded this is unaffected.",
+            event_category="backtest", event_type="battery_degraded",
+            reason=reason,
+            measured=measured, failed=len(failures), skipped=len(skipped),
+            failed_labels=failures[:20], skipped_labels=skipped[:20],
+            oversized_labels=oversized[:20],
+            nags=nags, wall_seconds=wall, max_seconds=cap_seconds)
+        if skipped:
+            print(f"WALL CAP {cap_seconds}s reached — not started: "
+                  f"{', '.join(skipped)}")
+    else:
+        logger.info(
+            "Weekly battery complete",
+            event_category="backtest", event_type="battery_completed",
+            measured=measured, wall_seconds=wall, max_seconds=cap_seconds)
+    # ALWAYS 0, including after a SIGTERM. See the docstring: a stale trend
+    # chart is not a page, and the backfill's exit code must not be able to
+    # inherit this one's opinion.
+    return 0
+
+
+
 def run_screen_cmd(args, config: Config, logger) -> int:
     """Screen the whole universe (FC-032 Phase 5). Returns a process exit code."""
     from datetime import date, datetime
@@ -891,10 +1619,12 @@ class SweepPersistence:
         self.dataset = dataset
 
 
-def run_sweep_cmd(args, config: Config, logger) -> int:
+def run_sweep_cmd(args, config: Config, logger, *,
+                  spec_override=None, submitted_via=None, run_id=None,
+                  pin_id=None, writer_override=None) -> int:
     """Replay many scenarios over many symbols (FC-060 Layers 2/3).
 
-    Two entry shapes, one code path:
+    Three entry shapes, one code path:
 
     * ``--scenarios <yaml>`` — the operator CLI. Unchanged by Layer 3: it does
       not persist unless ``--persist`` is passed, so the byte-identical-report
@@ -903,6 +1633,27 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
       the run id arrive as per-execution env overrides, and persistence is
       implied: an execution whose results nobody can read is an execution nobody
       should have launched.
+    * ``spec_override=<dict>`` — an IN-PROCESS caller holding a spec, which is
+      the weekly battery (FC-096 Phase B B4). It behaves exactly like Job mode
+      (persistence implied, ``force`` honoured, the same validators) and differs
+      in one respect that matters: it takes its ``run_id`` and its clock from
+      the CALLER, never from ``SWEEP_RUN_ID`` / ``SWEEP_SUBMITTED_AT``. One
+      execution submits many sweeps, and every one of them inheriting the
+      execution's run id would collapse thirty runs into one.
+
+    ``submitted_via`` / ``pin_id`` are provenance the in-process caller stamps
+    on every row of the run (``'battery'``, and the pin being re-measured).
+    They are parameters rather than env reads for the same reason: they vary
+    per sweep within one process.
+
+    ``writer_override`` lets an in-process caller supply the store. The battery
+    does, for two reasons: one writer per EXECUTION instead of one per item
+    (thirty `ScenarioRunWriter` constructions is thirty BigQuery clients and
+    thirty schema reconciles for one execution), and — the load-bearing half —
+    it is how the battery knows whether THIS run got a status row. A failure
+    before the first write leaves no record of the attempt, and the battery has
+    to write one itself; asking BigQuery afterwards would make that decision
+    depend on how fast a streamed row becomes visible to a query.
 
     Returns an exit code.
     """
@@ -926,9 +1677,26 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
             "sweep: pass either --scenarios <yaml> or --spec-env <VAR>, not "
             "both — two sources of truth for one run is one too many."
         )
+    if spec_override is not None and (spec_env or args.scenarios):
+        raise SystemExit(
+            "sweep: an in-process spec cannot be combined with --scenarios or "
+            "--spec-env — two sources of truth for one run is one too many."
+        )
 
-    if spec_env:
+    if spec_override is not None:
+        # The battery's shape. A COPY, because this function mutates nothing of
+        # the caller's but the caller keeps the pin's spec for its own logging
+        # and a shared dict is how one of them ends up describing the other.
+        spec = dict(spec_override)
+    elif spec_env:
         spec = load_spec_from_env(spec_env)
+
+    # From here the two spec-carrying shapes are one path: the Job's spec and
+    # the battery's go through the SAME validators, which is what makes a pin
+    # that would be refused by the Job refused at battery time instead of three
+    # minutes into a replay.
+    job_mode = spec is not None
+    if job_mode:
         scenarios = scenarios_from_spec(spec)
         end = _spec_date(spec, 'end') or date.today()
         start = (_spec_date(spec, 'start')
@@ -985,6 +1753,13 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     # `run_sweep` validates too, but by then a `running` row exists and the
     # operator has a failed sweep in the store for what is a typo. This costs
     # microseconds and turns that into an immediate, explained refusal.
+    #
+    # **This is also the battery's revalidation** (FC-096 Phase B B4). EVERY
+    # refusal this function can raise — here, and every `SystemExit` above —
+    # happens before the first write, and `run_battery_cmd` depends on that: it
+    # catches the refusal and writes the pin's own `failed` row, which would be
+    # a duplicate (or worse, would leave an orphaned `running` row behind) if a
+    # refusal could ever land after the store section began.
     from src.backtesting.scenarios.overrides import validate_overrides
 
     for scenario in scenarios:
@@ -1029,15 +1804,25 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         ],
     }
 
-    persist = bool(spec_env) or bool(getattr(args, 'persist', False))
+    persist = job_mode or bool(getattr(args, 'persist', False))
     # `force` is an instruction about THIS submission, not a property of the
     # question being asked, so it is excluded from `sweep_key`
     # (identity.NON_IDENTITY_FIELDS). Including it would give a forced re-run a
     # different key from the run it deliberately reproduces.
-    force = bool((spec or {}).get('force', False)) if spec_env else False
-    run_id = os.environ.get('SWEEP_RUN_ID') or uuid.uuid4().hex[:16]
-    submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
-                    or datetime.now(timezone.utc).isoformat())
+    force = bool((spec or {}).get('force', False)) if job_mode else False
+    if spec_override is not None:
+        # The IN-PROCESS caller owns the identity of each submission, and the
+        # environment is deliberately not consulted. `SWEEP_RUN_ID` and
+        # `SWEEP_SUBMITTED_AT` are per-EXECUTION overrides: one battery
+        # execution submits the standing set plus every pin, and honouring them
+        # here would write all of those runs under one run_id and one partition
+        # — thirty runs collapsed into an unreadable timeline.
+        run_id = run_id or uuid.uuid4().hex[:16]
+        submitted_at = datetime.now(timezone.utc).isoformat()
+    else:
+        run_id = run_id or os.environ.get('SWEEP_RUN_ID') or uuid.uuid4().hex[:16]
+        submitted_at = (os.environ.get('SWEEP_SUBMITTED_AT')
+                        or datetime.now(timezone.utc).isoformat())
     git_commit = os.environ.get('GIT_COMMIT') or None
     # FC-096 Phase B: the dedup key is the CONTENT of `src/**`, not the commit.
     # A merge that cannot change a replay (docs, dashboard, build config) leaves
@@ -1052,7 +1837,8 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         run_id=run_id,
         submitted_at=submitted_at,
         sweep_key=key,
-        submitted_via=(os.environ.get('SWEEP_SUBMITTED_VIA')
+        submitted_via=(submitted_via
+                       or os.environ.get('SWEEP_SUBMITTED_VIA')
                        or ('dashboard' if spec_env else 'cli')),
         engine_version=ENGINE_VERSION,
         git_commit=git_commit,
@@ -1072,6 +1858,10 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
         # linkage.
         base_config_hash=sweep_store.base_config_hash(snapshot),
         engine_config_hash=config_hash(config),
+        # FC-096 Phase B B4. NULL on every run that is not a pin's; the battery
+        # passes the pin it is re-measuring, and it is what makes that pin's
+        # weekly history — and therefore the 3-week nag — queryable.
+        pin_id=pin_id,
     )
 
     # FC-096 Phase B B2. Detail artifacts ride the SAME gate as BigQuery
@@ -1095,9 +1885,12 @@ def run_sweep_cmd(args, config: Config, logger) -> int:
     if persist:
         # Profile-derived, never hardcoded (the FC-075 DD-4 lesson): a
         # covered-call profile running a sweep writes to its own dataset rather
-        # than into the wheel's store.
-        writer = sweep_store.ScenarioRunWriter(dataset_id=config.bigquery_dataset)
-        if not writer.enabled and spec_env:
+        # than into the wheel's store. An in-process caller may supply its own
+        # (the battery does — see `writer_override` in the docstring).
+        writer = (writer_override if writer_override is not None
+                  else sweep_store.ScenarioRunWriter(
+                      dataset_id=config.bigquery_dataset))
+        if not writer.enabled and job_mode:
             # FAIL BEFORE REPLAYING, in Job mode only. An execution launched from
             # the dashboard exists solely to put rows in the store: eight minutes
             # of 1-vCPU compute whose output goes to a log nobody reads is worse

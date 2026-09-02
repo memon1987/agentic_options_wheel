@@ -414,6 +414,28 @@ def _sweep_token() -> Optional[str]:
     return os.getenv("SWEEP_SUBMIT_TOKEN") or None
 
 
+def _require_sweep_token(authorization: Optional[str]) -> None:
+    """The submit gate, applied verbatim to the pin writes.
+
+    Extracted rather than repeated a third time: the 503-when-unconfigured and
+    the constant-time compare are the two halves that must not drift between
+    the endpoints that spend money.
+    """
+    configured = _sweep_token()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
+                    "on this service. Create the `sweep-submit-token` secret "
+                    "and wire it with `gcloud run services update "
+                    "options-wheel-dashboard --update-secrets="
+                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
+    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
+        raise HTTPException(
+            status_code=401,
+            detail="a valid `Authorization: Bearer <token>` is required to submit")
+
+
 def _project() -> str:
     return (os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
             or "gen-lang-client-0607444019")
@@ -748,19 +770,7 @@ async def run_sim(
     import httpx
     from starlette.concurrency import run_in_threadpool
 
-    configured = _sweep_token()
-    if not configured:
-        raise HTTPException(
-            status_code=503,
-            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
-                    "on this service. Create the `sweep-submit-token` secret "
-                    "and wire it with `gcloud run services update "
-                    "options-wheel-dashboard --update-secrets="
-                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
-    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
-        raise HTTPException(
-            status_code=401,
-            detail="a valid `Authorization: Bearer <token>` is required to submit")
+    _require_sweep_token(authorization)
 
     # Re-read the env rather than trusting only the import-time constant: the
     # module-level value is what production uses, and the re-read is what lets a
@@ -822,6 +832,205 @@ async def run_sim(
                                                     "application/json"))
 
 
+# ----------------------------------------------------------------------
+# FC-096 Phase B B4 — pinned scenarios.
+#
+# A pin is a spec the weekly battery re-measures for ever. The three routes
+# below are a thin caller over `services/sweeps.py`, where every rule lives and
+# where the bot CI image can actually run it.
+#
+# The GET is public, like every other read on this dashboard (FC-094 owns that
+# decision): a pin is a hypothetical over historical data, and the same spec is
+# already visible on any sweep it has produced. The WRITES are token-gated,
+# because a pin spends Job time every Saturday for ever — which is a bigger
+# commitment than one submit, not a smaller one.
+# ----------------------------------------------------------------------
+
+
+@router.get("/sims/pins")
+async def list_pins(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    """Every pin's CURRENT state — latest row per `pin_id`, newest first.
+
+    Active only by default: that is the set the battery runs, and it is the
+    question an operator is nearly always asking. `?include_inactive=true`
+    shows what has been un-pinned as well, which the store keeps for ever
+    because a pin is retired by an `active=false` row rather than a delete.
+
+    The spec comes back DECODED. A pin whose stored text will not parse is
+    returned with `spec: null` and the raw text on `spec_json` rather than
+    hidden — it is precisely the row worth seeing, because the battery refuses
+    it every week and says so.
+
+    A plain `bool` default rather than `Query(default=False)`: FastAPI reads it
+    as a query parameter either way, and the plain default is what makes a
+    direct call to this handler — which is how it is tested, the dashboard
+    image's deps not being present in the bot CI image — pass a real `False`
+    instead of a truthy `Query` object.
+    """
+    bq = get_bigquery_service()
+    try:
+        rows = bq.get_pins(active_only=not include_inactive)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    return [sweeps.shape_pin(row) for row in rows]
+
+
+@router.post("/sims/pins", status_code=201)
+async def create_pin(
+    body: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Pin a spec into the weekly battery, as a ROLLING window.
+
+    Body: `{"spec": {...}, "note": "optional"}` — the same absolute-dated spec
+    `POST /sweeps` takes, validated by the SAME `validate_spec`, so a pin the
+    Job would refuse is refused now rather than discovered by the battery three
+    Saturdays later.
+
+    **The window the spec carries becomes a SHAPE.** `(end - start)` and
+    `(end - holdout_start)` are stored as `window_days` / `holdout_days`, and
+    every Saturday the battery re-anchors them to the last settled session. So
+    a pin measures the same question over a window that MOVES, which is what
+    makes its weekly rows a trend series rather than one answer repeated. The
+    dates you post are kept verbatim in the stored spec as the record of what
+    you asked for; they are not what gets replayed after the first week.
+
+    * **503** when `SWEEP_SUBMIT_TOKEN` is unset — fail closed, as the submit does.
+    * **401** when the bearer does not match (constant-time compare).
+    * **422** with the runner's own reason for a spec that could not run, for a
+      body that is not `{spec, note}`, or for a pinned `force`.
+    * **409** when there are already `MAX_ACTIVE_PINS` active — naming the cap,
+      because the remedy is to un-pin one and the operator needs to know which
+      list to look at.
+    * **409** when an ACTIVE pin already carries this exact spec — naming THAT
+      pin, so "it is already pinned" is actionable rather than merely a refusal.
+    * **201** with the new pin.
+
+    Nothing here launches anything. The pin takes effect on the next battery,
+    which runs after the Saturday backfill.
+    """
+    _require_sweep_token(authorization)
+    try:
+        spec, note = sweeps.validate_pin_body(body)
+    except sweeps.SweepValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    spec_json = sweeps.pin_spec_json(spec)
+    # The window the operator typed becomes a SHAPE here, and this is the whole
+    # of the conversion: the spec they posted is stored verbatim as the record,
+    # and these two numbers are what the battery re-anchors every Saturday.
+    # Without them a pin is frozen to a historical window whose answer cannot
+    # change, so the dedup hits from the second week on and the trend series
+    # holds one point (FC-096 D1; the defect this PR's data review caught).
+    window_days, holdout_days = sweeps.pin_window_shape(spec)
+    bq = get_bigquery_service()
+    try:
+        existing = bq.get_pins(active_only=True)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+
+    duplicate = sweeps.duplicate_active_pin(
+        spec, window_days=window_days, holdout_days=holdout_days,
+        pins=existing)
+    if duplicate is not None:
+        # Checked BEFORE the cap: an operator re-pinning something already
+        # pinned should be told that, not told the list is full — the second
+        # message would send them to remove a pin to make room for one that is
+        # already there.
+        raise HTTPException(
+            status_code=409,
+            detail=(f"pin {duplicate.get('pin_id')} already asks this exact "
+                    f"question"
+                    + (f" (note: {duplicate.get('note')})"
+                       if duplicate.get('note') else "")
+                    + ". The battery would replay one and deduplicate the "
+                      "other, so the second pin would cost a row and measure "
+                      "nothing new. Edit or un-pin that one instead."))
+    active = sweeps.active_pin_count(existing)
+    if active >= sweeps.MAX_ACTIVE_PINS:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{active} pins are already active, which is the cap of "
+                    f"{sweeps.MAX_ACTIVE_PINS} (FC-096 D1). Every pin is a "
+                    f"sweep the battery runs every Saturday inside one Job "
+                    f"execution, so the cap is what keeps that execution inside "
+                    f"its wall clock. Un-pin one first: GET "
+                    f"/api/v2/sims/pins, then DELETE "
+                    f"/api/v2/sims/pins/{{pin_id}}."))
+
+    pin_id = sweeps.new_pin_id()
+    row = sweeps.pin_row(pin_id=pin_id, spec_json=spec_json, active=True,
+                         window_days=window_days, holdout_days=holdout_days,
+                         note=note)
+    try:
+        bq.insert_pin(row)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    return {"pin_id": pin_id, "active": True, "note": note, "spec": spec,
+            # Echoed so the caller can SEE that the window became rolling — the
+            # dates they posted are a record, and the two numbers are what runs.
+            "window_days": window_days, "holdout_days": holdout_days,
+            "active_pins": active + 1, "max_active_pins": sweeps.MAX_ACTIVE_PINS}
+
+
+@router.delete("/sims/pins/{pin_id}")
+async def delete_pin(
+    pin_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Un-pin: write an `active=false` row. The history is never destroyed.
+
+    Insert-only, like everything else in this store. "What was pinned last
+    quarter, and when did it stop being measured" stays answerable, and the
+    deactivation row carries the same spec so a reader taking the latest row can
+    see what was retired without walking back.
+
+    * **503 / 401** exactly as the create does.
+    * **404** when no pin has ever had this id — never a silent success, because
+      a typo'd id that returned 200 would leave the operator believing a pin
+      they are still paying for every Saturday is gone.
+    * **200** with `deactivated: false` when it was ALREADY inactive. Idempotent
+      and honest: nothing was written, and the answer says so rather than
+      stacking identical rows on every retry.
+    """
+    _require_sweep_token(authorization)
+    if not pin_id or len(pin_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid pin_id")
+    bq = get_bigquery_service()
+    try:
+        current = bq.get_pin(pin_id)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"no pin {pin_id}. GET /api/v2/sims/pins lists the active "
+                    f"ones; add ?include_inactive=true to see retired ones."))
+    if not current.get("active"):
+        return {"pin_id": pin_id, "active": False, "deactivated": False,
+                "detail": "this pin was already inactive; nothing was written"}
+    row = sweeps.pin_row(pin_id=pin_id, spec_json=current.get("spec_json"),
+                         active=False,
+                         window_days=current.get("window_days"),
+                         holdout_days=current.get("holdout_days"),
+                         note=current.get("note"))
+    try:
+        bq.insert_pin(row)
+    except Exception as exc:  # noqa: BLE001
+        if _sweep_store_missing(exc):
+            raise _tables_missing()
+        raise
+    return {"pin_id": pin_id, "active": False, "deactivated": True}
+
+
 @router.post("/sweeps", status_code=202)
 async def submit_sweep(
     spec: Dict[str, Any] = Body(...),
@@ -863,19 +1072,7 @@ async def submit_sweep(
     never a silent one. The reverse order has the worse failure: an execution
     running with no row, which no reader can see and no dedup can find.
     """
-    configured = _sweep_token()
-    if not configured:
-        raise HTTPException(
-            status_code=503,
-            detail=("sweeps are disabled: SWEEP_SUBMIT_TOKEN is not configured "
-                    "on this service. Create the `sweep-submit-token` secret and "
-                    "wire it with `gcloud run services update "
-                    "options-wheel-dashboard --update-secrets="
-                    "SWEEP_SUBMIT_TOKEN=sweep-submit-token:latest`."))
-    if not sweeps.token_matches(sweeps.extract_bearer(authorization), configured):
-        raise HTTPException(
-            status_code=401,
-            detail="a valid `Authorization: Bearer <token>` is required to submit")
+    _require_sweep_token(authorization)
 
     try:
         normalised = sweeps.validate_spec(spec)

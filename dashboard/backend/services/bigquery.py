@@ -1739,7 +1739,8 @@ class BigQueryService:
             # some client paths surface that as a generic GoogleCloudError
             # rather than NotFound, so the message is checked too.
             if "Not found" in str(e) and ("scenario_sweeps" in str(e)
-                                          or "scenario_runs" in str(e)):
+                                          or "scenario_runs" in str(e)
+                                          or "scenario_pins" in str(e)):
                 raise NotFound(str(e))
             logger.error(f"BigQuery error: {e}")
             raise Exception(f"Database query failed: {str(e)}")
@@ -1827,6 +1828,52 @@ class BigQueryService:
             note_identity_query_degraded(exc)
             return None
         return rows[0] if rows else None
+
+    # ------------------------------------------------------------------
+    # FC-096 Phase B B4 — pins.
+    #
+    # Same boundary as the sweep tables: the ENGINE's writer owns the schema
+    # (`persist._pins_schema`), and this backend only reads rows and inserts
+    # them. A pin write before that reconcile has ever run fails loudly with
+    # `TABLES_MISSING_DETAIL` rather than creating a table with half a schema.
+    # ------------------------------------------------------------------
+    def get_pins(self, *, active_only: bool = False) -> List[Dict[str, Any]]:
+        """Current state of every pin — latest row per ``pin_id``."""
+        from services.sweeps import pins_sql
+
+        return self._sweep_query(
+            pins_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("active_only", "BOOL",
+                                           bool(active_only))],
+        )
+
+    def get_pin(self, pin_id: str) -> Optional[Dict[str, Any]]:
+        """The current state of one pin, or None."""
+        from services.sweeps import one_pin_sql
+
+        rows = self._sweep_query(
+            one_pin_sql(self.dataset),
+            [bigquery.ScalarQueryParameter("pin_id", "STRING", pin_id)],
+        )
+        return rows[0] if rows else None
+
+    def insert_pin(self, row: Dict[str, Any]) -> None:
+        """Insert one ``scenario_pins`` row. Raises on failure, deliberately.
+
+        The caller has already told the operator what it is about to do; a
+        swallowed failure here would report a pin that the battery will never
+        see. There is no additive-column degrade on this path: the table has
+        seven columns (``pin_id``, ``spec_json``, ``active``, ``written_at``,
+        ``note``, and the rolling shape ``window_days`` / ``holdout_days``) and
+        this build knows all of them, so an unknown-field error means the table
+        is not the one this code was written against — which is a migration to
+        look at, not a row to narrow. The count is not decorative: it is the
+        reason this path may raise where ``insert_sweep_status`` degrades.
+        """
+        table = f"{self.dataset}.scenario_pins"
+        errors = self.client.insert_rows_json(table, [row])
+        if errors:
+            raise Exception(f"scenario_pins insert failed: {str(errors)[:400]}")
 
     def insert_sweep_status(self, row: Dict[str, Any]) -> None:
         """Insert one ``scenario_sweeps`` row. Raises on failure, deliberately.

@@ -57,6 +57,8 @@ def test_the_walk_finds_the_policies():
         "job_failure_alert_policy.json",
         "lake_freshness_alert_policy.json",
         "lake_freshness_degraded_alert_policy.json",
+        # FC-096 Phase B B4
+        "battery_degraded_alert_policy.json",
     ):
         assert required in names, f"{required} is missing from {POLICY_DIR}"
 
@@ -204,3 +206,60 @@ class TestTheFC096Policies:
                 "lake_freshness_no_universe warn by design, and the degraded "
                 "policy is where that becomes visible rather than silent"
             )
+
+
+class TestTheBatteryPolicy:
+    """FC-096 Phase B B4. The battery ALWAYS exits 0, so this log event is the
+    only thing that can notice a week of missing trend points."""
+
+    @staticmethod
+    def _filter():
+        doc = load(POLICY_DIR / "battery_degraded_alert_policy.json")
+        return doc["conditions"][0]["conditionMatchedLog"]["filter"]
+
+    def test_it_is_a_nag_not_a_page(self):
+        """24h, exactly like its two degraded twins. A measurement that did not
+        happen is not an outage, and paging for one is how the channel gets
+        filtered until the page that matters is missed too."""
+        doc = load(POLICY_DIR / "battery_degraded_alert_policy.json")
+        twin = load(POLICY_DIR / "lake_freshness_degraded_alert_policy.json")
+        assert doc["alertStrategy"]["notificationRateLimit"]["period"] == "86400s"
+        assert (doc["alertStrategy"]["notificationRateLimit"]
+                == twin["alertStrategy"]["notificationRateLimit"])
+
+    def test_it_watches_the_job_the_battery_actually_runs_in(self):
+        """Not a Cloud Run REVISION. The battery rides the `data-backfill` Job
+        execution, and every other log-based policy in this directory except
+        the Job-failure one watches services — the easy mistake to make by
+        imitation."""
+        f = self._filter()
+        assert 'resource.type="cloud_run_job"' in f
+        assert '"data-backfill"' in f
+
+    def test_it_matches_the_events_main_py_actually_emits(self):
+        """The policy and the emitter are in different files and nothing but
+        this stops one being renamed without the other."""
+        import inspect
+
+        import main as cli
+
+        f = self._filter()
+        for event in ("battery_degraded", "battery_pin_nag"):
+            assert event in f, f"{event} is not watched"
+        source = inspect.getsource(cli.run_battery_cmd)
+        assert 'event_type="battery_degraded"' in source
+        assert 'event_type="battery_pin_nag"' in inspect.getsource(
+            cli._battery_nag)
+
+    def test_it_does_not_filter_on_severity(self):
+        """This project's Cloud Run logs are plain text with severity DEFAULT
+        (the FC-030 gotcha, restated by FC-098), so `severity>=ERROR` would
+        match nothing at all. The Job-failure policy can use it because Cloud
+        Run itself emits the execution-failure entry."""
+        assert "severity" not in self._filter()
+
+    def test_it_matches_the_event_not_its_reasons(self):
+        """A `reason` added later would stop being watched with nothing to show
+        for it — the lake-degraded policy's rule, and the same trap."""
+        f = self._filter()
+        assert "jsonPayload.reason" not in f

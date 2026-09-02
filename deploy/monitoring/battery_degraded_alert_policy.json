@@ -1,0 +1,26 @@
+{
+  "displayName": "Weekly battery degraded — trend points are missing",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "The weekly battery did not measure everything it was asked to",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"data-backfill\" AND (jsonPayload.event_type=\"battery_degraded\" OR jsonPayload.event_type=\"battery_pin_nag\" OR textPayload:\"battery_degraded\" OR textPayload:\"battery_pin_nag\")"
+      }
+    }
+  ],
+  "documentation": {
+    "content": "The Saturday battery ran and did not measure everything it was asked to. Some trend series have no point this week.\n\n**This is a NAG, NOT A PAGE** — the notification rate limit is 24h, deliberately mirroring `lake_freshness_degraded_alert_policy.json`. A measurement that did not happen is not an outage, and paging for one is how a channel gets filtered until the page that matters is missed too.\n\n**The DATA is fine, or you would already know.** The battery runs only after a SUCCESSFUL `data-backfill` (`BACKFILL_THEN_BATTERY=true` on the Job, FC-096 Phase B B4), and a failed backfill exits the execution non-zero and fires `job_failure_alert_policy.json` instead. The two exit classes are separated on purpose: the lake is the substrate everything reads, so its failure pages; a stale trend chart nags. The battery ALWAYS exits 0, which is why this log event exists at all — there is no exit code to watch.\n\nTwo events are matched, and they mean different things:\n\n- **`battery_degraded`** — the run finished with items that failed or were skipped. Read `reason`:\n  - `store_unavailable` — the scenario store could not be opened. Nothing was measured. This is the same class of failure as a sweep Job that cannot persist; check the BigQuery client, the project, and `options_wheel.scenario_sweeps`.\n  - `wall_cap` — the battery hit `BATTERY_MAX_SECONDS` (14400 = 4h) and refused to START anything further. `skipped_labels` names what did not run. **The expected cause is an engine-change week**: the dedup key is a content hash of `src/**`, so the first Saturday after any merge that touches the engine invalidates every stored result and every sweep genuinely replays. One such week is normal; two in a row on an unchanged engine is not, and means a symbol is materialising far slower than it should.\n  - `items_failed` — one or more items failed or were refused. `failed_labels` names them (`standing:<SYMBOL>` or `pin:<pin_id>`). Each one already has its own `battery_pin_failed` event with a reason, and its own `failed` row in `scenario_sweeps` — query by `pin_id` or `submitted_via='battery'`.\n\n- **`battery_pin_nag`** — one pin has been REFUSED three consecutive weeks. It will never be measured again until somebody edits or removes it. The usual cause is an allowlist rule that moved under a pin nobody has looked at since (FC-096 Phase A PR-2 moved the DTE keys, which is the precedent). The remedy is to re-pin the corrected spec: `GET /api/v2/sims/pins` to find it, `DELETE /api/v2/sims/pins/{pin_id}`, then `POST /api/v2/sims/pins` with the fixed spec. A refusal is distinguished from an ordinary failure by the `pin invalid: ` prefix on the row's `error` — only refusals count towards the nag, because a vendor outage is not something the operator can fix by editing a pin.\n\nTriage:\n\n```\n# what the execution actually did, in order\ngcloud logging read 'resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"data-backfill\" AND jsonPayload.event_type=(\"battery_started\" OR \"battery_pin_failed\" OR \"battery_pin_nag\" OR \"battery_degraded\" OR \"battery_completed\")' --limit=50 --freshness=8d\n\n# the rows themselves\nbq query --use_legacy_sql=false 'SELECT run_id, pin_id, status, error, submitted_at FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` WHERE submitted_via = \"battery\" ORDER BY submitted_at DESC LIMIT 40'\n```\n\nKNOWN NON-CAUSES — do not chase these:\n\n1. A `deduplicated` outcome is a SUCCESS, not a failure. A week in which nothing about the engine or the window changed costs almost nothing by design, and those items count as measured.\n2. `severity` is not filtered on, and that is deliberate. This project's Cloud Run logs are plain text with severity DEFAULT (the FC-030 gotcha, restated by FC-098), so a filter on `severity>=ERROR` would match nothing at all. The event name is the signal.\n3. This policy says nothing about the LIVE strategy. The battery replays historical data and trades nothing.",
+    "mimeType": "text/markdown"
+  },
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ],
+  "enabled": true,
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "86400s"
+    },
+    "autoClose": "86400s"
+  }
+}

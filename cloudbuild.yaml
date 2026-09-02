@@ -1360,6 +1360,29 @@ steps:
   # which is the whole point of the schedule. Baking a default window in here
   # would make the scheduler's behaviour a property of the last deploy.
   #
+  # `BACKFILL_THEN_BATTERY=true` (FC-096 Phase B B4) composes the Saturday:
+  # after a SUCCESSFUL backfill the same execution runs `--command battery`,
+  # which re-measures the standing set (base config, one sweep per live symbol,
+  # trailing year with holdout) and every active pin against the lake it just
+  # refreshed. It is on the Job DEFINITION rather than the schedule so the
+  # `backfill-weekly` scheduler needs no change at all. A FAILED backfill skips
+  # it (the lake is not what a measurement would be taken against), and the
+  # battery's own failures never touch this Job's exit code — they are an
+  # ERROR-severity `battery_degraded` log watched by a 24 h nag policy, because
+  # a stale trend chart is not a page.
+  #
+  # Deliberately NOT added: `SIM_ARTIFACT_BUCKET`. The battery persists, so it
+  # writes per-cell detail artifacts — and `artifact_store.DEFAULT_ARTIFACT_BUCKET`
+  # already resolves to the right bucket when the variable is unset, which is
+  # exactly how `deploy-sweep-job` runs. Setting it here would be a second place
+  # for that name to drift from.
+  #
+  # Wall clock, on the record: the battery refuses to START a new sweep past
+  # `BATTERY_MAX_SECONDS` (14400 = 4h), so the worst case here is the backfill
+  # plus 4h plus the longest single sweep — comfortably inside the 6h task
+  # timeout below, which is what keeps a long measurement pass from turning a
+  # successful DATA run into a Job-failure page.
+  #
   # `--task-timeout=21600` (6h): the historical widening runs one symbol-year
   # per execution at measured cold rates (~5.5 min/symbol-month at 22-reach),
   # and the weekly freshness run finishes in minutes. A task killed at the
@@ -1379,7 +1402,7 @@ steps:
           --region=us-central1 \
           --command=python \
           --args=main.py,--command,backfill \
-          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA \
+          --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA,BACKFILL_THEN_BATTERY=true \
           --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
           --memory=1Gi \
           --cpu=1 \
