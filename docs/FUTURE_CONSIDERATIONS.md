@@ -1037,7 +1037,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
-### FC-097: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
+### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
 **Scope:** covered_call
 **Status:** Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
@@ -1049,7 +1049,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Decide:** (a) wire CC rolling — add the `rolling:` block to `covered_call.yaml`, create the CC roll scheduler, set the env lever; or (b) declare CC no-roll deliberate — correct `docs/CLAUDE.md`'s inventory and the FC-075 phase docs, and record the rationale (assignment above basis is the strategy completing, not a defect). The FC-096 Phase C replay will mirror whichever is decided (its plan currently documents the roller as inert for CC).
 
-**Links:** FC-078 (the wheel roller), FC-075 (CC profile), `docs/plans/fc-096-c.md` (plan-review finding HIGH-4).
+**Links:** FC-078 (the wheel roller), FC-075 (CC profile), `docs/plans/fc-096-c.md` (plan-review finding HIGH-4). Renumbered from a duplicate FC-097 — that number was already taken by the OI-sourcing entry filed in another session (see RELEASE_2026-09-01.md, which also filed FC-098/FC-099).
 
 ---
 
