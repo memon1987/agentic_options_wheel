@@ -16,10 +16,19 @@ google-cloud-storage>=2.10.0,<3.0.0
 # own pins because the ES256 round-trip test runs in the bot CI image, and a
 # test that skips in CI is not a regression guard.
 #
+# `google-auth` is PINNED to the dashboard image's exact pin, breaking this
+# file's range convention on purpose: the ES256 round-trip test that proves IAP
+# assertions verify runs HERE, and a range let it resolve to a different
+# google-auth than the one that actually ships (measured: 2.57.0 in a fresh CI
+# install vs the dashboard's 2.43.0). Testing a verifier we do not ship is the
+# same defect the fastapi/starlette/httpx pins at the bottom of this file were
+# added to close. The two must be bumped together.
+#
 # NOTE: this file is inside `engine_identity`'s digest (FC-096 Phase B PR-a),
-# so this line MOVES the identity and invalidates every stored dedup key once —
+# so these lines MOVE the identity and invalidate every stored dedup key once —
 # the documented, accepted cost of any dependency edit here. `ENGINE_VERSION` is
 # deliberately NOT bumped: a JWT library cannot move a replay's numerics.
+google-auth==2.43.0
 cryptography>=42.0.0,<47.0.0
 
 # Data manipulation and analysis

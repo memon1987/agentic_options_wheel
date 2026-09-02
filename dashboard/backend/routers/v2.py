@@ -321,20 +321,33 @@ async def bot_health_uncovered_symbols() -> Dict[str, Any]:
     return await _evaluate_uncovered_symbols()
 
 
-# FC-096 Phase D — **this route is EXEMPT from the OPERATORS chain, by
-# decision.** It is a POST, but its one caller is machinery, not a person: the
+# FC-096 Phase D — **EXEMPT from the OPERATORS chain, by decision; NOT exempt
+# from verification** (plan rev 4).
+#
+# It is a POST, but its one caller is machinery, not a person: the
 # `drawdown-pause-alert-daily` Cloud Scheduler job, running as the compute
 # service account. Once IAP is on, that SA is admitted by
-# `roles/iap.httpsResourceAccessor` and reaches this handler with a valid
-# assertion whose email is the SA's — an identity that will never be on an
-# OPERATORS allowlist of human accounts. Applying the uniform write gate here
-# would therefore 403 the scheduler every day at 17:45 and take the alert
-# silently offline: the FC-030 failure class, arriving through the door built
-# to prevent it. IAP admission IS this endpoint's authorization. It writes
-# nothing, spends nothing and returns an evaluation, so there is nothing behind
-# it that an admitted viewer must not see.
+# `roles/iap.httpsResourceAccessor` and arrives with a valid assertion whose
+# email is the SA's — an identity that will never be on an OPERATORS allowlist
+# of human accounts. Applying the write gate here would 403 the scheduler every
+# evening and take the drawdown alert silently offline: the FC-030 failure
+# class, arriving through the door built to prevent it. IAP admission IS this
+# endpoint's authorization; it writes nothing, spends nothing, and returns an
+# evaluation an admitted viewer may see.
+#
+# What it is NOT exempt from is looking at the header. `_verify_assertion_if_present`:
+#   absent            -> pass. Pre-flip that is every request, the scheduler's
+#                        included; post-flip IAP does not admit one.
+#   present + INVALID -> 401, same sanitized `iap_assertion_invalid` event as
+#                        everywhere else. Uniform loudness: the documented
+#                        exception must not also be the one endpoint where a
+#                        forged header is accepted in silence, because that is
+#                        the first place a prober looks.
+#   present + valid   -> pass, whoever it is. OPERATORS is not consulted.
 @router.post("/bot-health/pause-alert-check")
-async def pause_alert_check() -> Dict[str, Any]:
+async def pause_alert_check(
+    x_goog_iap_jwt_assertion: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     """Log an alert when a held symbol has been uncovered too long.
 
     Triggered daily post-close by Cloud Scheduler (route and schedule
@@ -344,7 +357,13 @@ async def pause_alert_check() -> Dict[str, Any]:
     Monitoring log-based policy turns that into an operator email.
 
     Returns the evaluation either way so the check is manually invokable.
+
+    **Auth (FC-096 Phase D):** verify-when-present, never authorize — see the
+    comment above the decorator. A present assertion that does not verify is a
+    401; everything else runs.
     """
+    _verify_assertion_if_present(x_goog_iap_jwt_assertion)
+
     threshold_days = _alert_threshold_days()
 
     try:
@@ -449,6 +468,39 @@ def _require_sweep_token(authorization: Optional[str]) -> None:
             detail="a valid `Authorization: Bearer <token>` is required to submit")
 
 
+def _assertion_header(value) -> Optional[str]:
+    """Normalise the raw `x-goog-iap-jwt-assertion` argument to `str` or None.
+
+    A handler called DIRECTLY — which is how this router is tested, the
+    dashboard image's deps being absent from the bot CI image — receives the
+    `Header(...)` FieldInfo object itself, not its default: only FastAPI
+    resolves that. The object is TRUTHY, so without this an omitted argument
+    would look like a PRESENT assertion and every direct-call test in the suite
+    would take the IAP branch. Same trap the `include_inactive` note below
+    documents for `Query`. Anything that is not a string is "no assertion"; a
+    real request always yields `str` or `None`.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _verify_assertion_if_present(assertion) -> Optional[object]:
+    """Verify-when-present, never authorize — the EXEMPT routes' whole gate.
+
+    Absent assertion → pass (IAP admission is the authorization, and pre-flip
+    nothing carries one). Present and INVALID → **401**, with the same
+    sanitized log event every other route emits. Present and valid → pass,
+    whatever the identity, `OPERATORS` not consulted.
+
+    The middle branch is the point: "exempt from the role check" must not decay
+    into "never looks at the header", or the documented exception becomes the
+    one endpoint on this service where a forged assertion is silently accepted.
+    """
+    try:
+        return auth.authenticate_only(_assertion_header(assertion))
+    except auth.IapAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
 def _require_write_access(assertion: Optional[str],
                           authorization: Optional[str]):
     """FC-096 Phase D — the ONE gate every write route on this service uses.
@@ -459,9 +511,12 @@ def _require_write_access(assertion: Optional[str],
     * **No assertion** (every request until the operator flips IAP on) -> the
       pre-existing token gate, called with the same argument and reaching the
       same 503/401 with the same detail strings. This is the PR-1 no-op
-      property, and `TestThePr1NoOpProbe` exists to prove it: deploying this
-      change before the console session must not alter the service's behaviour
-      by a byte.
+      property, and `TestThePr1NoOpProbe` exists to prove it: for
+      NO-ASSERTION requests on the API routes, deploying this change ahead of
+      the console session does not alter one byte of the answer. (Scope, stated
+      because it is not total: `/openapi.json` does change — the routes gain a
+      header parameter — and an assertion-BEARING request is deliberately
+      handled differently from `main`, which ignored the header.)
     * **Assertion present but invalid** -> 401 with a distinct log event,
       emitted by `services/auth.py`. **Never** a fall-through to the token
       path: a forged pre-flip header or a broken `IAP_AUDIENCE` has to be loud.
@@ -480,19 +535,8 @@ def _require_write_access(assertion: Optional[str],
     later audit trail has an identity to record without another signature
     change.
     """
-    if not isinstance(assertion, str):
-        # A handler called DIRECTLY — which is how this router is tested, the
-        # dashboard image's deps being absent from the bot CI image — receives
-        # the `Header(...)` FieldInfo object itself, not its default: only
-        # FastAPI resolves that. It is truthy, so without this line an omitted
-        # argument would look like a PRESENT assertion and every direct-call
-        # test in the suite would take the IAP branch. Same trap the
-        # `include_inactive` note below documents for `Query`. Anything that is
-        # not a string is "no assertion"; a real request always yields `str` or
-        # `None`.
-        assertion = None
     try:
-        identity = auth.authorize_write(assertion)
+        identity = auth.authorize_write(_assertion_header(assertion))
     except auth.IapAuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     if identity is None:

@@ -46,14 +46,21 @@ async def report_frontend_error(body: FrontendErrorReport):
     Cloud Logging sink, tagged with event_category="frontend"
     so it can be queried separately from backend errors.
     """
+    # EVERY caller-controlled field is truncated, not just `stack`. This sink
+    # is reachable by anyone the perimeter admits (anonymous today; every
+    # signed-in viewer after the FC-096 Phase D flip) and it writes straight
+    # through to Cloud Logging and on into BigQuery. An untruncated `error` or
+    # `url` is an unbounded write into log storage — the same exposure the
+    # `stack[:500]` bound already acknowledged, left open on the three fields
+    # beside it.
     logger.error(
         "Frontend error reported",
         event_category="frontend",
         event_type="frontend_error",
-        error=body.error,
+        error=body.error[:500],
         stack=body.stack[:500],
-        url=body.url,
-        component=body.component,
+        url=body.url[:500],
+        component=body.component[:200] if body.component else body.component,
     )
 
     return {"status": "logged"}

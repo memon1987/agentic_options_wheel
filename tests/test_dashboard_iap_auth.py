@@ -14,12 +14,15 @@ Four things are under test here, and they fail in very different ways:
 3. **The router wiring** — that all four write routes go through the chain,
    that the header actually binds through FastAPI, and that the two exempt
    routes are genuinely exempt.
-4. **The PR-1 no-op property.** This PR ships BEFORE the console flip. With no
-   assertion on the request the service must behave byte-identically to the
-   revision before it — same statuses, same detail strings, and the verifier
-   never even consulted. That is the whole safety argument for merging and
-   deploying this ahead of the IAP session, so it is probed rather than
-   asserted in prose.
+4. **The PR-1 no-op property.** This PR ships BEFORE the console flip. For
+   **no-assertion requests on the API routes** the service must answer
+   byte-identically to the revision before it — same statuses, same detail
+   strings, and the verifier never even consulted. That is the whole safety
+   argument for merging and deploying this ahead of the IAP session, so it is
+   probed rather than asserted in prose. Two deliberate exclusions from that
+   claim: `/openapi.json` gains the header parameter, and an
+   assertion-BEARING request is handled differently from `main` (which ignored
+   the header) — that difference is the feature.
 
 Network discipline: every test either injects the verifier or injects the certs
 transport. Nothing here reaches the IAP keys endpoint, GCP, or BigQuery.
@@ -33,7 +36,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests._dashboard_path import (  # noqa: E402
     HAS_FASTAPI,
@@ -282,11 +284,15 @@ class TestTheChain:
             A.authorize_write("an-assertion")
         assert exc.value.status_code == 401
 
-    def test_the_invalid_reason_is_logged_but_not_returned(self, monkeypatch, caplog):
-        """The caller gets a friendly message; the log gets the cause.
+    def test_the_verifier_message_reaches_neither_the_caller_nor_the_log(
+            self, monkeypatch, caplog):
+        """Only the exception TYPE and a fingerprint are recorded.
 
-        Returning "Token has wrong audience X, expected Y" to an unauthenticated
-        caller hands them a configuration oracle.
+        The caller gets a friendly message — returning "Token has wrong audience
+        X, expected Y" to an unauthenticated caller hands them a configuration
+        oracle. The LOG gets no more, which is the security fix: google-auth's
+        `MalformedError` quotes the raw token back in its message (see
+        `TestTheLogNeverCarriesTheToken`).
         """
         configure(monkeypatch)
         stub_verifier(monkeypatch,
@@ -297,7 +303,10 @@ class TestTheChain:
         assert "wrong audience" not in exc.value.detail
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "iap_assertion_invalid" in logged
-        assert "wrong audience" in logged
+        assert "ValueError" in logged
+        # The verifier's message is NOT in the log either.
+        assert "wrong audience" not in logged, logged
+        assert "/projects/1/" not in logged, logged
 
     def test_a_wrong_issuer_is_invalid(self, monkeypatch):
         """`verify_token` checks signature, aud and expiry — NOT `iss`."""
@@ -380,6 +389,125 @@ class TestTheChain:
         stub_verifier(monkeypatch, result=claims(email=OPERATOR))
         with pytest.raises(A.NotAnOperator):
             A.authorize_write("an-assertion")
+
+
+class TestTheLogNeverCarriesTheToken:
+    """An IAP assertion is a live credential. It must never reach the log sink.
+
+    google-auth's ``MalformedError`` embeds the **full raw token** in its
+    message — take a genuine signed assertion, append ``.junk``, and the whole
+    thing comes back verbatim. Interpolating that message into a WARNING puts a
+    replayable credential at rest in Cloud Logging and then in BigQuery, for the
+    retention period, readable by anyone with log access.
+
+    It is also, until the console flip, an anonymous **write-anything** channel:
+    the origin is world-reachable, so a stranger can put any bytes they like in
+    the header and have them written to the sink.
+
+    So the rule is absolute — the logged reason is the exception TYPE plus a
+    12-hex SHA-256 fingerprint, and nothing else.
+    """
+
+    #: Long enough that a substring scan is meaningful, and shaped like a JWT.
+    ASSERTION = ("eyJhbGciOiJFUzI1NiIsImtpZCI6InNlY3JldC1raWQifQ"
+                 ".eyJlbWFpbCI6ImF0dGFja2VyQGV2aWwuY29tIn0"
+                 ".c2lnbmF0dXJlLWJ5dGVzLXRoYXQtbXVzdC1uZXZlci1iZS1sb2dnZWQ")
+
+    def _log(self, monkeypatch, caplog, exc, assertion=None):
+        configure(monkeypatch)
+        stub_verifier(monkeypatch, raises=exc)
+        with caplog.at_level(logging.WARNING, logger=A.logger.name):
+            with pytest.raises(A.AssertionInvalid):
+                A.authorize_write(assertion or self.ASSERTION)
+        return "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_malformed_error_quoting_the_whole_token_logs_none_of_it(
+            self, monkeypatch, caplog):
+        """The exact probe from review, reproduced as a regression test."""
+        message = f"Can't parse segment: {self.ASSERTION}.junk"
+        logged = self._log(monkeypatch, caplog, ValueError(message))
+        assert self.ASSERTION not in logged
+        assert "Can't parse segment" not in logged
+
+    def test_no_substring_of_the_assertion_appears_anywhere_in_the_log(
+            self, monkeypatch, caplog):
+        """The strong form: not the token, not a chunk of it, not a segment.
+
+        Scanned in 16-character windows — long enough that a coincidence is
+        implausible and short enough to catch a partial leak (a truncated
+        message, one JWT segment, the header alone).
+        """
+        logged = self._log(monkeypatch, caplog,
+                           ValueError(f"bad token {self.ASSERTION}"))
+        windows = [self.ASSERTION[i:i + 16]
+                   for i in range(0, len(self.ASSERTION) - 16)]
+        leaked = [w for w in windows if w in logged]
+        assert not leaked, f"{len(leaked)} fragment(s) of the assertion leaked: {leaked[:3]}"
+        # ...and the three JWT segments individually.
+        for segment in self.ASSERTION.split("."):
+            assert segment not in logged, segment
+
+    def test_the_exception_type_and_a_fingerprint_are_what_is_logged(
+            self, monkeypatch, caplog):
+        """Sanitised, not silent. A burst of failures still correlates."""
+        logged = self._log(monkeypatch, caplog, ValueError("anything at all"))
+        assert "iap_assertion_invalid" in logged
+        assert "ValueError" in logged
+        assert A.assertion_fingerprint(self.ASSERTION) in logged
+        # The message itself is gone.
+        assert "anything at all" not in logged
+
+    def test_the_detail_returned_to_the_caller_is_also_clean(self, monkeypatch):
+        configure(monkeypatch)
+        stub_verifier(monkeypatch,
+                      raises=ValueError(f"raw {self.ASSERTION} here"))
+        with pytest.raises(A.AssertionInvalid) as exc:
+            A.authorize_write(self.ASSERTION)
+        assert self.ASSERTION not in exc.value.detail
+        # And no fingerprint either: the caller learns nothing they did not send.
+        assert A.assertion_fingerprint(self.ASSERTION) not in exc.value.detail
+
+    def test_the_same_assertion_fingerprints_the_same_way(self):
+        """Correlation is the whole point of keeping anything at all."""
+        assert (A.assertion_fingerprint(self.ASSERTION)
+                == A.assertion_fingerprint(self.ASSERTION))
+        assert (A.assertion_fingerprint(self.ASSERTION)
+                != A.assertion_fingerprint(self.ASSERTION + "x"))
+
+    def test_the_fingerprint_is_twelve_hex_and_not_reversible_in_shape(self):
+        fp = A.assertion_fingerprint(self.ASSERTION)
+        assert len(fp) == 12
+        assert all(c in "0123456789abcdef" for c in fp), fp
+        # It is a PREFIX of the sha256, so it cannot contain token bytes.
+        import hashlib
+        assert hashlib.sha256(self.ASSERTION.encode()).hexdigest().startswith(fp)
+
+    def test_it_survives_a_non_utf8_and_a_non_string_assertion(self):
+        """Header values are attacker-controlled; hashing must not raise.
+
+        An exception escaping the *logging* path would turn a refusal into a
+        500 — and a 500 on the auth path is an availability bug reachable by
+        anyone.
+        """
+        assert len(A.assertion_fingerprint("\udcff\udcfe")) == 12
+        assert len(A.assertion_fingerprint(b"\xff\xfe")) == 12
+        assert len(A.assertion_fingerprint(None)) == 12
+
+    def test_the_router_401_body_carries_nothing_from_the_assertion(
+            self, monkeypatch):
+        """End-to-end: what the HTTP client actually receives."""
+        if not _HAS_FASTAPI:
+            pytest.skip("needs FastAPI (routers.v2)")
+        import routers.v2 as v2
+        from fastapi import HTTPException
+
+        configure(monkeypatch)
+        stub_verifier(monkeypatch,
+                      raises=ValueError(f"Can't parse segment: {self.ASSERTION}"))
+        with pytest.raises(HTTPException) as exc:
+            v2._require_write_access(self.ASSERTION, None)
+        assert exc.value.status_code == 401
+        assert self.ASSERTION not in str(exc.value.detail)
 
 
 class TestTheSignedAssertionIsTheOnlyIdentitySource:
@@ -944,6 +1072,16 @@ class TestTheExemptRoutes:
     the claim under test is about a real HTTP request carrying a real IAP
     header — a handler call cannot distinguish "exempt" from "does not read the
     header".
+
+    **What "exempt" means differs between the two, deliberately** (plan rev 4):
+
+    * `pause-alert-check` is exempt from the OPERATORS chain but **verifies when
+      an assertion is present** — absent passes, valid passes whoever it is,
+      INVALID is a 401. Otherwise the documented exception would also be the one
+      endpoint on this service where a forged header is accepted in silence, and
+      it is the first place a prober looks precisely because it is documented.
+    * `/api/errors` is ungated outright: viewers' browsers post it, and IAP
+      admission is the only thing standing in front of it post-flip.
     """
 
     @pytest.fixture
@@ -997,6 +1135,69 @@ class TestTheExemptRoutes:
         monkeypatch.delenv(A.OPERATORS_ENV, raising=False)
         r = client.post("/api/v2/bot-health/pause-alert-check",
                         headers=self.ASSERTION)
+        assert r.status_code == 200, r.text
+
+    def test_pause_alert_check_401s_an_INVALID_assertion(self, client,
+                                                         monkeypatch):
+        """Exempt from AUTHORIZATION, not from VERIFICATION (plan rev 4).
+
+        A forged header here must be as loud as a forged header anywhere else.
+        The alternative is a documented blind spot: the one route a prober is
+        told to try, answering 200 to a token that verifies against nothing.
+        """
+        stub_verifier(monkeypatch, raises=ValueError("bad signature"))
+        r = client.post("/api/v2/bot-health/pause-alert-check",
+                        headers={"x-goog-iap-jwt-assertion": "forged"})
+        assert r.status_code == 401, r.text
+        assert "could not be verified" in r.json()["detail"]
+
+    def test_pause_alert_check_401s_when_the_audience_is_unconfigured(
+            self, client, monkeypatch):
+        """The fail-closed posture reaches this route too."""
+        monkeypatch.delenv(A.AUDIENCE_ENV, raising=False)
+        r = client.post("/api/v2/bot-health/pause-alert-check",
+                        headers=self.ASSERTION)
+        assert r.status_code == 401, r.text
+        assert A.AUDIENCE_ENV in r.json()["detail"]
+
+    def test_the_401_happens_before_any_evaluation(self, client, monkeypatch):
+        """A refused request must not have cost a BigQuery read.
+
+        The evaluator is replaced with a bomb: if verification ran second, a
+        forged header would already have spent the query.
+        """
+        import routers.v2 as v2
+
+        async def bomb():  # pragma: no cover - the point is it is not called
+            raise AssertionError("evaluated before verifying the assertion")
+
+        monkeypatch.setattr(v2, "_evaluate_uncovered_symbols", bomb)
+        stub_verifier(monkeypatch, raises=ValueError("bad signature"))
+        r = client.post("/api/v2/bot-health/pause-alert-check",
+                        headers={"x-goog-iap-jwt-assertion": "forged"})
+        assert r.status_code == 401, r.text
+
+    def test_the_scheduler_still_passes_with_a_valid_sa_assertion(self, client):
+        """The whole reason for the exemption, stated as its own test."""
+        r = client.post("/api/v2/bot-health/pause-alert-check",
+                        headers=self.ASSERTION)
+        assert r.status_code == 200, r.text
+
+    def test_the_errors_sink_ignores_an_INVALID_assertion(self, client,
+                                                          monkeypatch):
+        """`/api/errors` is ungated OUTRIGHT — it does not even verify.
+
+        Different from `pause-alert-check` on purpose. A browser whose IAP
+        session has just expired is exactly the session whose crash report is
+        worth having, and a 401 here would drop it. Nothing behind this route
+        reads the identity, so there is nothing for a forged header to reach.
+        """
+        stub_verifier(monkeypatch, raises=ValueError("bad signature"))
+        r = client.post("/api/errors",
+                        headers={"x-goog-iap-jwt-assertion": "forged"}, json={
+                            "error": "boom", "stack": "at x", "url": "https://d/",
+                            "timestamp": "2026-09-02T00:00:00Z",
+                            "userAgent": "pytest"})
         assert r.status_code == 200, r.text
 
     def test_the_errors_sink_accepts_a_viewers_report(self, client, monkeypatch):
@@ -1102,13 +1303,46 @@ class TestTheDeployConfigCarriesTheRolesEnv:
 
     @pytest.fixture(scope="class")
     def env(self):
-        steps = yaml.safe_load((REPO_ROOT / "cloudbuild.yaml").read_text())["steps"]
-        step = next(s for s in steps if s["id"] == "deploy-dashboard-canary")
-        script = "\n".join(a for a in step["args"] if isinstance(a, str))
-        line = next(ln for ln in script.splitlines()
-                    if "--set-env-vars=" in ln and "gcloud" not in ln)
-        raw = line.strip().rstrip("\\").strip()[len("--set-env-vars="):]
-        return dict(kv.split("=", 1) for kv in raw.split(","))
+        """The dashboard deploy's `--set-env-vars`, parsed.
+
+        Reuses the cloudbuild contract test's own `deploy_flags()` rather than
+        scanning the script text: that helper walks the backslash-continued
+        `gcloud run deploy` command, so a COMMENT mentioning the flag - and this
+        step now carries a worked `^;^` example in one - cannot be mistaken for
+        the flag itself.
+        """
+        from tests.test_cloudbuild_contract import deploy_flags, load_steps
+
+        step = next(s for s in load_steps() if s["id"] == "deploy-dashboard-canary")
+        flag = next(f for f in deploy_flags(step)
+                    if f.startswith("--set-env-vars="))
+        raw = flag[len("--set-env-vars="):].strip("\'\"")
+        return self._parse_env_value(raw)
+
+    @staticmethod
+    def _parse_env_value(raw):
+        """Handle BOTH the comma form and gcloud's `^<delim>^` alternate form.
+
+        Written to survive the delimiter switch that invite day forces: a second
+        operator puts a SPACE in `OPERATORS`, which the comma form cannot carry
+        through an unquoted bash line. When that lands, this parser already
+        reads it and the assertions below keep their meaning - which is the
+        point of writing it now rather than discovering it in a red build.
+        """
+        sep = ","
+        if len(raw) > 2 and raw[0] == "^":
+            end = raw.index("^", 1)
+            sep = raw[1:end]
+            raw = raw[end + 1:]
+        return dict(kv.split("=", 1) for kv in raw.split(sep))
+
+    def test_the_parser_reads_the_future_delimiter_form(self):
+        """The switch is documented in three places; here it is executable."""
+        parsed = self._parse_env_value(
+            "^;^GCP_PROJECT=p;OPERATORS=a@x.com b@x.com")
+        assert parsed["GCP_PROJECT"] == "p"
+        assert parsed["OPERATORS"] == "a@x.com b@x.com"
+        assert set(parsed["OPERATORS"].split()) == {"a@x.com", "b@x.com"}
 
     def test_the_audience_is_deployed_and_is_the_documented_shape(self, env):
         assert env[A.AUDIENCE_ENV] == DEPLOYED_AUDIENCE
@@ -1193,6 +1427,99 @@ class TestTheModuleConstantsMatchTheDocumentedIapFacts:
 
         src = inspect.getsource(A.verify_assertion)
         assert "certs_url=PUBLIC_KEYS_URL" in src, src
+
+
+class TestIdentityIsUsableAsAValue:
+    """Defining `__eq__` without `__hash__` makes a class UNHASHABLE.
+
+    Python sets `__hash__ = None` in that case, so an `Identity` could not go
+    into a set or be used as a dict key — and the failure would surface at the
+    first caller that tried it, far from here, as a bare `TypeError`.
+    """
+
+    def test_equal_identities_hash_equally(self):
+        a = A.Identity(email="a@x.com", subject="1")
+        b = A.Identity(email="a@x.com", subject="1")
+        assert a == b
+        assert hash(a) == hash(b)
+
+    def test_it_can_go_in_a_set_and_dedupes(self):
+        a = A.Identity(email="a@x.com", subject="1")
+        b = A.Identity(email="a@x.com", subject="1")
+        c = A.Identity(email="b@x.com", subject="2")
+        assert len({a, b, c}) == 2
+
+    def test_a_different_identity_is_unequal(self):
+        assert (A.Identity(email="a@x.com", subject="1")
+                != A.Identity(email="a@x.com", subject="2"))
+        assert A.Identity(email="a@x.com") != "a@x.com"
+
+
+@pytest.mark.skipif(not _HAS_TESTCLIENT,
+                    reason="needs FastAPI AND httpx (fastapi.testclient)")
+class TestTheErrorSinkBoundsWhatItWrites:
+    """Every caller-controlled field is length-capped, not just `stack`.
+
+    This route writes straight through to Cloud Logging and on into BigQuery,
+    and it is reachable by anyone the perimeter admits — anonymous today, every
+    signed-in viewer after the flip. An untruncated `error` or `url` is an
+    unbounded write into log storage: the exposure the pre-existing
+    `stack[:500]` bound already acknowledged, left open on the three fields
+    beside it.
+    """
+
+    @pytest.fixture
+    def sink(self, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import routers.errors as errors_router
+
+        captured = {}
+
+        def fake_error(_message, **kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(errors_router.logger, "error", fake_error)
+        app = FastAPI()
+        app.include_router(errors_router.router, prefix="/api/errors")
+        return TestClient(app), captured
+
+    def test_every_free_text_field_is_capped(self, sink):
+        client, captured = sink
+        huge = "A" * 100_000
+        r = client.post("/api/errors", json={
+            "error": huge, "stack": huge, "url": huge,
+            "timestamp": "2026-09-02T00:00:00Z", "userAgent": huge,
+            "component": huge})
+        assert r.status_code == 200, r.text
+        assert len(captured["error"]) == 500
+        assert len(captured["stack"]) == 500
+        assert len(captured["url"]) == 500
+        assert len(captured["component"]) == 200
+        # Nothing anywhere near the 100k that was posted.
+        for key in ("error", "stack", "url", "component"):
+            assert len(captured[key]) < 1000, key
+
+    def test_a_null_component_stays_null(self, sink):
+        """The optional field must not become `""` or raise on slicing None."""
+        client, captured = sink
+        r = client.post("/api/errors", json={
+            "error": "boom", "stack": "at x", "url": "https://d/",
+            "timestamp": "2026-09-02T00:00:00Z", "userAgent": "pytest"})
+        assert r.status_code == 200, r.text
+        assert captured["component"] is None
+
+    def test_short_values_are_untouched(self, sink):
+        client, captured = sink
+        r = client.post("/api/errors", json={
+            "error": "boom", "stack": "at x", "url": "https://d/",
+            "timestamp": "2026-09-02T00:00:00Z", "userAgent": "pytest",
+            "component": "Overview"})
+        assert r.status_code == 200, r.text
+        assert captured["error"] == "boom"
+        assert captured["url"] == "https://d/"
+        assert captured["component"] == "Overview"
 
 
 def test_the_module_imports_without_fastapi():

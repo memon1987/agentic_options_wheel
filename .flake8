@@ -1,0 +1,20 @@
+# Lint config, committed so "flake8 clean" is a reproducible claim rather than
+# a description of one person's invocation (FC-096 Phase D PR-1 review).
+#
+# 100 columns, not flake8's default 79: this repo's prevailing style is a
+# 100-column soft limit with long explanatory comments, and 79 would report
+# thousands of pre-existing violations, which is the same as reporting none.
+#
+# There is no lint step in `cloudbuild.yaml` — step 1 runs pytest only — so this
+# file governs local and review-time runs. Adding a CI gate is a separate change
+# with its own baseline problem.
+[flake8]
+max-line-length = 100
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    build,
+    dist,
+    dashboard/frontend,
+    node_modules

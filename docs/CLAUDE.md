@@ -1111,11 +1111,29 @@ as before (`TestThePr1NoOpProbe` pins that byte-for-byte).
 | a valid assertion, email in `OPERATORS` | allowed; the bearer token is **ignored** |
 | a valid assertion, email NOT in `OPERATORS` | **403** naming the mechanism. No token fallback, or one leaked token defeats the migration |
 
-Exempt from the chain, on the record:
-`POST /api/v2/bot-health/pause-alert-check` (its caller is the daily scheduler's
-service account — a uniform gate would 403 it every evening and take the
-drawdown alert silently offline) and `POST /api/errors` (viewers' browsers post
-it; IAP admission is what removes today's anonymous log-injection exposure).
+Exempt from the **OPERATORS** chain, on the record — and note what "exempt"
+does and does not mean:
+
+- `POST /api/v2/bot-health/pause-alert-check` — **verify-when-present, never
+  authorize.** Its caller is the daily scheduler's service account, an identity
+  that will never be on a human allowlist, so a uniform gate would 403 it every
+  evening and take the drawdown alert silently offline. But it still *verifies*:
+  absent ⇒ pass, present+invalid ⇒ **401** with the same event, present+valid ⇒
+  pass whoever it is. The documented exception must not also be the one endpoint
+  where a forged header is accepted in silence — that is the first place a
+  prober looks.
+- `POST /api/errors` — ungated by decision. Viewers' browsers post it, and
+  gating it would drop exactly the crash reports nobody is watching for. What
+  Phase D does here is remove the **anonymous** caller. Every caller-controlled
+  field is length-capped before it reaches the log sink.
+
+**Nothing is ever logged from the assertion itself.** google-auth's
+`MalformedError` quotes the **full raw token** back in its message, so an
+`iap_assertion_invalid` line records the exception *type* plus
+`sha256(assertion)[:12]` and nothing more — enough to correlate a burst of
+failures, never enough to replay one. Anything else would put a live credential
+at rest in Cloud Logging and BigQuery, and (pre-flip, while the origin is still
+anonymous) hand a stranger a write-anything channel into the log sink.
 
 Two env vars, both in the dashboard's `--set-env-vars` in `cloudbuild.yaml`
 (which REPLACES the whole env set on every deploy, so an out-of-band value
@@ -1133,21 +1151,48 @@ survives only until the next merge) and frozen in
   between variables. Unset/empty ⇒ 403 saying the *revision* has no allowlist,
   never "you are a viewer".
 
+#### Adding the second operator — read this first
+
+Today's value is **one token**, so it needs no quoting and the deploy line is
+plain. **The moment a second address is added the value contains a space**, and
+that line lives inside an unquoted `bash -c` script in `cloudbuild.yaml`: bash
+word-splits it and gcloud receives `b@x.com` as a positional argument. Red
+build, from a one-word edit. Quoting alone does not fix it either — the flag's
+own separator is the comma, which cannot express a value containing a space.
+
+gcloud's answer is an **alternate delimiter**: prefix the value with `^<char>^`
+and that character separates the variables instead of the comma. Write the whole
+flag as one quoted argument:
+
+```bash
+--set-env-vars='^;^TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app;GCP_PROJECT=$PROJECT_ID;PAUSE_ALERT_THRESHOLD_DAYS=7;GIT_COMMIT=$COMMIT_SHA;SWEEP_JOB_NAME=backtest-sweep;SIM_SERVICE_URL=https://sim-service-799970961417.us-central1.run.app;IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard;OPERATORS=a@x.com b@x.com'
+```
+
+`;` because no value in that set contains one; the `^;^` prefix is consumed by
+gcloud, not by the shell. **Re-freeze `tests/fixtures/cloudbuild_contract.json`
+in the same commit** — the whole flag string is frozen, so switching delimiter is
+a fixture change too (`deploy_flags()` tokenises with `shlex`, which handles the
+quoted form).
+
 **Recovery path — no build required, minutes:**
 
 ```bash
-# Widen or repair the write allowlist on the running service
+# Widen or repair the write allowlist on the running service.
+# Same delimiter rule: a multi-operator value needs the ^;^ form.
 gcloud run services update options-wheel-dashboard --region=us-central1 \
-  --update-env-vars OPERATORS='zeshan@tkzmgroup.com someone@else.com'
+  --update-env-vars '^;^OPERATORS=zeshan@tkzmgroup.com someone@else.com'
 
-# Same shape if the audience is wrong or missing
+# Same shape if the audience is wrong or missing (single value, no delimiter
+# needed — it contains no space)
 gcloud run services update options-wheel-dashboard --region=us-central1 \
   --update-env-vars IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard
 ```
 
-This creates a new revision without rebuilding the image. **It is undone by the
-next merge** (`--set-env-vars` replaces the env set), so any lasting change has
-to land in `cloudbuild.yaml` and be re-frozen in the fixture.
+This creates a new revision without rebuilding the image. ⚠️ **It is silently
+undone by the next merge** — `--set-env-vars` in `cloudbuild.yaml` replaces the
+entire env set — so it is a stopgap for an outage, never the record. Any lasting
+change has to land in `cloudbuild.yaml` (with the delimiter treatment above) and
+be re-frozen in the fixture.
 
 **`cryptography` is load-bearing here and its absence is silent.** IAP signs with
 ES256; google-auth binds `google.auth.crypt.es256 = None` when `cryptography` is

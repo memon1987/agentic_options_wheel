@@ -32,13 +32,23 @@ this migration:**
    token gate, because a forged header or a broken audience configuration must
    surface as an alertable event rather than as "the token still works".
 
-**The PR-1 no-op property.** Until the operator flips IAP on, no request carries
-an assertion, and ``authorize_write`` returns ``None`` for every one of them —
-so the caller falls straight through to the pre-existing
-``SWEEP_SUBMIT_TOKEN`` gate and the service behaves byte-identically to the
-revision before this change. That property is what makes this PR deployable
-before the console session, and it is tested
+**The PR-1 no-op property, stated precisely.** For a request that carries **no
+assertion** — which is every request until the operator flips IAP on —
+``authorize_write`` returns ``None``, the caller falls straight through to the
+pre-existing ``SWEEP_SUBMIT_TOKEN`` gate, and **the API routes answer
+byte-identically to the revision before this change**. That is what makes this
+PR deployable ahead of the console session, and it is probed
 (``TestThePr1NoOpProbe`` in ``tests/test_dashboard_iap_auth.py``).
+
+Two things this claim deliberately does NOT cover, both intended:
+
+* **``/openapi.json`` changes.** The write routes gain an
+  ``x-goog-iap-jwt-assertion`` header parameter, and the generated schema shows
+  it. Nothing consumes that schema in this project, but the bytes differ.
+* **An assertion-bearing request now behaves differently.** ``main`` ignored the
+  header entirely; this revision verifies it and can answer 401/403 where
+  ``main`` answered 503/401/200. Pre-flip nobody sends one except a prober —
+  and a prober getting a loud 401 instead of silence is the point.
 
 **FastAPI-free on purpose.** This module raises its own ``IapAuthError`` and the
 router translates it into an ``HTTPException``. The rules that decide who may
@@ -48,6 +58,7 @@ which is the same reason ``services/sweeps.py`` is written the way it is.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from collections.abc import Mapping as _MappingABC
@@ -198,6 +209,13 @@ class Identity:
                 and other.email == self.email
                 and other.subject == self.subject)
 
+    def __hash__(self) -> int:
+        # Defining `__eq__` sets `__hash__` to None, making the class
+        # unhashable — so an `Identity` could not go in a set or be a dict key,
+        # and the failure would appear at the first caller that tried, not here.
+        # Kept consistent with `__eq__`: equal identities hash equally.
+        return hash((self.email, self.subject))
+
 
 # --------------------------------------------------------------------------- #
 # Configuration readers. Read the env on EVERY call, never at import: an
@@ -264,12 +282,55 @@ def verify_assertion(assertion: str, audience: str) -> Mapping[str, Any]:
     """
     import google.oauth2.id_token
 
+    # A HIDDEN SECOND BRANCH lives inside `verify_token`: if the certs response
+    # contains a `keys` member it is treated as a JWKS document, and the
+    # function then constructs its OWN `jwt.PyJWKClient(certs_url)` and fetches
+    # the URL again itself — bypassing the `request` object entirely. Two
+    # consequences worth knowing before anyone edits this:
+    #   * it needs `pyjwt`, which this image does not install, so that branch
+    #     would raise ImportError -> AssertionInvalid (fail closed, loudly);
+    #   * the `_certs_request` seam would NOT contain it, so a test injecting a
+    #     JWKS-shaped payload would make a real network call.
+    # IAP publishes the x.509 dict format (`{kid: PEM}`) at PUBLIC_KEYS_URL
+    # today, so the dict branch is the live one and the tests inject that shape.
+    # If Google ever moves that endpoint to JWKS, this function needs `pyjwt`
+    # pinned and a different seam — a failure that would present as every
+    # assertion refused, immediately and everywhere.
     return google.oauth2.id_token.verify_token(
         assertion,
         _certs_request(),
         audience=audience,
         certs_url=PUBLIC_KEYS_URL,
     )
+
+
+def assertion_fingerprint(assertion) -> str:
+    """A stable, non-reversible 12-hex handle for one assertion.
+
+    **This is what gets logged. The token never is, and neither does anything
+    derived from it — including the verifier's own exception message.**
+
+    google-auth's ``MalformedError`` embeds the FULL RAW TOKEN in its message
+    (probed on this branch: a genuine signed assertion with ``.junk`` appended
+    comes back with the whole thing verbatim). Interpolating that message into
+    a log line puts a replayable credential at rest in Cloud Logging and then in
+    BigQuery, readable by anyone with log access, for the retention period. And
+    because the origin is world-reachable until the console flip, an anonymous
+    caller can currently POST any header value they like and have it written to
+    the sink — a write-anything channel dressed up as an auth failure.
+
+    Twelve hex characters is enough to correlate a burst of failures with one
+    another (same session, same forged header, same broken client) without
+    being enough to reconstruct anything. Correlating a fingerprint back to a
+    specific token requires already possessing that token.
+    """
+    if isinstance(assertion, str):
+        data = assertion.encode("utf-8", "replace")
+    elif isinstance(assertion, (bytes, bytearray)):
+        data = bytes(assertion)
+    else:  # pragma: no cover - defensive; callers pass str
+        data = repr(assertion).encode("utf-8", "replace")
+    return hashlib.sha256(data).hexdigest()[:12]
 
 
 def identity_from_assertion(assertion: str) -> Identity:
@@ -297,11 +358,15 @@ def identity_from_assertion(assertion: str) -> Identity:
     try:
         claims = verify_assertion(assertion, audience)
     except Exception as exc:  # noqa: BLE001 - every failure mode is a refusal
+        # The EXCEPTION TYPE and a fingerprint, and deliberately nothing else.
+        # `str(exc)` is not safe to log here: google-auth's `MalformedError`
+        # quotes the full raw token back at you. See `assertion_fingerprint`.
         raise AssertionInvalid(
             detail=("the IAP assertion on this request could not be verified. "
                     "If your session has expired, reload the page to sign in "
                     "again."),
-            reason=f"{type(exc).__name__}: {exc}",
+            reason=(f"{type(exc).__name__} "
+                    f"(assertion sha256:{assertion_fingerprint(assertion)})"),
         )
 
     if not isinstance(claims, _MappingABC):  # pragma: no cover - library contract
@@ -335,6 +400,36 @@ def identity_from_assertion(assertion: str) -> Identity:
 # The write chain.
 # --------------------------------------------------------------------------- #
 
+def authenticate_only(assertion: Optional[str]) -> Optional[Identity]:
+    """**Verify when present; never authorize.** Two outcomes only:
+
+    * **assertion ABSENT** → ``None``. Nothing was claimed, so nothing is
+      checked. Pre-flip that is every request; post-flip it cannot happen on a
+      request IAP itself admitted.
+    * **assertion PRESENT** → the verified ``Identity``, or ``AssertionInvalid``
+      (401).
+
+    This is the whole gate for a route EXEMPT from the OPERATORS chain
+    (``POST /bot-health/pause-alert-check``): its authorization is IAP
+    admission, so there is nothing further to decide. But "exempt from the role
+    check" must not decay into "never looks at the header". A route that
+    ignored a present-but-invalid assertion would be the one place in this
+    service where a forged header is silently accepted — and it is the place a
+    prober finds FIRST, precisely because it is the documented exception.
+
+    Every refusal is logged HERE rather than at the call site, so a route that
+    acquires the gate cannot forget the log line.
+    """
+    if not assertion or not assertion.strip():
+        return None
+
+    try:
+        return identity_from_assertion(assertion.strip())
+    except IapAuthError as exc:
+        logger.warning("%s: %s", exc.log_event, exc.reason)
+        raise
+
+
 def authorize_write(assertion: Optional[str]) -> Optional[Identity]:
     """The Phase D write gate. Three outcomes, pinned by the plan:
 
@@ -349,17 +444,13 @@ def authorize_write(assertion: Optional[str]) -> Optional[Identity]:
       allowlist gets ``OperatorsUnconfigured`` (403). An operator gets their
       ``Identity`` back and the token is not consulted at all.
 
-    Every refusal is logged here rather than at the call site, so a new write
-    route cannot acquire the gate and forget the log line.
+    The verify half is ``authenticate_only`` — shared rather than repeated, so
+    the exempt route and the gated ones cannot drift on what "invalid" means,
+    on what gets logged when it happens, or on what is safe to put in the log.
     """
-    if not assertion or not assertion.strip():
+    identity = authenticate_only(assertion)
+    if identity is None:
         return None
-
-    try:
-        identity = identity_from_assertion(assertion.strip())
-    except IapAuthError as exc:
-        logger.warning("%s: %s", exc.log_event, exc.reason)
-        raise
 
     operators = operator_emails()
     if not operators:

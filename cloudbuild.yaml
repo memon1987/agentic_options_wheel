@@ -743,12 +743,36 @@ steps:
           #     a total write outage post-flip.
           #   OPERATORS - SPACE-separated emails allowed to WRITE. Space, not
           #     comma, because a comma is what separates variables in this very
-          #     flag: the day a second operator is added, a comma-joined value
-          #     would silently become a second env var. Everyone else who signs
-          #     in reads everything and gets a 403 on writes.
-          # Emergency widen/narrow without a build:
+          #     flag: a comma-joined value would silently become a second env
+          #     var. Everyone else who signs in reads everything and gets a 403
+          #     on writes.
+          #
+          # >>> READ THIS BEFORE ADDING THE SECOND OPERATOR. <<<
+          # The value below is ONE token, so it needs no quoting. The moment a
+          # second address is added it contains a SPACE, and this line is inside
+          # an unquoted `bash -c` script: bash word-splits it and gcloud sees
+          # `b@x.com` as a positional argument. Red build, on a one-word edit.
+          # Quoting is not the fix either - `--set-env-vars` would then take the
+          # comma-separated list it cannot express a space in. gcloud's own
+          # answer is an ALTERNATE DELIMITER: prefix the value with ^<delim>^ and
+          # that character separates the variables instead of the comma. Write
+          # the whole flag as ONE quoted argument, exactly like this:
+          #
+          #   --set-env-vars='^;^TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app;GCP_PROJECT=$PROJECT_ID;PAUSE_ALERT_THRESHOLD_DAYS=7;GIT_COMMIT=$COMMIT_SHA;SWEEP_JOB_NAME=backtest-sweep;SIM_SERVICE_URL=https://sim-service-799970961417.us-central1.run.app;IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard;OPERATORS=a@x.com b@x.com'
+          #
+          # (`;` chosen because no value here contains one; the `^;^` prefix is
+          # consumed by gcloud, not by the shell.) Re-freeze
+          # tests/fixtures/cloudbuild_contract.json in the SAME commit - the
+          # whole flag string is frozen, so the delimiter switch is a fixture
+          # change too, and `deploy_flags()` in the contract test tokenises with
+          # shlex, which handles the quoted form.
+          #
+          # Emergency widen/narrow without a build (SURVIVES ONLY UNTIL THE NEXT
+          # MERGE - `--set-env-vars` above replaces the whole env set, so this is
+          # a stopgap, never the record):
           #   gcloud run services update options-wheel-dashboard \
-          #     --update-env-vars OPERATORS='a@x.com b@x.com'
+          #     --region=us-central1 \
+          #     --update-env-vars '^;^OPERATORS=a@x.com b@x.com'
           # Both values are frozen in tests/fixtures/cloudbuild_contract.json;
           # changing either one has to be re-frozen there in the same PR.
           if gcloud run deploy options-wheel-dashboard \
