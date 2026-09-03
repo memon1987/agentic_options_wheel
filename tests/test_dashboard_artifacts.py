@@ -771,3 +771,265 @@ class TestTheArtifactEndpoint:
         assert response.status_code == 404
         assert "--persist" in response.json()["detail"], (
             "a different handler answered — the artifact route is shadowed")
+
+
+# --------------------------------------------------------------------------- #
+# The bars sidecar: path rules, store, and the route (FC-096 Phase E PR-1)
+#
+# Everything the cell artifact's tests protect, one path segment shorter — plus
+# the one risk that is new: a sidecar is absent for an ENTIRE POPULATION of runs
+# (every one replayed before PR-1 deployed), so "absent" has to keep meaning
+# exactly one thing or the console degrades on the wrong signal.
+# --------------------------------------------------------------------------- #
+BARS_PAYLOAD = {"schema": 1, "provenance": {"symbol": "AAPL", "split": "fit"},
+                "bars": [], "buy_and_hold": None}
+
+
+def _bars_object(run_id="r1", symbol="AAPL", split="all"):
+    return engine_identity.bars_object_name(run_id, symbol, split)
+
+
+class TestTheBarsReaderAndTheWriterAgree:
+    def test_the_endpoint_builds_the_object_name_the_engine_writes(self):
+        """One function, imported by both sides. A second implementation here
+        would drift, and its drift would 404 a sidecar that exists — the most
+        confusing possible symptom."""
+        assert A.bars_name("r1", "AAPL", "holdout") == (
+            engine_identity.bars_object_name("r1", "AAPL", "holdout"))
+
+    def test_the_two_object_families_are_addressed_differently(self):
+        """A sidecar is per (run, symbol, split); a cell artifact is per (run,
+        scenario, symbol, split). Their names must not collide even when a
+        scenario is literally called `bars`."""
+        assert A.bars_name("r1", "AAPL", "all") != A.object_name(
+            "r1", "bars", "AAPL", "all")
+
+    def test_the_engine_can_parse_back_what_the_dashboard_addresses(self):
+        assert engine_identity.parse_bars_object_name(
+            A.bars_name("r1", "AAPL", "fit")) == {
+                "run_id": "r1", "symbol": "AAPL", "split": "fit"}
+
+
+class TestBarsPathValidation:
+    def test_the_happy_path_normalises_the_symbol(self):
+        assert A.validate_bars_path("r1", "aapl", "fit") == ("r1", "AAPL", "fit")
+
+    @pytest.mark.parametrize("run_id", ["../etc", "a/b", "", "x" * 65, "r1\n"])
+    def test_a_run_id_that_is_really_a_path_is_refused(self, run_id):
+        with pytest.raises(A.ArtifactPathError):
+            A.validate_bars_path(run_id, "AAPL", "all")
+
+    @pytest.mark.parametrize("symbol", ["a b", "A__B", "TOOLONGSYMBOLNAME1",
+                                        "", "AAPL\n", "AAPL/../x"])
+    def test_a_bad_symbol_is_refused(self, symbol):
+        with pytest.raises(A.ArtifactPathError):
+            A.validate_bars_path("r1", symbol, "all")
+
+    @pytest.mark.parametrize("symbol", ["AAPL", "BRK.B", "RDS-A", "F"])
+    def test_real_tickers_are_accepted(self, symbol):
+        assert A.validate_bars_path("r1", symbol, "all")[1] == symbol
+
+    @pytest.mark.parametrize("split", ["everything", "", "FIT", "all\n"])
+    def test_an_unknown_split_is_refused(self, split):
+        """`runner._windows` produces exactly three. A fourth can only 404, and
+        a name it built would be an object nothing ever wrote."""
+        with pytest.raises(A.ArtifactPathError):
+            A.validate_bars_path("r1", "AAPL", split)
+
+    def test_the_three_splits_are_the_runners_three(self):
+        assert A.SPLITS == ("all", "fit", "holdout")
+
+    def test_no_newline_can_reach_a_stored_bars_name(self):
+        r"""`\Z`, never `$`: Python's `$` also matches immediately BEFORE a
+        trailing newline, and a newline in an object name is a header-splitting
+        character the GCS client only rejects at serve time."""
+        for kwargs in ({"run_id": "r1\n"}, {"symbol": "AAPL\n"},
+                       {"split": "fit\n"}):
+            args = {"run_id": "r1", "symbol": "AAPL", "split": "fit"}
+            args.update(kwargs)
+            with pytest.raises(A.ArtifactPathError):
+                A.validate_bars_path(**args)
+
+
+class TestTheBarsStore:
+    def test_it_decompresses_the_stored_gzip(self):
+        name = _bars_object()
+        store, _ = _store({name: gzip.compress(json.dumps(BARS_PAYLOAD).encode())})
+        assert json.loads(store.fetch_bars("r1", "AAPL", "all")) == BARS_PAYLOAD
+
+    def test_a_plain_json_object_is_served_as_is(self):
+        name = _bars_object()
+        store, _ = _store({name: json.dumps(BARS_PAYLOAD).encode()})
+        assert json.loads(store.fetch_bars("r1", "AAPL", "all")) == BARS_PAYLOAD
+
+    def test_absence_is_none_and_nothing_else_is(self):
+        """The normal answer for every run replayed before PR-1 deployed."""
+        store, _ = _store({})
+        assert store.fetch_bars("r1", "AAPL", "all") is None
+
+    def test_a_missing_BUCKET_is_not_the_benign_absence(self):
+        """GCS raises the same `NotFound` for a missing bucket and a missing
+        object; only resolving the bucket FIRST tells them apart. Without that
+        order a missing IAM grant reports "no sidecar for this window" on every
+        window, for ever.
+
+        MUTATION CHECK: catch `NotFound` around the download alone and this
+        returns `None` instead of raising.
+        """
+        from google.cloud.exceptions import NotFound
+
+        store, _ = _store({}, bucket_raises=NotFound("no such bucket"))
+        with pytest.raises(A.ArtifactBucketError):
+            store.fetch_bars("r1", "AAPL", "all")
+
+    def test_a_zero_byte_object_raises_rather_than_serving_empty(self):
+        """An empty 200 would draw an empty chart where a truncated write
+        happened."""
+        store, _ = _store({_bars_object(): b""})
+        with pytest.raises(A.ArtifactReadError, match="EMPTY"):
+            store.fetch_bars("r1", "AAPL", "all")
+
+    def test_a_bad_path_is_refused_before_any_gcs_call(self):
+        store, gcs = _store({})
+        with pytest.raises(A.ArtifactPathError):
+            store.fetch_bars("../etc", "AAPL", "all")
+        assert gcs.resolved == [] and gcs.bucket_obj.requested == []
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
+class TestTheBarsEndpoint:
+    def _get(self, v2, run_id="r1", symbol="AAPL", split="all"):
+        # Called DIRECTLY: a sync `def`, like the cell-artifact route.
+        return v2.sweep_window_bars(run_id, symbol, split)
+
+    @pytest.fixture
+    def wired(self, monkeypatch):
+        import routers.v2 as v2
+
+        monkeypatch.setenv(A.ARTIFACT_BUCKET_ENV, "test-bucket")
+        A._reset_for_tests()
+        yield v2
+        A._reset_for_tests()
+
+    def test_200_returns_the_decompressed_json(self, wired, monkeypatch):
+        name = _bars_object()
+        store, _ = _store({name: gzip.compress(json.dumps(BARS_PAYLOAD).encode())})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+
+        response = self._get(wired)
+        assert response.status_code == 200
+        assert response.media_type == "application/json"
+        assert json.loads(response.body) == BARS_PAYLOAD
+        assert response.headers["x-artifact-object"] == name
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_404_when_the_sidecar_is_absent(self, wired, monkeypatch):
+        """The normal answer for a pre-PR-1 run and for a window whose base arm
+        errored — and the detail says BOTH, plus the remedy.
+
+        MUTATION CHECK: swap this for the 502 branch and an operator goes
+        looking for an IAM grant that is fine.
+        """
+        from fastapi import HTTPException
+
+        store, _ = _store({})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 404
+        assert "base arm" in exc.value.detail
+        assert "--persist" in exc.value.detail
+
+    @pytest.mark.parametrize("kwargs", [
+        {"run_id": "../etc"}, {"symbol": "a b"}, {"split": "everything"},
+        {"run_id": "r1\n"},
+    ])
+    def test_400_on_a_path_segment_that_cannot_address_an_object(
+            self, wired, monkeypatch, kwargs):
+        from fastapi import HTTPException
+
+        store, gcs = _store({})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired, **kwargs)
+        assert exc.value.status_code == 400
+        assert gcs.resolved == [] and gcs.bucket_obj.requested == [], (
+            "GCS must not be touched at all")
+
+    def test_503_when_no_bucket_is_configured(self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        monkeypatch.setattr(A, "get_artifact_store",
+                            lambda: A.ArtifactStore(bucket=""))
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 503
+        assert A.ARTIFACT_BUCKET_ENV in exc.value.detail
+
+    def test_502_when_the_read_itself_fails(self, wired, monkeypatch):
+        """Unreadable is not absent.
+
+        MUTATION CHECK: return 404 here and a missing `storage.objects.get`
+        grant reads as "this run stored no bars", on every window, for ever.
+        """
+        from fastapi import HTTPException
+
+        store, _ = _store({}, raises=RuntimeError("403 forbidden"))
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 502
+        assert "403" in exc.value.detail
+
+    def test_502_when_the_BUCKET_cannot_be_resolved(self, wired, monkeypatch):
+        from fastapi import HTTPException
+        from google.cloud.exceptions import NotFound
+
+        store, _ = _store({}, bucket_raises=NotFound("no such bucket"))
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 502
+        assert "could not be resolved" in exc.value.detail
+
+    def test_502_on_a_zero_byte_object(self, wired, monkeypatch):
+        from fastapi import HTTPException
+
+        store, _ = _store({_bars_object(): b""})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            self._get(wired)
+        assert exc.value.status_code == 502
+        assert "EMPTY" in exc.value.detail
+
+    def test_the_handler_is_SYNC_so_a_stalled_read_uses_the_threadpool(self, wired):
+        """The GCS client is blocking: an `async def` would run a 30 s stalled
+        download ON the event loop and freeze every other request this worker is
+        serving."""
+        import inspect
+
+        assert not inspect.iscoroutinefunction(wired.sweep_window_bars)
+
+    def test_the_route_is_registered_where_the_plan_says(self, wired):
+        paths = {r.path for r in wired.router.routes}
+        assert "/sweeps/{run_id}/bars/{symbol}/{split}" in paths
+
+    def test_it_does_not_shadow_the_artifact_route(self, wired, monkeypatch):
+        """Both live under `/sweeps/{run_id}/...` and Starlette matches in
+        order. The two shapes differ in arity, so neither can swallow the other
+        — asserted rather than assumed."""
+        paths = {r.path for r in wired.router.routes}
+        assert "/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}" in paths
+        assert "/sweeps/{run_id}/bars/{symbol}/{split}" in paths
+
+    def test_it_reads_the_bars_address_not_the_artifact_address(
+            self, wired, monkeypatch):
+        """MUTATION CHECK: build the name with `object_name(run_id, 'base', ...)`
+        and this fetches a CELL artifact — which for a base cell exists, so the
+        route would 200 with the wrong object."""
+        store, gcs = _store({_bars_object(): gzip.compress(b"{}")})
+        monkeypatch.setattr(A, "get_artifact_store", lambda: store)
+        self._get(wired)
+        assert gcs.bucket_obj.requested == [
+            "sim-artifacts/v1/r1/bars/AAPL__all.json.gz"]

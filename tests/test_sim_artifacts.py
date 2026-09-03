@@ -29,14 +29,19 @@ from unittest.mock import patch
 import pytest
 
 from src.backtesting.data.chain_store import ChainStore
+from src.backtesting.data.provider import StockBar
 from src.backtesting.engine.broker import BacktestBroker
 from src.backtesting.engine.simulator import DailyState, SimulationResult
 from src.backtesting.metrics.cycles import build_cycles
+from src.backtesting.metrics.fitness import BuyAndHold
 from src.backtesting.reporting import artifact_store as store_module
 from src.backtesting.reporting.artifact import (
     ARTIFACT_SCHEMA,
+    BARS_SCHEMA,
+    BARS_SOURCE,
     MID_FILL_BASIS,
     ArtifactMeta,
+    bars_artifact,
     cell_artifact,
 )
 from src.backtesting.reporting.artifact_store import (
@@ -47,8 +52,11 @@ from src.backtesting.reporting.artifact_store import (
 from src.backtesting.scenarios import Scenario, run_sweep
 from src.backtesting.scenarios.identity import (
     artifact_object_name,
+    bars_object_name,
     parse_artifact_object_name,
+    parse_bars_object_name,
     validate_scenario_name,
+    validate_symbol,
 )
 from src.utils.config import Config
 
@@ -164,6 +172,20 @@ def _hand_built_result() -> SimulationResult:
     )
 
 
+def _bench(**kw) -> BuyAndHold:
+    """A benchmark of the shape `_buy_and_hold` produces (FC-096 Phase E PR-1).
+
+    Hand-built rather than replayed here because the frozen-fixture test needs a
+    benchmark present on the artifact to pin its key set at all, and the golden
+    replay's own benchmark is exercised separately (see the parity tests, which
+    use a REAL scored report).
+    """
+    fields = dict(shares=990, entry_price=101.0, exit_price=105.0,
+                  starting_cash=100_000.0, dividends_per_share=0.5)
+    fields.update(kw)
+    return BuyAndHold(**fields)
+
+
 def _meta(**kw) -> ArtifactMeta:
     base = dict(
         run_id="run0123456789ab", scenario="base", symbol="AAA", split="all",
@@ -171,6 +193,7 @@ def _meta(**kw) -> ArtifactMeta:
         engine_identity="e" * 16, arm_max_dte=7, sweep_max_dte=21,
         window_start=date(2024, 6, 3), window_end=date(2024, 6, 28),
         fill_haircut=0.25, starting_cash=100_000.0, git_commit="deadbeef",
+        benchmark=_bench(), capital_base=100_000.0,
     )
     base.update(kw)
     return ArtifactMeta(**base)
@@ -277,6 +300,7 @@ def _key_sets(payload) -> dict:
         "cycles": sorted(payload["cycles"][0]),
         "rejections": sorted(payload["rejections"][0]),
         "counters": sorted(payload["counters"]),
+        "benchmark": sorted(payload["benchmark"]),
         "earnings_coverage": sorted(payload["earnings_coverage"]),
         "roll_records": sorted(payload["roll_records"][0]),
         "ledger_detail_by_kind": {k: sorted(v) for k, v in sorted(detail_kinds.items())},
@@ -1075,7 +1099,654 @@ class TestTheCliWritesNothingWithoutPersist:
         ])
         assert code == 0
         names = sorted(gcs.buckets["test-bucket"].objects)
-        assert len(names) == 2, names
+        # Two cells + ONE bars sidecar for the single (symbol, split) window.
+        # FC-096 Phase E PR-1: the sidecar rides the same `--persist` gate, so
+        # this is still "the flag, not a writer that never works" — it now pins
+        # BOTH object families onto that one flag.
+        assert len(names) == 3, names
         assert all(n.startswith("sim-artifacts/v1/") for n in names)
         assert any(n.endswith("base__AAA__all.json.gz") for n in names)
         assert any(n.endswith("tighter__AAA__all.json.gz") for n in names)
+        assert sum(1 for n in names if "/bars/" in n) == 1, names
+        assert any(n.endswith("bars/AAA__all.json.gz") for n in names)
+
+
+# =========================================================================== #
+# 10. The bars sidecar (FC-096 Phase E PR-1)
+#
+# The sidecar exists because there is NO durable bar series the dashboard could
+# read instead: `BarStore` is a per-container local parquet cache by explicit
+# design, no Job or service mounts a GCS volume, neither bucket has a bars
+# prefix, and BigQuery's stock history covers the live universe only. So every
+# way this object could quietly lie is a way the console's price chart, its
+# buy-and-hold curve and its deployment tile quietly lie:
+#
+# * a curve re-derived from the SPEC's cash instead of the scored benchmark —
+#   correct for a wheel replay, and wrong by the whole position size for a
+#   covered-call one;
+# * a dividend interval off by one day, which hands the benchmark a free quarter
+#   on exactly the high-yield names it exists to judge;
+# * a clip taken on the REQUESTED window rather than the decision-day bounds,
+#   which shifts the curve's first point off the benchmark's entry;
+# * a sidecar emitted per ARM rather than per window, inviting a reader to take
+#   arm C's chart for its own.
+# =========================================================================== #
+BARS_FIXTURE = Path(__file__).parent / "fixtures" / "sim_bars_schema_v1.json"
+
+
+def _bar(day: date, close: float, symbol: str = "AAA") -> StockBar:
+    return StockBar(symbol=symbol, bar_date=day, open=close, high=close + 1.0,
+                    low=close - 1.0, close=close, volume=5_000_000)
+
+
+def _states(days) -> list:
+    return [DailyState(day=d, equity=1.0, cash=1.0, reserved_collateral=0.0,
+                       open_options=0, shares_held={}) for d in days]
+
+
+@lru_cache(maxsize=1)
+def _golden_scored():
+    """A REAL replay of the golden window, scored — result, bars, report, days.
+
+    Not hand-built: the parity property this pins is between the sidecar's last
+    curve point and a ``BuyAndHold`` the ENGINE produced from its own bars and
+    its own dividend schedule. A hand-made benchmark would satisfy the
+    arithmetic while proving nothing about the two producers agreeing.
+    """
+    from src.backtesting import evaluate as evaluate_module
+
+    days, closes, expirations = dip_then_recovering_window()
+    result = _golden_simulator("XYZ", closes, expirations, days).run()
+    provider = ScriptedProvider("XYZ", closes, expirations)
+    bars = provider.get_stock_bars("XYZ", min(closes), max(closes))
+    report = evaluate_module._score("XYZ", result, bars, 50_000.0)
+    assert report.benchmark is not None, (
+        "the golden window produced no benchmark, so the parity test would "
+        "assert nothing — fix the window, do not hand-build one")
+    return result, bars, report, days
+
+
+class TestTheBarsSidecarIsTheEnginesOwnBenchmark:
+    def test_the_last_curve_point_equals_the_scored_final_value(self):
+        """Parity (i), on a REAL scored replay.
+
+        ``daily[-1].value == BuyAndHold.final_value`` holds BY CONSTRUCTION, not
+        by coincidence: the clip is the decision-day bounds, so the last bar's
+        close IS ``exit_price``, and the dividend term at the exit day is exactly
+        the total ``_score`` scoped the benchmark to.
+
+        MUTATION CHECK: clip to the REQUESTED window instead of the decision-day
+        bounds and the last point moves onto a warm-up-tail bar; re-derive
+        ``shares`` as ``starting_cash // close`` and it moves by whole shares.
+        """
+        result, bars, report, days = _golden_scored()
+        payload = bars_artifact(
+            bars, "XYZ", ("all", days[0], days[-1]),
+            daily=result.daily, benchmark=report.benchmark, dividends=None)
+        curve = payload["buy_and_hold"]["daily"]
+        assert curve, "the curve is empty"
+        assert curve[-1]["value"] == pytest.approx(report.benchmark.final_value)
+        assert curve[-1]["date"] == result.daily[-1].day.isoformat()
+
+    def test_the_final_value_is_the_rows_benchmark_return_over_capital(self):
+        """The other half of parity (i): the curve reconciles to the SCALAR the
+        ``scenario_runs`` row carries, so a console showing both cannot disagree
+        with itself."""
+        result, bars, report, days = _golden_scored()
+        payload = bars_artifact(
+            bars, "XYZ", ("all", days[0], days[-1]),
+            daily=result.daily, benchmark=report.benchmark, dividends=None)
+        bh = payload["buy_and_hold"]
+        assert bh["final_value"] == pytest.approx(
+            bh["capital_base"] * (1 + report.benchmark.total_return))
+        assert bh["daily"][-1]["value"] == pytest.approx(bh["final_value"])
+
+    def test_the_cell_artifacts_benchmark_stamp_equals_the_sidecars(self):
+        """The console cross-checks these two numbers and hides the curve on a
+        mismatch. They must be the same number for a same-spec run, and they are
+        because both are COPIED off one ``BuyAndHold``."""
+        result, bars, report, days = _golden_scored()
+        sidecar = bars_artifact(
+            bars, "XYZ", ("all", days[0], days[-1]),
+            daily=result.daily, benchmark=report.benchmark, dividends=None)
+        cell = cell_artifact(result, _meta(
+            symbol="XYZ", benchmark=report.benchmark, capital_base=50_000.0))
+        assert cell["benchmark"]["final_value"] == pytest.approx(
+            sidecar["buy_and_hold"]["final_value"])
+        assert cell["benchmark"]["shares"] == sidecar["buy_and_hold"]["shares"]
+        assert cell["benchmark"]["entry_day"] == sidecar["buy_and_hold"]["entry_day"]
+        assert cell["benchmark"]["exit_day"] == sidecar["buy_and_hold"]["exit_day"]
+        assert cell["provenance"]["capital_base"] == 50_000.0
+
+    def test_the_CC_HOOK_a_lot_based_benchmark_curves_on_the_lot_value(self):
+        """Parity (ii) — the hook Phase C extends (§D-2).
+
+        A covered-call benchmark is 100 shares against a LOT-sized
+        ``starting_cash``, not the spec's $100k. The curve builder takes the
+        ``BuyAndHold`` INSTANCE and copies ``shares``/``starting_cash`` off it,
+        so the lot case works without a line of covered-call code here.
+
+        MUTATION CHECK: make ``_buy_and_hold_block`` derive
+        ``shares = int(capital_base // entry_price)`` from a spec-sized cash and
+        this test's ``capital_base`` assertion fails by an order of magnitude.
+        """
+        days = [date(2024, 6, 3), date(2024, 6, 4), date(2024, 6, 5)]
+        bars = [_bar(days[0], 100.0), _bar(days[1], 102.0), _bar(days[2], 104.0)]
+        lot_value = 100 * 100.0
+        bench = BuyAndHold(shares=100, entry_price=100.0, exit_price=104.0,
+                           starting_cash=lot_value, dividends_per_share=0.0)
+        payload = bars_artifact(
+            bars, "AAA", ("all", days[0], days[-1]),
+            daily=_states(days), benchmark=bench, dividends=None)
+        bh = payload["buy_and_hold"]
+        assert bh["capital_base"] == lot_value == 10_000.0
+        assert bh["shares"] == 100
+        assert bh["daily"][-1]["value"] == pytest.approx(bench.final_value)
+        assert bh["daily"][-1]["value"] == pytest.approx(10_400.0)
+
+    def test_shares_are_COPIED_never_re_derived_from_the_capital_base(self):
+        """The contract §D-2 states: the builder takes the ``BuyAndHold``
+        INSTANCE and copies its position, rather than computing one.
+
+        Today ``_buy_and_hold`` happens to build ``shares = cash // entry``, so
+        a re-derivation would coincide with the copy on every wheel replay AND
+        on a lot whose value is `shares × price` — which is why the CC-hook test
+        above cannot catch it. This one uses a benchmark where the two
+        deliberately diverge (100 shares against a $50k base), so the invariant
+        is pinned as a CONTRACT instead of being silently load-bearing the day
+        Phase C sizes a lot some other way.
+
+        MUTATION CHECK: `shares = int(capital_base // entry_price)` reports
+        $55,000 against the benchmark's own $51,000 — a position five times the
+        real one.
+        """
+        days = [date(2024, 6, 3), date(2024, 6, 4)]
+        bars = [_bar(days[0], 100.0), _bar(days[1], 110.0)]
+        bench = BuyAndHold(shares=100, entry_price=100.0, exit_price=110.0,
+                           starting_cash=50_000.0, dividends_per_share=0.0)
+        assert int(bench.starting_cash // bench.entry_price) != bench.shares, (
+            "this fixture only tests anything while the two disagree")
+        payload = bars_artifact(
+            bars, "AAA", ("all", days[0], days[-1]),
+            daily=_states(days), benchmark=bench, dividends=None)
+        bh = payload["buy_and_hold"]
+        assert bh["shares"] == 100
+        assert bh["daily"][-1]["value"] == pytest.approx(bench.final_value)
+        assert bh["daily"][-1]["value"] == pytest.approx(51_000.0)
+
+    def test_null_benchmark_means_null_buy_and_hold(self):
+        """``buy_and_hold`` is null EXACTLY when the report had no benchmark. A
+        block of nulls would read as "the benchmark was flat"."""
+        days = [date(2024, 6, 3), date(2024, 6, 4)]
+        payload = bars_artifact(
+            [_bar(days[0], 100.0), _bar(days[1], 101.0)], "AAA",
+            ("all", days[0], days[-1]),
+            daily=_states(days), benchmark=None, dividends=None)
+        assert payload["buy_and_hold"] is None
+        assert payload["bars"], "the bars themselves still serve"
+
+
+class TestTheClipIsTheDecisionDayBounds:
+    def test_warm_up_bars_are_excluded_and_the_count_is_stamped(self):
+        """MUTATION CHECK: clip to the REQUESTED window and `bars_in_window`
+        jumps from 3 to 6, taking the curve's first point with it."""
+        window_days = [date(2024, 6, 5), date(2024, 6, 6), date(2024, 6, 7)]
+        warmup = [_bar(date(2024, 5, d), 90.0) for d in (1, 2, 3)]
+        bars = warmup + [_bar(d, 100.0 + i) for i, d in enumerate(window_days)]
+        payload = bars_artifact(
+            bars, "AAA", ("all", date(2024, 5, 1), date(2024, 6, 10)),
+            daily=_states(window_days), benchmark=None, dividends=None)
+        assert [b["date"] for b in payload["bars"]] == [
+            d.isoformat() for d in window_days]
+        assert payload["provenance"]["bars_in_window"] == 3
+        # The FULL materialised span is still stamped, as the freshness fact.
+        assert payload["provenance"]["data_from"] == "2024-05-01"
+        assert payload["provenance"]["data_to"] == "2024-06-07"
+        assert payload["provenance"]["window"] == {
+            "start": "2024-05-01", "end": "2024-06-10"}
+        assert payload["provenance"]["first_decision_day"] == "2024-06-05"
+        assert payload["provenance"]["last_decision_day"] == "2024-06-07"
+
+    def test_the_rows_are_ohlcv_in_date_order(self):
+        days = [date(2024, 6, 5), date(2024, 6, 6)]
+        payload = bars_artifact(
+            [_bar(days[1], 101.0), _bar(days[0], 100.0)], "AAA",
+            ("all", days[0], days[-1]), daily=_states(days),
+            benchmark=None, dividends=None)
+        assert [b["date"] for b in payload["bars"]] == [
+            "2024-06-05", "2024-06-06"]
+        assert payload["bars"][0] == {
+            "date": "2024-06-05", "open": 100.0, "high": 101.0, "low": 99.0,
+            "close": 100.0, "volume": 5_000_000}
+
+    def test_an_empty_daily_refuses_rather_than_writing_nulls(self):
+        with pytest.raises(ValueError, match="no decision days"):
+            bars_artifact([_bar(date(2024, 6, 3), 100.0)], "AAA",
+                          ("all", date(2024, 6, 3), date(2024, 6, 3)),
+                          daily=[], benchmark=None, dividends=None)
+
+
+class TestTheDividendIntervalIsHalfOpenAtEntry:
+    """``div_ps(entry_day, t]`` — ``DividendSchedule.total_between``'s interval.
+
+    A buyer at the close of the entry day does NOT receive a dividend going ex
+    that day; a holder selling at the close on an ex-date DOES. Getting this
+    wrong by one day hands the benchmark a free quarter on exactly the
+    high-yield names it exists to judge.
+    """
+
+    DAYS = [date(2024, 6, 3), date(2024, 6, 4), date(2024, 6, 5)]
+
+    def _payload(self, ex_dates):
+        from src.backtesting.data.dividends import Dividend, DividendSchedule
+
+        schedule = DividendSchedule(
+            {"AAA": [Dividend(ex_date=d, amount=1.0) for d in ex_dates]})
+        bars = [_bar(d, 100.0) for d in self.DAYS]
+        bench = BuyAndHold(
+            shares=10, entry_price=100.0, exit_price=100.0,
+            starting_cash=1_000.0,
+            dividends_per_share=schedule.total_between(
+                "AAA", self.DAYS[0], self.DAYS[-1]))
+        return bars_artifact(bars, "AAA", ("all", self.DAYS[0], self.DAYS[-1]),
+                             daily=_states(self.DAYS), benchmark=bench,
+                             dividends=schedule), bench
+
+    def test_a_dividend_going_ex_on_the_ENTRY_day_is_the_sellers(self):
+        """MUTATION CHECK: make the lower bound inclusive (``after <= ex_date``)
+        and every point on this curve gains $10."""
+        payload, bench = self._payload([self.DAYS[0]])
+        values = [p["value"] for p in payload["buy_and_hold"]["daily"]]
+        assert values == [1_000.0, 1_000.0, 1_000.0]
+        assert bench.dividends_per_share == 0.0
+
+    def test_a_dividend_going_ex_on_the_EXIT_day_is_collected(self):
+        """MUTATION CHECK: make the upper bound exclusive and the last point
+        loses $10 while ``BuyAndHold.final_value`` keeps it — parity breaks."""
+        payload, bench = self._payload([self.DAYS[-1]])
+        values = [p["value"] for p in payload["buy_and_hold"]["daily"]]
+        assert values == [1_000.0, 1_000.0, 1_010.0]
+        assert values[-1] == pytest.approx(bench.final_value)
+
+    def test_a_mid_window_dividend_steps_the_curve_once(self):
+        payload, bench = self._payload([self.DAYS[1]])
+        values = [p["value"] for p in payload["buy_and_hold"]["daily"]]
+        assert values == [1_000.0, 1_010.0, 1_010.0]
+        assert values[-1] == pytest.approx(bench.final_value)
+
+
+class TestTheBarsSchemaIsFrozen:
+    def test_the_full_key_set_matches_the_fixture(self):
+        """Same contract as the cell artifact's: ADDING a field updates the
+        fixture; removing or renaming one bumps ``BARS_SCHEMA`` and the object
+        prefix, because a stored object outlives the code that wrote it."""
+        days = [date(2024, 6, 3), date(2024, 6, 4)]
+        payload = bars_artifact(
+            [_bar(days[0], 100.0), _bar(days[1], 102.0)], "AAA",
+            ("all", days[0], days[-1]), daily=_states(days),
+            benchmark=BuyAndHold(shares=990, entry_price=100.0,
+                                 exit_price=102.0, starting_cash=100_000.0),
+            dividends=None, run_id="r", engine_identity="e", git_commit="g")
+        got = {
+            "schema": payload["schema"],
+            "top_level": sorted(payload),
+            "provenance": sorted(payload["provenance"]),
+            "provenance.window": sorted(payload["provenance"]["window"]),
+            "bars": sorted(payload["bars"][0]),
+            "buy_and_hold": sorted(payload["buy_and_hold"]),
+            "buy_and_hold.daily": sorted(payload["buy_and_hold"]["daily"][0]),
+        }
+        expected = json.loads(BARS_FIXTURE.read_text())
+        assert got["schema"] == expected["schema"] == BARS_SCHEMA
+        for section in sorted(expected):
+            assert got[section] == expected[section], section
+        assert sorted(got) == sorted(expected), "a whole SECTION appeared or vanished"
+
+    def test_the_source_stamp_says_these_are_the_replays_own_bars(self):
+        days = [date(2024, 6, 3)]
+        payload = bars_artifact([_bar(days[0], 100.0)], "AAA",
+                                ("fit", days[0], days[0]),
+                                daily=_states(days), benchmark=None,
+                                dividends=None)
+        assert payload["provenance"]["source"] == BARS_SOURCE == "materialised bars"
+        assert payload["provenance"]["split"] == "fit"
+
+    def test_every_number_is_finite_or_null(self):
+        days = [date(2024, 6, 3), date(2024, 6, 4)]
+        raw = json.dumps(bars_artifact(
+            [_bar(days[0], 100.0), _bar(days[1], 102.0)], "AAA",
+            ("all", days[0], days[-1]), daily=_states(days),
+            benchmark=BuyAndHold(shares=990, entry_price=100.0,
+                                 exit_price=102.0, starting_cash=100_000.0),
+            dividends=None))
+        assert "NaN" not in raw and "Infinity" not in raw
+
+    def test_the_bytes_round_trip_through_the_writers_serialiser(self):
+        days = [date(2024, 6, 3)]
+        payload = bars_artifact([_bar(days[0], 100.0)], "AAA",
+                                ("all", days[0], days[0]),
+                                daily=_states(days), benchmark=None,
+                                dividends=None)
+        raw = artifact_bytes(payload)
+        assert raw[:2] == b"\x1f\x8b"
+        assert json.loads(gzip.decompress(raw)) == json.loads(
+            json.dumps(payload, sort_keys=True, default=str))
+
+
+class TestTheBarsObjectName:
+    def test_the_name_is_the_documented_one(self):
+        assert bars_object_name("r1", "GOOGL", "fit") == (
+            "sim-artifacts/v1/r1/bars/GOOGL__fit.json.gz")
+
+    def test_it_round_trips(self):
+        assert parse_bars_object_name(
+            bars_object_name("r1", "BRK.B", "holdout")) == {
+                "run_id": "r1", "symbol": "BRK.B", "split": "holdout"}
+
+    def test_the_two_families_do_not_collide(self):
+        """A scenario literally named ``bars`` writes an OBJECT called
+        ``bars__SYM__split.json.gz``; the sidecar writes into a DIRECTORY called
+        ``bars/``. Neither parser accepts the other's name.
+
+        MUTATION CHECK: drop the ``bars`` guard from
+        ``parse_artifact_object_name`` and it answers ``run_id='bars'`` for a
+        sidecar instead of raising.
+        """
+        cell = artifact_object_name("r1", "bars", "AAA", "all")
+        sidecar = bars_object_name("r1", "AAA", "all")
+        assert cell != sidecar
+        assert parse_artifact_object_name(cell) == {
+            "run_id": "r1", "scenario": "bars", "symbol": "AAA", "split": "all"}
+        with pytest.raises(ValueError, match="bars sidecar"):
+            parse_artifact_object_name(sidecar)
+        with pytest.raises(ValueError, match="directory segment"):
+            parse_bars_object_name(cell)
+
+    @pytest.mark.parametrize("bad", [
+        "sim-artifacts/v1/r1/bars/AAA__all.json",
+        "sim-artifacts/v1/r1/AAA__all.json.gz",
+        "bars/AAA__all.json.gz",
+        "sim-artifacts/v1/r1/bars/AAAall.json.gz",
+        "sim-artifacts/v1/r1/bars/__all.json.gz",
+        "",
+    ])
+    def test_a_name_that_is_not_one_of_ours_raises(self, bad):
+        with pytest.raises(ValueError):
+            parse_bars_object_name(bad)
+
+    def test_a_trailing_newline_cannot_reach_a_stored_name(self):
+        r"""``\Z``, not ``$`` — the lesson ``SCENARIO_NAME_RE`` records. A
+        newline in an object name is a header-splitting character the GCS client
+        rejects at serve time, i.e. long after the write."""
+        with pytest.raises(ValueError):
+            validate_symbol("AAA\n", "bars path")
+
+
+class TestTheBarsWriter:
+    def test_it_writes_the_gzip_at_the_documented_address(self):
+        gcs = FakeGCS()
+        writer = ArtifactWriter("r1", bucket="test-bucket", client=gcs)
+        assert writer.write_bars(
+            {"schema": 1, "provenance": {"run_id": "r1", "symbol": "AAA",
+                                         "split": "fit"}}) is True
+        bucket = gcs.buckets["test-bucket"]
+        (name, data), = bucket.objects.items()
+        assert name == "sim-artifacts/v1/r1/bars/AAA__fit.json.gz"
+        # Opaque gzip and NO `content_encoding`: setting the latter turns on
+        # GCS decompressive transcoding, so a download would silently return
+        # decompressed bytes and every reader's gzip handling would be a lie
+        # that happens to work.
+        assert bucket.uploads[0]["content_type"] == "application/gzip"
+        assert "content_encoding" not in bucket.uploads[0]
+        assert json.loads(gzip.decompress(data))["schema"] == 1
+        assert writer.bars_written == 1 and writer.bars_failed == 0
+
+    def test_the_bars_counters_are_kept_apart_from_the_cell_counters(self):
+        """``artifacts_complete`` is "one artifact per non-errored CELL".
+        Folding the sidecar into ``written`` would make that arithmetic wrong on
+        any sweep with more than one arm — which is every sweep.
+
+        MUTATION CHECK: increment ``self.written`` in ``write_bars`` and this
+        fails.
+        """
+        gcs = FakeGCS()
+        writer = ArtifactWriter("r1", bucket="test-bucket", client=gcs)
+        writer.write({"provenance": {"run_id": "r1", "scenario": "base",
+                                     "symbol": "AAA", "split": "fit"}})
+        writer.write_bars({"provenance": {"run_id": "r1", "symbol": "AAA",
+                                          "split": "fit"}})
+        assert (writer.written, writer.failed) == (1, 0)
+        assert (writer.bars_written, writer.bars_failed) == (1, 0)
+
+    def test_a_gcs_failure_is_counted_and_swallowed(self):
+        gcs = FakeGCS(raises=RuntimeError("503 backend error"))
+        writer = ArtifactWriter("r1", bucket="test-bucket", client=gcs)
+        assert writer.write_bars(
+            {"provenance": {"run_id": "r1", "symbol": "AAA",
+                            "split": "fit"}}) is False
+        assert writer.bars_failed == 1 and writer.bars_written == 0
+        assert "503" in writer.last_error
+
+    def test_an_empty_bucket_env_disables_it(self, monkeypatch):
+        monkeypatch.setenv(store_module.ARTIFACT_BUCKET_ENV, "")
+        monkeypatch.setattr(store_module, "_storage_client", _no_client)
+        writer = ArtifactWriter("r1")
+        assert writer.enabled is False
+        assert writer.write_bars({"provenance": {"symbol": "AAA"}}) is False
+        assert writer.bars_written == 0 and writer.bars_failed == 0
+
+
+class TestTheBarsSink:
+    def test_one_sidecar_per_window_from_the_BASE_arm_only(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """The headline sink test.
+
+        MUTATION CHECK: drop the ``scenario.name == BASE_SCENARIO_NAME`` guard
+        and this sweep emits THREE identical sidecars for one window — which is
+        what would let a reader open arm C's chart believing it is arm C's.
+        """
+        seen = []
+        result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                        [Scenario("tighter", {"strategy.min_put_premium": 0.30}),
+                         Scenario("wider", {"strategy.min_put_premium": 0.10})],
+                        artifact_sink=lambda _a: None, bars_sink=seen.append,
+                        run_id="R1", engine_identity="EID", git_commit="C0FFEE")
+        assert len(result.rows) == 3 and not result.errors
+        assert len(seen) == 1, [s["provenance"] for s in seen]
+        prov = seen[0]["provenance"]
+        assert prov["run_id"] == "R1"
+        assert prov["engine_identity"] == "EID"
+        assert prov["git_commit"] == "C0FFEE"
+        assert prov["symbol"] == "AAA" and prov["split"] == "all"
+        assert seen[0]["schema"] == BARS_SCHEMA
+
+    def test_a_base_replay_that_RAISES_leaves_the_window_with_no_sidecar(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """§Behaviour contract: the other arms' ROWS still persist; only the
+        evidence is missing, and the console degrades through the absent-sidecar
+        path rather than drawing a curve from another arm.
+
+        MUTATION CHECK: emit the sidecar before the row is built, or from
+        whichever arm happens to be first, and this fails.
+        """
+        from src.backtesting.engine.simulator import Simulator
+
+        real_replay = Simulator.replay
+
+        def boom(self, materialised, **kw):
+            if self.config.min_put_premium == 0.50:   # the base profile's floor
+                raise RuntimeError("base blew up")
+            return real_replay(self, materialised, **kw)
+
+        seen = []
+        with patch.object(Simulator, "replay", boom):
+            result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                            [Scenario("tighter",
+                                      {"strategy.min_put_premium": 0.30})],
+                            bars_sink=seen.append)
+        assert seen == [], "a failed base arm must emit no sidecar"
+        assert len(result.errors) == 1
+        non_base = [r for r in result.rows if r.scenario != "base"]
+        assert len(non_base) == 1 and non_base[0].error is None
+        assert non_base[0].total_return is not None
+
+    def test_a_failed_MATERIALISATION_emits_no_sidecar(
+            self, tmp_path, one_symbol, one_symbol_config):
+        from src.backtesting.scenarios import runner as runner_module
+
+        seen = []
+        with patch.object(runner_module, "_materialise_window",
+                          side_effect=RuntimeError("no data")):
+            result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                            [Scenario("a", {})], bars_sink=seen.append)
+        assert seen == []
+        assert len(result.errors) == len(result.rows) == 2
+
+    def test_a_raising_sink_does_not_error_the_row_or_the_cell_artifact(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """MUTATION CHECK: drop ``_emit_bars``'s own ``try`` and a GCS outage
+        turns every completed base cell into an error row. Its guard is SEPARATE
+        from ``_emit_artifact``'s so a sidecar failure cannot cost the cell
+        artifact that was already written."""
+        cells = []
+
+        def explode(_payload):
+            raise RuntimeError("bars sink is down")
+
+        result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                        [Scenario("a", {})], artifact_sink=cells.append,
+                        bars_sink=explode)
+        assert not result.errors
+        assert all(row.total_return is not None for row in result.rows)
+        assert len(cells) == 2, "the cell artifacts still landed"
+
+    def test_a_serialiser_failure_is_swallowed_too(
+            self, tmp_path, one_symbol, one_symbol_config):
+        with patch("src.backtesting.reporting.artifact.bars_artifact",
+                   side_effect=ValueError("serialiser bug")):
+            result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                            [Scenario("a", {})], bars_sink=lambda _a: None)
+        assert not result.errors
+
+    def test_an_UNIMPORTABLE_serialiser_is_swallowed_too(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """The import lives INSIDE ``_emit_bars``'s guard, not above it."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def refuse(name, *args, **kwargs):
+            if "reporting.artifact" in name or name.endswith("artifact"):
+                raise ImportError("no module named artifact (simulated)")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", refuse):
+            result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                            [Scenario("a", {})], bars_sink=lambda _a: None)
+        assert not result.errors, [r.error for r in result.errors]
+
+    def test_no_bars_sink_means_no_bars_work_at_all(
+            self, tmp_path, one_symbol, one_symbol_config):
+        with patch("src.backtesting.reporting.artifact.bars_artifact") as built:
+            _sweep(tmp_path, one_symbol, one_symbol_config, [Scenario("a", {})],
+                   artifact_sink=lambda _a: None)
+        built.assert_not_called()
+
+    def test_one_sidecar_per_SPLIT_when_the_run_has_a_holdout(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """Two windows, two sidecars — the sidecar is per (symbol, split), which
+        is exactly what the route's three path segments address, and the two
+        windows must not share a bar."""
+        days, provider = one_symbol
+        seen = []
+        run_sweep(
+            one_symbol_config, [Scenario("a", {})], ["AAA"], days[0], days[-1],
+            holdout_start=days[20], starting_cash=50_000.0,
+            chain_store=ChainStore(str(tmp_path)), bar_provider=provider,
+            quiet_logs=False, bars_sink=seen.append, run_id="R2",
+        )
+        by_split = {s["provenance"]["split"]: s for s in seen}
+        assert sorted(by_split) == ["fit", "holdout"]
+        fit_dates = {b["date"] for b in by_split["fit"]["bars"]}
+        holdout_dates = {b["date"] for b in by_split["holdout"]["bars"]}
+        assert fit_dates and holdout_dates
+        assert not (fit_dates & holdout_dates), "the two windows must not overlap"
+
+
+class TestTheGitCommitStampIsPopulated:
+    def test_the_runner_passes_it_through_to_every_cell_artifact(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """§Found while planning 1: ``provenance.git_commit`` was ``null`` on
+        EVERY stored artifact, because ``run_sweep`` had no parameter for it
+        while both callers held the value.
+
+        MUTATION CHECK: drop ``git_commit=git_commit`` from the
+        ``_emit_artifact`` call and every stamp goes back to ``None``.
+        """
+        seen = []
+        _sweep(tmp_path, one_symbol, one_symbol_config,
+               [Scenario("a", {})], artifact_sink=seen.append,
+               git_commit="abc1234")
+        assert seen
+        assert all(a["provenance"]["git_commit"] == "abc1234" for a in seen)
+
+    def test_it_is_null_when_the_caller_has_none(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """Unset ``GIT_COMMIT`` is a real state (a manual ``gcloud builds
+        submit``), and it must stamp null rather than an empty string that reads
+        as a commit."""
+        seen = []
+        _sweep(tmp_path, one_symbol, one_symbol_config,
+               [Scenario("a", {})], artifact_sink=seen.append)
+        assert all(a["provenance"]["git_commit"] is None for a in seen)
+
+
+class TestTheCapitalBaseAndBenchmarkStamps:
+    def test_a_wheel_cell_stamps_its_starting_cash_as_the_capital_base(
+            self, tmp_path, one_symbol, one_symbol_config):
+        seen = []
+        _sweep(tmp_path, one_symbol, one_symbol_config,
+               [Scenario("a", {})], artifact_sink=seen.append)
+        for art in seen:
+            assert art["provenance"]["capital_base"] == 50_000.0
+            assert art["provenance"]["starting_cash"] == 50_000.0
+
+    def test_a_stamped_base_is_NOT_overwritten_by_starting_cash(self):
+        """The Phase C contract. ``capital_base`` is what every ratio divides
+        by; a covered-call artifact's is the lot value, and falling back to the
+        spec's float would scale every tile by the wrong number while looking
+        entirely plausible.
+
+        MUTATION CHECK: read ``meta.starting_cash`` first in the stamp and this
+        fails.
+        """
+        payload = cell_artifact(_hand_built_result(),
+                                _meta(starting_cash=100_000.0,
+                                      capital_base=10_000.0))
+        assert payload["provenance"]["capital_base"] == 10_000.0
+        assert payload["provenance"]["starting_cash"] == 100_000.0
+
+    def test_the_cells_benchmark_is_the_ARMS_own_scored_one(
+            self, tmp_path, one_symbol, one_symbol_config):
+        """Every arm stamps a benchmark, and it reconciles to that arm's OWN
+        row: the benchmark is a property of the window, so two arms of one
+        window agree — which is exactly why the sidecar can be written once.
+
+        MUTATION CHECK: stamp `None` and the console loses its cross-check
+        against the sidecar entirely.
+        """
+        seen = []
+        result = _sweep(tmp_path, one_symbol, one_symbol_config,
+                        [Scenario("a", {})], artifact_sink=seen.append)
+        by_arm = {a["provenance"]["scenario"]: a for a in seen}
+        for row in result.rows:
+            bench = by_arm[row.scenario]["benchmark"]
+            assert bench is not None
+            assert bench["total_return"] == pytest.approx(row.benchmark_return)
+            assert bench["capital_base"] == 50_000.0
+        assert (by_arm["a"]["benchmark"]["final_value"]
+                == pytest.approx(by_arm["base"]["benchmark"]["final_value"]))
+
+    def test_a_report_without_a_benchmark_stamps_null(self):
+        payload = cell_artifact(_hand_built_result(), _meta(benchmark=None))
+        assert payload["benchmark"] is None

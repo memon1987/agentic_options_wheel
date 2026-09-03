@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services.sweep_report_text import (
@@ -42,6 +42,8 @@ from services.sweep_report_text import (
     CROSS_SCENARIO_CAVEAT,
     DTE_REACH_BIAS,
     DTE_REACH_BIAS_THRESHOLD,
+    FORECAST_CAVEAT,
+    FORECAST_REFUSAL_IN_SAMPLE,
     HOLDOUT_SEMANTICS,
     IN_SAMPLE_BANNER,
     MIN_DAYS_IN_POSITION,
@@ -1637,6 +1639,65 @@ def _common_delta(index, scenarios_symbols, scenario: str, split: str
     return _median(deltas), len(deltas)
 
 
+def _cell_delta(index, scenario: str, symbol: str,
+                split: str) -> Optional[float]:
+    """This CELL's annualised delta against base, or ``None``.
+
+    FC-096 Phase E PR-1, decision 13. It is
+    ``annualized_return_arm − annualized_return_base`` for the SAME symbol and
+    the SAME split, through ``_measured_value`` — so an `insuf` or `low-act`
+    cell on either side yields ``None``, never a number.
+
+    **``None`` on the base cell itself, never ``0.0``.** An arm is not a delta
+    against itself, and a served `0.0` renders as a real, neutral result: the
+    one cell in the grid that is guaranteed to look like "no difference" would
+    be the one where the question is meaningless. The scenario-level
+    `summary.delta_vs_base` already draws the same distinction; this keeps the
+    per-cell scalar consistent with it.
+    """
+    if scenario == BASE_SCENARIO_NAME:
+        return None
+    arm = _measured_value(index.get((scenario, symbol, split)))
+    base = _measured_value(index.get((BASE_SCENARIO_NAME, symbol, split)))
+    if arm is None or base is None:
+        return None
+    return arm - base
+
+
+def _cell_sign_agrees(index, scenario: str, symbol: str) -> Optional[bool]:
+    """Whether THIS symbol's fit and holdout deltas vs base share a sign.
+
+    ``True``/``False`` only when all FOUR cells are measured (arm fit, arm
+    holdout, base fit, base holdout) — the same condition ``_sign_agreement``
+    counts a symbol as `comparable` under, and the same delta-not-raw-return
+    definition: an arm whose raw return is positive in both windows has shown
+    nothing about itself, only that the market went up.
+
+    ``None`` when the symbol is not comparable — which includes every cell of an
+    `all`-split run, since there is no holdout to agree with. A ``False`` there
+    would say "the arm disagreed with itself", which is a finding; "we cannot
+    tell" is not.
+
+    It is a property of (scenario, symbol), so both splits' cells carry the same
+    answer. Deliberate: the console shows it beside the scenario-level
+    "agreeing/comparable across N symbols" count, and a value that changed
+    between the two splits of one symbol would imply a per-split notion of
+    agreement that does not exist.
+    """
+    cells = [
+        _measured_value(index.get((scenario, symbol, "fit"))),
+        _measured_value(index.get((scenario, symbol, "holdout"))),
+        _measured_value(index.get((BASE_SCENARIO_NAME, symbol, "fit"))),
+        _measured_value(index.get((BASE_SCENARIO_NAME, symbol, "holdout"))),
+    ]
+    if any(c is None for c in cells):
+        return None
+    fit_delta = cells[0] - cells[2]
+    hold_delta = cells[1] - cells[3]
+    return ((fit_delta > 0) == (hold_delta > 0)
+            and (fit_delta < 0) == (hold_delta < 0))
+
+
 def _sign_agreement(index, symbols, scenario: str) -> Tuple[int, int]:
     """``(agreeing, comparable)`` for one arm's fit/holdout pair.
 
@@ -1730,6 +1791,257 @@ def spec_max_dte(spec: Dict[str, Any]) -> int:
     return reach
 
 
+# ============================================================================ #
+# The forecast range (FC-096 Phase E component 7)
+# ============================================================================ #
+
+# The two bases, named. PREMIUM is the operator's signed income view; TOTAL is
+# the companion that keeps it from misleading. Both are always rendered — round
+# 1 established that on the live fixture the premium run-rate ORDERS THE TWO
+# WINDOWS THE OTHER WAY from total P&L, because a wheel stuck long writes more
+# calls on assigned shares while the position bleeds. A premium-only range rises
+# exactly when the strategy is doing worst.
+FORECAST_BASES = ("net_option_pnl", "total_pnl")
+
+# What `annual_low`/`annual_high` are scaled by. The UI multiplies `per_day` by
+# whatever horizon the operator picks; this pair exists so that at least one
+# horizon is computed SERVER-SIDE and a test can pin the client's arithmetic
+# against it rather than against itself.
+FORECAST_ANNUAL_DAYS = 365
+
+# The horizons the panel offers besides the default (the holdout's own length).
+FORECAST_HORIZON_CHOICES = (30, 90, 365)
+
+
+def _window_days(windows: Dict[str, Dict[str, Any]], split: str) -> Optional[int]:
+    """``(end − start).days`` for the ROW's REQUESTED window, or ``None``.
+
+    The requested window, not the replay's decision-day bounds: `fitness.py`
+    measures `days` between the first and last DECISION day, and that pair is
+    not on any persisted row — it lives on the artifact. The two differ by at
+    most the non-session edges of the window, and `FORECAST_CAVEAT` says the
+    rate is per CALENDAR day over the requested window so the reader is not left
+    to assume otherwise. Picked over the alternatives because it is the only
+    definition this layer can compute at all; the choice is recorded in the plan
+    (§Forecast, A1) rather than left implicit.
+
+    ``None`` — never 0 — on a missing or unparseable window: a zero would be a
+    division by zero at best and an infinite run-rate at worst.
+    """
+    window = (windows or {}).get(split) or {}
+    start = _as_date(window.get("start"))
+    end = _as_date(window.get("end"))
+    if start is None or end is None:
+        return None
+    days = (end - start).days
+    return days if days > 0 else None
+
+
+def _as_date(value: Any) -> Optional[date]:
+    """An ISO date string (or date/datetime) -> ``date``; anything else -> ``None``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate(numerator: Optional[float], days: Optional[int]) -> Optional[float]:
+    """``numerator / days`` as a float, or ``None`` if either input is unusable.
+
+    **A NULL input yields ``None``, never ``0``.** `persist._finite` NULLs a
+    non-finite number on the way into the store, so a null here means "this was
+    not measured" — and a forecast of $0/day for a symbol whose P&L was not
+    recorded is a number an operator would act on.
+    """
+    if numerator is None or days is None or days <= 0:
+        return None
+    try:
+        value = float(numerator)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value / days
+
+
+def _basis_block(fit_per_day: Optional[float],
+                 holdout_per_day: Optional[float]) -> Optional[Dict[str, Any]]:
+    """One basis's range, or ``None`` when either window's rate is missing.
+
+    The bounds are min/max of the two rates rather than (fit, holdout) in order:
+    the range is "somewhere between what these two windows paid", and which
+    window happened to be the better one is already on the two named fields.
+    """
+    if fit_per_day is None or holdout_per_day is None:
+        return None
+    low = min(fit_per_day, holdout_per_day)
+    high = max(fit_per_day, holdout_per_day)
+    return {
+        "fit_per_day": fit_per_day,
+        "holdout_per_day": holdout_per_day,
+        "low_per_day": low,
+        "high_per_day": high,
+        "annual_low": low * FORECAST_ANNUAL_DAYS,
+        "annual_high": high * FORECAST_ANNUAL_DAYS,
+    }
+
+
+def _portfolio_sum(entries: Sequence[Dict[str, Any]], basis: str
+                   ) -> Optional[Dict[str, Any]]:
+    """The sum of one basis over the INCLUDED symbols, or ``None``.
+
+    ``None`` when any included symbol lacks that basis — a covered-call run with
+    no stamped capital base is the live case, where every `total_pnl` is
+    suppressed. Summing the subset that happens to have it would produce a
+    portfolio line over a different symbol set from the one named beside it,
+    which is precisely the comparison the "n of N" label exists to prevent.
+    """
+    blocks = [e[basis] for e in entries]
+    if not blocks or any(b is None for b in blocks):
+        return None
+    low = sum(b["low_per_day"] for b in blocks)
+    high = sum(b["high_per_day"] for b in blocks)
+    return {
+        "fit_per_day": sum(b["fit_per_day"] for b in blocks),
+        "holdout_per_day": sum(b["holdout_per_day"] for b in blocks),
+        "low_per_day": low,
+        "high_per_day": high,
+        "annual_low": low * FORECAST_ANNUAL_DAYS,
+        "annual_high": high * FORECAST_ANNUAL_DAYS,
+    }
+
+
+def _forecast(index, scenarios: Sequence[str], symbols: Sequence[str],
+              windows: Dict[str, Dict[str, Any]], spec: Dict[str, Any],
+              ) -> Optional[Dict[str, Any]]:
+    """Two run-rate ranges per scenario × symbol, plus a portfolio sum.
+
+    Computed HERE rather than in the UI (decision 7) for the reason every other
+    aggregate is: the UI's only arithmetic is ``per_day × horizon``, which is a
+    display scaling, and a second implementation of "which cells count" would
+    eventually extrapolate an `insuf` cell.
+
+    ``None`` when the run has no usable fit/holdout window pair at all; the
+    caller pairs that with ``forecast_refusal``.
+    """
+    days_fit = _window_days(windows, "fit")
+    days_holdout = _window_days(windows, "holdout")
+    if days_fit is None or days_holdout is None:
+        return None
+
+    # The wheel's capital base is the spec's per-symbol notional. Phase C stamps
+    # a lot-based base on the ARTIFACT; no persisted ROW carries one, so a
+    # covered-call run's total-P&L basis is SUPPRESSED here rather than scaled
+    # by a $100k float it never traded (§Degrading for CC, §D-4). Strategy is
+    # read canonical-by-omission: absent means wheel.
+    strategy = str(spec.get("strategy") or "wheel")
+    cash = spec.get("starting_cash")
+    capital_base = (float(DEFAULT_STARTING_CASH if cash is None else cash)
+                    if strategy != "covered_call" else None)
+
+    by_scenario: Dict[str, Any] = {}
+    for scenario in scenarios:
+        entries: Dict[str, Any] = {}
+        excluded: Dict[str, str] = {}
+        for symbol in symbols:
+            fit = index.get((scenario, symbol, "fit"))
+            holdout = index.get((scenario, symbol, "holdout"))
+            reason = _forecast_exclusion(fit, holdout)
+            if reason is not None:
+                excluded[symbol] = reason
+                continue
+
+            premium = _basis_block(
+                _rate(fit.get("option_pnl"), days_fit),
+                _rate(holdout.get("option_pnl"), days_holdout))
+            total = None
+            if capital_base is not None:
+                total = _basis_block(
+                    _rate(_scaled(fit.get("total_return"), capital_base), days_fit),
+                    _rate(_scaled(holdout.get("total_return"), capital_base),
+                          days_holdout))
+            if premium is None and total is None:
+                # Measured on both sides, but no usable input on either basis.
+                # Named rather than served as a row of nulls, so the panel can
+                # say WHY the symbol is absent from the portfolio sum.
+                excluded[symbol] = "null_inputs"
+                continue
+
+            entries[symbol] = {
+                # The fill assumption these rates were measured under. The row's
+                # `bid_fill_return` comes from a SECOND replay, and a rate read
+                # off one basis beside a scalar from the other is the pairing
+                # this stamp exists to prevent.
+                "fill": {"basis": "mid",
+                         "fill_haircut": fit.get("fill_haircut")},
+                "days": {"fit": days_fit, "holdout": days_holdout},
+                "capital_base": capital_base,
+                "net_option_pnl": premium,
+                "total_pnl": total,
+            }
+
+        included = [s for s in symbols if s in entries]
+        rows = [entries[s] for s in included]
+        portfolio: Dict[str, Any] = {
+            "included": included,
+            "excluded": excluded,
+            "n_included": len(included),
+            "n_symbols": len(symbols),
+            "net_option_pnl": _portfolio_sum(rows, "net_option_pnl"),
+            "total_pnl": _portfolio_sum(rows, "total_pnl"),
+            "refusal": None,
+        }
+        if not included:
+            portfolio["refusal"] = (
+                "No symbol in this arm was measured in BOTH windows, so there "
+                "is nothing to sum.")
+        by_scenario[scenario] = {"symbols": entries, "portfolio": portfolio}
+
+    return {
+        # The default the panel opens on: "the next period like the one you held
+        # out". Any other horizon is an extrapolation and the UI says so.
+        "default_horizon_days": days_holdout,
+        "horizon_choices": list(FORECAST_HORIZON_CHOICES),
+        "annual_days": FORECAST_ANNUAL_DAYS,
+        "capital_base": capital_base,
+        "strategy": strategy,
+        "days": {"fit": days_fit, "holdout": days_holdout},
+        "by_scenario": by_scenario,
+    }
+
+
+def _scaled(fraction: Optional[float],
+            capital_base: Optional[float]) -> Optional[float]:
+    """``fraction × capital_base`` in dollars, or ``None`` if either is absent."""
+    if fraction is None or capital_base is None:
+        return None
+    try:
+        return float(fraction) * float(capital_base)
+    except (TypeError, ValueError):
+        return None
+
+
+def _forecast_exclusion(fit: Optional[Dict[str, Any]],
+                        holdout: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why this symbol has no forecast, or ``None`` when it has one.
+
+    A symbol needs BOTH windows measured. The reason names which side and what
+    state it was in, because "excluded" with no reason is how a portfolio line
+    over four of six symbols gets read as a portfolio line over six.
+    """
+    for label, row in (("fit", fit), ("holdout", holdout)):
+        if row is None:
+            return f"{label}: no cell"
+        state = _cell_state(row)
+        if state != "measured":
+            return f"{label}: {state}"
+    return None
+
+
 def shape_results(sweep_row: Dict[str, Any],
                   run_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Everything ``/sims`` renders, derived once here (D11).
@@ -1777,14 +2089,44 @@ def shape_results(sweep_row: Dict[str, Any],
                     "state": _cell_state(row),
                     "verdict": row.get("verdict"),
                     "demote": row.get("demote"),
+                    # FC-096 Phase E PR-1: EVERY persisted performance,
+                    # activity and fill column, plus the two hashes and the
+                    # replay clock. The store held all of these and the shaper
+                    # emitted twelve, so fourteen `SweepResultRow` fields were
+                    # permanently null in the SPA — not because the number was
+                    # missing but because nothing served it (§Found while
+                    # planning 2). Added here rather than fetched per cell from
+                    # a second route: they are one row each, already loaded.
+                    "scenario_hash": row.get("scenario_hash"),
+                    "config_hash": row.get("config_hash"),
                     "annualized_return": row.get("annualized_return"),
                     "total_return": row.get("total_return"),
+                    "annualized_return_on_collateral": row.get(
+                        "annualized_return_on_collateral"),
+                    "benchmark_return": row.get("benchmark_return"),
+                    "excess_return": row.get("excess_return"),
+                    "option_pnl": row.get("option_pnl"),
+                    "stock_pnl_realized": row.get("stock_pnl_realized"),
+                    "stock_pnl_unrealized": row.get("stock_pnl_unrealized"),
+                    "max_drawdown": row.get("max_drawdown"),
+                    "win_rate": row.get("win_rate"),
+                    "assignment_rate": row.get("assignment_rate"),
                     "days_in_position_fraction": row.get("days_in_position_fraction"),
                     "cycles_completed": row.get("cycles_completed"),
+                    "cycles_open": row.get("cycles_open"),
+                    "decision_days": row.get("decision_days"),
                     "puts_sold": row.get("puts_sold"),
                     "calls_sold": row.get("calls_sold"),
                     "bid_fill_return": row.get("bid_fill_return"),
                     "verdict_flips_on_fill": row.get("verdict_flips_on_fill"),
+                    "replay_seconds": row.get("replay_seconds"),
+                    # Per-cell Δ vs base and per-cell sign agreement, SERVED so
+                    # the console never derives either. Both go through
+                    # `_measured_value`, the one choke point that decides which
+                    # cells count.
+                    "delta_vs_base_annualized": _cell_delta(
+                        index, scenario, symbol, split),
+                    "sign_agrees": _cell_sign_agrees(index, scenario, symbol),
                     "error": row.get("error"),
                 }
             by_scenario[scenario] = cells
@@ -1847,6 +2189,26 @@ def shape_results(sweep_row: Dict[str, Any],
     # the page must not present an empty list as "checked, all clear".
     earnings_gaps = _json_list(sweep_row.get("earnings_symbols_without_data"))
 
+    # FC-096 Phase E PR-1, component 7. Two run-rate ranges — the operator's
+    # signed PREMIUM view and the TOTAL-P&L companion beside it — computed
+    # server-side so the UI's only arithmetic is `per_day × horizon`.
+    #
+    # An IN-SAMPLE run gets none at all, and the refusal is a sentence rather
+    # than a silence: a range whose two bounds both come from the window the arm
+    # was chosen on is a restatement of that window, not a forecast, and the
+    # single most likely way this panel could mislead is by rendering one
+    # anyway.
+    forecast = None
+    forecast_refusal = None
+    if in_sample_only:
+        forecast_refusal = FORECAST_REFUSAL_IN_SAMPLE
+    else:
+        forecast = _forecast(index, scenarios, symbols, windows, spec)
+        if forecast is None:
+            forecast_refusal = (
+                "This run has no fit/holdout window pair with a positive span, "
+                "so there is no second window to bound a range with.")
+
     return {
         "run": dict(sweep_row),
         "spec": spec,
@@ -1875,6 +2237,14 @@ def shape_results(sweep_row: Dict[str, Any],
         # absent from the committed earnings table. Rendering it on `/sims` is
         # Phase E; serving it now means the number exists to render.
         "earnings_symbols_without_data": earnings_gaps,
+        # FC-096 Phase E PR-1. `forecast` is null exactly when `forecast_refusal`
+        # is set, and never the other way round; the panel renders the refusal
+        # verbatim. `forecast_caveat` is served UNCONDITIONALLY — the panel
+        # refuses to render on a blank one, so it must not be something the
+        # payload can omit by accident.
+        "forecast": forecast,
+        "forecast_refusal": forecast_refusal,
+        "forecast_caveat": FORECAST_CAVEAT,
         "cross_scenario_caveat": CROSS_SCENARIO_CAVEAT,
         "rejection_tally_caveat": TALLY_CAVEAT,
         "in_sample_banner": IN_SAMPLE_BANNER if in_sample_only else None,

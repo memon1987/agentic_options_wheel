@@ -168,6 +168,51 @@ class TestTheReportProseIsNotAFork:
             f"this commit."
         )
 
+    # FC-096 Phase E PR-1. The forecast is a DASHBOARD component: `report.py`
+    # does not render one, so `FORECAST_CAVEAT` and its refusal string have no
+    # original to be a copy of. The exception is NAMED rather than implicit —
+    # an un-named exception is how a second constant quietly joins it and the
+    # fork guard stops covering the prose it was written for.
+    DASHBOARD_ONLY_PROSE = {"FORECAST_CAVEAT", "FORECAST_REFUSAL_IN_SAMPLE"}
+
+    def test_the_dashboard_only_set_is_exactly_the_forecast_prose(self):
+        """Every prose constant in `sweep_report_text` is a copy of `report.py`'s
+        EXCEPT the named exceptions — and the set of exceptions is asserted, not
+        assumed.
+
+        MUTATION CHECK: add a new prose constant here without an original and
+        this fails, naming it. Delete `FORECAST_CAVEAT` from `report.py`'s
+        exception set (i.e. add it to `report.py`) and this fails the other way,
+        which is the correct failure if the CLI ever prints the forecast.
+        """
+        prose = {
+            name for name in vars(T)
+            if name.isupper() and not name.startswith("_")
+            and isinstance(getattr(T, name), (str, tuple, list))
+        }
+        orphans = {name for name in prose if not hasattr(engine_report, name)}
+        assert orphans == self.DASHBOARD_ONLY_PROSE, (
+            f"prose constants with no original in report.py: {sorted(orphans)}. "
+            f"Either copy the value into report.py or add the name to "
+            f"DASHBOARD_ONLY_PROSE with a reason.")
+
+    @pytest.mark.parametrize("name", sorted(DASHBOARD_ONLY_PROSE))
+    def test_the_dashboard_only_prose_is_non_empty(self, name):
+        """The forecast panel REFUSES to render on a blank caveat, so an empty
+        string here is not a cosmetic defect — it silently removes the panel."""
+        value = getattr(T, name)
+        assert isinstance(value, str) and len(value.strip()) > 80
+
+    def test_the_forecast_caveat_names_both_bases_and_the_refusal(self):
+        """The sentence is load-bearing: it is what keeps two extrapolated
+        run-rates from being read as a confidence interval, and what warns that
+        the PREMIUM rate can rise while the strategy fails."""
+        text = T.FORECAST_CAVEAT
+        assert "NOT a confidence interval" in text
+        assert "PREMIUM" in text and "TOTAL" in text
+        assert "cash-basis" in text
+        assert "in-sample run has no forecast" in text
+
     def test_base_scenario_name_matches(self):
         from src.backtesting.scenarios.runner import BASE_SCENARIO_NAME
         assert T.BASE_SCENARIO_NAME == BASE_SCENARIO_NAME
@@ -3687,3 +3732,577 @@ class TestThePinEndpoints:
         out = self._create(v2)
         assert [r["pin_id"] for r in self._run(v2.list_pins())] == [
             out["pin_id"]]
+
+
+# ==========================================================================
+# (6b) FC-096 Phase E PR-1 — the data contract `shape_results` now serves
+#
+# Three additions, and each closes a way the console would otherwise have to
+# derive a number the store already holds:
+#
+# * the FULL persisted scalar set per cell (fourteen `SweepResultRow` fields
+#   were permanently null in the SPA because nothing served them);
+# * per-cell `delta_vs_base_annualized` and `sign_agrees`, so no client ever
+#   subtracts two returns or decides which cells count;
+# * the two-basis `forecast`, refused outright on an in-sample run.
+# ==========================================================================
+PERSISTED_CELL_SCALARS = [
+    # `persist.py`'s performance / activity / fill block, verbatim.
+    "total_return", "annualized_return", "annualized_return_on_collateral",
+    "benchmark_return", "excess_return", "option_pnl", "stock_pnl_realized",
+    "stock_pnl_unrealized", "max_drawdown", "win_rate", "assignment_rate",
+    "puts_sold", "calls_sold", "cycles_completed", "cycles_open",
+    "decision_days", "days_in_position_fraction", "bid_fill_return",
+    "verdict_flips_on_fill",
+    # Plus the two hashes and the replay clock.
+    "scenario_hash", "config_hash", "replay_seconds",
+]
+
+
+class TestEveryPersistedScalarReachesTheCell:
+    """§Found while planning 2: the store held 26 fields per cell and the shaper
+    emitted 12, so `normaliseReport.rowFromCell` read fourteen of them as
+    permanently `null` — not because the numbers were missing but because
+    nothing served them.
+    """
+
+    def test_every_persisted_column_is_on_every_cell(self, shaped_and_engine):
+        """MUTATION CHECK: delete any one key from the cell dict and this names
+        it."""
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"]["fit"]["base"]["AAPL"]
+        missing = [k for k in PERSISTED_CELL_SCALARS if k not in cell]
+        assert missing == [], missing
+
+    def test_the_values_are_the_ROWS_never_recomputed(self, shaped_and_engine):
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"]["fit"]["tighter"]["NVDA"]
+        assert cell["annualized_return"] == pytest.approx(0.30)
+        assert cell["scenario_hash"] == "h-tighter"
+        assert cell["config_hash"] == "cfg"
+        assert cell["replay_seconds"] == pytest.approx(1.1)
+        assert cell["decision_days"] == 180
+        assert cell["cycles_open"] == 0
+
+    def test_an_errored_cell_still_carries_the_keys(self, shaped_and_engine):
+        """The SPA builds one row shape for every state; a cell that dropped
+        keys on error would make `rowFromCell` read undefined rather than
+        null."""
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"]["fit"]["wider"]["NVDA"]
+        assert cell["state"] == "error"
+        for key in PERSISTED_CELL_SCALARS:
+            assert key in cell, key
+
+    def test_the_existing_keys_are_unchanged(self, shaped_and_engine):
+        """The contract is a SUPERSET: PR-2..PR-5 degrade to "not served" for
+        anything new, and nothing that already rendered may move."""
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"]["holdout"]["tighter"]["UNH"]
+        assert cell["state"] == "low_activity"
+        assert cell["verdict"] == "fit"
+        assert cell["demote"] is False
+        assert cell["days_in_position_fraction"] == pytest.approx(0.05)
+        assert cell["error"] is None
+
+
+class TestThePerCellDeltaVsBase:
+    """Decision 13. `annualized_return_arm − annualized_return_base`, same
+    symbol, same split, through `_measured_value`."""
+
+    def test_a_measured_pair_gives_the_difference(self, shaped_and_engine):
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"]["fit"]["tighter"]["AAPL"]
+        assert cell["delta_vs_base_annualized"] == pytest.approx(0.14 - 0.10)
+
+    def test_the_BASE_cell_is_NULL_not_zero(self, shaped_and_engine):
+        """§A9. An arm is not a delta against itself, and a served `0.0` renders
+        as a real, neutral result: the one cell where the question is
+        meaningless would be the one that looks like "no difference".
+
+        MUTATION CHECK: return `0.0` for the base cell and this fails on every
+        base cell in the grid.
+        """
+        shaped, _sweep, _ = shaped_and_engine
+        for split in shaped["grid"]:
+            for symbol in shaped["symbols"]:
+                cell = shaped["grid"][split]["base"][symbol]
+                if cell is None:
+                    continue
+                assert cell["delta_vs_base_annualized"] is None, (split, symbol)
+
+    @pytest.mark.parametrize("split,scenario,symbol", [
+        ("holdout", "tighter", "NVDA"),   # base is `insufficient` there
+        ("fit", "tighter", "UNH"),        # the arm is `low_activity`
+        ("fit", "wider", "NVDA"),         # the arm errored
+        ("holdout", "wider", "NVDA"),     # errored on both sides
+    ])
+    def test_it_is_null_whenever_either_side_is_unmeasured(
+            self, shaped_and_engine, split, scenario, symbol):
+        """The four unmeasured states, each from a real cell in the fixture.
+        `insuf` and `low-act` cells DO carry an `annualized_return`; the point
+        of `_measured_value` is that it must never become a delta."""
+        shaped, _sweep, _ = shaped_and_engine
+        cell = shaped["grid"][split][scenario][symbol]
+        assert cell["delta_vs_base_annualized"] is None
+        # ...and the raw number is still there, which is what makes the null
+        # a decision rather than an absence.
+        if cell["state"] in ("low_activity", "insufficient"):
+            assert cell["annualized_return"] is not None
+
+    def test_it_is_the_same_number_the_scenario_median_is_taken_over(
+            self, shaped_and_engine):
+        """One definition, two granularities. The median Δ on the summary row is
+        the median of exactly these per-cell values, so the strip and the grid
+        cannot disagree.
+
+        MUTATION CHECK: use `total_return` instead of `annualized_return` in
+        `_cell_delta` and this fails.
+        """
+        shaped, _sweep, _ = shaped_and_engine
+        for split in shaped["grid"]:
+            for scenario in shaped["scenarios"]:
+                if scenario == "base":
+                    continue
+                per_cell = sorted(
+                    c["delta_vs_base_annualized"]
+                    for c in (shaped["grid"][split][scenario][s]
+                              for s in shaped["symbols"])
+                    if c is not None and c["delta_vs_base_annualized"] is not None)
+                summary = next(r for r in shaped["summary"]
+                               if r["scenario"] == scenario and r["split"] == split)
+                assert len(per_cell) == summary["delta_symbols"], (split, scenario)
+                if per_cell:
+                    assert summary["delta_vs_base"] == pytest.approx(
+                        median(per_cell)), (split, scenario)
+
+
+class TestThePerCellSignAgreement:
+    def test_it_matches_the_scenario_level_count(self, shaped_and_engine):
+        """The strip shows both: the arm's `agreeing/comparable` "across N
+        symbols" AND this cell's own answer. They are one rule, so the count of
+        `True`s must equal `agreeing` and the count of non-`None`s `comparable`.
+
+        MUTATION CHECK: invert the comparison in `_cell_sign_agrees` and the
+        `agreeing` equality fails while `comparable` still passes — which is
+        exactly the defect a weaker test would miss.
+        """
+        shaped, _sweep, _ = shaped_and_engine
+        for scenario in shaped["scenarios"]:
+            values = [shaped["grid"]["fit"][scenario][s]["sign_agrees"]
+                      for s in shaped["symbols"]
+                      if shaped["grid"]["fit"][scenario][s] is not None]
+            expected = shaped["sign_agreement"][scenario]
+            assert sum(1 for v in values if v is True) == expected["agreeing"], scenario
+            assert sum(1 for v in values if v is not None) == expected["comparable"], scenario
+
+    def test_it_is_null_when_the_symbol_is_not_comparable(self, shaped_and_engine):
+        """`base`/NVDA is `insufficient` in the holdout, so no arm can be
+        compared on NVDA at all. `False` there would say "the arm disagreed with
+        itself", which is a finding; "we cannot tell" is not."""
+        shaped, _sweep, _ = shaped_and_engine
+        for scenario in shaped["scenarios"]:
+            for split in ("fit", "holdout"):
+                assert shaped["grid"][split][scenario]["NVDA"]["sign_agrees"] is None
+
+    def test_both_splits_of_one_symbol_carry_the_same_answer(
+            self, shaped_and_engine):
+        """It is a property of (scenario, symbol). A value that changed between
+        the two splits would imply a per-split notion of agreement that does not
+        exist."""
+        shaped, _sweep, _ = shaped_and_engine
+        for scenario in shaped["scenarios"]:
+            for symbol in shaped["symbols"]:
+                fit = shaped["grid"]["fit"][scenario][symbol]
+                hold = shaped["grid"]["holdout"][scenario][symbol]
+                assert fit["sign_agrees"] == hold["sign_agrees"], (scenario, symbol)
+
+    def test_a_run_with_no_holdout_agrees_about_nothing(self):
+        """Every cell of an `all`-split run is `None`: there is no second window
+        to agree with."""
+        rows = [
+            _cell_row("base", "AAPL", "all", 0.10),
+            _cell_row("tighter", "AAPL", "all", 0.14),
+        ]
+        shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
+        for scenario in ("base", "tighter"):
+            assert shaped["grid"]["all"][scenario]["AAPL"]["sign_agrees"] is None
+        assert shaped["sign_agreement"] is None
+
+    def test_a_disagreeing_arm_is_False_not_None(self):
+        """The distinction the whole scalar exists for."""
+        rows = [
+            _cell_row("base", "AAPL", "fit", 0.10),
+            _cell_row("base", "AAPL", "holdout", 0.10),
+            _cell_row("tighter", "AAPL", "fit", 0.20),      # +0.10 vs base
+            _cell_row("tighter", "AAPL", "holdout", 0.05),  # -0.05 vs base
+        ]
+        shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
+        assert shaped["grid"]["fit"]["tighter"]["AAPL"]["sign_agrees"] is False
+        assert shaped["grid"]["holdout"]["tighter"]["AAPL"]["sign_agrees"] is False
+
+    def test_an_agreeing_arm_is_True(self):
+        rows = [
+            _cell_row("base", "AAPL", "fit", 0.10),
+            _cell_row("base", "AAPL", "holdout", 0.10),
+            _cell_row("tighter", "AAPL", "fit", 0.20),
+            _cell_row("tighter", "AAPL", "holdout", 0.15),
+        ]
+        shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
+        assert shaped["grid"]["fit"]["tighter"]["AAPL"]["sign_agrees"] is True
+
+
+# --------------------------------------------------------------------------
+# The forecast (component 7)
+# --------------------------------------------------------------------------
+def _cell_row(scenario, symbol, split, ann, *, option_pnl=1000.0,
+              total_return=None, state="measured", fill_haircut=0.25):
+    """One persisted `scenario_runs` row, in the shape BigQuery hands back.
+
+    Hand-built rather than round-tripped through `rows_from_sweep` because the
+    forecast is about NULL handling and per-state exclusion, and a
+    `ScenarioResult` cannot express "measured, but `option_pnl` is NULL" — which
+    is precisely the state `persist._finite` produces from a non-finite number
+    and the state the plan says must yield `null`, never `0`.
+    """
+    row = {
+        "scenario_name": scenario, "symbol": symbol, "split": split,
+        "window_start": ("2025-08-01" if split != "holdout" else "2026-05-01"),
+        "window_end": ("2026-04-30" if split == "fit"
+                       else "2026-07-31" if split == "holdout"
+                       else "2026-07-31"),
+        "scenario_hash": f"h-{scenario}", "config_hash": "cfg",
+        "annualized_return": ann, "total_return": (
+            ann if total_return is None else total_return),
+        "option_pnl": option_pnl, "fill_haircut": fill_haircut,
+        "error": None, "insufficient": False, "low_activity": False,
+        "measured": False, "verdict": "fit",
+    }
+    if state == "measured":
+        row["measured"] = True
+    elif state == "insufficient":
+        row["insufficient"] = True
+    elif state == "low_activity":
+        row["low_activity"] = True
+    elif state == "error":
+        row["error"] = "RuntimeError: boom"
+    return row
+
+
+def _split_run(rows, **sweep_kw):
+    sweep_row = {"run_id": "r", "status": "done", "in_sample_only": False,
+                 "spec_json": json.dumps({"symbols": ["AAPL"],
+                                          "scenarios": [{"name": "tighter"}],
+                                          "starting_cash": 100_000.0})}
+    sweep_row.update(sweep_kw)
+    return S.shape_results(sweep_row, rows)
+
+
+def _fit_holdout(**kw):
+    """The minimal measured fit/holdout pair for one arm on one symbol."""
+    return [
+        _cell_row("base", "AAPL", "fit", 0.10, **kw),
+        _cell_row("base", "AAPL", "holdout", 0.06, **kw),
+        _cell_row("tighter", "AAPL", "fit", 0.14, **kw),
+        _cell_row("tighter", "AAPL", "holdout", 0.03, **kw),
+    ]
+
+
+class TestTheForecastFormula:
+    """`premium_w = option_pnl_w / days(w)`;
+    `total_w = total_return_w × capital_base / days(w)`.
+
+    `days(w)` is the ROW's REQUESTED window in calendar days — the only
+    definition this layer can compute, since the engine's decision-day bounds
+    live on the artifact and not on any row. `FORECAST_CAVEAT` says so out loud.
+    """
+
+    FIT_DAYS = (date(2026, 4, 30) - date(2025, 8, 1)).days
+    HOLDOUT_DAYS = (date(2026, 7, 31) - date(2026, 5, 1)).days
+
+    def test_the_days_are_the_requested_calendar_windows(self):
+        shaped = _split_run(_fit_holdout())
+        assert shaped["forecast"]["days"] == {
+            "fit": self.FIT_DAYS, "holdout": self.HOLDOUT_DAYS}
+
+    def test_the_premium_basis_is_option_pnl_per_calendar_day(self):
+        """MUTATION CHECK: divide by 365 (or by the decision-day count) and the
+        two rates move by the ratio of the windows."""
+        shaped = _split_run(_fit_holdout(option_pnl=2000.0))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        premium = block["net_option_pnl"]
+        assert premium["fit_per_day"] == pytest.approx(2000.0 / self.FIT_DAYS)
+        assert premium["holdout_per_day"] == pytest.approx(
+            2000.0 / self.HOLDOUT_DAYS)
+        assert premium["low_per_day"] == pytest.approx(
+            min(premium["fit_per_day"], premium["holdout_per_day"]))
+        assert premium["high_per_day"] == pytest.approx(
+            max(premium["fit_per_day"], premium["holdout_per_day"]))
+
+    def test_the_total_basis_scales_the_fraction_by_the_capital_base(self):
+        """The companion basis (§A1): TOTAL includes the stock leg marked at the
+        last close, so it can ORDER THE TWO WINDOWS THE OTHER WAY from premium —
+        which is the whole reason both are served."""
+        shaped = _split_run(_fit_holdout())
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        total = block["total_pnl"]
+        assert total["fit_per_day"] == pytest.approx(
+            0.14 * 100_000.0 / self.FIT_DAYS)
+        assert total["holdout_per_day"] == pytest.approx(
+            0.03 * 100_000.0 / self.HOLDOUT_DAYS)
+        assert block["capital_base"] == 100_000.0
+
+    def test_the_annual_pair_is_the_server_supplied_horizon_scaling(self):
+        """The UI's ONLY arithmetic is `per_day × H`. One horizon is computed
+        server-side so a client test can be pinned against it rather than
+        against itself.
+
+        MUTATION CHECK: scale by 252 (trading days) and this fails — the rate is
+        per CALENDAR day, which is what the caveat promises.
+        """
+        shaped = _split_run(_fit_holdout())
+        premium = (shaped["forecast"]["by_scenario"]["tighter"]
+                   ["symbols"]["AAPL"]["net_option_pnl"])
+        assert shaped["forecast"]["annual_days"] == 365
+        assert premium["annual_low"] == pytest.approx(
+            premium["low_per_day"] * 365)
+        assert premium["annual_high"] == pytest.approx(
+            premium["high_per_day"] * 365)
+        assert premium["annual_low"] <= premium["annual_high"]
+
+    def test_the_default_horizon_is_the_holdout_windows_length(self):
+        """"The next period like the one you held out". Any other horizon is an
+        extrapolation the panel has to label."""
+        shaped = _split_run(_fit_holdout())
+        assert shaped["forecast"]["default_horizon_days"] == self.HOLDOUT_DAYS
+        assert shaped["forecast"]["horizon_choices"] == [30, 90, 365]
+
+    def test_the_fill_assumption_is_stamped_on_every_symbol(self):
+        """The row's `bid_fill_return` comes from a SECOND replay. A rate read
+        off one basis beside a scalar from the other is the pairing this stamp
+        exists to prevent."""
+        shaped = _split_run(_fit_holdout(fill_haircut=0.6))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["fill"] == {"basis": "mid", "fill_haircut": 0.6}
+
+
+class TestTheForecastRefusesRatherThanGuesses:
+    def test_an_in_sample_run_gets_no_forecast_at_all(self):
+        """MUTATION CHECK: compute it anyway and an operator reads a run-rate
+        extrapolated from the window the arm was CHOSEN on."""
+        shaped = _split_run(_fit_holdout(), in_sample_only=True)
+        assert shaped["forecast"] is None
+        assert shaped["forecast_refusal"] == T.FORECAST_REFUSAL_IN_SAMPLE
+        assert "IN-SAMPLE" in shaped["forecast_refusal"]
+
+    def test_a_run_with_no_holdout_window_is_in_sample_by_derivation(self):
+        rows = [_cell_row("base", "AAPL", "all", 0.10),
+                _cell_row("tighter", "AAPL", "all", 0.14)]
+        shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
+        assert shaped["forecast"] is None
+        assert shaped["forecast_refusal"]
+
+    def test_the_caveat_is_served_even_when_the_forecast_is_refused(self):
+        """The panel refuses to render on a BLANK caveat, so it must not be
+        something the payload can omit by accident."""
+        for shaped in (_split_run(_fit_holdout()),
+                       _split_run(_fit_holdout(), in_sample_only=True),
+                       S.shape_results({"run_id": "r", "status": "running"}, [])):
+            assert shaped["forecast_caveat"] == T.FORECAST_CAVEAT
+            assert shaped["forecast_caveat"].strip()
+
+    def test_forecast_and_refusal_are_never_both_set(self):
+        for shaped in (_split_run(_fit_holdout()),
+                       _split_run(_fit_holdout(), in_sample_only=True)):
+            assert (shaped["forecast"] is None) == (
+                shaped["forecast_refusal"] is not None)
+
+    def test_a_running_sweep_shapes_without_raising(self):
+        shaped = S.shape_results({"run_id": "r", "status": "running"}, [])
+        assert shaped["forecast"] is None
+        assert shaped["forecast_refusal"]
+
+
+class TestTheForecastNeverTurnsANullIntoAZero:
+    def test_a_null_option_pnl_yields_null_not_zero(self):
+        """`persist._finite` NULLs a non-finite number on the way in, so a null
+        here means "not measured". A forecast of $0/day for a symbol whose P&L
+        was not recorded is a number an operator would act on.
+
+        MUTATION CHECK: coalesce the input to `0.0` and the premium block
+        becomes a real-looking $0/day range.
+        """
+        rows = _fit_holdout()
+        for row in rows:
+            row["option_pnl"] = None
+        shaped = _split_run(rows)
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]
+        # No basis at all -> the symbol is EXCLUDED and named, not served as a
+        # row of nulls.
+        assert "AAPL" not in block or block["AAPL"]["net_option_pnl"] is None
+
+    def test_a_null_on_ONE_basis_leaves_the_other_intact(self):
+        rows = _fit_holdout()
+        for row in rows:
+            row["option_pnl"] = None
+        shaped = _split_run(rows)
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["net_option_pnl"] is None
+        assert block["total_pnl"] is not None
+
+    def test_both_bases_null_excludes_the_symbol_with_a_reason(self):
+        rows = _fit_holdout()
+        for row in rows:
+            row["option_pnl"] = None
+            row["total_return"] = None
+        shaped = _split_run(rows)
+        arm = shaped["forecast"]["by_scenario"]["tighter"]
+        assert arm["symbols"] == {}
+        assert arm["portfolio"]["excluded"] == {"AAPL": "null_inputs"}
+        assert arm["portfolio"]["net_option_pnl"] is None
+        assert arm["portfolio"]["refusal"]
+
+    def test_a_non_finite_value_that_escaped_the_store_is_still_null(self):
+        rows = _fit_holdout()
+        rows[2]["option_pnl"] = float("nan")
+        shaped = _split_run(rows)
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["net_option_pnl"] is None
+
+
+class TestTheForecastExcludesUnmeasuredSymbolsAndNamesThem:
+    def _two_symbols(self, holdout_state="measured"):
+        rows = []
+        for scenario in ("base", "tighter"):
+            for split in ("fit", "holdout"):
+                rows.append(_cell_row(scenario, "AAPL", split, 0.10))
+                rows.append(_cell_row(
+                    scenario, "NVDA", split, 0.20,
+                    state=(holdout_state if split == "holdout" and
+                           scenario == "tighter" else "measured")))
+        return rows
+
+    def _shaped(self, rows):
+        return S.shape_results(
+            {"run_id": "r", "status": "done", "in_sample_only": False,
+             "spec_json": json.dumps({"symbols": ["AAPL", "NVDA"],
+                                      "scenarios": [{"name": "tighter"}]})},
+            rows)
+
+    def test_a_measured_pair_on_both_symbols_includes_both(self):
+        arm = self._shaped(self._two_symbols())["forecast"][
+            "by_scenario"]["tighter"]["portfolio"]
+        assert arm["included"] == ["AAPL", "NVDA"]
+        assert arm["excluded"] == {}
+        assert arm["n_included"] == 2 and arm["n_symbols"] == 2
+
+    @pytest.mark.parametrize("state", ["insufficient", "low_activity", "error"])
+    def test_an_unmeasured_holdout_excludes_the_symbol_and_names_the_state(
+            self, state):
+        """"n of N" is not decoration: a portfolio line over four of six symbols
+        read as a line over six is exactly what the label prevents.
+
+        MUTATION CHECK: fall through to `measured` for an unknown state and a
+        `low-act` symbol's idle-capital rate joins the sum.
+        """
+        arm = self._shaped(self._two_symbols(state))["forecast"][
+            "by_scenario"]["tighter"]["portfolio"]
+        assert arm["included"] == ["AAPL"]
+        assert arm["excluded"] == {"NVDA": f"holdout: {state}"}
+        assert arm["n_included"] == 1 and arm["n_symbols"] == 2
+
+    def test_a_missing_cell_is_named_too(self):
+        rows = [r for r in self._two_symbols()
+                if not (r["symbol"] == "NVDA" and r["split"] == "holdout"
+                        and r["scenario_name"] == "tighter")]
+        arm = self._shaped(rows)["forecast"]["by_scenario"]["tighter"]["portfolio"]
+        assert arm["excluded"] == {"NVDA": "holdout: no cell"}
+
+    def test_the_portfolio_sum_is_over_the_included_symbols_only(self):
+        arm = self._shaped(self._two_symbols())["forecast"][
+            "by_scenario"]["tighter"]
+        premium = arm["portfolio"]["net_option_pnl"]
+        per_symbol = [arm["symbols"][s]["net_option_pnl"] for s in ["AAPL", "NVDA"]]
+        assert premium["low_per_day"] == pytest.approx(
+            sum(b["low_per_day"] for b in per_symbol))
+        assert premium["high_per_day"] == pytest.approx(
+            sum(b["high_per_day"] for b in per_symbol))
+        assert premium["annual_low"] == pytest.approx(
+            premium["low_per_day"] * 365)
+
+    def test_an_arm_with_no_included_symbol_refuses_with_a_reason(self):
+        arm = self._shaped(self._two_symbols("error"))["forecast"][
+            "by_scenario"]["tighter"]["portfolio"]
+        rows = [r for r in self._two_symbols("error")]
+        # Now break AAPL too, so nothing is left.
+        for row in rows:
+            if row["symbol"] == "AAPL" and row["split"] == "holdout":
+                row["measured"] = False
+                row["insufficient"] = True
+        empty = self._shaped(rows)["forecast"]["by_scenario"]["tighter"]["portfolio"]
+        assert empty["included"] == []
+        assert empty["n_included"] == 0
+        assert empty["net_option_pnl"] is None
+        assert empty["total_pnl"] is None
+        assert "nothing to sum" in empty["refusal"]
+        assert arm["n_included"] == 1   # the un-broken run still had one
+
+    def test_the_base_arm_gets_a_forecast_too(self):
+        """The base arm is an arm. Its run-rate is the comparison every other
+        arm's is read against, and refusing it would leave the panel with
+        nothing to anchor on."""
+        forecast = self._shaped(self._two_symbols())["forecast"]
+        assert set(forecast["by_scenario"]) == {"base", "tighter"}
+        assert forecast["by_scenario"]["base"]["portfolio"]["n_included"] == 2
+
+
+class TestTheForecastSuppressesTotalPnlWithoutACapitalBase:
+    """§Degrading for CC. A covered-call replay's base is the synthetic LOT, and
+    no persisted ROW carries it — only the Phase C artifact will. Scaling
+    `total_return` by the spec's $100k float would report a number the run never
+    traded, and labels are not a substitute for a denominator.
+    """
+
+    def _cc(self, strategy="covered_call"):
+        return S.shape_results(
+            {"run_id": "r", "status": "done", "in_sample_only": False,
+             "spec_json": json.dumps({
+                 "symbols": ["AAPL"], "scenarios": [{"name": "tighter"}],
+                 "starting_cash": 100_000.0, "strategy": strategy})},
+            _fit_holdout())
+
+    def test_a_covered_call_run_suppresses_the_total_basis(self):
+        """MUTATION CHECK: fall back to `starting_cash` and this reports a
+        dollar rate scaled by a float the CC replay never held."""
+        forecast = self._cc()["forecast"]
+        block = forecast["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert forecast["strategy"] == "covered_call"
+        assert forecast["capital_base"] is None
+        assert block["capital_base"] is None
+        assert block["total_pnl"] is None
+        assert block["net_option_pnl"] is not None, (
+            "the PREMIUM basis needs no denominator and must still serve")
+
+    def test_the_portfolio_total_is_suppressed_too_not_summed_over_a_subset(self):
+        portfolio = self._cc()["forecast"]["by_scenario"]["tighter"]["portfolio"]
+        assert portfolio["total_pnl"] is None
+        assert portfolio["net_option_pnl"] is not None
+        assert portfolio["included"] == ["AAPL"]
+
+    def test_an_absent_strategy_is_the_WHEEL_canonical_by_omission(self):
+        """Every stored spec today omits it. Treating absence as anything but
+        `wheel` would suppress the total basis on the entire live corpus."""
+        forecast = _split_run(_fit_holdout())["forecast"]
+        assert forecast["strategy"] == "wheel"
+        assert forecast["capital_base"] == 100_000.0
+
+    def test_a_wheel_spec_without_starting_cash_uses_the_shared_default(self):
+        """`identity.DEFAULT_STARTING_CASH` — the same default `canonical_spec`
+        fills in, so a spec that omits it and one that spells it out forecast
+        identically."""
+        shaped = S.shape_results(
+            {"run_id": "r", "status": "done", "in_sample_only": False,
+             "spec_json": json.dumps({"symbols": ["AAPL"],
+                                      "scenarios": [{"name": "tighter"}]})},
+            _fit_holdout())
+        assert shaped["forecast"]["capital_base"] == S.DEFAULT_STARTING_CASH

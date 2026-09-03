@@ -1961,8 +1961,20 @@ def run_sweep_cmd(args, config: Config, logger, *,
                     artifact_sink=(artifact_writer.write
                                    if artifact_writer is not None
                                    and artifact_writer.enabled else None),
+                    # FC-096 Phase E PR-1. The SAME enabled-gate as the cell
+                    # artifacts: `artifact_writer` is only constructed under
+                    # `--persist`, so a CLI run without it writes nothing
+                    # anywhere, sidecars included.
+                    bars_sink=(artifact_writer.write_bars
+                               if artifact_writer is not None
+                               and artifact_writer.enabled else None),
                     run_id=run_id,
                     engine_identity=identity,
+                    # Provenance only — `engine_identity` is the identity. It
+                    # was already in scope here and simply never reached the
+                    # artifact, which is why every stored object carried
+                    # `provenance.git_commit: null`.
+                    git_commit=git_commit,
                 )
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
         failure = f"{type(exc).__name__}: {exc}"

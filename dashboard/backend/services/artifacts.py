@@ -4,12 +4,22 @@ The engine writes ``gs://<bucket>/sim-artifacts/v1/<run_id>/
 <scenario>__<symbol>__<split>.json.gz`` as it replays; this reads one back for
 the console. Phase E renders it — this PR only makes it reachable.
 
-**Pure functions here, a thin router there**, the rule
-``services/sweeps.py`` states: FastAPI is absent from the CI image that actually
-runs this suite, so any rule living in ``routers/v2.py`` is a rule nobody checks.
-Everything a mistake would cost — a path segment that escapes the prefix, an
-object name that disagrees with the writer's, a missing artifact rendered as an
-empty one — is decided in this file.
+**Pure functions here, a thin router there**, the rule ``services/sweeps.py``
+states. Note the JUSTIFICATION has changed: FastAPI is no longer absent from the
+CI image — the root ``requirements.txt`` pins ``fastapi``/``starlette``/``httpx``
+and the ``_HAS_FASTAPI``-guarded router tests run there — but the rule stands,
+because a pure module is testable without wiring a router and a rule stated in
+two places drifts. Everything a mistake would cost — a path segment that escapes
+the prefix, an object name that disagrees with the writer's, a missing artifact
+rendered as an empty one — is decided in this file.
+
+Since FC-096 Phase E PR-1 this module serves TWO object families out of the same
+prefix: the per-CELL detail artifact (``<scenario>__<symbol>__<split>``) and the
+per-WINDOW **bars sidecar** (``bars/<SYMBOL>__<split>``). The sidecar has no
+scenario segment on purpose — the bars are the window, every arm replayed
+against them, and its buy-and-hold curve is the base arm's SCORED benchmark.
+Both names come from ``scenario_identity``; neither parser accepts the other's
+name.
 
 **The object name is IMPORTED, not restated.** ``scenario_identity`` (the flat
 copy of ``src/backtesting/scenarios/identity.py`` that
@@ -43,11 +53,13 @@ from typing import Any, Dict, Optional, Tuple
 
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
-        SYMBOL_RE, artifact_object_name, validate_scenario_name, validate_symbol,
+        SYMBOL_RE, artifact_object_name, bars_object_name,
+        validate_scenario_name, validate_symbol,
     )
 except ImportError:  # dashboard image: the same file, copied flat
     from scenario_identity import (  # type: ignore
-        SYMBOL_RE, artifact_object_name, validate_scenario_name, validate_symbol,
+        SYMBOL_RE, artifact_object_name, bars_object_name,
+        validate_scenario_name, validate_symbol,
     )
 
 logger = logging.getLogger(__name__)
@@ -155,6 +167,39 @@ def object_name(run_id: str, scenario: str, symbol: str, split: str) -> str:
     return artifact_object_name(run_id, scenario, symbol, split)
 
 
+def validate_bars_path(run_id: str, symbol: str,
+                       split: str) -> Tuple[str, str, str]:
+    """Check the THREE segments of a bars sidecar path and return them normalised.
+
+    FC-096 Phase E PR-1. The same rules as ``validate_path`` minus the scenario:
+    a sidecar is one per (run, symbol, split), because the bars ARE the window
+    and every arm of it replayed against them. Written as its own function
+    rather than as ``validate_path(run_id, BASE, symbol, split)`` so that a
+    reader of a URL cannot conclude a sidecar is per-arm — and so the error
+    messages name the segments this route actually has.
+    """
+    if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+        raise ArtifactPathError(
+            f"invalid run_id {str(run_id)[:32]!r}: expected 1-64 characters "
+            f"from [A-Za-z0-9_-]")
+    symbol = (symbol or "").upper()
+    if not SYMBOL_RE.match(symbol):
+        raise ArtifactPathError(
+            f"invalid symbol {str(symbol)[:32]!r}: expected an uppercase "
+            f"ticker of at most 16 characters")
+    if split not in SPLITS:
+        raise ArtifactPathError(
+            f"invalid split {str(split)[:32]!r}: expected one of "
+            f"{', '.join(SPLITS)}")
+    return run_id, symbol, split
+
+
+def bars_name(run_id: str, symbol: str, split: str) -> str:
+    """The validated object name for one window's bars sidecar."""
+    run_id, symbol, split = validate_bars_path(run_id, symbol, split)
+    return bars_object_name(run_id, symbol, split)
+
+
 def decode(raw: bytes) -> bytes:
     """The stored object's bytes -> the JSON bytes a client should get.
 
@@ -248,6 +293,30 @@ class ArtifactStore:
             raise ArtifactReadError(
                 f"the artifact object {name!r} exists but is EMPTY — a "
                 f"truncated or failed write, not a cell that did nothing")
+        return decode(raw)
+
+    def fetch_bars(self, run_id: str, symbol: str,
+                   split: str) -> Optional[bytes]:
+        """One window's bars sidecar, or ``None`` when the OBJECT is absent.
+
+        FC-096 Phase E PR-1. Identical policy to ``fetch``, and identical for a
+        reason: "absent" and "unreadable" send an operator to different places
+        here too, and a sidecar is absent for a whole population of runs —
+        every one replayed before PR-1 deployed — so ``None`` has to keep
+        meaning exactly one thing.
+        """
+        from google.cloud.exceptions import NotFound
+
+        name = bars_name(run_id, symbol, split)
+        blob = self._bucket().blob(name)
+        try:
+            raw = blob.download_as_bytes(timeout=30.0)
+        except NotFound:
+            return None
+        if not raw:
+            raise ArtifactReadError(
+                f"the bars object {name!r} exists but is EMPTY — a truncated "
+                f"or failed write, not a window with no bars")
         return decode(raw)
 
 

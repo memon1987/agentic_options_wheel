@@ -564,8 +564,10 @@ def run_sweep(
     bar_provider: Optional[object] = None,
     quiet_logs: bool = True,
     artifact_sink: Optional[Callable[[dict], None]] = None,
+    bars_sink: Optional[Callable[[dict], None]] = None,
     run_id: Optional[str] = None,
     engine_identity: Optional[str] = None,
+    git_commit: Optional[str] = None,
     vendor_guard: Optional[Callable[[Any], Any]] = None,
     quiet_exempt: Sequence[str] = (),
 ) -> SweepResult:
@@ -606,9 +608,28 @@ def run_sweep(
             An ERRORED cell never calls it, which is what makes
             "artifact count == non-error cell count" a meaningful completeness
             check on the terminal status row.
-        run_id / engine_identity: provenance stamped into each artifact. Pure
-            pass-through — nothing in the replay reads them — and both default to
-            ``None`` so a caller that wants no artifacts passes nothing at all.
+        bars_sink: optional callable handed one ``bars_artifact`` dict per
+            (symbol, split) WINDOW (FC-096 Phase E PR-1) — the decision-window
+            closes the replay saw and the engine-computed buy-and-hold curve.
+            Emitted from the ``base`` arm ONLY, which always runs first
+            (``_with_base_first``), and only after that arm's row exists: a
+            window whose materialisation failed, or whose base replay raised,
+            gets no sidecar at all, and the other arms of that window then
+            render their price/benchmark panels through the absent-sidecar
+            degrade path. One object per window rather than per cell because the
+            bars ARE the window — every arm replayed against them — and N copies
+            would invite reading arm C's chart as its own. Its failures are
+            counted apart from the cell artifacts' (``bars_written`` /
+            ``bars_failed``) so ``artifacts_complete`` still means "one artifact
+            per non-errored cell".
+        run_id / engine_identity / git_commit: provenance stamped into each
+            artifact and sidecar. Pure pass-through — nothing in the replay
+            reads them — and all default to ``None`` so a caller that wants no
+            artifacts passes nothing at all. ``git_commit`` was previously
+            unreachable from here, which is why every stored artifact carried
+            ``provenance.git_commit: null`` (FC-096 Phase E §Found while
+            planning 1); the CLI and the sim service both hold the value and now
+            pass it.
 
     Raises:
         OverrideError: from the up-front validation pass, before any replay
@@ -764,8 +785,10 @@ def run_sweep(
                         earnings_gaps=earnings_gaps,
                         views=views,
                         artifact_sink=artifact_sink,
+                        bars_sink=bars_sink,
                         run_id=run_id,
                         engine_identity=engine_identity,
+                        git_commit=git_commit,
                         sweep_max_dte=max_dte,
                     )
                     result.rows.append(row)
@@ -920,8 +943,10 @@ def _replay_one(
     run_sensitivity: bool, earnings_gaps: Optional[set] = None,
     views: Optional[Dict[int, Materialised]] = None,
     artifact_sink: Optional[Callable[[dict], None]] = None,
+    bars_sink: Optional[Callable[[dict], None]] = None,
     run_id: Optional[str] = None,
     engine_identity: Optional[str] = None,
+    git_commit: Optional[str] = None,
     sweep_max_dte: Optional[int] = None,
 ) -> ScenarioResult:
     """Replay ONE arm against a view of the shared window masked to its reach.
@@ -952,6 +977,18 @@ def _replay_one(
       ``artifacts_complete`` arithmetic (artifacts == non-error cells) true.
     * building the artifact itself raises -> same as the first case; it is
       inside the same guarded block, so a serialiser bug cannot cost a run.
+
+    ``bars_sink`` (FC-096 Phase E PR-1) is called only when this arm is the
+    ``base`` arm, in its OWN guard after ``_emit_artifact``. Base-arm-only
+    because the sidecar describes the WINDOW — the same materialised bars every
+    arm of it replayed against — and the buy-and-hold it carries is the scored
+    benchmark, which is identical across arms for a given window by
+    construction (``_buy_and_hold`` reads the closes and the starting cash, not
+    the arm's config). Base always runs first (``_with_base_first``), so the
+    sidecar is on disk before any other arm's cell artifact of that window is.
+    A base arm that RAISES never reaches this line, so that window has no
+    sidecar at all — which is the honest state, and the one §D-5's degrade path
+    is written for.
     """
     split, w_start, w_end = window
     haircut = (
@@ -1011,10 +1048,19 @@ def _replay_one(
                 scenario=scenario.name, symbol=symbol, window=window,
                 cfg_hash=cfg_hash, scenario_hash=scenario_hash,
                 run_id=run_id, engine_identity=engine_identity,
+                git_commit=git_commit,
                 arm_max_dte=max_dte,
                 sweep_max_dte=(materialised.max_dte if sweep_max_dte is None
                                else sweep_max_dte),
                 haircut=haircut, starting_cash=starting_cash,
+                report=report,
+            )
+        if bars_sink is not None and scenario.name == BASE_SCENARIO_NAME:
+            _emit_bars(
+                bars_sink, bars, symbol=symbol, window=window,
+                daily=result.daily, benchmark=report.benchmark,
+                dividends=dividends, run_id=run_id,
+                engine_identity=engine_identity, git_commit=git_commit,
             )
         return row
     except Exception as exc:  # noqa: BLE001 - one arm must not lose the others
@@ -1036,9 +1082,10 @@ def _replay_one(
 def _emit_artifact(sink, result, *, scenario: str, symbol: str,
                    window: Tuple[str, date, date], cfg_hash: str,
                    scenario_hash: str, run_id: Optional[str],
-                   engine_identity: Optional[str], arm_max_dte: int,
+                   engine_identity: Optional[str], git_commit: Optional[str],
+                   arm_max_dte: int,
                    sweep_max_dte: Optional[int], haircut: float,
-                   starting_cash: float) -> None:
+                   starting_cash: float, report) -> None:
     """Build this cell's artifact and hand it to ``sink``. Swallows everything.
 
     The import is LOCAL on purpose: ``reporting.artifact`` pulls in the cycle
@@ -1054,6 +1101,11 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
     which is the whole point of stamping it: the shared window may reach much
     further because a different arm asked for it, and an artifact that reported
     the parent's reach would describe a chain this cell never saw.
+
+    ``report`` is THIS arm's scored ``FitnessReport`` (FC-096 Phase E PR-1).
+    Only its ``benchmark`` is read, and it is COPIED rather than re-derived: the
+    row's ``benchmark_return`` and ``excess_return`` came off that same object,
+    so a stamp built any other way could disagree with the row it sits beside.
     """
     split, w_start, w_end = window
     try:
@@ -1062,10 +1114,16 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
         sink(cell_artifact(result, ArtifactMeta(
             run_id=run_id, scenario=scenario, symbol=symbol, split=split,
             scenario_hash=scenario_hash, config_hash=cfg_hash,
-            engine_identity=engine_identity,
+            engine_identity=engine_identity, git_commit=git_commit,
             arm_max_dte=arm_max_dte, sweep_max_dte=sweep_max_dte,
             window_start=w_start, window_end=w_end,
             fill_haircut=haircut, starting_cash=starting_cash,
+            benchmark=(None if report is None else report.benchmark),
+            # The wheel's capital base IS its starting cash. Phase C stamps a
+            # lot-based base for a covered-call replay; it is passed explicitly
+            # rather than defaulted here so the covered-call path has to make
+            # the choice rather than inherit the wheel's.
+            capital_base=starting_cash,
         )))
     except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
         logger.warning(
@@ -1073,6 +1131,45 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
             "is unaffected",
             event_category="backtest", event_type="sim_artifact_write_failed",
             scenario=scenario, symbol=symbol, split=split, run_id=run_id,
+            error=f"{type(exc).__name__}: {exc}"[:300],
+        )
+
+
+def _emit_bars(sink, bars, *, symbol: str, window: Tuple[str, date, date],
+               daily, benchmark, dividends, run_id: Optional[str],
+               engine_identity: Optional[str],
+               git_commit: Optional[str]) -> None:
+    """Build this window's bars sidecar and hand it to ``sink``. Swallows everything.
+
+    FC-096 Phase E PR-1. Its own guard, separate from ``_emit_artifact``'s, for
+    a reason the shared one would not give: the two objects fail independently
+    (a sidecar can be too large, or the curve builder can hit a benchmark shape
+    it has not seen) and a sidecar failure must not take the CELL artifact of
+    the same base cell down with it. Everything else is ``_emit_artifact``'s
+    policy verbatim — the import lives INSIDE the ``try`` so an ImportError
+    costs the evidence and nothing else, and no failure here ever reaches
+    ``_replay_one``'s handler to turn a replayed cell into an error row.
+
+    Called for the ``base`` arm only; the caller enforces that, because the rule
+    is about which cell in the loop this is and not about the payload.
+    """
+    split, w_start, w_end = window
+    try:
+        from ..reporting.artifact import bars_artifact
+
+        sink(bars_artifact(
+            bars, symbol, window,
+            daily=daily, benchmark=benchmark, dividends=dividends,
+            run_id=run_id, engine_identity=engine_identity,
+            git_commit=git_commit,
+        ))
+    except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
+        logger.warning(
+            "Bars sidecar could not be produced for this window — its cells' "
+            "results are unaffected",
+            event_category="backtest", event_type="sim_bars_write_failed",
+            symbol=symbol, split=split, run_id=run_id,
+            window=f"{w_start}..{w_end}",
             error=f"{type(exc).__name__}: {exc}"[:300],
         )
 

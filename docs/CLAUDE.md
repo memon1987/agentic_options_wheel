@@ -1075,6 +1075,7 @@ this revision's `OPERATORS` allowlist.
 | `GET /api/v2/sweeps` | IAP only | recent runs, latest status per `run_id`, `stuck` label |
 | `GET /api/v2/sweeps/{run_id}` | IAP only | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
 | `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` | IAP only | one cell's **detail artifact** — equity curve, full ledger, cycles, rolls, rejection tally (FC-096 Phase B) |
+| `GET /api/v2/sweeps/{run_id}/bars/{symbol}/{split}` | IAP only | one window's **bars sidecar** — the decision-window OHLCV the replay saw plus the engine's buy-and-hold curve (FC-096 Phase E). Note the missing scenario segment: it is one object per (run, symbol, split), written from the BASE arm |
 | `POST /api/v2/sweeps` | **IAP operator**: valid signed assertion + email in `OPERATORS` | validate → 409 gate → write `submitted` → launch the Job → **202** |
 | `POST /api/v2/sims/run` | **the same** | proxy to the private `sim-service` with an **OIDC ID token** (`routers/live.py`'s pattern, NOT `_launch_job`'s control-plane OAuth token — each is a 401 at the other end); returns the service's status code and body **verbatim**, because its 409/422 bodies carry the estimate, the missing symbol-days and the remedy |
 | `GET /api/v2/sims/pins` | IAP only | the weekly battery's standing questions — active by default, `?include_inactive=true` for the retired ones, specs decoded (FC-096 Phase B B4) |
@@ -1118,6 +1119,39 @@ because shortening the bound is the dangerous direction.
   function the writer calls — not a second implementation. `__` is the field
   separator and `validate_scenario_name` forbids it in a name, which is what
   makes the `rsplit('__', 2)` parser sound.
+- **The bars sidecar is a SECOND object family under the same prefix**
+  (FC-096 Phase E), at
+  `gs://<bucket>/sim-artifacts/v1/<run_id>/bars/<SYMBOL>__<split>.json.gz`, and
+  it is **one per (run, symbol, split), not per cell** — written from the BASE
+  arm only, which always runs first. It carries the decision-window OHLCV the
+  replay actually saw and the **engine-computed buy-and-hold curve**, built from
+  the base arm's *scored* `FitnessReport.benchmark` rather than re-derived from
+  the spec's cash. It exists because there is no durable bar series the
+  dashboard could read instead: `BarStore` is a per-container local parquet
+  cache by explicit design (`bar_store.py:50-52`), no Job or service mounts a
+  GCS volume, neither bucket has a bars prefix, and
+  `stock_history_from_alpaca` covers the LIVE universe only — never a candidate,
+  and never the replay's own settlement-clamped series. Its counters
+  (`bars_written`/`bars_failed`, event `sim_bars_write_failed`) are kept apart
+  from the cell counters, because **`artifacts_complete` still means "one
+  artifact per non-errored CELL"** and folding them would break that arithmetic
+  on any multi-arm sweep. Its names come from
+  `scenario_identity.bars_object_name` / `parse_bars_object_name`, and neither
+  parser accepts the other family's name.
+- **Every run replayed before Phase E deployed has no sidecar, and that is
+  normal.** So does any window whose base arm errored. The console degrades:
+  BQ stock history for a live symbol (captioned, no markers) or the absent
+  state, and the B&H curve is omitted while the row's `benchmark_return` scalar
+  still shows. Re-submitting the same spec produces one — and it WILL replay,
+  because Phase E moved `engine_identity`.
+- **Two additive stamps landed on the cell artifact in the same PR**, both
+  REQUIRED: `benchmark` (this cell's scored buy-and-hold, or `null`) and
+  `provenance.capital_base` (the denominator every ratio on this cell is taken
+  over — `starting_cash` for a wheel replay, the synthetic lot's value for a
+  Phase C covered-call one). The console divides by `capital_base`, never by
+  `starting_cash`. `provenance.git_commit` was also **null on every artifact
+  ever stored** until this PR: `run_sweep` had no parameter for it while both
+  callers held the value.
 
 - **Nothing here is public any more** (FC-096 Phase D, 2026-09-02). The whole
   dashboard is behind IAP and `allUsers` is off the invoker policy, which closed
@@ -1138,9 +1172,20 @@ because shortening the bound is the dangerous direction.
   longer exists, and the dashboard is down on the next page load with nothing in
   the application logs — the application never started.
 - **Everything decidable lives in `services/sweeps.py`, not in the router.**
-  FastAPI is absent from the image Cloud Build tests with, so a rule written in
-  `routers/v2.py` is a rule nobody checks — the same reason `services/pause_alert.py`
-  exists. `tests/test_dashboard_sweeps.py` exercises the service module directly.
+  ⚠️ This section used to justify that with "FastAPI is absent from the image
+  Cloud Build tests with", and **that has been false since the root
+  `requirements.txt` pinned `fastapi==0.109.0` / `starlette==0.35.1` /
+  `httpx==0.26.0`** (`requirements.txt:152-155`): the `_HAS_FASTAPI`-guarded
+  router tests DO run in CI today, and `tests/_dashboard_path.HAS_TESTCLIENT`
+  is the separate, narrower guard for the ones that need `fastapi.testclient`.
+  The RULE survives its retired justification, for two better reasons: a pure
+  service module is testable without wiring a router, and a rule stated twice
+  (once in the router, once in the service) is a rule that drifts — the same
+  reason `services/pause_alert.py` exists. `tests/test_dashboard_sweeps.py`
+  exercises the service module directly, and the **CI-equivalent venv built
+  from the root `requirements.txt` alone** is the authoritative pytest
+  environment. Do not add the dashboard's own `requirements.txt` to it: its
+  pydantic pin clashes and produces five spurious `test_sim_service` failures.
 - **`shape_results` is asserted EQUAL to `report.py`** on a real sweep, so `/sims`
   and `sweep.md` cannot disagree about a median, a delta, or which cells count.
   Three constants that could not be imported (the report prose, `ENGINE_VERSION`,

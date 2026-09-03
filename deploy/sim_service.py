@@ -698,8 +698,16 @@ def _replay(run: "_Run") -> None:
             artifact_sink=(run.artifact_writer.write
                            if run.artifact_writer is not None
                            and run.artifact_writer.enabled else None),
+            # FC-096 Phase E PR-1, under the same enabled-gate as the cell
+            # artifacts: a deployment with no artifact bucket writes neither.
+            bars_sink=(run.artifact_writer.write_bars
+                       if run.artifact_writer is not None
+                       and run.artifact_writer.enabled else None),
             run_id=run.run_id,
             engine_identity=run.identity,
+            # Already held on the run (`GIT_COMMIT` is set on the service by
+            # `cloudbuild.yaml`); it simply never reached the artifact.
+            git_commit=run.git_commit,
             vendor_guard=_guard,
             quiet_exempt=(__name__,),
         )

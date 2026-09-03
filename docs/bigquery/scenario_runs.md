@@ -436,6 +436,26 @@ something false, and all four are worth knowing before querying one:
   alone cannot distinguish a cash account from an assigned one holding the same
   dollars, which is the first thing a reader needs from a wheel drawdown.
 
+Three more stamps landed in **FC-096 Phase E PR-1**, all REQUIRED and all
+additive:
+
+- **`benchmark`** — THIS cell's scored buy-and-hold, `{shares, entry_day,
+  entry_price, exit_day, exit_price, dividends_per_share_total, capital_base,
+  final_value, total_return}`, or `null` when the window had no usable
+  entry/exit close. Every field is COPIED off the `FitnessReport.benchmark` the
+  row's `benchmark_return` and `excess_return` came from, so the artifact and
+  its row cannot disagree. The console cross-checks it against the sidecar's
+  `buy_and_hold.final_value` and hides the curve on a mismatch rather than
+  drawing it.
+- **`provenance.capital_base`** — the denominator every ratio on this cell is
+  taken over. `starting_cash` for a wheel replay; the synthetic lot's value for
+  a Phase C covered-call one. **Divide by this, never by `starting_cash`**: on
+  a CC artifact the two differ by the whole position size, and the wrong one
+  looks entirely plausible.
+- **`provenance.git_commit`** — now POPULATED. It was `null` on every artifact
+  ever stored: `run_sweep` had no parameter for it, while the CLI and the sim
+  service both held the value.
+
 `"schema": 1` is in the JSON and mirrored by the `v1` in the object prefix; a
 frozen-fixture test (`tests/test_sim_artifacts.py`) pins the full key set,
 including the per-`kind` `LedgerEvent.detail` keys and the roll record's — which
@@ -445,13 +465,86 @@ is `CallRoller.execute_roll`'s success dict (`success`, `underlying`,
 production's record carries no date at all (the log line's timestamp is the
 date). Adding a field is additive; removing or renaming one bumps both.
 
-**What the artifact deliberately does NOT carry: any price series.** There is no
-underlying bar history and no buy-and-hold benchmark curve on the object — only
+**What the CELL artifact deliberately does NOT carry: any price series.** There
+is no underlying bar history and no buy-and-hold benchmark *curve* on it — only
 what the replay itself produced (trades, the equity curve, cycles, rolls, the
-tally). Phase E's price-overlay and vs-benchmark components read bars through
-their own path, defined in Phase E's plan; duplicating a bar series into every
-cell's artifact would multiply one shared series by `arms x symbols x splits` and
-create a second, staler copy of data the lake already owns.
+tally) plus the benchmark SCALARS above. Duplicating a bar series into every
+cell's artifact would multiply one shared series by `arms x symbols x splits`.
+FC-096 Phase E resolves the "read bars through their own path" placeholder this
+paragraph used to carry: it is the **bars sidecar** below.
+
+## The bars sidecar (FC-096 Phase E PR-1)
+
+One gzipped JSON object per **(run, symbol, split) window** — not per cell:
+
+```
+gs://gen-lang-client-0607444019-options-data/sim-artifacts/v1/<run_id>/bars/<SYMBOL>__<split>.json.gz
+```
+
+Read one with `GET /api/v2/sweeps/{run_id}/bars/{symbol}/{split}` (served
+decompressed, same 400/404/502/503 semantics as the cell route). Names come from
+`scenario_identity.bars_object_name` / `parse_bars_object_name`, and neither
+family's parser accepts the other's name.
+
+**Why it exists at all.** There is no durable bar series the dashboard could
+read instead. `BarStore` is a LOCAL parquet cache by explicit design
+(`bar_store.py:1,50-52`); the sim service builds one on its own filesystem and
+no Job or service mounts a GCS volume; neither bucket has a bars prefix; and
+BigQuery's `stock_history_from_alpaca` covers the LIVE universe plus SPY from a
+365-day backfill — never a candidate symbol, and never the replay's own
+settlement-clamped series. Building a durable bar store would be a Phase A-class
+change; the sidecar is smaller and is the replay's own data.
+
+```
+{"schema": 1,
+ "provenance": {run_id, symbol, split, window:{start,end}, first_decision_day,
+                last_decision_day, engine_identity, git_commit, generated_at,
+                source:"materialised bars", data_from, data_to, bars_in_window},
+ "bars": [{date, open, high, low, close, volume}, ...],
+ "buy_and_hold": null | {capital_base, shares, entry_day, entry_price, exit_day,
+                         exit_price, dividends_per_share_total, final_value,
+                         daily:[{date, value}, ...]}}
+```
+
+Five properties are the point:
+
+- **Base arm only.** `base` always runs first (`_with_base_first`), and the bars
+  ARE the window — every arm replayed against the same materialisation, and
+  `_buy_and_hold` reads the closes and the starting cash, not the arm's config.
+  N copies would invite reading arm C's chart as its own.
+- **The clip is the DECISION-DAY bounds** `[daily[0].day, daily[-1].day]` — the
+  same bounds `compute_fitness` measures `days` over and `_buy_and_hold` enters
+  and exits on. That is what makes `daily[-1].value == BuyAndHold.final_value`
+  hold by construction rather than by coincidence. `data_from`/`data_to` still
+  stamp the FULL materialised span, warm-up included, as the freshness fact.
+- **The curve is the ENGINE's, not a re-derivation.** `shares`, `entry_price`
+  and `capital_base` are copied off the scored `BuyAndHold` instance;
+  `value_t = capital_base + shares×(close_t − entry_price) + shares×div_ps(entry_day, t]`,
+  where `div_ps` is `DividendSchedule.total_between` — half-open at the entry day,
+  because a buyer at that close does not collect a dividend going ex that day.
+  For a Phase C covered-call benchmark `capital_base` is the LOT value, and
+  re-deriving shares from the spec's cash would silently describe a different
+  investment.
+- **`buy_and_hold` is `null` exactly when the report had no benchmark.** A block
+  of nulls would read as "the benchmark was flat".
+- **A window whose materialisation failed, or whose BASE arm raised, gets no
+  sidecar** — and the other arms' rows are unaffected. So does every run
+  replayed before Phase E deployed. A 404 here is normal; the console degrades
+  to BQ stock history (captioned, no markers) or the absent state, and the row's
+  `benchmark_return` scalar still shows.
+
+Storage is best-effort like the cell artifacts (`sim_bars_write_failed`,
+counters `bars_written`/`bars_failed`), but the counters are kept SEPARATE:
+`artifacts_complete` means "one artifact per non-errored CELL", and folding a
+per-window count into it would break that arithmetic on any multi-arm sweep.
+`tests/fixtures/sim_bars_schema_v1.json` freezes the key set on the same terms
+as the cell artifact's.
+
+⚠️ **Phase E PR-1 moved `engine_identity`** (it touches `src/**`), so every
+stored dedup key was invalidated once. The first re-submit of each old spec
+replays, and the first Saturday battery after the merge is the expensive one.
+That cost is borne by the REQUIRED `benchmark`/`capital_base`/`git_commit`
+stamps regardless; the sidecar's marginal identity cost is zero.
 
 **Storage is best-effort and accounted for.** Artifacts are evidence, not
 results: a GCS failure logs `sim_artifact_write_failed`, is counted, and never

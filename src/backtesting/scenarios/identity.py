@@ -158,6 +158,65 @@ def artifact_object_name(run_id: str, scenario: str, symbol: str,
             f"{ARTIFACT_NAME_SEPARATOR}{split}.json.gz")
 
 
+# Object-name sub-prefix for the per-(run, symbol, split) BARS SIDECAR
+# (FC-096 Phase E PR-1). It sits INSIDE the run's directory rather than beside
+# it — ``<prefix>/<run_id>/bars/<SYMBOL>__<split>.json.gz`` — so one run's whole
+# evidence set is still one `gcloud storage ls` away, and so a bars object can
+# never be mistaken for a cell artifact by any reader: a cell name carries THREE
+# ``__``-separated fields directly under the run directory, and a bars name
+# carries two inside a directory of its own. A scenario literally named ``bars``
+# is still unambiguous — it writes ``bars__SYM__split.json.gz``, an object, not
+# this directory.
+BARS_SUBPREFIX = "bars"
+
+
+def bars_object_name(run_id: str, symbol: str, split: str) -> str:
+    """The GCS object name for one window's bars sidecar (FC-096 Phase E PR-1).
+
+    ``<prefix>/<run_id>/bars/<SYMBOL>__<split>.json.gz``. Here for exactly the
+    reason ``artifact_object_name`` is here: the engine writes these and the
+    dashboard serves them, and the dashboard ships this module flat with no
+    engine behind it. One function, imported by both.
+
+    **There is no scenario field, and that is the design.** The sidecar is
+    emitted from the BASE arm only and describes the WINDOW — the bars every arm
+    of that window replayed against, plus the base arm's scored buy-and-hold —
+    so a per-arm copy would be N identical objects and an invitation to read the
+    third arm's curve as its own.
+    """
+    return (f"{ARTIFACT_PREFIX}/{run_id}/{BARS_SUBPREFIX}/{symbol}"
+            f"{ARTIFACT_NAME_SEPARATOR}{split}.json.gz")
+
+
+def parse_bars_object_name(name: str) -> Dict[str, str]:
+    """``{run_id, symbol, split}`` from a bars sidecar object name.
+
+    The inverse of ``bars_object_name``. It INSISTS on the ``bars/`` segment
+    rather than merely tolerating it: the two object families share a prefix,
+    and a parser that accepted either shape would eventually read one as the
+    other and hand a caller a curve from the wrong window.
+
+    Raises ``ValueError`` on anything that is not one of these names.
+    """
+    if not name.endswith(".json.gz"):
+        raise ValueError(f"not a bars object name (no .json.gz): {name!r}")
+    stem = name[: -len(".json.gz")]
+    head, _, tail = stem.rpartition("/")
+    segments = head.split("/")
+    if len(segments) < 2 or segments[-1] != BARS_SUBPREFIX or not segments[-2]:
+        raise ValueError(
+            f"not a bars object name (expected a {BARS_SUBPREFIX!r} directory "
+            f"segment under the run id): {name!r}")
+    run_id = segments[-2]
+    fields = tail.rsplit(ARTIFACT_NAME_SEPARATOR, 1)
+    if len(fields) != 2 or not all(fields):
+        raise ValueError(
+            f"not a bars object name (expected "
+            f"<symbol>__<split>.json.gz): {name!r}")
+    symbol, split = fields
+    return {"run_id": run_id, "symbol": symbol, "split": split}
+
+
 def parse_artifact_object_name(name: str) -> Dict[str, str]:
     """``{run_id, scenario, symbol, split}`` from an artifact object name.
 
@@ -175,6 +234,15 @@ def parse_artifact_object_name(name: str) -> Dict[str, str]:
         raise ValueError(f"not an artifact object name (no .json.gz): {name!r}")
     head, _, tail = stem.rpartition("/")
     run_id = head.rsplit("/", 1)[-1] if head else ""
+    # A bars sidecar is NOT a cell artifact. Its two-field stem already fails
+    # the arity check below, but the directory test is STATED rather than relied
+    # upon: the two families share a prefix, and a parser that answered
+    # `run_id="bars"` for one of them would be one rename away from being wrong
+    # silently instead of loudly.
+    if run_id == BARS_SUBPREFIX:
+        raise ValueError(
+            f"not an artifact object name — this is a bars sidecar; use "
+            f"parse_bars_object_name: {name!r}")
     parts = tail.rsplit(ARTIFACT_NAME_SEPARATOR, 2)
     if len(parts) != 3 or not all(parts):
         raise ValueError(

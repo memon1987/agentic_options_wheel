@@ -1659,3 +1659,69 @@ class TestTheAppItself:
             response = client.post("/simulate", json=spec())
         assert response.status_code == 500
         assert "wiring exploded" in response.json()["detail"]
+
+
+# ==========================================================================
+# FC-096 Phase E PR-1 — the sidecar sink and the git_commit stamp
+#
+# The service already held both values and passed neither. `git_commit` was the
+# reason EVERY stored artifact carried `provenance.git_commit: null`
+# (§Found while planning 1), and the sidecar is what the console's price chart
+# and buy-and-hold curve are drawn from.
+# ==========================================================================
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
+class TestTheServicePassesTheSidecarSinkAndTheCommit:
+    def _record(self, monkeypatch):
+        seen = {}
+
+        def recording_run_sweep(*args, **kwargs):
+            seen.update(kwargs)
+            return sweep_result()
+
+        monkeypatch.setattr("src.backtesting.scenarios.run_sweep",
+                            recording_run_sweep)
+        return seen
+
+    def test_with_a_bucket_both_sinks_are_the_writers_own_methods(
+            self, wired, monkeypatch):
+        """MUTATION CHECK: pass `artifact_writer.write` for both and every
+        sidecar lands at a cell artifact's address, overwriting one."""
+        monkeypatch.setenv("SIM_ARTIFACT_BUCKET", "test-bucket")
+        monkeypatch.setenv("GIT_COMMIT", "abc1234")
+        seen = self._record(monkeypatch)
+
+        sim._simulate(spec())
+        sim._WORKER.join(timeout=5)
+
+        assert seen["artifact_sink"] is not None
+        assert seen["bars_sink"] is not None
+        assert seen["artifact_sink"].__name__ == "write"
+        assert seen["bars_sink"].__name__ == "write_bars"
+        # The SAME writer instance, so one run's objects share a run id.
+        assert seen["artifact_sink"].__self__ is seen["bars_sink"].__self__
+        assert seen["git_commit"] == "abc1234"
+
+    def test_no_bucket_means_neither_sink(self, wired, monkeypatch):
+        """`SIM_ARTIFACT_BUCKET=""` is the explicit off switch, and the sidecar
+        rides the SAME gate: a deployment with artifacts off writes neither."""
+        monkeypatch.setenv("SIM_ARTIFACT_BUCKET", "")
+        seen = self._record(monkeypatch)
+
+        sim._simulate(spec())
+        sim._WORKER.join(timeout=5)
+
+        assert seen["artifact_sink"] is None
+        assert seen["bars_sink"] is None
+
+    def test_an_unset_commit_stamps_null_rather_than_an_empty_string(
+            self, wired, monkeypatch):
+        """A manual `gcloud builds submit` supplies no `$COMMIT_SHA`. An empty
+        string in the stamp would read as a commit."""
+        monkeypatch.delenv("GIT_COMMIT", raising=False)
+        seen = self._record(monkeypatch)
+
+        sim._simulate(spec())
+        sim._WORKER.join(timeout=5)
+
+        assert seen["git_commit"] is None

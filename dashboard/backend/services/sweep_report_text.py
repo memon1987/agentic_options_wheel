@@ -17,6 +17,15 @@ dashboard that quietly disagrees with the CLI about what a number means.
 
 Edit `report.py` FIRST, then copy the new value across here in the same
 commit. The test names the exact constant that diverged.
+
+**One constant here is deliberately NOT a copy.** `FORECAST_CAVEAT` (FC-096
+Phase E PR-1) has no original in `report.py`, because the forecast is a
+DASHBOARD component: `report.py` and the CLI markdown do not render one, and
+adding the prose there to satisfy a symmetry nothing reads would be a second
+place to keep it true. The fork test knows the exception by name
+(`DASHBOARD_ONLY_PROSE`) and asserts the set is exactly that one constant, so a
+future addition here cannot quietly join it. If the CLI report ever prints the
+forecast, this constant moves to `report.py` and the exception set empties.
 """
 
 BASE_SCENARIO_NAME = 'base'
@@ -134,3 +143,29 @@ DTE_REACH_BIAS = ('Arms reaching past 7 DTE are measured on THINNER data, and th
  'at these tenors, and the premium shortfalls quoted above were measured at 7 '
  "DTE. Read a long-DTE arm's RANK against other long-DTE arms; a "
  'long-versus-short comparison carries this on top of every bias listed here.')
+
+# FC-096 Phase E PR-1. DASHBOARD-ONLY prose — see the module docstring. The
+# forecast panel refuses to render on a blank caveat, so this constant is
+# load-bearing rather than decorative: it is the sentence that keeps two
+# extrapolated run-rates from being read as a confidence interval.
+FORECAST_CAVEAT = (
+    'Two run-rates, extrapolated. The bounds of each are the fit and holdout '
+    "windows' per-calendar-day rates over the row's requested window, scaled "
+    'to the horizon; they are NOT a confidence interval — one regime, two '
+    'windows, one engine whose premium is understated on both legs (see the '
+    'biases below). PREMIUM is cash-basis net option P&L: buybacks and fees '
+    'are inside, and options still open at window end are counted at their '
+    'sale price, unmarked — a wheel holding assigned shares writes MORE calls '
+    'while it loses, so this rate can rise while the strategy fails. TOTAL '
+    'includes the stock leg marked at the last close. Each symbol is an '
+    'independent replay on its own capital; the portfolio line is a sum over '
+    'the symbols measured in both windows, named. An in-sample run has no '
+    'forecast.')
+
+# What an `in_sample_only` run gets instead of a forecast. A run measured on the
+# window it would be chosen from has no out-of-sample rate to bound anything
+# with, so there is no second point and the "range" would be one number twice.
+FORECAST_REFUSAL_IN_SAMPLE = (
+    'This run is IN-SAMPLE ONLY, so there is no forecast. The range needs two '
+    'windows — a fit rate and a holdout rate — and an in-sample run has only '
+    'the window it was chosen from. Re-run with a holdout.')
