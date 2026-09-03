@@ -207,6 +207,27 @@ describe('the fill label (review round 1, F4)', () => {
     expect(labelOf()).toBe(ENGINE_DEFAULT);
   });
 
+  it('when the two DISAGREE, the artifact wins — it is the ledger on screen', () => {
+    // The captured run's artifact and forecast happen to agree, which would let
+    // a swapped source order pass unnoticed. They disagree here on both halves:
+    // the artifact is the object whose events, cycles and equity curve are being
+    // rendered, so its own stamp is what the label must describe. The forecast's
+    // fill belongs to a projection, not to this ledger.
+    const bidReplay = normaliseArtifact({
+      ...artifact13cc,
+      provenance: {
+        ...artifact13cc.provenance,
+        fill: { basis: 'bid', fill_haircut: 0.1 },
+      },
+    })!;
+    show('base', 'fit', { artifact: bidReplay });
+    expect(labelOf()).toBe('fill: bid · haircut 10% (engine default)');
+    // …and not the forecast's `mid` / 25%, which is what reading the forecast
+    // first produced.
+    expect(labelOf()).not.toMatch(/mid/);
+    expect(labelOf()).not.toMatch(/25%/);
+  });
+
   it('falls back to the forecast when there is no artifact', () => {
     show('base', 'fit', { artifact: null });
     expect(labelOf()).toBe(ENGINE_DEFAULT);
