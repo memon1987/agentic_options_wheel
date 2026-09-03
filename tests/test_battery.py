@@ -1528,3 +1528,62 @@ class TestNothingTouchesGCP:
         monkeypatch.setattr(bigquery, "Client", refuse)
         writer = FakeWriter()
         assert writer.list_pins() == []
+
+
+# ==========================================================================
+# FC-096 Phase E PR-1 — the battery inherits the sidecar via `run_sweep_cmd`
+#
+# The battery submits through the ORDINARY sweep machinery, so it needs no
+# sidecar code of its own — but "inherits it" is a claim, and the Saturday
+# battery is where most sidecars will actually be written (the standing set is
+# one sweep per live symbol, every week). If it did not inherit, the console
+# would render the operator's ad-hoc runs and nothing else.
+# ==========================================================================
+class TestTheBatteryInheritsTheBarsSidecar:
+    def _record(self, monkeypatch):
+        import src.backtesting.scenarios as scenarios_pkg
+
+        calls = []
+
+        def recording_run_sweep(*args, **kwargs):
+            calls.append(kwargs)
+            return clean_sweep()
+
+        monkeypatch.setattr(scenarios_pkg, "run_sweep", recording_run_sweep)
+        return calls
+
+    def test_every_battery_item_hands_run_sweep_both_sinks(self, wired,
+                                                           monkeypatch):
+        """MUTATION CHECK: gate the sidecar on anything other than
+        `artifact_writer.enabled` — a `submitted_via` check, say — and the
+        weekly battery silently stops producing them.
+        """
+        monkeypatch.setenv("SIM_ARTIFACT_BUCKET", "test-bucket")
+        monkeypatch.setattr(
+            "src.backtesting.reporting.artifact_store._storage_client",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("no GCS client may be built here")))
+        calls = self._record(monkeypatch)
+
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        assert calls, "the battery submitted nothing"
+        for kwargs in calls:
+            assert kwargs["artifact_sink"] is not None
+            assert kwargs["bars_sink"] is not None
+            assert kwargs["bars_sink"].__name__ == "write_bars"
+            assert kwargs["artifact_sink"].__self__ is kwargs["bars_sink"].__self__
+
+    def test_with_artifacts_switched_off_neither_sink_is_passed(
+            self, wired, monkeypatch):
+        """`SIM_ARTIFACT_BUCKET=""` — the explicit off switch. The sidecar rides
+        the same gate, so no GCS client is built for either."""
+        monkeypatch.setenv("SIM_ARTIFACT_BUCKET", "")
+        calls = self._record(monkeypatch)
+
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        assert calls
+        for kwargs in calls:
+            assert kwargs["artifact_sink"] is None
+            assert kwargs["bars_sink"] is None

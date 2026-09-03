@@ -423,8 +423,12 @@ async def pause_alert_check(
 # what the allowlist permits, what the caps are, whether another sweep is
 # running, what the launch body looks like, how a cell is classified — lives
 # in `services/sweeps.py`, which the root test suite exercises directly.
-# FastAPI is absent from the bot's CI image, so anything decided in this file
-# is decided untested.
+# FastAPI is NO LONGER absent from the bot's CI image — the root
+# `requirements.txt` pins `fastapi`/`starlette`/`httpx`, so the
+# `_HAS_FASTAPI`-guarded route tests do run there — but the rule stands on its
+# own merits: a rule stated in the router AND in the service is a rule that
+# drifts, and only the service half has the pure tests. Keep deciding things in
+# `services/`.
 #
 # EVERY ROUTE HERE IS BEHIND IAP (FC-096 Phase D). There is no anonymous
 # caller any more: `allUsers` was removed from the service's invoker policy at
@@ -780,9 +784,11 @@ def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
     blocking I/O call. The other routes here are `async` because they await
     `httpx` or call BigQuery through a service that is already offloaded.
 
-    Exposure: this sits on the public dashboard until IAP lands. Same class as
-    the rest of `/api/v2` (FC-094 / Phase D), called out in the plan's open
-    questions rather than quietly.
+    Exposure: **IAP only** (FC-096 Phase D, live 2026-09-02). `allUsers` is off
+    this service's invoker policy, so the sign-in is the gate and every identity
+    IAP admits may read this — sweep results are hypotheticals over historical
+    data, not the live book. There is no further check: only the WRITE routes
+    additionally require an email in `OPERATORS`.
     """
     store = artifacts.get_artifact_store()
     if not store.enabled:
@@ -823,6 +829,81 @@ def sweep_cell_artifact(run_id: str, scenario: str, symbol: str,
                    f"{run_id}. Cells that errored have none, and neither do "
                    f"runs replayed before artifacts existed or from the CLI "
                    f"without --persist.")
+    return Response(content=payload, media_type="application/json",
+                    headers=artifacts.artifact_headers(name))
+
+
+@router.get("/sweeps/{run_id}/bars/{symbol}/{split}")
+def sweep_window_bars(run_id: str, symbol: str, split: str) -> Response:
+    """One window's BARS SIDECAR: the closes the replay saw, and its B&H curve.
+
+    FC-096 Phase E PR-1 (§D-2). One object per (run, symbol, split) rather than
+    per cell: the bars ARE the window — every arm of it replayed against the
+    same materialisation — and the buy-and-hold curve is built by the ENGINE
+    from the base arm's scored `FitnessReport.benchmark`, never re-derived here
+    from the spec's cash.
+
+    **Why the engine writes it at all.** There is no durable bar series this
+    backend could read instead: `BarStore` is a per-container local parquet
+    cache by explicit design, no Job or service mounts a GCS volume, neither
+    bucket has a bars prefix, and BigQuery's `stock_history_from_alpaca` covers
+    the LIVE universe only — never a candidate symbol, and never the replay's
+    own settlement-clamped series.
+
+    Status semantics are `sweep_cell_artifact`'s, exactly:
+
+    * **400** when a path segment could not address an object.
+    * **404** when the sidecar is absent — the normal answer for **every run
+      replayed before this PR deployed**, for a split the run does not have,
+      and for a window whose base arm errored. The console degrades: the price
+      chart falls back to BQ history (captioned, no markers) or shows the
+      absent state, and the B&H curve is omitted while the row's
+      `benchmark_return` scalar still shows.
+    * **502** when the read FAILED (a missing bucket grant, an empty object) —
+      "unreadable" and "absent" send an operator to different places.
+    * **503** when no artifact bucket is configured for this deployment.
+    * **200** with the DECOMPRESSED JSON.
+
+    **A sync `def`**, for the reason `sweep_cell_artifact` is one: the GCS
+    client is blocking, and an `async def` would run a stalled 30 s download on
+    the event loop and freeze every other request this worker is serving.
+
+    Exposure: IAP only, same as every other GET in this family.
+    """
+    store = artifacts.get_artifact_store()
+    if not store.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="No artifact bucket is configured for this deployment "
+                   "(SIM_ARTIFACT_BUCKET), so no bars sidecars can be served.")
+    try:
+        name = artifacts.bars_name(run_id, symbol, split)
+    except artifacts.ArtifactPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        payload = store.fetch_bars(run_id, symbol, split)
+    except HTTPException:
+        raise
+    except artifacts.ArtifactReadError as exc:
+        logger.error("Bars object unusable: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except artifacts.ArtifactBucketError as exc:
+        logger.error("Artifact bucket unreachable: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Bars read failed for %s", name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read the bars object: "
+                   f"{type(exc).__name__}: {exc}")
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No bars sidecar for {symbol}/{split} in run {run_id}. "
+                   f"Sidecars are written from the base arm of each window, so "
+                   f"a window whose base arm errored has none — and neither "
+                   f"does any run replayed before FC-096 Phase E deployed. "
+                   f"Re-submitting the same spec produces one.")
     return Response(content=payload, media_type="application/json",
                     headers=artifacts.artifact_headers(name))
 

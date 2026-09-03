@@ -38,7 +38,7 @@ from typing import Any, Dict, Optional
 
 import structlog
 
-from ..scenarios.identity import artifact_object_name
+from ..scenarios.identity import artifact_object_name, bars_object_name
 
 logger = structlog.get_logger(__name__)
 
@@ -130,12 +130,27 @@ class ArtifactWriter:
         self._client = client
         self.written = 0
         self.failed = 0
+        # Counted SEPARATELY from the cell artifacts (FC-096 Phase E PR-1).
+        # `artifacts_complete` is "one artifact per non-errored CELL" and there
+        # is exactly one sidecar per (symbol, split) window — folding the two
+        # counts together would make that arithmetic wrong the moment a sweep
+        # had more than one arm.
+        self.bars_written = 0
+        self.bars_failed = 0
         self.last_error: Optional[str] = None
+        # And so is the last BARS error, for the same arithmetic reason one
+        # level down: `main.py`'s `sim_artifacts_incomplete` warning reports
+        # `last_error` beside the CELL counts, so a sidecar failure landing
+        # after a cell failure would replace the message that log line exists to
+        # carry — and a sidecar failure never makes a run's artifacts
+        # incomplete, so it would be an unrelated error under a cell heading.
+        self.last_bars_error: Optional[str] = None
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"ArtifactWriter(run_id={self.run_id!r}, "
                 f"bucket={self.bucket_name!r}, written={self.written}, "
-                f"failed={self.failed})")
+                f"failed={self.failed}, bars_written={self.bars_written}, "
+                f"bars_failed={self.bars_failed})")
 
     @property
     def enabled(self) -> bool:
@@ -189,4 +204,56 @@ class ArtifactWriter:
             )
             return False
         self.written += 1
+        return True
+
+    def write_bars(self, payload: Dict[str, Any]) -> bool:
+        """Store one window's bars sidecar. Returns whether it landed; never raises.
+
+        FC-096 Phase E PR-1. Same policy as ``write`` and for the same reason —
+        a price series the console draws a chart from is evidence, not a result
+        — with two deliberate differences:
+
+        * the address is ``bars_object_name`` (no scenario field): one sidecar
+          per (run, symbol, split), written from the BASE arm only;
+        * the counters are ``bars_written``/``bars_failed``, and the message is
+          ``last_bars_error``, all three kept apart from the cell equivalents so
+          ``artifacts_complete``'s "one artifact per non-errored cell"
+          arithmetic still holds AND the ``sim_artifacts_incomplete`` warning
+          still quotes the cell failure it is about.
+
+        The coordinates come out of the payload's own provenance, exactly as
+        ``write`` takes them, so the object name and the object's contents
+        cannot disagree about which window this is.
+        """
+        if not self.enabled:
+            return False
+        prov = (payload or {}).get("provenance") or {}
+        symbol = str(prov.get("symbol") or "")
+        split = str(prov.get("split") or "")
+        try:
+            name = bars_object_name(
+                prov.get("run_id") or self.run_id, symbol, split)
+            blob = self._bucket().blob(name)
+            blob.upload_from_string(
+                artifact_bytes(payload),
+                # No `content_encoding`, for the reason `write` states: setting
+                # it turns on GCS decompressive transcoding and every reader's
+                # gzip handling becomes a lie that happens to work.
+                content_type="application/gzip",
+                timeout=ARTIFACT_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
+            self.bars_failed += 1
+            self.last_bars_error = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning(
+                "Bars sidecar could not be written — the window's results are "
+                "unaffected, but its price series and buy-and-hold curve are "
+                "missing",
+                event_category="backtest",
+                event_type="sim_bars_write_failed",
+                run_id=self.run_id, symbol=symbol, split=split,
+                bucket=self.bucket_name, error=self.last_bars_error,
+            )
+            return False
+        self.bars_written += 1
         return True

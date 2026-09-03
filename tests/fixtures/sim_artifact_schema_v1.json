@@ -1,4 +1,15 @@
 {
+  "benchmark": [
+    "capital_base",
+    "dividends_per_share_total",
+    "entry_day",
+    "entry_price",
+    "exit_day",
+    "exit_price",
+    "final_value",
+    "shares",
+    "total_return"
+  ],
   "counters": [
     "candidate_days",
     "decision_days",
@@ -84,6 +95,7 @@
     ]
   },
   "provenance": [
+    "capital_base",
     "config_hash",
     "engine_identity",
     "fill",
@@ -131,6 +143,7 @@
   ],
   "schema": 1,
   "top_level": [
+    "benchmark",
     "binding_constraint",
     "counters",
     "cycles",

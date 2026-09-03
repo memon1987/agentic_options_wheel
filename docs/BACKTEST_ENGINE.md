@@ -609,6 +609,29 @@ Four properties are worth knowing before reading one:
   even constructed. Set `SIM_ARTIFACT_BUCKET=""` to turn artifacts off while keeping
   BigQuery persistence.
 
+Since **FC-096 Phase E** the artifact also stamps `benchmark` (this cell's SCORED
+buy-and-hold, or `null`) and `provenance.capital_base` (the denominator every ratio on
+the cell is taken over — `starting_cash` for a wheel replay, the synthetic lot's value
+for a covered-call one), and `provenance.git_commit` is finally POPULATED: it was `null`
+on every artifact ever stored, because `run_sweep` had no parameter for it.
+
+**Each persisting WINDOW also writes one bars sidecar** (FC-096 Phase E PR-1), at
+`gs://<bucket>/sim-artifacts/v1/<run_id>/bars/<SYMBOL>__<split>.json.gz`, readable
+through `GET /api/v2/sweeps/{run_id}/bars/{symbol}/{split}`. Note the missing scenario
+segment: it is **one object per (run, symbol, split), written from the `base` arm only**,
+because the bars ARE the window — every arm replayed against the same materialisation.
+It carries the decision-window OHLCV the replay saw, clipped to
+`[daily[0].day, daily[-1].day]`, plus the **engine-computed buy-and-hold curve** built
+from the base arm's scored `FitnessReport.benchmark` (shares and capital base COPIED off
+the instance, dividends through `DividendSchedule.total_between`'s half-open interval),
+so its last point equals `BuyAndHold.final_value` by construction. It exists because
+there is no durable bar series the dashboard could read instead: the bar cache is local
+parquet per container, neither bucket has a bars prefix, and BigQuery's stock history
+covers the live universe only. Same best-effort policy (`sim_bars_write_failed`), with
+its OWN counters — `artifacts_complete` still means "one artifact per non-errored cell".
+A window whose base arm errored gets no sidecar, and neither does any run replayed
+before Phase E deployed; the console degrades rather than drawing an empty chart.
+
 **`force: true`** in a spec skips the Job's dedup lookup — the only one that decides
 anything — for re-running a question whose answer you no longer trust; it suppresses the
 API's informational hint with it. It is excluded from `sweep_key`, so a forced run stays
