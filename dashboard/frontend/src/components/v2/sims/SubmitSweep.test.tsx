@@ -61,7 +61,21 @@ const response = (status: number, body: unknown) => ({
   status,
   statusText: '',
   type: 'basic',
+  headers: new Headers(),
   text: async () => JSON.stringify(body),
+});
+
+/** IAP's OWN 401: `text/html`, plus the header only IAP sets. */
+const iapUnauthorized = () => ({
+  ok: false,
+  status: 401,
+  statusText: '',
+  type: 'basic',
+  headers: new Headers({
+    'x-goog-iap-generated-response': 'true',
+    'content-type': 'text/html',
+  }),
+  text: async () => '<html><body>Sign in with Google</body></html>',
 });
 
 beforeEach(() => {
@@ -123,8 +137,8 @@ describe('SubmitSweep — the submit token is gone (FC-096 Phase D PR-2)', () =>
     expect(init.headers['X-Requested-With']).toBe('XMLHttpRequest');
   });
 
-  it('renders the session-expired state on a 401, with a reload action', async () => {
-    fetchMock.mockResolvedValue(response(401, { detail: 'no IAP assertion on this request' }));
+  it("renders the session-expired state on IAP's own 401, with a reload action", async () => {
+    fetchMock.mockResolvedValue(iapUnauthorized());
     setup();
     pickSymbol('AAPL');
     addPreset();
@@ -133,8 +147,31 @@ describe('SubmitSweep — the submit token is gone (FC-096 Phase D PR-2)', () =>
     expect(screen.getByTestId('session-expired').textContent).toMatch(/Session expired/i);
     expect(outcome.textContent).toMatch(/reload/i);
     expect(outcome.textContent).toMatch(/Nothing was submitted/);
-    // Not dressed as a spec problem: the operator must not go hunting the form.
+    // Not dressed as a spec problem, and not as a credential one: the operator
+    // must not go hunting the form for a token box that no longer exists. (The
+    // box's absence is pinned by the first test in this describe; this pins
+    // that IAP's OWN refusal never puts the word back on the screen.)
     expect(outcome.textContent).not.toMatch(/token/i);
+  });
+
+  it("renders a BACKEND 401's own diagnostic — NOT the generic expiry", async () => {
+    // Review round 1, F3. This is `iap_audience_unconfigured`: the detail
+    // carries the recovery command, and calling it an expiry would have the
+    // operator reload for ever against a service that cannot self-heal.
+    const detail =
+      'IAP_AUDIENCE is unset or blank on this revision, so every assertion is refused. ' +
+      'Recovery: `gcloud run services update options-wheel-dashboard ' +
+      '--update-env-vars IAP_AUDIENCE=/projects/799970961417/...`';
+    fetchMock.mockResolvedValue(response(401, { detail }));
+    setup();
+    pickSymbol('AAPL');
+    addPreset();
+    fireEvent.click(submitButton());
+    const outcome = await screen.findByTestId('submit-outcome');
+    expect(screen.queryByTestId('session-expired')).toBeNull();
+    expect(outcome.textContent).toContain('IAP_AUDIENCE');
+    expect(outcome.textContent).toMatch(/--update-env-vars/);
+    expect(outcome.textContent).toMatch(/could not verify an identity/i);
   });
 
   it('renders a 403 as an allowlist refusal, in the server’s words, NOT as an expiry', async () => {

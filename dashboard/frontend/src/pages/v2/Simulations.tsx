@@ -14,12 +14,7 @@
 import { useEffect, useState } from 'react';
 import { useApi } from '../../hooks/useApi';
 import type { LiveStrategyConfig, SweepDetail } from '../../types/v2';
-import {
-  SESSION_EXPIRED_MESSAGE,
-  useSweepAllowlist,
-  useSweepDetail,
-  useSweepList,
-} from '../../hooks/useSweeps';
+import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
 import SweepResults from '../../components/v2/sims/SweepResults';
@@ -36,21 +31,17 @@ export default function Simulations() {
     data: list,
     loading: listLoading,
     error: listError,
-    sessionExpired: listSessionExpired,
     refetch: refetchList,
   } = useSweepList();
-  const {
-    data: detail,
-    error: detailError,
-    sessionExpired: detailSessionExpired,
-  } = useSweepDetail(selectedRunId);
+  const { data: detail, error: detailError } = useSweepDetail(selectedRunId);
 
   const sweeps = list ?? [];
-  // FC-096 Phase D: the page is behind IAP, and an expired session makes every
-  // poll fail identically for ever. Said once, at the top, with the only action
-  // that helps — otherwise the operator reads three separate "could not read"
-  // errors and concludes the backend is down.
-  const sessionExpired = listSessionExpired || detailSessionExpired;
+  // FC-096 Phase D (review round 1, F1): this page USED to render its own
+  // session-expiry banner. It no longer does — `LayoutV2` renders exactly one,
+  // on every route, and the hooks here raise the tab-wide signal the instant a
+  // poll comes back signed out, so the layout's banner is not waiting on its
+  // own 60-second poll. Two banners on one screen would say the same thing
+  // twice and disagree about which of them owns the reload button.
 
   // Land on the newest run so the page is not empty on arrival. Only until the
   // operator picks one — after that their choice sticks. Depends on `list`, not
@@ -70,28 +61,6 @@ export default function Simulations() {
           what the bot did — for that, read the live pages.
         </p>
       </header>
-
-      {sessionExpired && (
-        <section
-          data-testid="session-expired-banner"
-          className="rounded-lg border border-yellow-700/70 bg-yellow-950/30 p-4 flex items-center justify-between gap-4 flex-wrap"
-        >
-          <div>
-            <p className="text-sm font-medium text-yellow-300">{SESSION_EXPIRED_MESSAGE}</p>
-            <p className="text-xs text-yellow-200/80 mt-1">
-              Nothing on this page is refreshing any more. Reloading signs you back in through
-              Google and returns you here.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => window.location.reload()}
-            className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
-          >
-            Reload
-          </button>
-        </section>
-      )}
 
       <SubmitSweep
         allowlist={allowlist}

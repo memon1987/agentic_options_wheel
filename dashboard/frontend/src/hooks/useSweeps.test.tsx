@@ -21,6 +21,11 @@ import {
   useSweepDetail,
   useSweepList,
 } from './useSweeps';
+import {
+  RELOAD_HINT,
+  resetSessionExpiredSignal,
+  sessionExpiredSnapshot,
+} from './iapSession';
 import type { SweepRow, SweepSpec } from '../types/v2';
 import shapedHoldout from '../test/fixtures/sweep_shaped_holdout.json';
 import shapedPending from '../test/fixtures/sweep_shaped_pending.json';
@@ -38,8 +43,32 @@ const jsonResponse = (status: number, body: unknown): Response =>
     status,
     statusText: '',
     type: 'basic',
+    headers: new Headers(),
     text: async () => JSON.stringify(body),
     json: async () => body,
+  }) as unknown as Response;
+
+/**
+ * IAP's OWN 401 — `text/html`, with the generated-response marker.
+ *
+ * Verified live by both round-1 reviewers, and the whole reason the 401
+ * classifier reads the body: the backend's 401 is JSON with a `detail` that
+ * names its own repair, and swallowing it told the operator to reload for ever.
+ */
+const iapUnauthorized = (): Response =>
+  ({
+    ok: false,
+    status: 401,
+    statusText: '',
+    type: 'basic',
+    headers: new Headers({
+      'x-goog-iap-generated-response': 'true',
+      'content-type': 'text/html',
+    }),
+    text: async () => '<html><body>Sign in with Google</body></html>',
+    json: async () => {
+      throw new SyntaxError('Unexpected token < in JSON at position 0');
+    },
   }) as unknown as Response;
 
 /** A 200 carrying HTML — what an expired IAP session serves in place of JSON. */
@@ -49,22 +78,19 @@ const htmlResponse = (body = '<html><body>Sign in</body></html>'): Response =>
     status: 200,
     statusText: '',
     type: 'basic',
+    headers: new Headers(),
     text: async () => body,
     json: async () => {
       throw new SyntaxError('Unexpected token < in JSON at position 0');
     },
   }) as unknown as Response;
 
-/** A cross-origin redirect the fetch could not read. */
-const opaqueResponse = (): Response =>
-  ({
-    ok: false,
-    status: 0,
-    statusText: '',
-    type: 'opaqueredirect',
-    text: async () => '',
-    json: async () => null,
-  }) as unknown as Response;
+// NOTE (review round 1, F7): an `opaqueResponse` double lived here, pinning the
+// `type === 'opaqueredirect' || status === 0` branches. Both were unreachable —
+// a same-origin `fetch` that gets redirected cross-origin ends as a REJECTED
+// `TypeError`, never as an opaque `Response` (those require `mode: 'no-cors'`,
+// which nothing in this SPA uses). Dead code with a live test is worse than
+// neither: it reads as a covered path. Branches and doubles both deleted.
 
 const row = (over: Partial<SweepRow> = {}): SweepRow => ({
   run_id: 'run1',
@@ -120,6 +146,7 @@ const advance = async (ms: number) => {
 };
 
 beforeEach(() => {
+  resetSessionExpiredSignal();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -127,6 +154,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  // Module state outlives a render; one expired test would poison every later
+  // one (and the `LayoutV2` banner assertions with them).
+  resetSessionExpiredSignal();
 });
 
 describe('submitSweep — one request, never a retry', () => {
@@ -151,7 +181,9 @@ describe('submitSweep — one request, never a retry', () => {
   });
 
   it.each([
-    [401, 'session_expired'],
+    // A JSON 401 is the BACKEND's, and its detail is the half that carries the
+    // repair — see the classification tests below. IAP's own 401 is HTML.
+    [401, 'unauthenticated'],
     [403, 'unauthorized'],
     [409, 'conflict'],
     [422, 'invalid'],
@@ -165,26 +197,52 @@ describe('submitSweep — one request, never a retry', () => {
     expect(outcome.kind).toBe(kind);
   });
 
-  it('classifies a 401 as a session expiry, not as a rejected credential', async () => {
-    // Post-IAP the only way a write reaches the backend without an assertion is
-    // a session that has ended. Telling the operator their "token" was rejected
+  it("classifies IAP's OWN 401 as a session expiry, not as a rejected credential", async () => {
+    // Post-IAP the only way a write reaches the browser without a session is
+    // one that has ended. Telling the operator their "token" was rejected
     // would send them looking for a credential that no longer exists.
-    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    fetchMock.mockResolvedValue(iapUnauthorized());
     expect(await submitSweep(SPEC)).toEqual({
       kind: 'session_expired',
       detail: SESSION_EXPIRED_MESSAGE,
     });
+    expect(sessionExpiredSnapshot()).toBe(true);
+  });
+
+  it("keeps the BACKEND's 401 diagnostic instead of saying 'session expired'", async () => {
+    // Review round 1, F3. `iap_audience_unconfigured`'s detail carries the
+    // `--update-env-vars` line that repairs it. Shown as an expiry, the
+    // operator reloads for ever against a service that cannot self-heal.
+    const detail =
+      'IAP_AUDIENCE is unset or blank on this revision. Recovery: `gcloud run ' +
+      'services update options-wheel-dashboard --update-env-vars IAP_AUDIENCE=...`';
+    fetchMock.mockResolvedValue(jsonResponse(401, { detail }));
+    const outcome = await submitSweep(SPEC);
+    expect(outcome.kind).toBe('unauthenticated');
+    expect((outcome as { detail: string }).detail).toContain('IAP_AUDIENCE');
+    expect((outcome as { detail: string }).detail).toContain(RELOAD_HINT);
+    // NOT an expiry: nothing about this is fixed by signing in again.
+    expect(sessionExpiredSnapshot()).toBe(false);
+  });
+
+  it('falls back to an expiry when a 401 body is empty or unparseable', async () => {
+    fetchMock.mockResolvedValue(
+      {
+        ok: false,
+        status: 401,
+        statusText: '',
+        type: 'basic',
+        headers: new Headers(),
+        text: async () => '',
+      } as unknown as Response,
+    );
+    expect((await submitSweep(SPEC)).kind).toBe('session_expired');
   });
 
   it('classifies a 200 carrying HTML as a session expiry', async () => {
     // IAP without `X-Requested-With` serves the sign-in page; belt and braces
     // for any hop that strips the header.
     fetchMock.mockResolvedValue(htmlResponse());
-    expect((await submitSweep(SPEC)).kind).toBe('session_expired');
-  });
-
-  it('classifies an opaque redirect as a session expiry', async () => {
-    fetchMock.mockResolvedValue(opaqueResponse());
     expect((await submitSweep(SPEC)).kind).toBe('session_expired');
   });
 
@@ -299,13 +357,27 @@ describe('the IAP session expiring is its own state (FC-096 Phase D)', () => {
     expect(init.headers['X-Requested-With']).toBe('XMLHttpRequest');
   });
 
-  it('flags a 401 as sessionExpired with the reload message', async () => {
+  it("flags IAP's 401 as sessionExpired with the reload message", async () => {
     vi.useFakeTimers();
-    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    fetchMock.mockResolvedValue(iapUnauthorized());
     const { result } = renderHook(() => useSweepList());
     await settle();
     expect(result.current.sessionExpired).toBe(true);
     expect(result.current.error).toBe(SESSION_EXPIRED_MESSAGE);
+    // What puts the LAYOUT's banner up without waiting for its 60s poll.
+    expect(sessionExpiredSnapshot()).toBe(true);
+  });
+
+  it("shows a BACKEND 401's own words and does NOT call it an expiry", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(
+      jsonResponse(401, { detail: 'IAP_AUDIENCE is unset or blank on this revision.' }),
+    );
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    expect(result.current.sessionExpired).toBe(false);
+    expect(result.current.error).toContain('IAP_AUDIENCE');
+    expect(sessionExpiredSnapshot()).toBe(false);
   });
 
   it('flags a 200 of HTML as sessionExpired rather than a JSON syntax error', async () => {
@@ -317,20 +389,12 @@ describe('the IAP session expiring is its own state (FC-096 Phase D)', () => {
     expect(result.current.error).toBe(SESSION_EXPIRED_MESSAGE);
   });
 
-  it('flags an opaque redirect as sessionExpired', async () => {
-    vi.useFakeTimers();
-    fetchMock.mockResolvedValue(opaqueResponse());
-    const { result } = renderHook(() => useSweepList());
-    await settle();
-    expect(result.current.sessionExpired).toBe(true);
-  });
-
   it('STOPS polling once the session is gone', async () => {
     // Every other error keeps polling, because it may be transient. This one
     // cannot recover without a reload, so polling on is four failed requests a
     // minute for as long as the tab stays open.
     vi.useFakeTimers();
-    fetchMock.mockResolvedValue(jsonResponse(401, { detail: 'no IAP assertion' }));
+    fetchMock.mockResolvedValue(iapUnauthorized());
     const { result } = renderHook(() => useSweepList());
     await settle();
     expect(fetchMock).toHaveBeenCalledTimes(1);

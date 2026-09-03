@@ -512,6 +512,10 @@ function Outcome({
     Exclude<SubmitOutcome['kind'], 'accepted' | 'session_expired'>,
     string
   > = {
+    // A BACKEND 401 (review round 1, F3): `iap_audience_unconfigured`, an
+    // id-token with no email claim, or no assertion at all. NOT an expiry —
+    // the detail below carries the repair, so it is rendered verbatim.
+    unauthenticated: 'Refused — the service could not verify an identity',
     unauthorized: 'Refused — your account is not an operator',
     conflict: 'Refused — a sweep is already in flight',
     invalid: 'Refused — the spec is not legal',

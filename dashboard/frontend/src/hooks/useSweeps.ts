@@ -25,6 +25,14 @@ import type {
 } from '../types/v2';
 import { isTerminalSweepStatus } from '../types/v2';
 import { normaliseSweepDetail, normaliseSweepList } from '../components/v2/sims/normaliseReport';
+import {
+  IAP_XHR_HEADERS,
+  SESSION_EXPIRED_MESSAGE,
+  SessionExpiredError,
+  isSessionExpired,
+  markSessionExpired,
+  unauthorizedError,
+} from './iapSession';
 
 export const SWEEP_POLL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -32,55 +40,14 @@ const REQUEST_TIMEOUT_MS = 20_000;
 // --------------------------------------------------------------------------- //
 // IAP (FC-096 Phase D PR-2)
 // --------------------------------------------------------------------------- //
+//
+// The header, the message, the error class and the 401 classifier all live in
+// `iapSession.ts` now. They used to live here AND in `useApi.ts`, and the two
+// copies drifted immediately — which is the defect review round 1 called F1.
+// Re-exported because `Simulations.tsx` and `SubmitSweep.tsx` import them from
+// this module.
 
-/**
- * Sent on EVERY request this module makes.
- *
- * The dashboard now sits behind Identity-Aware Proxy, and IAP answers a request
- * whose session has expired with a **302 to the Google sign-in page**. A `fetch`
- * follows that redirect to another origin and the SPA gets back either a CORS
- * failure or a lump of HTML — in both cases something that reads as "the API is
- * broken" rather than "you are signed out". With this header IAP answers
- * **401** instead, which is a thing the code below can recognise and say out
- * loud. It is not authentication; it is the difference between a diagnosable
- * state and a mystery.
- */
-const IAP_XHR_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' } as const;
-
-/** What the operator is told when their IAP session is gone. */
-export const SESSION_EXPIRED_MESSAGE =
-  'Session expired — reload the page to sign in again.';
-
-class SessionExpiredError extends Error {
-  readonly sessionExpired = true;
-  constructor() {
-    super(SESSION_EXPIRED_MESSAGE);
-    this.name = 'SessionExpiredError';
-  }
-}
-
-/** True for the error thrown when a response looked like a signed-out session. */
-export const isSessionExpired = (err: unknown): boolean =>
-  !!err && (err as { sessionExpired?: boolean }).sessionExpired === true;
-
-/**
- * Does this response mean "your session is gone" rather than "the API said no"?
- *
- * Three shapes, and each one is reachable:
- *   * **401** — what IAP returns for an expired session once the request
- *     carries `X-Requested-With`, and also what the backend returns for a write
- *     that arrives with no assertion at all.
- *   * **an opaque response** (`type` opaque / opaqueredirect, `status` 0) — a
- *     cross-origin redirect the fetch could not read.
- *   * **a body that is not JSON** on an otherwise-fine response — a sign-in
- *     HTML page served where the API should be.
- * The third is checked at parse time, not here.
- */
-const looksSignedOut = (response: Response): boolean =>
-  response.status === 401 ||
-  response.status === 0 ||
-  response.type === 'opaque' ||
-  response.type === 'opaqueredirect';
+export { SESSION_EXPIRED_MESSAGE, isSessionExpired } from './iapSession';
 
 // --------------------------------------------------------------------------- //
 // Submit
@@ -96,11 +63,20 @@ const looksSignedOut = (response: Response): boolean =>
 export type SubmitOutcome =
   | { kind: 'accepted'; body: SweepSubmitAccepted }
   /**
-   * 401, or an unreadable/non-JSON answer — the IAP session is gone. Split out
-   * from `unauthorized` because the remedy is completely different: this one is
-   * fixed by reloading the page, and no amount of re-reading the error helps.
+   * IAP's own 401, or an unreadable/non-JSON answer — the session is gone.
+   * Split out from `unauthorized` because the remedy is completely different:
+   * this one is fixed by reloading the page, and no amount of re-reading the
+   * error helps.
    */
   | { kind: 'session_expired'; detail: string }
+  /**
+   * 401 from the BACKEND, carrying its own diagnostic (review round 1, F3).
+   * `iap_audience_unconfigured` — whose detail carries the `--update-env-vars`
+   * line that repairs it — an id-token with no `email` claim, and
+   * `NO_ASSERTION_DETAIL` all arrive here. Rendered as an expiry instead, the
+   * operator reloads for ever against a service that cannot recover on its own.
+   */
+  | { kind: 'unauthenticated'; detail: string }
   /** 403 — signed in, but not on the `OPERATORS` allowlist. */
   | { kind: 'unauthorized'; status: number; detail: string }
   /** 409 — another sweep is already in flight. The detail names it. */
@@ -187,8 +163,17 @@ export async function submitSweep(spec: SweepSpec): Promise<SubmitOutcome> {
     clearTimeout(timer);
   }
 
-  if (looksSignedOut(response)) {
-    return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+  // A 401 is read BEFORE it is classified: IAP's is `text/html` (and carries
+  // `x-goog-iap-generated-response`), the backend's is JSON with a `detail`
+  // that names its own repair. Deciding first — which is what this did — threw
+  // the second one away. (Review round 1, F3.)
+  if (response.status === 401) {
+    const err = unauthorizedError(response, await response.text().catch(() => ''));
+    if (isSessionExpired(err)) {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    return { kind: 'unauthenticated', detail: err.message };
   }
 
   const body = await readBody(response);
@@ -200,6 +185,7 @@ export async function submitSweep(spec: SweepSpec): Promise<SubmitOutcome> {
     // expiry rather than "the API returned no run_id", which would send the
     // operator to the runs list to look for a sweep that was never submitted.)
     if (typeof body === 'string') {
+      markSessionExpired();
       return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
     }
     const b = (body ?? {}) as Partial<SweepSubmitAccepted>;
@@ -223,9 +209,9 @@ export async function submitSweep(spec: SweepSpec): Promise<SubmitOutcome> {
 
   const detail = detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim());
   switch (response.status) {
-    // 401 is handled above as a session expiry. 403 is the other thing
-    // entirely: signed in, verified, and not on the write allowlist — which no
-    // reload will fix, so the server's own message is what to show.
+    // 401 is handled above (expiry, or the backend's own diagnostic). 403 is
+    // the other thing entirely: signed in, verified, and not on the write
+    // allowlist — which no reload will fix, so the server's message is shown.
     case 403:
       return { kind: 'unauthorized', status: response.status, detail };
     // The 409 body is `{detail}` only — the detail already names the blocking
@@ -258,7 +244,11 @@ interface PollState<T> {
 
 async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, headers: IAP_XHR_HEADERS });
-  if (looksSignedOut(response)) throw new SessionExpiredError();
+  // Body first, verdict second — see `submitSweep`. IAP's 401 is a sign-out;
+  // the backend's carries a diagnostic that must reach the screen intact.
+  if (response.status === 401) {
+    throw unauthorizedError(response, await response.text().catch(() => ''));
+  }
   if (!response.ok) {
     const body = await readBody(response);
     throw new Error(detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim()));
@@ -372,6 +362,10 @@ function usePolledGet<T>(
         if (cancelled || !mounted.current) return;
         const e = err as Error;
         if (e.name === 'AbortError') return;
+        // The layout polls `/api/live/account` once a MINUTE; this polls every
+        // 15s. Marking the tab-wide signal is what puts the banner up now
+        // rather than up to 45s from now, behind three unexplained errors.
+        if (isSessionExpired(e)) markSessionExpired();
         setState((prev) => ({
           data: prev.data,
           loading: false,

@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Simulations from './Simulations';
+import { resetSessionExpiredSignal, sessionExpiredSnapshot } from '../../hooks/iapSession';
 import shapedHoldout from '../../test/fixtures/sweep_shaped_holdout.json';
 import shapedPending from '../../test/fixtures/sweep_shaped_pending.json';
 
@@ -70,12 +71,14 @@ const show = () =>
 const statusRegion = async () => await screen.findByTestId('results-status');
 
 beforeEach(() => {
+  resetSessionExpiredSignal();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  resetSessionExpiredSignal();
 });
 
 describe('Simulations — a run that has not finished never renders as a report', () => {
@@ -168,48 +171,50 @@ describe('Simulations — a done run renders the report', () => {
   });
 });
 
-
-describe('Simulations — an expired IAP session is said once, at the top', () => {
-  // FC-096 Phase D PR-2. Without this the operator reads three separate "could
-  // not be read" errors (list, detail, allowlist) and concludes the backend is
-  // down, when the truth is that they are signed out and one reload fixes it.
-  const signedOut = () =>
+describe('Simulations — the expiry banner belongs to the LAYOUT, not this page', () => {
+  // FC-096 Phase D PR-2, review round 1 (F1). This page used to own the only
+  // session-expired banner in the app, which is exactly why Overview, By Symbol
+  // and Bot Health had none. `LayoutV2` renders it now — on every route — and
+  // this page's job is to RAISE THE SIGNAL fast, because it polls every 15s
+  // while the layout's own read runs once a minute.
+  //
+  // The banner itself is asserted in `components/v2/LayoutV2.test.tsx`.
+  const signedOutByIap = () =>
     ({
       ok: false,
       status: 401,
       statusText: '',
       type: 'basic',
-      text: async () => JSON.stringify({ detail: 'no IAP assertion on this request' }),
-      json: async () => ({ detail: 'no IAP assertion on this request' }),
+      headers: new Headers({ 'x-goog-iap-generated-response': 'true' }),
+      text: async () => '<html><body>Sign in with Google</body></html>',
     }) as unknown as Response;
 
-  it('renders the banner with a reload action when a poll comes back 401', async () => {
-    fetchMock.mockResolvedValue(signedOut());
+  it('raises the tab-wide signal when a poll comes back signed out', async () => {
+    expect(sessionExpiredSnapshot()).toBe(false);
+    fetchMock.mockResolvedValue(signedOutByIap());
     show();
-    const banner = await screen.findByTestId('session-expired-banner');
-    expect(banner.textContent).toMatch(/Session expired/i);
-    expect(banner.textContent).toMatch(/reload/i);
-    expect(screen.getByRole('button', { name: /reload/i })).toBeInTheDocument();
+    await waitFor(() => expect(sessionExpiredSnapshot()).toBe(true));
   });
 
-  it('renders no banner while the session is good', async () => {
-    serve(shapedHoldout);
+  it('renders NO banner of its own — one screen, one banner', async () => {
+    fetchMock.mockResolvedValue(signedOutByIap());
     show();
-    await waitFor(() => expect(screen.getByTestId('sweep-results')).toBeInTheDocument());
+    await waitFor(() => expect(sessionExpiredSnapshot()).toBe(true));
     expect(screen.queryByTestId('session-expired-banner')).toBeNull();
   });
 
-  it('renders no banner for an ordinary read failure — that is not a sign-out', async () => {
+  it('does not raise the signal for an ordinary read failure', async () => {
     fetchMock.mockResolvedValue({
       ok: false,
       status: 500,
       statusText: '',
       type: 'basic',
+      headers: new Headers(),
       text: async () => JSON.stringify({ detail: 'boom' }),
       json: async () => ({ detail: 'boom' }),
     } as unknown as Response);
     show();
     await waitFor(() => expect(screen.getByText(/could not be read/i)).toBeInTheDocument());
-    expect(screen.queryByTestId('session-expired-banner')).toBeNull();
+    expect(sessionExpiredSnapshot()).toBe(false);
   });
 });
