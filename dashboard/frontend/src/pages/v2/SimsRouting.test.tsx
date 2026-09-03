@@ -367,6 +367,11 @@ describe('deep links and navigation', () => {
     expect(region.textContent).toMatch(/points at ITSELF/);
     expect(region.textContent).not.toMatch(/not recorded on this row/);
     expect(seen.pathname).toBe(`/sims/${RUN}/base/GOOGL/fit`);
+    // NOT followed at all. Following it lands on the path already on display,
+    // which leaves the pathname identical and is therefore invisible except
+    // here: the navigation itself must never happen, or every render of a
+    // corrupt row spends a history write to arrive where it already is.
+    expect(navLog.map((n) => n.type)).toEqual(['POP']);
   });
 
   it('the bias footer is the LAST thing on the page, below the console (F2)', async () => {
