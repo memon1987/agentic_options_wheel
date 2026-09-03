@@ -15,11 +15,16 @@
 // the server's summary has no column for and without which the row would not
 // add up to the cells on screen.
 //
-// Everything narrative — the in-sample banner, the holdout semantics, the bias
-// footer, the cross-scenario and rejection-tally caveats — is printed BYTE FOR
-// BYTE from the API. These are the runner's own words about how far its numbers
-// can be trusted. An earlier cut stripped markdown out of them, which quietly
-// edited a warning; the fix is to render the string and nothing but the string.
+// Everything narrative — the in-sample banner, the holdout semantics, the
+// cross-scenario and rejection-tally caveats — is printed BYTE FOR BYTE from the
+// API. These are the runner's own words about how far its numbers can be
+// trusted. An earlier cut stripped markdown out of them, which quietly edited a
+// warning; the fix is to render the string and nothing but the string.
+//
+// FC-096 Phase E PR-2 (review round 1, F2): the bias footer is NOT rendered
+// here any more. It lives in `BiasFooter.tsx` and the PAGE renders it after the
+// console, so the caveats stay the last word on the screen instead of ending up
+// in the middle of the evidence they qualify.
 
 import type { SweepReport, SweepRow } from '../../../types/v2';
 import { fmtNumber, cls } from '../../../utils/format';
@@ -50,7 +55,7 @@ const splitLabel = (s: string) => SPLIT_LABEL[s] ?? s;
  * string must not be able to suppress the warning. This copy is the fallback of
  * last resort — the payload's own words are used whenever they arrive.
  */
-const IN_SAMPLE_FALLBACK =
+export const IN_SAMPLE_FALLBACK =
   'IN-SAMPLE ONLY — this ranking has not been validated. Every arm below was ' +
   'measured on the same window it would be chosen from, over a single volatility ' +
   'regime. The best-looking arm is more often the luckiest one than the best one. ' +
@@ -450,28 +455,6 @@ export default function SweepResults({ sweep, report, raw }: Props) {
         </div>
       </div>
 
-      {/* ---- The bias footer, byte for byte. ---- */}
-      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-4" data-testid="bias-footer">
-        <h3 className="text-sm font-semibold text-gray-300">How far to trust these numbers</h3>
-        <Verbatim text={report.cross_scenario_caveat} className="text-xs text-gray-400 mt-3" />
-        <Verbatim text={report.rejection_tally_caveat} className="text-xs text-gray-400 mt-3" />
-        <ul className="mt-3 space-y-2">
-          {report.known_biases.map((bias) => (
-            <li key={bias.title}>
-              <p className="text-xs font-semibold text-gray-300">{bias.title}</p>
-              <Verbatim text={bias.detail} className="text-xs text-gray-500" />
-            </li>
-          ))}
-        </ul>
-        <p className="text-xs text-gray-500 mt-3">
-          A cell is <span className="font-mono text-gray-300">insuf</span> when the window contained no
-          completed cycle, <span className="font-mono text-amber-300">low-act N%</span> when a position
-          was held on under {Math.round((report.min_days_in_position ?? 0.25) * 100)}% of decision days,
-          and <span className="font-mono text-purple-300">unknown</span> when the stored row carries no
-          state flag at all. None of the three is a small return: all are excluded from every median
-          and every Δ on this page.
-        </p>
-      </div>
     </section>
   );
 }

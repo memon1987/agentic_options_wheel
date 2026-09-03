@@ -84,6 +84,7 @@ export default function RunsList({ sweeps, selectedRunId, onSelect, loading, err
                 return (
                   <tr
                     key={row.run_id}
+                    data-testid={`run-row-${row.run_id}`}
                     onClick={() => onSelect(row.run_id)}
                     // Selecting a run is a real action, so it has to be reachable
                     // without a mouse. A row is the click target rather than a

@@ -11,7 +11,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import Simulations from './Simulations';
 import { resetSessionExpiredSignal, sessionExpiredSnapshot } from '../../hooks/iapSession';
 import shapedHoldout from '../../test/fixtures/sweep_shaped_holdout.json';
@@ -32,6 +32,15 @@ const listRow = (over: Record<string, unknown> = {}) => ({
   stuck: false,
   ...over,
 });
+
+const notFound = (detail: string) =>
+  ({
+    ok: false,
+    status: 404,
+    statusText: 'Not Found',
+    text: async () => JSON.stringify({ detail }),
+    json: async () => ({ detail }),
+  }) as unknown as Response;
 
 const ok = (body: unknown) =>
   ({
@@ -55,16 +64,34 @@ const serve = (detail: unknown, listOver: Record<string, unknown> = {}) => {
         } }),
       );
     }
+    // FC-096 Phase E PR-2: the console's two reads live under the same prefix
+    // as the detail route, so they are answered FIRST and with a 404 — the
+    // normal answer for a run with no stored objects, and the state these
+    // status tests are about.
+    if (/\/artifacts\/|\/bars\//.test(url)) {
+      return Promise.resolve(notFound('No detail artifact for this cell in this run.'));
+    }
     if (url.startsWith('/api/v2/sweeps/')) return Promise.resolve(ok(detail));
     if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow(listOver)]));
     return Promise.resolve(ok({ stock_symbols: ['AAPL', 'NVDA'] }));
   });
 };
 
-const show = () =>
+/**
+ * Mount the page under the REAL routes (FC-096 Phase E PR-2, decision 4).
+ *
+ * The selected run and cell are path segments now, so a bare `<Simulations />`
+ * inside a router would leave `useParams` permanently empty and the page would
+ * never resolve a run — the test would pass on a page that could not work.
+ */
+const show = (path = '/sims') =>
   render(
-    <MemoryRouter>
-      <Simulations />
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route path="/sims" element={<Simulations />} />
+        <Route path="/sims/:runId" element={<Simulations />} />
+        <Route path="/sims/:runId/:scenario/:symbol/:split" element={<Simulations />} />
+      </Routes>
     </MemoryRouter>,
   );
 
@@ -122,19 +149,25 @@ describe('Simulations — a run that has not finished never renders as a report'
     expect(screen.queryByTestId('sweep-results')).toBeNull();
   });
 
-  it('links a deduplicated run at the original rather than showing a report', async () => {
+  it('a deduplicated run with NO pointer says so, and offers nothing to open', async () => {
+    // The pointer-bearing case never reaches this shell any more: the page
+    // follows it (review round 1, F5; asserted in `SimsRouting.test.tsx`). What
+    // is left is the dead end — a dedup row whose original was never recorded,
+    // which is unopenable and has to say that rather than render a button that
+    // navigates nowhere.
     serve(
       {
         ...shapedPending,
         status: 'deduplicated',
-        run: { ...shapedPending.run, status: 'deduplicated', deduplicated_to: 'older-run' },
+        run: { ...shapedPending.run, status: 'deduplicated', deduplicated_to: null },
       },
-      { status: 'deduplicated', deduplicated_to: 'older-run' },
+      { status: 'deduplicated', deduplicated_to: null },
     );
     show();
     const region = await statusRegion();
     expect(region.textContent).toMatch(/nothing was replayed/);
-    expect(screen.getByRole('button', { name: /Open older-run/ })).toBeInTheDocument();
+    expect(region.textContent).toMatch(/not recorded on this row/);
+    expect(screen.queryByRole('button', { name: /^Open / })).toBeNull();
     expect(screen.queryByTestId('sweep-results')).toBeNull();
   });
 

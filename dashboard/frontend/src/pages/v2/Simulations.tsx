@@ -10,17 +10,102 @@
 // documented biases — never a record of what the bot did. That distinction is
 // the reason sweeps get their own store (plan D1) instead of `backtest_runs`,
 // and it is said in the header rather than left implicit.
+//
+// FC-096 Phase E PR-2 (decision 4): **the URL is the state.** The selected run
+// and cell live in the path, not in `useState`, so a deep link, a reload and
+// the Back button all land on the same screen. The push/replace split is the
+// part worth stating: EVERY user selection pushes, so Back walks the operator's
+// own history; only the AUTOMATIC choices — newest run on arrival, default cell
+// when a run resolves — replace, so Back never has to fight an auto-select to
+// leave the page.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
-import type { LiveStrategyConfig, SweepDetail } from '../../types/v2';
+import type { LiveStrategyConfig, SweepDetail, SweepReport } from '../../types/v2';
 import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
 import SweepResults from '../../components/v2/sims/SweepResults';
+import BiasFooter from '../../components/v2/sims/BiasFooter';
+import Console from '../../components/v2/console/Console';
+
+/** Where the console opens when nobody has chosen a cell. */
+export interface CellSelection {
+  scenario: string;
+  symbol: string;
+  split: string;
+}
+
+/**
+ * The split a run opens on: **holdout if it has one, else the run's own first
+ * split** (which is `all` on a run submitted without a holdout).
+ *
+ * A run's splits are `['all']` XOR `['fit', 'holdout']`, so this never invents
+ * one. `fit` is deliberately never the default on a run that HAS a holdout:
+ * opening on the in-sample window is exactly the reading the holdout exists to
+ * prevent, and an operator who lands there does not necessarily notice which
+ * window the numbers came from.
+ */
+export function defaultSplit(splits: string[]): string | null {
+  if (splits.includes('holdout')) return 'holdout';
+  return splits[0] ?? null;
+}
+
+/**
+ * The cell a run opens on: the first NON-BASE arm if there is one, the first
+ * symbol, the default split.
+ *
+ * Non-base first because the question that made someone submit a sweep is "what
+ * does the change do", and base is the thing it is measured against rather than
+ * the thing under test. A base-only run opens on base.
+ */
+export function defaultCell(report: SweepReport): CellSelection | null {
+  const scenario = report.scenarios.find((s) => s !== 'base') ?? report.scenarios[0];
+  const symbol = report.symbols[0];
+  const split = defaultSplit(report.windows.map((w) => w.split));
+  if (!scenario || !symbol || !split) return null;
+  return { scenario, symbol, split };
+}
+
+/** Is this cell addressable in this run? A stale deep link is not. */
+export function cellExists(report: SweepReport, cell: CellSelection): boolean {
+  return (
+    report.scenarios.includes(cell.scenario) &&
+    report.symbols.includes(cell.symbol) &&
+    report.windows.some((w) => w.split === cell.split)
+  );
+}
+
+/**
+ * The run a `deduplicated` row auto-followed FROM, off the history entry's own
+ * state. Anything else -- a typed URL, a bookmark, a reload of a plain cell --
+ * is `null`, and the destination says nothing about dedup.
+ */
+export function readDedupFrom(state: unknown): string | null {
+  if (!state || typeof state !== 'object') return null;
+  const value = (state as { dedupFrom?: unknown }).dedupFrom;
+  return typeof value === 'string' && value ? value : null;
+}
+
+export const cellPath = (runId: string, cell: CellSelection): string =>
+  `/sims/${encodeURIComponent(runId)}/${encodeURIComponent(cell.scenario)}/` +
+  `${encodeURIComponent(cell.symbol)}/${encodeURIComponent(cell.split)}`;
 
 export default function Simulations() {
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const { runId, scenario, symbol, split } = useParams<{
+    runId?: string;
+    scenario?: string;
+    symbol?: string;
+    split?: string;
+  }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const selectedRunId = runId ?? null;
+  // Set by the dedup auto-follow below, so the destination can say which run it
+  // was reached from. Absent on a typed or bookmarked URL, which is exactly the
+  // notice's scope.
+  const dedupFrom = readDedupFrom(location.state);
 
   // The universe checkboxes track the LIVE strategy config rather than a
   // hardcoded list — a symbol added to `stocks.symbols` shows up here without a
@@ -43,13 +128,94 @@ export default function Simulations() {
   // own 60-second poll. Two banners on one screen would say the same thing
   // twice and disagree about which of them owns the reload button.
 
-  // Land on the newest run so the page is not empty on arrival. Only until the
-  // operator picks one — after that their choice sticks. Depends on `list`, not
-  // the derived `sweeps`: `?? []` is a fresh identity on every render.
+  /**
+   * A user's choice. PUSHES, so Back returns to what they were looking at.
+   *
+   * Re-selecting the run already on screen is a NO-OP (review round 1, F9). It
+   * used to push `/sims/<same run>`, which dropped the cell out of the URL and
+   * let the default-cell effect replace it — so clicking the highlighted row
+   * silently threw away the cell the operator was reading, and left a history
+   * entry that does nothing but undo itself.
+   */
+  const selectRun = (id: string) => {
+    if (id === selectedRunId) return;
+    navigate(`/sims/${encodeURIComponent(id)}`);
+  };
+  const selectCell = (cell: CellSelection) => {
+    if (selectedRunId) navigate(cellPath(selectedRunId, cell));
+  };
+
+  // Land on the newest run so the page is not empty on arrival — REPLACING, so
+  // Back from here leaves /sims rather than bouncing off an auto-select.
+  // Depends on `list`, not the derived `sweeps`: `?? []` is a fresh identity on
+  // every render.
   useEffect(() => {
     const first = list?.[0];
-    if (selectedRunId === null && first) setSelectedRunId(first.run_id);
-  }, [selectedRunId, list]);
+    if (selectedRunId === null && first) {
+      navigate(`/sims/${encodeURIComponent(first.run_id)}`, { replace: true });
+    }
+  }, [selectedRunId, list, navigate]);
+
+  // F1 (review round 1): the report on screen must belong to the URL's run.
+  //
+  // `usePolledGet` clears the previous run's data inside an EFFECT, so the first
+  // committed render after a run switch carries the NEW `selectedRunId` and the
+  // OLD `detail`. Two things went wrong in that one frame: the default/repair
+  // effect below read the stale report, decided the new run "does not have" the
+  // URL's cell, and `navigate(replace)`d to a cell of run A under run B's id --
+  // destroying the operator's own history entry, so Back landed on the wrong
+  // cell; and `ResultsRegion` rendered run A's grid under run B's URL.
+  //
+  // So everything downstream is gated on the IDENTITY, not on presence. A
+  // mismatch renders the loading state, which is what it actually is.
+  const detailMatchesUrl = !!detail && detail.sweep.run_id === selectedRunId;
+  const matchedDetail = detailMatchesUrl ? detail : null;
+  const report = matchedDetail?.results ?? null;
+  const selection = useMemo<CellSelection | null>(
+    () => (scenario && symbol && split ? { scenario, symbol, split } : null),
+    [scenario, symbol, split],
+  );
+
+  // Default the CELL once a run resolves, and repair a deep link that names a
+  // cell this run does not have (a bookmark from a different sweep). Both are
+  // automatic, so both replace.
+  useEffect(() => {
+    if (!selectedRunId || !report) return;
+    if (selection && cellExists(report, selection)) return;
+    const fallback = defaultCell(report);
+    // `state` is CARRIED, not dropped (confirmation pass, F5 gap). Entering a
+    // deduplicated run from the runs list is two replaces: the auto-follow puts
+    // `{dedupFrom}` on the entry, and this one immediately replaced it away —
+    // so the destination lost the only record of where it was reached from and
+    // neither the notice nor the footer's "reached from" row rendered. Both
+    // replaces edit the SAME history entry, so its state has to survive them.
+    if (fallback) {
+      navigate(cellPath(selectedRunId, fallback), { replace: true, state: location.state });
+    }
+  }, [selectedRunId, report, selection, navigate, location.state]);
+
+  // F5 (review round 1): a `deduplicated` row stored NOTHING under its own id --
+  // the whole point of dedup is that nothing was replayed. Sec D-3 says the page
+  // "opens X", so it does: the same cell under `deduplicated_to`, REPLACING,
+  // because a run that holds no evidence is not a screen worth keeping in the
+  // operator's history. The run it was reached from travels in the history
+  // entry's state, so the destination can say so rather than pretending the
+  // operator asked for it.
+  const dedupPointer =
+    matchedDetail && matchedDetail.sweep.status === 'deduplicated'
+      ? (matchedDetail.sweep.deduplicated_to ?? null)
+      : null;
+  // A row pointing at ITSELF is corrupt, not resolvable: following it would
+  // navigate to the screen already on display, for ever. Not followed, and said
+  // in its own words below rather than reported as a missing pointer.
+  const dedupTarget = dedupPointer && dedupPointer !== selectedRunId ? dedupPointer : null;
+  useEffect(() => {
+    if (!dedupTarget || !selectedRunId) return;
+    const path = selection
+      ? cellPath(dedupTarget, selection)
+      : `/sims/${encodeURIComponent(dedupTarget)}`;
+    navigate(path, { replace: true, state: { dedupFrom: selectedRunId } });
+  }, [dedupTarget, selectedRunId, selection, navigate]);
 
   return (
     <div className="space-y-6">
@@ -66,24 +232,111 @@ export default function Simulations() {
         allowlist={allowlist}
         allowlistError={allowlistError}
         universe={liveConfig?.stock_symbols ?? []}
-        onSubmitted={(runId) => {
-          setSelectedRunId(runId);
+        onSubmitted={(id) => {
+          selectRun(id);
           refetchList();
         }}
-        onSelectRun={setSelectedRunId}
+        onSelectRun={selectRun}
       />
 
       <RunsList
         sweeps={sweeps}
         selectedRunId={selectedRunId}
-        onSelect={setSelectedRunId}
+        onSelect={selectRun}
         loading={listLoading}
         error={listError}
       />
 
       {selectedRunId && (
-        <ResultsRegion detail={detail} detailError={detailError} onSelect={setSelectedRunId} />
+        <ResultsRegion
+          detail={matchedDetail}
+          // A read error belongs to the run that produced it. While the URL and
+          // the loaded detail disagree there is no error to attribute yet.
+          detailError={detail && !detailMatchesUrl ? null : detailError}
+          selection={selection}
+          onSelectCell={selectCell}
+          dedupFrom={dedupFrom}
+        />
       )}
+    </div>
+  );
+}
+
+/**
+ * Cell selector + split switch.
+ *
+ * The split switch offers **exactly the splits this run has** — never a fixed
+ * three-way `all/fit/holdout` toggle. A run is either windowed (`fit` +
+ * `holdout`) or not (`all`), and offering the other shape's buttons invites a
+ * click that can only produce a 404 and a confused reading of why.
+ */
+function CellSelector({
+  report,
+  selection,
+  onSelectCell,
+}: {
+  report: SweepReport;
+  selection: CellSelection;
+  onSelectCell: (cell: CellSelection) => void;
+}) {
+  const splits = report.windows.map((w) => w.split);
+  const chip = (active: boolean) =>
+    `px-2 py-1 rounded text-xs border ${
+      active
+        ? 'bg-blue-950/60 border-blue-700 text-blue-200'
+        : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200'
+    }`;
+
+  return (
+    <div data-testid="cell-selector" className="flex flex-wrap gap-4 items-start">
+      <div>
+        <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Arm</div>
+        <div className="flex flex-wrap gap-1">
+          {report.scenarios.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={chip(s === selection.scenario)}
+              onClick={() => onSelectCell({ ...selection, scenario: s })}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Symbol</div>
+        <div className="flex flex-wrap gap-1">
+          {report.symbols.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={chip(s === selection.symbol)}
+              onClick={() => onSelectCell({ ...selection, symbol: s })}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Split</div>
+        <div data-testid="split-switch" className="flex flex-wrap gap-1">
+          {splits.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={chip(s === selection.split)}
+              onClick={() => onSelectCell({ ...selection, split: s })}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        {report.holdout_semantics && (
+          <p className="text-[11px] text-gray-500 mt-1 max-w-md">{report.holdout_semantics}</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -102,11 +355,17 @@ export default function Simulations() {
 function ResultsRegion({
   detail,
   detailError,
-  onSelect,
+  selection,
+  onSelectCell,
+  dedupFrom,
 }: {
   detail: SweepDetail | null;
   detailError: string | null;
-  onSelect: (runId: string) => void;
+  /** The cell in the URL, or `null` until the default effect has replaced it. */
+  selection: CellSelection | null;
+  onSelectCell: (cell: CellSelection) => void;
+  /** The deduplicated run this screen was auto-opened from, if any. */
+  dedupFrom: string | null;
 }) {
   if (detailError && !detail) {
     return (
@@ -187,22 +446,18 @@ function ResultsRegion({
     );
   }
 
+  // A `deduplicated` row WITH a pointer never reaches here: the page follows it
+  // (see the auto-follow effect above) rather than parking the operator on a run
+  // that stored nothing. Only the dead end is rendered -- a dedup row whose
+  // pointer was never recorded, which is unopenable and has to say so.
   if (sweep.status === 'deduplicated') {
     return shell(
       <p className="text-sm text-gray-400 mt-2">
         {id} was deduplicated: this exact spec had already completed on this engine and commit, so
         nothing was replayed.{' '}
-        {sweep.deduplicated_to ? (
-          <button
-            type="button"
-            onClick={() => onSelect(sweep.deduplicated_to as string)}
-            className="text-blue-400 hover:text-blue-300 underline font-mono"
-          >
-            Open {sweep.deduplicated_to}
-          </button>
-        ) : (
-          'The original run is not recorded on this row.'
-        )}
+        {sweep.deduplicated_to === sweep.run_id
+          ? 'This row points at ITSELF, which cannot be true — the pointer is corrupt, not missing. The run that answered this spec has to be found by its spec in the runs list.'
+          : 'The original run is not recorded on this row, so there is nothing to open — find it by its spec in the runs list.'}
       </p>,
     );
   }
@@ -218,14 +473,40 @@ function ResultsRegion({
     );
   }
 
+  // FC-096 Phase E PR-2: the grid stays exactly where it was, and the console
+  // mounts UNDER it. The grid is how a run is read across arms and symbols; the
+  // console is how one cell of it is read in depth, and neither replaces the
+  // other.
+  //
+  // The bias footer is LAST, below the console (review round 1, F2). It used to
+  // be `SweepResults`'s own final child, which put "how far to trust these
+  // numbers" in the MIDDLE of the page the moment the console mounted beneath
+  // it — the caveats above half the evidence they qualify, and the operator's
+  // last word on the screen a provenance table. The order is asserted with
+  // `compareDocumentPosition` rather than left to whoever edits this JSX next.
   return (
-    <>
+    <div className="space-y-6">
       {detailError && (
         <p className="text-xs text-yellow-400">
           ⚠ Could not refresh this run ({detailError}) — showing the last good read.
         </p>
       )}
       <SweepResults sweep={sweep} report={results} raw={raw} />
-    </>
+      {selection && cellExists(results, selection) && (
+        <section className="rounded-lg border border-gray-700 bg-gray-800 p-5 space-y-4">
+          <h2 className="text-base font-semibold text-white">Cell detail</h2>
+          <CellSelector report={results} selection={selection} onSelectCell={onSelectCell} />
+          <Console
+            sweep={sweep}
+            report={results}
+            scenario={selection.scenario}
+            symbol={selection.symbol}
+            split={selection.split}
+            dedupFrom={dedupFrom}
+          />
+        </section>
+      )}
+      <BiasFooter report={results} />
+    </div>
   );
 }

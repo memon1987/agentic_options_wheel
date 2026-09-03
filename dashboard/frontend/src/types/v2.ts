@@ -419,6 +419,27 @@ export interface SweepRow {
    * second clock buys you.
    */
   stuck?: boolean;
+  /**
+   * FC-096 Phase E: did EVERY non-errored cell of this run store its artifact?
+   *
+   * Three-state on purpose. `true` = the evidence set is complete; `false` =
+   * at least one artifact write FAILED, so a 404 on a cell of this run is a
+   * storage failure rather than a quiet replay; `null`/absent = the run predates
+   * the column and says nothing either way. The console never turns `null` into
+   * `false`: "we do not know" and "it broke" send an operator to different
+   * places.
+   */
+  artifacts_complete?: boolean | null;
+  /**
+   * The engine build that replayed this run — served on the row since Phase B
+   * and, until FC-096 Phase E, absent from this type while present in the
+   * payload (`normaliseSweepDetail` spreads `payload.run` wholesale).
+   *
+   * The console compares it against the STORED ARTIFACT'S identity and flags a
+   * mismatch in red: an object written by a different build than the row claims
+   * is the one provenance failure a reader cannot otherwise see.
+   */
+  engine_identity?: string | null;
 }
 
 /**
@@ -460,6 +481,25 @@ export interface SweepResultRow {
   bid_fill_return: number | null;
   verdict_flips_on_fill: boolean | null;
   replay_seconds: number | null;
+  /**
+   * FC-096 Phase E PR-1: this cell's annualised return MINUS the base cell's,
+   * computed by the server over the same (symbol, split).
+   *
+   * `null` on the base cell itself and whenever either side is unmeasured —
+   * NEVER `0.0`. A zero would read as "this arm matched base"; the truth is
+   * "there is no Δ to state". The console renders the tile only when non-null.
+   */
+  delta_vs_base_annualized: number | null;
+  /**
+   * Does this cell's fit/holdout pair move the same way as base's?
+   *
+   * `true`/`false` only when all four cells (arm fit+holdout, base fit+holdout)
+   * are measured; `null` otherwise, rendered as `—`. This is the PER-CELL
+   * answer; `SweepReport.sign_agreement` is the scenario-level COUNT across
+   * symbols, and the two are labelled differently so one is never read as the
+   * other.
+   */
+  sign_agrees: boolean | null;
   error: string | null;
   insufficient: boolean;
   low_activity: boolean;
@@ -552,6 +592,26 @@ export interface SweepReport {
   in_sample_banner: string | null;
   holdout_semantics: string | null;
   persisted?: boolean;
+  // --- FC-096 Phase E ------------------------------------------------------ //
+  /**
+   * Symbols whose earnings calendar had no rows for this window.
+   *
+   * Served by `GET /sweeps/{run_id}` since Phase B and dropped on the floor by
+   * the SPA until now (plan §Found while planning 4). An empty array means the
+   * gate had data for everything; a NAME in it means the earnings gate could
+   * not run for that symbol, which is a caveat on its cells, not a defect.
+   */
+  earnings_symbols_without_data: string[];
+  /** The DTE reach this run actually replayed under. `> 7` is the masked reach. */
+  effective_max_dte: number | null;
+  /** See `SweepRow.artifacts_complete`. Three-state; `null` says nothing. */
+  artifacts_complete: boolean | null;
+  /** Server-computed run-rates (§Forecast). `null` when the server refused. */
+  forecast: SimForecast | null;
+  /** Mandatory prose beside any forecast. A blank one makes the panel refuse. */
+  forecast_caveat: string | null;
+  /** Why there is no forecast — e.g. an in-sample run. Rendered verbatim. */
+  forecast_refusal: string | null;
 }
 
 /**
@@ -601,6 +661,17 @@ export interface SweepAllowlist {
   rejected: Array<{ key: string; reason: string }>;
   presets: SweepPreset[];
   caps: SweepCaps;
+  /**
+   * `OVERRIDE_VALUE_TYPES` — key -> `band` | `number` | `int` | `bool` |
+   * `symbols` (`services/sweeps.py`).
+   *
+   * The tweak bar (PR-4) types its controls from THIS, never from
+   * `allowed[].description`, which is prose written for a human and would make
+   * the control set depend on how a sentence is phrased.
+   */
+  value_types?: Record<string, string>;
+  /** The engine's default value per allowed key, when the server supplies it. */
+  defaults?: Record<string, unknown>;
 }
 
 /** One arm. `base` is IMPLICIT and reserved — never declared here. */
@@ -650,4 +721,310 @@ export interface LiveStrategyConfig {
   stock_symbols?: string[];
   put_delta_range?: number[];
   call_delta_range?: number[];
+}
+
+// ---------------------------------------------------------------------------
+// FC-096 Phase E — the per-cell detail artifact and its bars sidecar.
+//
+// These mirror `src/backtesting/reporting/artifact.py` KEY FOR KEY (frozen by
+// `tests/fixtures/sim_artifact_schema_v1.json` and `sim_bars_schema_v1.json`).
+// The engine writes one gzipped object per non-errored cell as it replays and
+// one bars sidecar per (run, symbol, split) from the base arm; the console
+// renders them and computes nothing that feeds a verdict.
+//
+// Two rules are encoded in the types themselves:
+//
+//   * `SimLedgerEvent.kind` is the seven known kinds OR any string. An event
+//     kind this build has never seen (Phase C's `synthetic_lot_open`, say) must
+//     render with a neutral badge and its raw kind, never be dropped and never
+//     crash — a union of seven literals would have made dropping it the easy
+//     path.
+//   * Every Phase-E stamp is OPTIONAL. Objects written before PR-1 deployed
+//     carry no `benchmark` and no `provenance.capital_base`, and the console's
+//     job is to say so, not to substitute a default that would silently become
+//     a denominator.
+// ---------------------------------------------------------------------------
+
+/** The seven ledger kinds this build knows. Any other string is still valid. */
+export const KNOWN_LEDGER_KINDS = [
+  'sell_put_open',
+  'sell_call_open',
+  'buy_to_close',
+  'expire_worthless',
+  'put_assignment',
+  'call_assignment',
+  'dividend',
+] as const;
+
+export type KnownLedgerKind = (typeof KNOWN_LEDGER_KINDS)[number];
+
+/**
+ * A known kind, or any other string the engine may write later.
+ *
+ * `string & Record<never, never>` rather than a bare `string`: the intersection
+ * is the idiom that keeps editor completion offering the seven literals while
+ * still ACCEPTING any string, so a build that predates Phase C's
+ * `synthetic_lot_open` can carry it rather than drop it. (`string & {}` is the
+ * more familiar spelling of the same trick and is what `ban-types` objects to.)
+ */
+export type SimLedgerKind = KnownLedgerKind | (string & Record<never, never>);
+
+export interface SimLedgerEvent {
+  date: string;
+  kind: SimLedgerKind;
+  underlying: string;
+  /** OCC symbol for an option event; the underlying for a share/dividend one. */
+  symbol: string;
+  contracts: number;
+  shares: number;
+  price: number | null;
+  cash_delta: number;
+  fees: number;
+  detail: Record<string, unknown>;
+}
+
+/** One decision day's account state. `shares_held` is per underlying. */
+export interface SimDailyState {
+  date: string;
+  equity: number;
+  cash: number;
+  reserved_collateral: number;
+  open_options: number;
+  shares_held: Record<string, number>;
+}
+
+/** One wheel cycle, exactly as `compute_fitness` materialised it. */
+export interface SimCycle {
+  underlying: string;
+  start: string;
+  end: string | null;
+  days: number | null;
+  is_open: boolean;
+  outcome: string | null;
+  puts_sold: number;
+  calls_sold: number;
+  contracts_closed: number;
+  rolls: number;
+  event_count: number;
+  assigned: boolean;
+  called_away: boolean;
+  shares_acquired: number;
+  cost_basis: number | null;
+  exit_price: number | null;
+  capital_at_risk: number | null;
+  max_collateral: number | null;
+  option_pnl: number;
+  stock_pnl: number;
+  dividends: number;
+  fees: number;
+  total_pnl: number;
+  return_on_capital: number | null;
+  annualized_return: number | null;
+}
+
+export interface SimRollRecord {
+  day: string;
+  underlying: string;
+  contracts: number;
+  old_strike: number | null;
+  new_strike: number | null;
+  net_credit: number | null;
+  success: boolean;
+  btc_order_id?: string | null;
+  stc_order_id?: string | null;
+}
+
+/** One ranked rejection reason and how many decision days it bound on. */
+export interface SimRejection {
+  reason: string;
+  days: number;
+}
+
+export interface SimCounters {
+  decision_days?: number;
+  candidate_days?: number;
+  ledger_events?: number;
+  rolls_evaluated?: number;
+  rolls_executed?: number;
+  early_assignments?: number;
+  dividends_credited?: number;
+  unpriced_ex_div_calls?: number;
+  final_equity?: number;
+  total_return?: number;
+}
+
+export interface SimEarningsCoverage {
+  symbols_without_data: string[];
+  symbols_past_horizon: string[];
+}
+
+/**
+ * The scored buy-and-hold benchmark — `fitness.BuyAndHold`, stamped per cell
+ * by PR-1 and repeated inside the bars sidecar.
+ *
+ * `capital_base` is `BuyAndHold.starting_cash`, which for a Phase C covered-call
+ * benchmark is the LOT value rather than the spec's cash. Labelled everywhere as
+ * "full investment of $capital_base at the first close".
+ */
+export interface SimBenchmark {
+  shares: number;
+  entry_day: string;
+  entry_price: number;
+  exit_day: string;
+  exit_price: number;
+  dividends_per_share_total: number;
+  capital_base: number;
+  final_value: number;
+  total_return: number;
+}
+
+export interface SimArtifactWindow {
+  start: string;
+  end: string;
+  first_decision_day: string;
+  last_decision_day: string;
+}
+
+export interface SimArtifactProvenance {
+  run_id: string;
+  scenario: string;
+  symbol: string;
+  split: string;
+  window: SimArtifactWindow;
+  engine_identity: string | null;
+  git_commit: string | null;
+  generated_at: string | null;
+  config_hash: string | null;
+  scenario_hash: string | null;
+  starting_cash: number | null;
+  fill: { basis: string | null; fill_haircut: number | null } | null;
+  masked_reach: Record<string, number> | null;
+  /**
+   * PR-1 stamp: THE denominator every ratio on this cell uses.
+   *
+   * `undefined` on an object written before PR-1 deployed. The console divides
+   * by this field and, on a non-wheel artifact that lacks it, suppresses the
+   * ratio tiles rather than falling back to `starting_cash` — see
+   * `artifactDigest.ts`.
+   */
+  capital_base?: number;
+  /** Phase C stamps this. Absent ⇒ wheel (canonical by omission). */
+  strategy?: string;
+}
+
+export interface SimArtifact {
+  schema: number;
+  provenance: SimArtifactProvenance;
+  daily: SimDailyState[];
+  ledger: SimLedgerEvent[];
+  cycles: SimCycle[];
+  roll_records: SimRollRecord[];
+  rejections: SimRejection[];
+  binding_constraint: string | null;
+  counters: SimCounters;
+  earnings_coverage: SimEarningsCoverage | null;
+  /** PR-1 stamp; `undefined` before it, `null` when the replay had none. */
+  benchmark?: SimBenchmark | null;
+}
+
+// --- the bars sidecar ------------------------------------------------------ //
+
+export interface SimBar {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/**
+ * The engine-built buy-and-hold curve.
+ *
+ * NOTE the key: the curve is `buy_and_hold.daily`, and `bars_in_window` lives
+ * under `provenance` — verified against the live sidecar of run
+ * `13cc2729d1c74211` rather than taken from the plan's prose.
+ */
+export interface SimBuyAndHold {
+  capital_base: number;
+  shares: number;
+  entry_day: string;
+  entry_price: number;
+  exit_day: string;
+  exit_price: number;
+  dividends_per_share_total: number;
+  final_value: number;
+  daily: Array<{ date: string; value: number }>;
+}
+
+export interface SimBarsProvenance {
+  run_id: string;
+  symbol: string;
+  split: string;
+  window: { start: string; end: string };
+  first_decision_day: string;
+  last_decision_day: string;
+  engine_identity: string | null;
+  git_commit: string | null;
+  generated_at: string | null;
+  source: string | null;
+  data_from: string | null;
+  data_to: string | null;
+  bars_in_window: number | null;
+}
+
+export interface SimBars {
+  schema: number;
+  provenance: SimBarsProvenance;
+  bars: SimBar[];
+  /** `null` exactly when the scored replay had no benchmark. */
+  buy_and_hold: SimBuyAndHold | null;
+}
+
+// --- the server-computed forecast (§Forecast) ------------------------------ //
+
+/** One basis' run-rate pair. Every field is `null` when an input was NULL. */
+export interface SimForecastBasis {
+  fit_per_day: number | null;
+  holdout_per_day: number | null;
+  low_per_day: number | null;
+  high_per_day: number | null;
+  annual_low: number | null;
+  annual_high: number | null;
+  /** Portfolio rows only: how many symbols were summed. */
+  n_summed?: number;
+}
+
+export interface SimForecastSymbol {
+  fill: { basis: string | null; fill_haircut: number | null; is_engine_default?: boolean };
+  days: { fit: number | null; holdout: number | null };
+  capital_base: number | null;
+  net_option_pnl: SimForecastBasis;
+  total_pnl: SimForecastBasis;
+}
+
+export interface SimForecastPortfolio {
+  included: string[];
+  /** symbol -> the state that excluded it, e.g. `"fit: insufficient"`. */
+  excluded: Record<string, string>;
+  excluded_by_basis?: Record<string, Record<string, string>>;
+  n_included: number;
+  n_symbols: number;
+  net_option_pnl: SimForecastBasis | null;
+  total_pnl: SimForecastBasis | null;
+  /** Why there is no portfolio sum. Rendered verbatim when non-null. */
+  refusal: string | null;
+}
+
+export interface SimForecast {
+  default_horizon_days: number;
+  horizon_choices: number[];
+  annual_days: number;
+  capital_base: number | null;
+  strategy: string | null;
+  days: { fit: number | null; holdout: number | null };
+  by_scenario: Record<
+    string,
+    { symbols: Record<string, SimForecastSymbol>; portfolio: SimForecastPortfolio }
+  >;
 }
