@@ -1049,6 +1049,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §Forecast range; PR-1 #121 PR body "deferred"), FC-060 guardrails.
 
+### FC-102: a regression-monitor unit test opens a real outbound socket — ambient-environment class, instance ten
+
+**Scope:** shared
+**Status:** Filed 2026-09-03 (found by the FC-096 Phase E PR-1 confirmation pass running the suite with non-loopback `socket.connect` patched to raise)
+**Size estimate:** S
+
+**Problem:** `tests/test_regression_monitor_risk.py::TestDuplicateUnderlying::test_passes_when_each_underlying_has_one_option` passes in ~2.5 s on a networked machine and HANGS indefinitely with sockets blocked — something in `check_risk_parameters` (`tools/testing/regression_monitor.py`) reaches past the monkeypatched `_get` / BigQuery seams and retries an outbound connect with backoff. A unit test whose pass depends on the network is the tenth instance of the class documented in memory (CI image deps, `/workspace` artifacts, unpinned ASGI majors, …); this one is silent because CI has network.
+
+**Proposal:** find the leak (likely a client constructed at import or a retry path not behind the seam), inject it, and add the socket-block plugin the confirmation passes use (`-p` raising on non-loopback connect) as an opt-in CI step so the class cannot recur unnoticed. Test: the file passes under the block.
+
+**Links:** the ambient-environment class (memory `session_2026_08_28_program.md`), FC-096 Phase E PR-1 #121.
+
 
 ## Completed
 
