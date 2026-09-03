@@ -89,6 +89,12 @@ function rowFromCell(
     bid_fill_return: num(cell.bid_fill_return),
     verdict_flips_on_fill: bool(cell.verdict_flips_on_fill),
     replay_seconds: num(cell.replay_seconds),
+    // FC-096 Phase E PR-1 served these per cell; PR-2 passes them through.
+    // `num`/`bool` return null for anything non-numeric/non-boolean, which is
+    // exactly the contract: the server writes `null` on the base cell and on
+    // every unmeasured pairing, and a 0 there would read as "matched base".
+    delta_vs_base_annualized: num(cell.delta_vs_base_annualized),
+    sign_agrees: bool(cell.sign_agrees),
     error: state === 'error' ? (error ?? 'errored') : error,
     insufficient: state === 'insufficient',
     low_activity: state === 'low_activity',
@@ -227,6 +233,21 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
       typeof payload.in_sample_banner === 'string' ? payload.in_sample_banner : null,
     holdout_semantics:
       typeof payload.holdout_semantics === 'string' ? payload.holdout_semantics : null,
+    // --- FC-096 Phase E ---------------------------------------------------- //
+    // The first three have been served since Phase B and dropped on the floor
+    // here (plan §Found while planning 4). `artifacts_complete` stays
+    // THREE-STATE: `null` is "this run predates the column", which is not the
+    // same claim as "an artifact write failed", and the footer says so.
+    earnings_symbols_without_data: Array.isArray(payload.earnings_symbols_without_data)
+      ? payload.earnings_symbols_without_data.filter((s): s is string => typeof s === 'string')
+      : [],
+    effective_max_dte: num(payload.effective_max_dte),
+    artifacts_complete: bool(payload.artifacts_complete),
+    forecast: isRecord(payload.forecast) ? (payload.forecast as unknown as SweepReport['forecast']) : null,
+    forecast_caveat:
+      typeof payload.forecast_caveat === 'string' ? payload.forecast_caveat : null,
+    forecast_refusal:
+      typeof payload.forecast_refusal === 'string' ? payload.forecast_refusal : null,
   };
 }
 
