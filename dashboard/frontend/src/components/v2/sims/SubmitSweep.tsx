@@ -10,14 +10,14 @@
 // `src/backtesting/scenarios/overrides.py` gives the runner, and the 502 carries
 // the exact grant command — rewording either would drop the actionable half.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type {
   SweepAllowlist,
   SweepPreset,
   SweepScenarioSpec,
 } from '../../../types/v2';
 import { cls } from '../../../utils/format';
-import { submitSweep, writeStoredToken, type SubmitOutcome } from '../../../hooks/useSweeps';
+import { SESSION_EXPIRED_MESSAGE, submitSweep, type SubmitOutcome } from '../../../hooks/useSweeps';
 import {
   DEFAULT_HOLDOUT_DAYS,
   DEFAULT_WINDOW_DAYS,
@@ -35,8 +35,6 @@ interface Props {
   allowlist: SweepAllowlist | null;
   allowlistError: string | null;
   universe: string[];
-  token: string;
-  onTokenChange: (token: string) => void;
   /** Called with the accepted run_id so the page can select it immediately. */
   onSubmitted: (runId: string) => void;
   /** Open another run (the `prior_done_run_id` hint) without submitting. */
@@ -61,8 +59,6 @@ export default function SubmitSweep({
   allowlist,
   allowlistError,
   universe,
-  token,
-  onTokenChange,
   onSubmitted,
   onSelectRun,
 }: Props) {
@@ -124,11 +120,10 @@ export default function SubmitSweep({
           scenarios,
         },
         holdoutEnabled,
-        token,
         allowlist,
         scenarioParseError: parsed.error,
       }),
-    [allSymbols, start, end, holdoutEnabled, holdoutStart, cashValue, scenarios, token, allowlist, parsed.error],
+    [allSymbols, start, end, holdoutEnabled, holdoutStart, cashValue, scenarios, allowlist, parsed.error],
   );
 
   // A haircut typed outside [0, 1] is a form error even with no arms declared.
@@ -136,10 +131,6 @@ export default function SubmitSweep({
     haircutValue !== undefined && (!Number.isFinite(haircutValue) || haircutValue < 0 || haircutValue > 1);
 
   const canSubmit = validation.valid && !haircutBad && !submitting;
-
-  useEffect(() => {
-    writeStoredToken(token);
-  }, [token]);
 
   const applyPreset = (preset: SweepPreset) => {
     const existing = parsed.scenarios ?? [];
@@ -170,7 +161,7 @@ export default function SubmitSweep({
       scenarios,
     });
     // ONE request. See `submitSweep`: a retried submit can duplicate a Job.
-    const result = await submitSweep(spec, token);
+    const result = await submitSweep(spec);
     setSubmitting(false);
     setOutcome(result);
     if (result.kind === 'accepted') {
@@ -414,26 +405,11 @@ export default function SubmitSweep({
         </div>
       </div>
 
-      {/* --- token --- */}
-      <div>
-        <label className="block text-sm font-medium text-gray-300" htmlFor="sweep-token">
-          Submit token
-        </label>
-        <input
-          id="sweep-token"
-          type="password"
-          value={token}
-          onChange={(e) => onTokenChange(e.target.value)}
-          autoComplete="off"
-          placeholder="SWEEP_SUBMIT_TOKEN"
-          className="mt-1 w-full bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-sm text-gray-200 font-mono"
-        />
-        <p className="text-xs text-gray-500 mt-1">
-          Kept in this tab's sessionStorage only — gone when the tab closes, never sent anywhere but
-          the submit.
-        </p>
-        <IssueList issues={issuesFor(validation.issues, 'token')} />
-      </div>
+      {/* No credential field. FC-096 Phase D retired `SWEEP_SUBMIT_TOKEN`: the
+          page is behind IAP, the session cookie is the credential, and the API
+          authorises the write against its `OPERATORS` allowlist. A viewer's
+          submit comes back 403 with the server's own message; a signed-out one
+          comes back 401 and is rendered as the session-expired state below. */}
 
       <IssueList issues={issuesFor(validation.issues, 'caps')} />
 
@@ -470,6 +446,34 @@ function Outcome({
   outcome: SubmitOutcome;
   onSelectRun: (runId: string) => void;
 }) {
+  // The IAP session is gone. Rendered on its own, with the one action that
+  // helps, because every other refusal on this form is about the SPEC and this
+  // one is not: re-reading it, fixing it or resubmitting it all fail the same
+  // way until the page is reloaded and the operator signs in again.
+  if (outcome.kind === 'session_expired') {
+    return (
+      <div
+        data-testid="submit-outcome"
+        className="rounded border border-yellow-700/70 bg-yellow-950/30 p-3 space-y-2"
+      >
+        <p data-testid="session-expired" className="text-sm font-medium text-yellow-300">
+          {SESSION_EXPIRED_MESSAGE}
+        </p>
+        <p className="text-xs text-yellow-200/80">
+          Nothing was submitted. Your Identity-Aware Proxy session has ended — reloading takes you
+          through Google sign-in and back to this page.
+        </p>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
+        >
+          Reload
+        </button>
+      </div>
+    );
+  }
+
   if (outcome.kind === 'accepted') {
     const prior = outcome.body.prior_done_run_id;
     return (
@@ -504,12 +508,19 @@ function Outcome({
     );
   }
 
-  const label: Record<Exclude<SubmitOutcome['kind'], 'accepted'>, string> = {
-    unauthorized: 'Rejected — token',
+  const label: Record<
+    Exclude<SubmitOutcome['kind'], 'accepted' | 'session_expired'>,
+    string
+  > = {
+    // A BACKEND 401 (review round 1, F3): `iap_audience_unconfigured`, an
+    // id-token with no email claim, or no assertion at all. NOT an expiry —
+    // the detail below carries the repair, so it is rendered verbatim.
+    unauthenticated: 'Refused — the service could not verify an identity',
+    unauthorized: 'Refused — your account is not an operator',
     conflict: 'Refused — a sweep is already in flight',
     invalid: 'Refused — the spec is not legal',
     launch_failed: 'The Job could not be launched',
-    disabled: 'Submits are disabled',
+    disabled: 'Submits are unavailable',
     error: 'The submit failed',
   };
 

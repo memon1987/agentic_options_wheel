@@ -845,19 +845,64 @@ and stored in `options_wheel.scenario_pins` — insert-only and latest-row-wins
 like the sweep tables, so un-pinning writes an `active=false` row rather than
 deleting one. `persist.py` owns that schema; the writer's reconcile creates the
 table, so the first persisted sweep (or the first battery) after this ships is
-what brings it into existence. The API is token-gated on the writes and public
-on the read, like every other pair on this dashboard:
+what brings it into existence. The whole API sits behind IAP; the writes
+additionally require the caller's email to be in `OPERATORS` (FC-096 Phase D —
+the `SWEEP_SUBMIT_TOKEN` bearer is retired).
+
+**The supported programmatic path is IMPERSONATION.** Mint an id-token for the
+IAP OAuth client as the automation service account, then use it on every call:
 
 ```bash
-curl -H "Authorization: Bearer $SWEEP_SUBMIT_TOKEN" -X POST \
+TOK=$(gcloud auth print-identity-token \
+  --impersonate-service-account=claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com \
+  --audiences=799970961417-me9jr43mn5eu2a0i41qk28d7pho4iktj.apps.googleusercontent.com \
+  --include-email)
+```
+
+**Two preconditions, and both are already satisfied** — they are listed because
+a failure of either is silent in different ways:
+
+1. The SA holds **`roles/iap.httpsResourceAccessor`** on the service (the
+   operator grant; command in *The IAP roles layer* below). Without it IAP
+   refuses at the door — a **403**, never a redirect, and nothing in the
+   dashboard's logs.
+2. The SA's email is in **`OPERATORS`** (this is what FC-096 Phase D PR-2 added;
+   it lives in `cloudbuild.yaml`'s `--set-env-vars`). Without it the request is
+   admitted and reads work, and every WRITE is a 403 naming the allowlist.
+
+Impersonating also requires the *caller* to hold
+**`roles/iam.serviceAccountTokenCreator`** on that SA. A **key credential** for
+the SA (`GOOGLE_APPLICATION_CREDENTIALS` pointing at a downloaded key, then
+`gcloud auth print-identity-token --audiences=<client id>`) mints an acceptable
+token too — verified live 2026-09-02, the key path carries the `email` claim on
+its own — but it is **not** the recommended path: it is a long-lived credential
+on disk where impersonation is a short-lived one, minted on demand and revocable
+by removing one IAM binding.
+
+`--include-email` is **mandatory, not tidiness**: an impersonated identity token
+carries no `email` claim by default, IAP rejects it outright, and the failure
+arrives as an IAP-level 401 with nothing in the dashboard's logs (seen live,
+2026-09-02). The `--audiences` value is the **custom OAuth client id**, not the
+service URL — the Google-managed default client blocks programmatic OIDC
+entirely, which is what 401'd the scheduler until the client was allowlisted in
+`access_settings.oauth_settings.programmaticClients`.
+
+```bash
+curl -H "Authorization: Bearer $TOK" -X POST \
   https://<dashboard>/api/v2/sims/pins \
   -d '{"spec": {"symbols": ["AAPL"], "start": "2025-08-01", "end": "2026-07-31",
                 "holdout_start": "2026-05-01", "scenarios": []},
        "note": "the tighter delta band"}'
-curl https://<dashboard>/api/v2/sims/pins            # active; ?include_inactive=true for all
-curl -H "Authorization: Bearer $SWEEP_SUBMIT_TOKEN" -X DELETE \
+curl -H "Authorization: Bearer $TOK" \
+  https://<dashboard>/api/v2/sims/pins   # active; ?include_inactive=true for all
+curl -H "Authorization: Bearer $TOK" -X DELETE \
   https://<dashboard>/api/v2/sims/pins/<pin_id>
 ```
+
+Note the GET carries the token too. It is not an authorization change — every
+identity IAP admits may read everything — it is that **there is no anonymous
+caller any more**: without a token IAP answers a 302 to Google sign-in, and
+`curl` will happily print that HTML as if it were the answer.
 
 The spec is wrapped in `{"spec": ..., "note": ...}` rather than spread, so a
 misspelled spec field is still refused as one. Three refusals are worth knowing:
@@ -1018,17 +1063,23 @@ regression; do not treat those columns as data.
 `/api/v2/sweeps*` is the dashboard's only endpoint family that *causes* anything.
 Five routes, and the asymmetry between them is deliberate:
 
+**Every route below is behind IAP** (FC-096 Phase D): `allUsers` is off the
+service's invoker policy, so "IAP only" in the auth column means *any identity
+IAP admits* — the sign-in is the gate, and there is no further check. "IAP
+operator" means additionally: a valid signed assertion whose `email` claim is in
+this revision's `OPERATORS` allowlist.
+
 | route | auth | what it does |
 |---|---|---|
-| `GET /api/v2/sweeps/allowlist` | none | the override keys, the refusals **and their reasons**, presets, caps. Static — no BigQuery |
-| `GET /api/v2/sweeps` | none | recent runs, latest status per `run_id`, `stuck` label |
-| `GET /api/v2/sweeps/{run_id}` | none | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
-| `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` | none | one cell's **detail artifact** — equity curve, full ledger, cycles, rolls, rejection tally (FC-096 Phase B) |
-| `POST /api/v2/sweeps` | **`Authorization: Bearer $SWEEP_SUBMIT_TOKEN`** | validate → 409 gate → write `submitted` → launch the Job → **202** |
-| `POST /api/v2/sims/run` | **the same bearer token** | proxy to the private `sim-service` with an **OIDC ID token** (`routers/live.py`'s pattern, NOT `_launch_job`'s control-plane OAuth token — each is a 401 at the other end); returns the service's status code and body **verbatim**, because its 409/422 bodies carry the estimate, the missing symbol-days and the remedy |
-| `GET /api/v2/sims/pins` | none | the weekly battery's standing questions — active by default, `?include_inactive=true` for the retired ones, specs decoded (FC-096 Phase B B4) |
-| `POST /api/v2/sims/pins` | **the same bearer token** | pin a spec: `{"spec": {...}, "note": "..."}` → **201**. 422 for a spec `POST /sweeps` would refuse (or a pinned `force`), 409 for the 20-active cap or for a pin already asking the same question, naming it |
-| `DELETE /api/v2/sims/pins/{pin_id}` | **the same bearer token** | un-pin: writes an `active=false` row, never deletes. 404 on an unknown id; `deactivated: false` when it was already inactive |
+| `GET /api/v2/sweeps/allowlist` | IAP only | the override keys, the refusals **and their reasons**, presets, caps. Static — no BigQuery |
+| `GET /api/v2/sweeps` | IAP only | recent runs, latest status per `run_id`, `stuck` label |
+| `GET /api/v2/sweeps/{run_id}` | IAP only | status + `shape_results` (grid, per-scenario summary, deltas over the common measured subset, sign agreement, the bias footer) |
+| `GET /api/v2/sweeps/{run_id}/artifacts/{scenario}/{symbol}/{split}` | IAP only | one cell's **detail artifact** — equity curve, full ledger, cycles, rolls, rejection tally (FC-096 Phase B) |
+| `POST /api/v2/sweeps` | **IAP operator**: valid signed assertion + email in `OPERATORS` | validate → 409 gate → write `submitted` → launch the Job → **202** |
+| `POST /api/v2/sims/run` | **the same** | proxy to the private `sim-service` with an **OIDC ID token** (`routers/live.py`'s pattern, NOT `_launch_job`'s control-plane OAuth token — each is a 401 at the other end); returns the service's status code and body **verbatim**, because its 409/422 bodies carry the estimate, the missing symbol-days and the remedy |
+| `GET /api/v2/sims/pins` | IAP only | the weekly battery's standing questions — active by default, `?include_inactive=true` for the retired ones, specs decoded (FC-096 Phase B B4) |
+| `POST /api/v2/sims/pins` | **the same** | pin a spec: `{"spec": {...}, "note": "..."}` → **201**. 422 for a spec `POST /sweeps` would refuse (or a pinned `force`), 409 for the 20-active cap or for a pin already asking the same question, naming it |
+| `DELETE /api/v2/sims/pins/{pin_id}` | **the same** | un-pin: writes an `active=false` row, never deletes. 404 on an unknown id; `deactivated: false` when it was already inactive |
 
 **The sim proxy is a proxy, not a second API** (FC-096 Phase B PR-c). Every rule
 about what a spec may contain, what it costs and whether the chain lake covers
@@ -1068,14 +1119,24 @@ because shortening the bound is the dangerous direction.
   separator and `validate_scenario_name` forbids it in a name, which is what
   makes the `rsplit('__', 2)` parser sound.
 
-- **The GETs are public because everything on this dashboard is** (it is reachable
-  by `allUsers` — FC-094 owns that decision). Sweep results are hypotheticals over
-  historical data, not the live book. Only the submit is gated, because a submit
-  spends Job time.
-- **The token compare is `hmac.compare_digest`, and it fails closed.** An unset
-  `SWEEP_SUBMIT_TOKEN` returns 503 "sweeps disabled" rather than accepting
-  anything. The secret is wired out-of-band (`--update-secrets`), so "not
-  configured yet" is a real state.
+- **Nothing here is public any more** (FC-096 Phase D, 2026-09-02). The whole
+  dashboard is behind IAP and `allUsers` is off the invoker policy, which closed
+  FC-094. The GETs are ungated *beyond* the sign-in — sweep results are
+  hypotheticals over historical data, not the live book, and the signed
+  assumption is that every invited identity sees everything — while the writes
+  additionally require `OPERATORS`, because a write spends Job time.
+- **The `SWEEP_SUBMIT_TOKEN` gate is GONE** (PR-2), not disabled: the bearer
+  helpers were deleted from `services/sweeps.py` and the router reads no such
+  variable. A write with no assertion is a **401 naming IAP** and carrying the
+  programmatic recipe. The env var may still be bound to a running revision, and
+  it changes nothing — but the ORDER of retiring it does. The operator unbinds
+  the secret (`--remove-secrets=SWEEP_SUBMIT_TOKEN`, a new revision) AFTER this
+  deploys, and deletes the secret only after that. **Deleting it while a live
+  revision still binds it breaks THAT revision, not the next one:** the binding
+  is a pinned secret version and the dashboard runs `--min-instances=0`, so the
+  next request is a cold start, the cold start cannot resolve a secret that no
+  longer exists, and the dashboard is down on the next page load with nothing in
+  the application logs — the application never started.
 - **Everything decidable lives in `services/sweeps.py`, not in the router.**
   FastAPI is absent from the image Cloud Build tests with, so a rule written in
   `routers/v2.py` is a rule nobody checks — the same reason `services/pause_alert.py`
@@ -1096,20 +1157,60 @@ because shortening the bound is the dangerous direction.
   `execution_name` is stored so an operator can go and look. A `submitted` row with
   no `running` row after 10 minutes renders as "stuck" — a label, not a cancel.
 
-### The IAP roles layer (FC-096 Phase D PR-1) — shipped, INERT until the flip
+### The IAP roles layer (FC-096 Phase D) — LIVE
 
 `dashboard/backend/services/auth.py` verifies the signed
-`x-goog-iap-jwt-assertion` header and decides who may write. It is deployed but
-**does nothing yet**: until the operator turns IAP on, no request carries an
-assertion, so every write falls through to the `SWEEP_SUBMIT_TOKEN` gate exactly
-as before (`TestThePr1NoOpProbe` pins that byte-for-byte).
+`x-goog-iap-jwt-assertion` header and decides who may write. IAP was turned on
+and `allUsers` removed at the console session on **2026-09-02**; PR-2 then
+deleted the `SWEEP_SUBMIT_TOKEN` fall-through, so the table below is the whole
+of the write gate.
 
 | request carries | outcome on the four write routes |
 |---|---|
-| no assertion | the existing bearer-token gate, unchanged (503 unconfigured / 401 mismatch) |
-| an assertion that does not verify | **401**, log event `iap_assertion_invalid`. **Never** a fall-through to the token — a forged header or a broken audience must be loud |
-| a valid assertion, email in `OPERATORS` | allowed; the bearer token is **ignored** |
-| a valid assertion, email NOT in `OPERATORS` | **403** naming the mechanism. No token fallback, or one leaked token defeats the migration |
+| no assertion | **401** naming IAP, carrying the browser remedy (reload to sign in) and the programmatic recipe. There is nothing to fall back to |
+| an assertion that does not verify | **401**, log event `iap_assertion_invalid`. A forged header or a broken audience must be loud |
+| a valid assertion, email in `OPERATORS` | allowed |
+| a valid assertion, email NOT in `OPERATORS` | **403** naming the mechanism |
+
+**The SPA sends `X-Requested-With: XMLHttpRequest` on every fetch, and that is
+load-bearing.** Without it IAP answers an expired session with a **302 to
+Google's sign-in page**, which a `fetch` follows cross-origin and the SPA
+receives as a network failure or a lump of HTML — indistinguishable from "the
+API is down". With it IAP answers **401**, which the hooks recognise and render
+as *"Session expired — reload the page to sign in again"*, once, at the top of
+the page, with a reload button; polling then STOPS, because nothing about that
+state recovers without a reload. The full IAP session-refresh iframe is
+deliberately NOT implemented — named as a Phase E item.
+
+Three mechanics behind that sentence, because each one is a way it was false in
+review round 1:
+
+- **One banner, in the app shell.** `LayoutV2` renders it, so every route gets
+  it. It used to live on `/sims` alone, which is why Overview, By Symbol and Bot
+  Health polled a signed-out API for ever with nothing on screen to say so.
+- **Both hooks stop.** `useSweeps` stopped; `useApi` — the hook every other page
+  reads through — threw the same error, kept the fact in an `error` string no
+  caller read, and went on firing its refresh interval. It now returns
+  `sessionExpired` and its interval bails on it.
+- **The banner does not wait for the layout's own poll.** `/api/live/account`
+  refreshes once a MINUTE and the `/sims` hooks every 15s, so `hooks/iapSession.ts`
+  carries a tab-wide signal: whichever hook notices first marks it, the layout
+  renders once.
+
+**A 401 is not automatically an expiry.** IAP's own 401 is `text/html` and
+carries `x-goog-iap-generated-response`; the BACKEND's is JSON with a `detail`
+that names its own repair — `iap_audience_unconfigured` (whose detail carries
+the `--update-env-vars` recovery below), an id-token with no `email` claim, and
+`NO_ASSERTION_DETAIL`. The SPA reads the body BEFORE it decides: a JSON `detail`
+is shown verbatim with a short reload hint; HTML, an empty body, or IAP's own
+header is the generic expiry. Classifying every 401 as an expiry — which is what
+the first cut did — swallows the only message that says how to fix it, and the
+operator reloads for ever.
+
+**Local dev sees the 401s and that is correct.** `vite` proxies `/api` to a bare
+`uvicorn` with no IAP in front of it, so nothing carries an assertion and every
+write answers `NO_ASSERTION_DETAIL`. The gate is the perimeter, and a laptop has
+no perimeter. Reads work normally.
 
 Exempt from the **OPERATORS** chain, on the record — and note what "exempt"
 does and does not mean:
@@ -1151,28 +1252,53 @@ survives only until the next merge) and frozen in
   between variables. Unset/empty ⇒ 403 saying the *revision* has no allowlist,
   never "you are a viewer".
 
-#### Adding the second operator — read this first
+#### The second operator is the automation SA — this is the form in use
 
-Today's value is **one token**, so it needs no quoting and the deploy line is
-plain. **The moment a second address is added the value contains a space**, and
-that line lives inside an unquoted `bash -c` script in `cloudbuild.yaml`: bash
-word-splits it and gcloud receives `b@x.com` as a positional argument. Red
-build, from a one-word edit. Quoting alone does not fix it either — the flag's
-own separator is the comma, which cannot express a value containing a space.
+`OPERATORS` holds **two** entries: `zeshan@tkzmgroup.com` and
+`claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com`. The
+service account is not a convenience. `POST /sims/run`, `POST /sims/pins` and
+`DELETE /sims/pins/{id}` have **no frontend caller** — they are curl-only
+surfaces — so once the bearer token is retired an impersonated id-token for that
+SA is the only credential that can reach them.
 
-gcloud's answer is an **alternate delimiter**: prefix the value with `^<char>^`
-and that character separates the variables instead of the comma. Write the whole
-flag as one quoted argument:
+The value therefore contains a **space**, and the deploy line lives inside an
+unquoted `bash -c` script in `cloudbuild.yaml`, where bash would word-split it
+and hand gcloud the second address as a positional argument. Quoting alone does
+not fix it either — the flag's own separator is the comma, which cannot express
+a value containing a space. gcloud's answer is an **alternate delimiter**:
+prefix the value with `^<char>^` and that character separates the variables
+instead of the comma, with the whole flag as one quoted argument. That is the
+form deployed today:
 
 ```bash
---set-env-vars='^;^TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app;GCP_PROJECT=$PROJECT_ID;PAUSE_ALERT_THRESHOLD_DAYS=7;GIT_COMMIT=$COMMIT_SHA;SWEEP_JOB_NAME=backtest-sweep;SIM_SERVICE_URL=https://sim-service-799970961417.us-central1.run.app;IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard;OPERATORS=a@x.com b@x.com'
+--set-env-vars='^;^TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app;GCP_PROJECT=$PROJECT_ID;PAUSE_ALERT_THRESHOLD_DAYS=7;GIT_COMMIT=$COMMIT_SHA;SWEEP_JOB_NAME=backtest-sweep;SIM_SERVICE_URL=https://sim-service-799970961417.us-central1.run.app;IAP_AUDIENCE=/projects/799970961417/locations/us-central1/services/options-wheel-dashboard;OPERATORS=zeshan@tkzmgroup.com claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com'
 ```
 
 `;` because no value in that set contains one; the `^;^` prefix is consumed by
-gcloud, not by the shell. **Re-freeze `tests/fixtures/cloudbuild_contract.json`
-in the same commit** — the whole flag string is frozen, so switching delimiter is
-a fixture change too (`deploy_flags()` tokenises with `shlex`, which handles the
-quoted form).
+gcloud, not by the shell. A **third** operator is now just another
+space-separated address inside the existing quotes. **Re-freeze
+`tests/fixtures/cloudbuild_contract.json` in the same commit** — the whole flag
+string is frozen there.
+
+⚠️ `deploy_flags()` in `tests/test_cloudbuild_contract.py` does **not** use bare
+`shlex` for this, and an earlier revision of this section wrongly said it did.
+In non-posix mode `shlex` treats a quote that opens mid-word as an ordinary
+character, so `shlex.split("--x='a b'", posix=False)` returns `["--x='a", "b'"]`
+— the flag loses everything after the first space and the fixture would freeze a
+truncated `OPERATORS` with every assertion still green. The helper now hides the
+spaces inside quoted spans before tokenising and puts them back.
+
+**Being in `OPERATORS` is not admission.** It decides who may WRITE once IAP has
+already let the request in. Every identity — human or SA — also needs
+`roles/iap.httpsResourceAccessor` on the service:
+
+```bash
+gcloud iap web add-iam-policy-binding --project=gen-lang-client-0607444019 \
+  --resource-type=cloud-run --region=us-central1 \
+  --service=options-wheel-dashboard \
+  --member=serviceAccount:claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com \
+  --role=roles/iap.httpsResourceAccessor --condition=None
+```
 
 **Recovery path — no build required, minutes:**
 

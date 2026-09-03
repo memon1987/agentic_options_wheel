@@ -64,7 +64,6 @@ const good = (over: Record<string, unknown> = {}) => ({
     ...over,
   },
   holdoutEnabled: true,
-  token: 'a-token',
   allowlist: ALLOWLIST,
 });
 
@@ -95,10 +94,13 @@ describe('validateSpec — the four things a submit needs', () => {
     expect(messages(v)).toMatch(/at least one arm/i);
   });
 
-  it('is invalid with no token', () => {
-    const v = validateSpec({ ...good(), token: '   ' });
-    expect(v.valid).toBe(false);
-    expect(messages(v)).toMatch(/token is required/i);
+  it('is VALID with no credential of any kind (FC-096 Phase D PR-2)', () => {
+    // The submit token was the fourth requirement and it is retired. The
+    // browser's IAP session is the credential now, and this function cannot
+    // see it — so there is nothing here to validate, and a lingering token
+    // rule would disable the button for every operator, permanently.
+    expect(validateSpec(good()).valid).toBe(true);
+    expect(messages(validateSpec(good()))).not.toMatch(/token/i);
   });
 });
 

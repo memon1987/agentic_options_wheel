@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
+import { SESSION_EXPIRED_MESSAGE, useSessionExpiredSignal } from '../../hooks/iapSession';
 
 interface AccountData {
   paper_trading?: boolean;
@@ -17,10 +18,26 @@ const navItems = [
 
 export default function LayoutV2() {
   const [menuOpen, setMenuOpen] = useState(false);
-  const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
+  const { data: account, sessionExpired: accountSessionExpired } = useApi<AccountData>(
+    '/api/live/account',
+    { refreshInterval: 60_000 },
+  );
 
   // FC-031: default to PAPER when the flag is missing — the safe direction.
   const isPaperTrading = account?.paper_trading ?? true;
+
+  // FC-096 Phase D PR-2 (review round 1, F1): the ONE session-expiry banner,
+  // here because this layout wraps EVERY route — the /sims page having its own
+  // was why the other three pages had none and polled on for ever.
+  //
+  // Two sources, deliberately:
+  //   * this layout's own poll, which is the guarantee — the banner does not
+  //     depend on any other hook being wired up;
+  //   * the tab-wide signal, which is the LATENCY — this poll runs once a
+  //     minute and the /sims hooks run every 15s, so without it the banner
+  //     could trail the page's own failures by up to 45 seconds.
+  const signalled = useSessionExpiredSignal();
+  const sessionExpired = accountSessionExpired || signalled;
 
   return (
     <div className="min-h-screen bg-gray-900">
@@ -103,6 +120,28 @@ export default function LayoutV2() {
       {/* Main Content */}
       <main className="lg:pl-60 pt-16 lg:pt-0">
         <div className="p-4 lg:p-6 max-w-7xl">
+          {sessionExpired && (
+            <section
+              data-testid="session-expired-banner"
+              role="alert"
+              className="mb-6 rounded-lg border border-yellow-700/70 bg-yellow-950/30 p-4 flex items-center justify-between gap-4 flex-wrap"
+            >
+              <div>
+                <p className="text-sm font-medium text-yellow-300">{SESSION_EXPIRED_MESSAGE}</p>
+                <p className="text-xs text-yellow-200/80 mt-1">
+                  Nothing on this page is refreshing any more. Reloading signs you back in through
+                  Google and returns you here.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
+              >
+                Reload
+              </button>
+            </section>
+          )}
           <Outlet />
         </div>
       </main>

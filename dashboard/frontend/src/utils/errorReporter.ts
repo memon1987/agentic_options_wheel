@@ -21,7 +21,15 @@ export function reportError(error: ErrorReport): void {
     // Fire-and-forget POST — we don't want error reporting to itself cause issues
     fetch(ERROR_ENDPOINT, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // FC-096 Phase D: behind IAP, an expired session answers a plain fetch
+        // with a 302 to Google's sign-in page. This makes it a 401 instead, so
+        // a report from a signed-out tab fails as one request rather than as a
+        // cross-origin redirect chain. The sink itself stays ungated — the
+        // crash report of a session that just expired is one worth having.
+        'X-Requested-With': 'XMLHttpRequest',
+      },
       body: JSON.stringify(error),
     }).catch(() => {
       // Silently swallow — cannot do anything if error reporting fails

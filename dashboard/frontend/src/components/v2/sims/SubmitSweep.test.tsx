@@ -35,7 +35,7 @@ const ALLOWLIST: SweepAllowlist = {
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
-const setup = (token = 'a-token') => {
+const setup = () => {
   const onSubmitted = vi.fn();
   const onSelectRun = vi.fn();
   render(
@@ -43,8 +43,6 @@ const setup = (token = 'a-token') => {
       allowlist={ALLOWLIST}
       allowlistError={null}
       universe={['AAPL', 'NVDA']}
-      token={token}
-      onTokenChange={vi.fn()}
       onSubmitted={onSubmitted}
       onSelectRun={onSelectRun}
     />,
@@ -62,7 +60,22 @@ const response = (status: number, body: unknown) => ({
   ok: status >= 200 && status < 300,
   status,
   statusText: '',
+  type: 'basic',
+  headers: new Headers(),
   text: async () => JSON.stringify(body),
+});
+
+/** IAP's OWN 401: `text/html`, plus the header only IAP sets. */
+const iapUnauthorized = () => ({
+  ok: false,
+  status: 401,
+  statusText: '',
+  type: 'basic',
+  headers: new Headers({
+    'x-goog-iap-generated-response': 'true',
+    'content-type': 'text/html',
+  }),
+  text: async () => '<html><body>Sign in with Google</body></html>',
 });
 
 beforeEach(() => {
@@ -80,20 +93,14 @@ describe('SubmitSweep — the button is gated on the whole spec', () => {
     expect(submitButton()).toBeDisabled();
   });
 
-  it('becomes enabled only once symbols, an arm and a token are all present', () => {
+  it('becomes enabled once symbols and an arm are present — there is no third thing', () => {
     setup();
     pickSymbol('AAPL');
     expect(submitButton()).toBeDisabled(); // a symbol alone is not a comparison
     addPreset();
+    // FC-096 Phase D PR-2: a submit token used to be required here. The button
+    // must now enable WITHOUT one, or the form is unusable post-retirement.
     expect(submitButton()).toBeEnabled();
-  });
-
-  it('stays disabled without a token, however complete the spec', () => {
-    setup('');
-    pickSymbol('AAPL');
-    addPreset();
-    expect(submitButton()).toBeDisabled();
-    expect(screen.getByText(/token is required/i)).toBeInTheDocument();
   });
 
   it('goes back to disabled when the only arm is removed', () => {
@@ -104,6 +111,81 @@ describe('SubmitSweep — the button is gated on the whole spec', () => {
     setArms('[]');
     expect(submitButton()).toBeDisabled();
     expect(screen.getByText(/at least one arm/i)).toBeInTheDocument();
+  });
+});
+
+describe('SubmitSweep — the submit token is gone (FC-096 Phase D PR-2)', () => {
+  it('renders no credential field at all', () => {
+    setup();
+    // Not merely optional — ABSENT. A password box labelled "Submit token" on a
+    // page behind IAP invites the operator to paste a secret that nothing reads.
+    expect(screen.queryByLabelText(/submit token/i)).toBeNull();
+    expect(screen.queryByPlaceholderText(/SWEEP_SUBMIT_TOKEN/)).toBeNull();
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(screen.queryByText(/token is required/i)).toBeNull();
+  });
+
+  it('posts with NO Authorization header and WITH X-Requested-With', async () => {
+    fetchMock.mockResolvedValue(response(200, { run_id: 'abc', status: 'submitted' }));
+    const { onSubmitted } = setup();
+    pickSymbol('AAPL');
+    addPreset();
+    fireEvent.click(submitButton());
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalledWith('abc'));
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.headers.Authorization).toBeUndefined();
+    expect(init.headers['X-Requested-With']).toBe('XMLHttpRequest');
+  });
+
+  it("renders the session-expired state on IAP's own 401, with a reload action", async () => {
+    fetchMock.mockResolvedValue(iapUnauthorized());
+    setup();
+    pickSymbol('AAPL');
+    addPreset();
+    fireEvent.click(submitButton());
+    const outcome = await screen.findByTestId('submit-outcome');
+    expect(screen.getByTestId('session-expired').textContent).toMatch(/Session expired/i);
+    expect(outcome.textContent).toMatch(/reload/i);
+    expect(outcome.textContent).toMatch(/Nothing was submitted/);
+    // Not dressed as a spec problem, and not as a credential one: the operator
+    // must not go hunting the form for a token box that no longer exists. (The
+    // box's absence is pinned by the first test in this describe; this pins
+    // that IAP's OWN refusal never puts the word back on the screen.)
+    expect(outcome.textContent).not.toMatch(/token/i);
+  });
+
+  it("renders a BACKEND 401's own diagnostic — NOT the generic expiry", async () => {
+    // Review round 1, F3. This is `iap_audience_unconfigured`: the detail
+    // carries the recovery command, and calling it an expiry would have the
+    // operator reload for ever against a service that cannot self-heal.
+    const detail =
+      'IAP_AUDIENCE is unset or blank on this revision, so every assertion is refused. ' +
+      'Recovery: `gcloud run services update options-wheel-dashboard ' +
+      '--update-env-vars IAP_AUDIENCE=/projects/799970961417/...`';
+    fetchMock.mockResolvedValue(response(401, { detail }));
+    setup();
+    pickSymbol('AAPL');
+    addPreset();
+    fireEvent.click(submitButton());
+    const outcome = await screen.findByTestId('submit-outcome');
+    expect(screen.queryByTestId('session-expired')).toBeNull();
+    expect(outcome.textContent).toContain('IAP_AUDIENCE');
+    expect(outcome.textContent).toMatch(/--update-env-vars/);
+    expect(outcome.textContent).toMatch(/could not verify an identity/i);
+  });
+
+  it('renders a 403 as an allowlist refusal, in the server’s words, NOT as an expiry', async () => {
+    const detail =
+      'viewer@example.com is signed in and may read everything, but writes are limited to OPERATORS.';
+    fetchMock.mockResolvedValue(response(403, { detail }));
+    setup();
+    pickSymbol('AAPL');
+    addPreset();
+    fireEvent.click(submitButton());
+    const outcome = await screen.findByTestId('submit-outcome');
+    expect(screen.queryByTestId('session-expired')).toBeNull();
+    expect(outcome.textContent).toMatch(/not an operator/i);
+    expect(outcome.textContent).toContain(detail);
   });
 });
 
@@ -281,14 +363,16 @@ describe("SubmitSweep — the server's answer is shown verbatim", () => {
     expect((await screen.findByTestId('submit-outcome')).textContent).toContain(grant);
   });
 
-  it('shows a 503 as sweeps disabled', async () => {
-    fetchMock.mockResolvedValue(response(503, { detail: 'sweeps disabled: no SWEEP_SUBMIT_TOKEN' }));
+  it('shows a 503 with the API’s own reason', async () => {
+    fetchMock.mockResolvedValue(
+      response(503, { detail: 'the scenario_sweeps tables do not exist yet' }),
+    );
     setup();
     fill();
     fireEvent.click(submitButton());
     const outcome = await screen.findByTestId('submit-outcome');
-    expect(outcome.textContent).toMatch(/Submits are disabled/);
-    expect(outcome.textContent).toMatch(/no SWEEP_SUBMIT_TOKEN/);
+    expect(outcome.textContent).toMatch(/Submits are unavailable/);
+    expect(outcome.textContent).toMatch(/tables do not exist yet/);
   });
 
   it('submits on Enter from a field, not only on the button', async () => {

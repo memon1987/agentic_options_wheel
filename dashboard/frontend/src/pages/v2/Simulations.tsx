@@ -14,18 +14,12 @@
 import { useEffect, useState } from 'react';
 import { useApi } from '../../hooks/useApi';
 import type { LiveStrategyConfig, SweepDetail } from '../../types/v2';
-import {
-  readStoredToken,
-  useSweepAllowlist,
-  useSweepDetail,
-  useSweepList,
-} from '../../hooks/useSweeps';
+import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
 import SweepResults from '../../components/v2/sims/SweepResults';
 
 export default function Simulations() {
-  const [token, setToken] = useState<string>(() => readStoredToken());
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
   // The universe checkboxes track the LIVE strategy config rather than a
@@ -33,10 +27,21 @@ export default function Simulations() {
   // frontend deploy. A failed read is not fatal: free text still works.
   const { data: liveConfig } = useApi<LiveStrategyConfig>('/api/live/config');
   const { data: allowlist, error: allowlistError } = useSweepAllowlist();
-  const { data: list, loading: listLoading, error: listError, refetch: refetchList } = useSweepList();
+  const {
+    data: list,
+    loading: listLoading,
+    error: listError,
+    refetch: refetchList,
+  } = useSweepList();
   const { data: detail, error: detailError } = useSweepDetail(selectedRunId);
 
   const sweeps = list ?? [];
+  // FC-096 Phase D (review round 1, F1): this page USED to render its own
+  // session-expiry banner. It no longer does — `LayoutV2` renders exactly one,
+  // on every route, and the hooks here raise the tab-wide signal the instant a
+  // poll comes back signed out, so the layout's banner is not waiting on its
+  // own 60-second poll. Two banners on one screen would say the same thing
+  // twice and disagree about which of them owns the reload button.
 
   // Land on the newest run so the page is not empty on arrival. Only until the
   // operator picks one — after that their choice sticks. Depends on `list`, not
@@ -61,8 +66,6 @@ export default function Simulations() {
         allowlist={allowlist}
         allowlistError={allowlistError}
         universe={liveConfig?.stock_symbols ?? []}
-        token={token}
-        onTokenChange={setToken}
         onSubmitted={(runId) => {
           setSelectedRunId(runId);
           refetchList();

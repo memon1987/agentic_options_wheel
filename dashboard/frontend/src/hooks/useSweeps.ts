@@ -25,31 +25,29 @@ import type {
 } from '../types/v2';
 import { isTerminalSweepStatus } from '../types/v2';
 import { normaliseSweepDetail, normaliseSweepList } from '../components/v2/sims/normaliseReport';
+import {
+  IAP_XHR_HEADERS,
+  SESSION_EXPIRED_MESSAGE,
+  SessionExpiredError,
+  isSessionExpired,
+  markSessionExpired,
+  unauthorizedError,
+} from './iapSession';
 
 export const SWEEP_POLL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 
-/** Where the operator's token lives. sessionStorage: gone when the tab closes. */
-export const SWEEP_TOKEN_STORAGE_KEY = 'fc060.sweepSubmitToken';
+// --------------------------------------------------------------------------- //
+// IAP (FC-096 Phase D PR-2)
+// --------------------------------------------------------------------------- //
+//
+// The header, the message, the error class and the 401 classifier all live in
+// `iapSession.ts` now. They used to live here AND in `useApi.ts`, and the two
+// copies drifted immediately — which is the defect review round 1 called F1.
+// Re-exported because `Simulations.tsx` and `SubmitSweep.tsx` import them from
+// this module.
 
-export const readStoredToken = (): string => {
-  try {
-    return window.sessionStorage.getItem(SWEEP_TOKEN_STORAGE_KEY) ?? '';
-  } catch {
-    // Safari private mode throws on sessionStorage access. An unreachable store
-    // means "no token remembered", never a crashed page.
-    return '';
-  }
-};
-
-export const writeStoredToken = (token: string): void => {
-  try {
-    if (token) window.sessionStorage.setItem(SWEEP_TOKEN_STORAGE_KEY, token);
-    else window.sessionStorage.removeItem(SWEEP_TOKEN_STORAGE_KEY);
-  } catch {
-    /* see readStoredToken */
-  }
-};
+export { SESSION_EXPIRED_MESSAGE, isSessionExpired } from './iapSession';
 
 // --------------------------------------------------------------------------- //
 // Submit
@@ -64,7 +62,22 @@ export const writeStoredToken = (token: string): void => {
  */
 export type SubmitOutcome =
   | { kind: 'accepted'; body: SweepSubmitAccepted }
-  /** 401/403 — the token is missing or wrong. */
+  /**
+   * IAP's own 401, or an unreadable/non-JSON answer — the session is gone.
+   * Split out from `unauthorized` because the remedy is completely different:
+   * this one is fixed by reloading the page, and no amount of re-reading the
+   * error helps.
+   */
+  | { kind: 'session_expired'; detail: string }
+  /**
+   * 401 from the BACKEND, carrying its own diagnostic (review round 1, F3).
+   * `iap_audience_unconfigured` — whose detail carries the `--update-env-vars`
+   * line that repairs it — an id-token with no `email` claim, and
+   * `NO_ASSERTION_DETAIL` all arrive here. Rendered as an expiry instead, the
+   * operator reloads for ever against a service that cannot recover on its own.
+   */
+  | { kind: 'unauthenticated'; detail: string }
+  /** 403 — signed in, but not on the `OPERATORS` allowlist. */
   | { kind: 'unauthorized'; status: number; detail: string }
   /** 409 — another sweep is already in flight. The detail names it. */
   | { kind: 'conflict'; detail: string }
@@ -72,7 +85,8 @@ export type SubmitOutcome =
   | { kind: 'invalid'; detail: string }
   /** 502 — the Job could not be launched (usually an IAM grant). */
   | { kind: 'launch_failed'; detail: string }
-  /** 503 — `SWEEP_SUBMIT_TOKEN` is not configured; submits are fail-closed off. */
+  /** 503 — the API refused: the sweep tables do not exist yet, or a dependency
+   * this route needs is unconfigured. Fail-closed, with the reason in `detail`. */
   | { kind: 'disabled'; detail: string }
   | { kind: 'error'; status: number | null; detail: string };
 
@@ -112,10 +126,15 @@ async function readBody(response: Response): Promise<unknown> {
 /**
  * POST the spec. EXACTLY ONE request, no retry, ever.
  *
+ * **No `Authorization` header.** The `SWEEP_SUBMIT_TOKEN` bearer was retired in
+ * FC-096 Phase D PR-2; the browser's IAP session cookie is what authenticates
+ * this request, and the backend authorises it against `OPERATORS`. There is
+ * nothing for this function to carry.
+ *
  * Exported as a plain function (not a hook) so the no-retry contract can be
  * tested directly against a fetch spy.
  */
-export async function submitSweep(spec: SweepSpec, token: string): Promise<SubmitOutcome> {
+export async function submitSweep(spec: SweepSpec): Promise<SubmitOutcome> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
@@ -124,7 +143,7 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
+        ...IAP_XHR_HEADERS,
       },
       body: JSON.stringify(spec),
       signal: controller.signal,
@@ -144,9 +163,31 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
     clearTimeout(timer);
   }
 
+  // A 401 is read BEFORE it is classified: IAP's is `text/html` (and carries
+  // `x-goog-iap-generated-response`), the backend's is JSON with a `detail`
+  // that names its own repair. Deciding first — which is what this did — threw
+  // the second one away. (Review round 1, F3.)
+  if (response.status === 401) {
+    const err = unauthorizedError(response, await response.text().catch(() => ''));
+    if (isSessionExpired(err)) {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    return { kind: 'unauthenticated', detail: err.message };
+  }
+
   const body = await readBody(response);
 
   if (response.ok) {
+    // `readBody` hands back the RAW TEXT when the body would not parse as JSON.
+    // On a 2xx that means the sign-in page arrived where the API's answer
+    // should be — an expired session, not a malformed API. (Reported as an
+    // expiry rather than "the API returned no run_id", which would send the
+    // operator to the runs list to look for a sweep that was never submitted.)
+    if (typeof body === 'string') {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
     const b = (body ?? {}) as Partial<SweepSubmitAccepted>;
     if (typeof b.run_id !== 'string') {
       return {
@@ -168,7 +209,9 @@ export async function submitSweep(spec: SweepSpec, token: string): Promise<Submi
 
   const detail = detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim());
   switch (response.status) {
-    case 401:
+    // 401 is handled above (expiry, or the backend's own diagnostic). 403 is
+    // the other thing entirely: signed in, verified, and not on the write
+    // allowlist — which no reload will fix, so the server's message is shown.
     case 403:
       return { kind: 'unauthorized', status: response.status, detail };
     // The 409 body is `{detail}` only — the detail already names the blocking
@@ -194,15 +237,32 @@ interface PollState<T> {
   data: T | null;
   loading: boolean;
   error: string | null;
+  /** The last read failed because the IAP session is gone, not because the API
+   *  is broken. Rendered as its own state: the fix is a reload, not a retry. */
+  sessionExpired: boolean;
 }
 
 async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
-  const response = await fetch(url, { signal });
+  const response = await fetch(url, { signal, headers: IAP_XHR_HEADERS });
+  // Body first, verdict second — see `submitSweep`. IAP's 401 is a sign-out;
+  // the backend's carries a diagnostic that must reach the screen intact.
+  if (response.status === 401) {
+    throw unauthorizedError(response, await response.text().catch(() => ''));
+  }
   if (!response.ok) {
     const body = await readBody(response);
     throw new Error(detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim()));
   }
-  return (await response.json()) as T;
+  // NOT `response.json()`: an expired IAP session can answer 200 with the
+  // sign-in page's HTML, and `json()` would report that as a syntax error at
+  // character 0 — a message that sends the reader to the API instead of to the
+  // sign-in button.
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new SessionExpiredError();
+  }
 }
 
 /**
@@ -230,7 +290,12 @@ function usePolledGet<T>(
   /** Adapts the wire payload. A null result is reported as a shape error. */
   normalise?: (raw: unknown) => T | null,
 ): PollState<T> & { refetch: () => void } {
-  const [state, setState] = useState<PollState<T>>({ data: null, loading: !!url, error: null });
+  const [state, setState] = useState<PollState<T>>({
+    data: null,
+    loading: !!url,
+    error: null,
+    sessionExpired: false,
+  });
   const [tick, setTick] = useState(0);
   const mounted = useRef(true);
   // Read inside the interval callback so the timer never closes over stale data.
@@ -257,7 +322,7 @@ function usePolledGet<T>(
   useEffect(() => {
     if (!url) {
       loadedUrlRef.current = null;
-      setState({ data: null, loading: false, error: null });
+      setState({ data: null, loading: false, error: null, sessionExpired: false });
       return;
     }
     const controller = new AbortController();
@@ -276,7 +341,7 @@ function usePolledGet<T>(
     // what the keep-last-good-data rule below exists to prevent.
     if (loadedUrlRef.current !== url) {
       loadedUrlRef.current = url;
-      setState({ data: null, loading: true, error: null });
+      setState({ data: null, loading: true, error: null, sessionExpired: false });
     } else {
       setState((prev) => ({ ...prev, loading: true }));
     }
@@ -291,12 +356,22 @@ function usePolledGet<T>(
         if (data === null && adapt) {
           throw new Error('The API returned a sweep payload this build cannot read.');
         }
-        if (!cancelled && mounted.current) setState({ data, loading: false, error: null });
+        if (!cancelled && mounted.current)
+          setState({ data, loading: false, error: null, sessionExpired: false });
       } catch (err) {
         if (cancelled || !mounted.current) return;
         const e = err as Error;
         if (e.name === 'AbortError') return;
-        setState((prev) => ({ data: prev.data, loading: false, error: e.message }));
+        // The layout polls `/api/live/account` once a MINUTE; this polls every
+        // 15s. Marking the tab-wide signal is what puts the banner up now
+        // rather than up to 45s from now, behind three unexplained errors.
+        if (isSessionExpired(e)) markSessionExpired();
+        setState((prev) => ({
+          data: prev.data,
+          loading: false,
+          error: e.message,
+          sessionExpired: isSessionExpired(e),
+        }));
       } finally {
         inFlight = false;
       }
@@ -305,7 +380,13 @@ function usePolledGet<T>(
     void load();
 
     const interval = setInterval(() => {
-      const { data, error } = stateRef.current;
+      const { data, error, sessionExpired } = stateRef.current;
+      // A signed-out session is the ONE failure worth stopping for. Every other
+      // error keeps polling, because it may be transient; this one cannot
+      // recover in this page's lifetime — the operator has to reload and sign
+      // in — so polling on would be four requests a minute that can only fail,
+      // for as long as the tab is open.
+      if (sessionExpired) return;
       // Nothing loaded yet, or the last read failed: keep trying. Only a
       // SUCCESSFUL read gets to say "this is final, stop asking".
       if (data !== null && !error && !shouldPollRef.current(data)) return;
