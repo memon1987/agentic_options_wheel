@@ -1,11 +1,14 @@
 """The dashboard's artifact endpoint (FC-096 Phase B B2).
 
-Same split as ``tests/test_dashboard_sweeps.py`` and for the same reason:
-FastAPI is absent from the CI image this suite runs in, so anything worth
+Same split as ``tests/test_dashboard_sweeps.py`` and for the same reason.
+FastAPI is NO LONGER absent from the CI image this suite runs in — the root
+``requirements.txt`` pins ``fastapi``/``starlette``/``httpx``, so the route
+tests below do execute there — but the split stands on its own: anything worth
 getting wrong lives in ``dashboard/backend/services/artifacts.py`` and is
-exercised directly here; the endpoint tests are class-scoped-skipped rather
-than module-scoped, so a missing FastAPI cannot silently skip the pure tests
-above them too.
+exercised directly here, where no ASGI stack can be between the assertion and
+the rule. The endpoint tests are still class-scoped-skipped rather than
+module-scoped, so an environment that DOES lack FastAPI (the bot image's own
+runtime, a partial install) cannot silently skip the pure tests above them too.
 
 What is actually at risk:
 
@@ -928,6 +931,13 @@ class TestTheBarsEndpoint:
         """The normal answer for a pre-PR-1 run and for a window whose base arm
         errored — and the detail says BOTH, plus the remedy.
 
+        It deliberately does NOT offer the cell route's third cause, "a CLI run
+        without `--persist`". That cause is unreachable HERE: a run with no
+        persisted rows has no `run_id` for anyone to put in this path, so the
+        only way to read it is to have seen the row that a `--persist` run
+        wrote. Listing a cause the reader cannot be in sends them to check
+        something that is definitionally fine.
+
         MUTATION CHECK: swap this for the 502 branch and an operator goes
         looking for an IAM grant that is fine.
         """
@@ -939,7 +949,11 @@ class TestTheBarsEndpoint:
             self._get(wired)
         assert exc.value.status_code == 404
         assert "base arm" in exc.value.detail
-        assert "--persist" in exc.value.detail
+        assert "before FC-096 Phase E deployed" in exc.value.detail
+        assert "Re-submitting" in exc.value.detail
+        assert "--persist" not in exc.value.detail, (
+            "the CLI-without-persist cause is unreachable on this route: no "
+            "row means no run_id to ask about")
 
     @pytest.mark.parametrize("kwargs", [
         {"run_id": "../etc"}, {"symbol": "a b"}, {"split": "everything"},

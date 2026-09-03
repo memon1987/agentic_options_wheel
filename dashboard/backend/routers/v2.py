@@ -902,9 +902,8 @@ def sweep_window_bars(run_id: str, symbol: str, split: str) -> Response:
             detail=f"No bars sidecar for {symbol}/{split} in run {run_id}. "
                    f"Sidecars are written from the base arm of each window, so "
                    f"a window whose base arm errored has none — and neither "
-                   f"does any run replayed before FC-096 Phase E deployed, nor "
-                   f"one from the CLI without --persist. Re-submitting the "
-                   f"same spec produces one.")
+                   f"does any run replayed before FC-096 Phase E deployed. "
+                   f"Re-submitting the same spec produces one.")
     return Response(content=payload, media_type="application/json",
                     headers=artifacts.artifact_headers(name))
 

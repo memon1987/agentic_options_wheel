@@ -499,6 +499,19 @@ def _buy_and_hold_block(benchmark: Optional[BuyAndHold], rows: List[Dict[str, An
     ``exit_price`` and the dividend term is its ``dividends_per_share``, so the
     last curve point equals ``BuyAndHold.final_value`` exactly.
 
+    **The construction rests on one invariant the simulator does not state.**
+    ``entry_day``/``exit_day`` are ``bars_artifact``'s clip — ``daily[0].day``
+    and ``daily[-1].day`` of the base arm's ``SimulationResult`` — while
+    ``compute_fitness`` takes ``report.start``/``report.end`` from the same two
+    values of the ``daily`` list it is handed. The parity is therefore only as
+    true as "the ``daily`` the sidecar clips to is the ``daily`` the report was
+    scored over". Nothing in the simulator's contract promises that; a future
+    change that filtered ``daily`` on the way into scoring (or returned a
+    padded curve to the artifact) would move the clip off the scored window and
+    the curve's last point off ``final_value``, silently. A test on the golden
+    replay pins ``provenance.first_decision_day == report.start`` and
+    ``last_decision_day == report.end`` so that change fails loudly instead.
+
     ``None`` exactly when ``benchmark`` is ``None``.
     """
     if benchmark is None:

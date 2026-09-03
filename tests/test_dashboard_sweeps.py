@@ -212,6 +212,16 @@ class TestTheReportProseIsNotAFork:
         assert "PREMIUM" in text and "TOTAL" in text
         assert "cash-basis" in text
         assert "in-sample run has no forecast" in text
+        # Round 1. The two bases differ by the OPEN-OPTION marks as well as by
+        # the stock leg: `broker.equity()` is
+        # `cash + long stock at close − short options at their chain mark`, so
+        # a short call that has run against the account is already subtracted
+        # from TOTAL and is not in PREMIUM at all. A caveat that said only
+        # "TOTAL includes the stock leg" let a reader treat the gap between the
+        # two rates as the stock leg's P&L, which it is not.
+        assert "FULLY MARKED" in text
+        assert "chain mark" in text
+        assert "OPEN-OPTION marks" in text
 
     def test_base_scenario_name_matches(self):
         from src.backtesting.scenarios.runner import BASE_SCENARIO_NAME
@@ -220,6 +230,21 @@ class TestTheReportProseIsNotAFork:
     def test_activity_floor_matches(self):
         from src.backtesting.metrics.fitness import MIN_DAYS_IN_POSITION
         assert T.MIN_DAYS_IN_POSITION == MIN_DAYS_IN_POSITION
+
+    def test_the_default_fill_haircut_matches_the_engine(self):
+        """Round 1. `sweeps.py` resolves a NULL `fill_haircut` column to the
+        engine default, so it needs the number — and takes it by IMPORT from
+        `identity.py`, the module `dashboard/Dockerfile` copies into the image
+        as `scenario_identity.py` (already the source of `DEFAULT_STARTING_CASH`
+        here). `identity`'s own copy is pinned equal to `evaluate`'s by
+        `tests/test_scenario_persist.py`; this pins the third link, so a local
+        `0.25` cannot creep back in unguarded.
+
+        MUTATION CHECK: hardcode `0.25` in `sweeps.py` and change
+        `evaluate.DEFAULT_FILL_HAIRCUT`, and only this chain fails.
+        """
+        from src.backtesting.evaluate import DEFAULT_FILL_HAIRCUT
+        assert S.DEFAULT_FILL_HAIRCUT == DEFAULT_FILL_HAIRCUT
 
 
 class TestTheEngineVersionIsNotAFork:
@@ -3880,21 +3905,71 @@ class TestThePerCellDeltaVsBase:
 class TestThePerCellSignAgreement:
     def test_it_matches_the_scenario_level_count(self, shaped_and_engine):
         """The strip shows both: the arm's `agreeing/comparable` "across N
-        symbols" AND this cell's own answer. They are one rule, so the count of
-        `True`s must equal `agreeing` and the count of non-`None`s `comparable`.
+        symbols" AND this cell's own answer. Over the NON-base arms they are one
+        rule, so the count of `True`s must equal `agreeing` and the count of
+        non-`None`s `comparable`.
+
+        Base is excluded on purpose and the next test says why: the scalar is
+        `null` there while `_sign_agreement` still counts base's trivially
+        agreeing symbols, because that count is a fork-guarded copy of a
+        `report.py` number and is not this PR's to move.
 
         MUTATION CHECK: invert the comparison in `_cell_sign_agrees` and the
         `agreeing` equality fails while `comparable` still passes — which is
         exactly the defect a weaker test would miss.
         """
         shaped, _sweep, _ = shaped_and_engine
+        checked = 0
         for scenario in shaped["scenarios"]:
+            if scenario == "base":
+                continue
             values = [shaped["grid"]["fit"][scenario][s]["sign_agrees"]
                       for s in shaped["symbols"]
                       if shaped["grid"]["fit"][scenario][s] is not None]
             expected = shaped["sign_agreement"][scenario]
             assert sum(1 for v in values if v is True) == expected["agreeing"], scenario
             assert sum(1 for v in values if v is not None) == expected["comparable"], scenario
+            checked += 1
+        assert checked, "the fixture has no non-base arm, so this asserted nothing"
+
+    def test_the_BASE_cell_is_NULL_not_true(self, shaped_and_engine):
+        """Round 1, and the twin of `test_the_BASE_cell_is_NULL_not_zero`.
+
+        On base both deltas are identically `0.0` — the arm compared with
+        itself — so the sign predicate is VACUOUSLY satisfied and a served
+        `True` puts the console's strongest "this arm reproduced out of sample"
+        marker on the one cell where the question is meaningless. Decision 13
+        defines the scalar as `true|false|null`; `null` is the same answer
+        `delta_vs_base_annualized` already gives that cell.
+
+        MUTATION CHECK: drop the base guard in `_cell_sign_agrees` and every
+        measured base cell comes back `True`.
+        """
+        shaped, _sweep, _ = shaped_and_engine
+        for split in shaped["grid"]:
+            for symbol in shaped["symbols"]:
+                cell = shaped["grid"][split]["base"][symbol]
+                if cell is None:
+                    continue
+                assert cell["sign_agrees"] is None, (split, symbol)
+
+    def test_the_base_cell_is_null_even_when_every_cell_is_measured(self):
+        """The fixture above has unmeasured cells, which would mask the guard
+        with the comparability rule. Here all four cells are measured, so the
+        only thing that can produce `None` on base is the guard itself."""
+        rows = [
+            _cell_row("base", "AAPL", "fit", 0.10),
+            _cell_row("base", "AAPL", "holdout", 0.10),
+            _cell_row("tighter", "AAPL", "fit", 0.20),
+            _cell_row("tighter", "AAPL", "holdout", 0.15),
+        ]
+        shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
+        assert shaped["grid"]["fit"]["base"]["AAPL"]["sign_agrees"] is None
+        assert shaped["grid"]["holdout"]["base"]["AAPL"]["sign_agrees"] is None
+        # The arm's own answer is unaffected, and the scenario-level COUNT still
+        # counts base — deliberately, see the class docstring above.
+        assert shaped["grid"]["fit"]["tighter"]["AAPL"]["sign_agrees"] is True
+        assert shaped["sign_agreement"]["base"]["comparable"] == 1
 
     def test_it_is_null_when_the_symbol_is_not_comparable(self, shaped_and_engine):
         """`base`/NVDA is `insufficient` in the holdout, so no arm can be
@@ -4083,7 +4158,73 @@ class TestTheForecastFormula:
         exists to prevent."""
         shaped = _split_run(_fit_holdout(fill_haircut=0.6))
         block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
-        assert block["fill"] == {"basis": "mid", "fill_haircut": 0.6}
+        assert block["fill"] == {"basis": "mid", "fill_haircut": 0.6,
+                                 "is_engine_default": False}
+
+
+class TestTheServedHaircutIsTheOneTheReplayRanAt:
+    """Round 1. `persist.py` stores `Scenario.fill_haircut` VERBATIM, so an arm
+    that did not declare one — every `base` arm, and most others — persists
+    NULL. The runner substitutes `DEFAULT_FILL_HAIRCUT` before replaying and the
+    cell ARTIFACT stamps that resolved number, so serving the column verbatim
+    told the panel "unknown fill" about a replay whose fill is known exactly,
+    and disagreed with the artifact beside it.
+    """
+
+    def test_an_undeclared_haircut_serves_the_engine_default_and_says_so(self):
+        """The live base-arm case.
+
+        MUTATION CHECK: remove the `None` fallback and `fill_haircut` is `null`
+        on every base arm and every arm that took the default — which is nearly
+        the whole corpus.
+        """
+        from src.backtesting.evaluate import DEFAULT_FILL_HAIRCUT
+        shaped = _split_run(_fit_holdout(fill_haircut=None))
+        for arm in ("base", "tighter"):
+            fill = (shaped["forecast"]["by_scenario"][arm]
+                    ["symbols"]["AAPL"]["fill"])
+            assert fill["fill_haircut"] == DEFAULT_FILL_HAIRCUT == 0.25, arm
+            assert fill["is_engine_default"] is True, arm
+
+    def test_a_declared_haircut_is_served_verbatim_and_not_flagged(self):
+        """MUTATION CHECK: invert `is_engine_default` and this fails while the
+        undeclared case above still passes on the number alone."""
+        shaped = _split_run(_fit_holdout(fill_haircut=0.4))
+        fill = (shaped["forecast"]["by_scenario"]["tighter"]
+                ["symbols"]["AAPL"]["fill"])
+        assert fill["fill_haircut"] == 0.4
+        assert fill["is_engine_default"] is False
+
+    def test_a_declared_haircut_EQUAL_to_the_default_is_still_declared(self):
+        """The discriminating case: "0.25 because the arm asked for it" and
+        "0.25 because nothing asked" are the same number and not the same
+        statement — only the second moves if the engine's default ever does.
+
+        MUTATION CHECK: derive the flag from `value == DEFAULT_FILL_HAIRCUT`
+        instead of from the NULL and this fails.
+        """
+        fill = (_split_run(_fit_holdout(fill_haircut=0.25))["forecast"]
+                ["by_scenario"]["tighter"]["symbols"]["AAPL"]["fill"])
+        assert fill["fill_haircut"] == 0.25
+        assert fill["is_engine_default"] is False
+
+    def test_the_default_is_imported_not_restated(self):
+        """`identity.py` is copied into the dashboard image by the Dockerfile
+        and is already this module's source of `DEFAULT_STARTING_CASH`, so the
+        constant needed no engine-side move and no fourth copy.
+
+        Pinned by OBJECT IDENTITY, not by value: a local
+        `DEFAULT_FILL_HAIRCUT = 0.25` would satisfy an equality test forever and
+        is exactly the drift the copy discipline exists to stop.
+        """
+        import re
+
+        from src.backtesting.scenarios import identity
+        assert S.DEFAULT_FILL_HAIRCUT is identity.DEFAULT_FILL_HAIRCUT
+        source = open(S.__file__).read()
+        assert not re.search(r"^DEFAULT_FILL_HAIRCUT\s*=", source, re.M), (
+            "the engine default is assigned in sweeps.py; import it from "
+            "identity/scenario_identity instead")
 
 
 class TestTheForecastRefusesRatherThanGuesses:
@@ -4146,9 +4287,16 @@ class TestTheForecastNeverTurnsANullIntoAZero:
         for row in rows:
             row["option_pnl"] = None
         shaped = _split_run(rows)
-        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        arm = shaped["forecast"]["by_scenario"]["tighter"]
+        block = arm["symbols"]["AAPL"]
         assert block["net_option_pnl"] is None
         assert block["total_pnl"] is not None
+        # The symbol is included (its total computed), so the missing PREMIUM
+        # sum has to be named against the basis rather than left blank.
+        assert arm["portfolio"]["included"] == ["AAPL"]
+        assert arm["portfolio"]["net_option_pnl"] is None
+        assert arm["portfolio"]["excluded_by_basis"]["net_option_pnl"] == {
+            "AAPL": "null_inputs"}
 
     def test_both_bases_null_excludes_the_symbol_with_a_reason(self):
         rows = _fit_holdout()
@@ -4230,6 +4378,73 @@ class TestTheForecastExcludesUnmeasuredSymbolsAndNamesThem:
         assert premium["annual_low"] == pytest.approx(
             premium["low_per_day"] * 365)
 
+    def test_a_basis_missing_on_ONE_included_symbol_is_summed_and_NAMED(self):
+        """Round 1's finding, and the case the payload used to get wrong.
+
+        `included`/`n_included`/`excluded` are per SYMBOL — a symbol is included
+        when EITHER basis computes. So a wheel run with two measured symbols,
+        one of whose `option_pnl` is NULL (`persist._finite`'s live case),
+        served `included: [AAPL, NVDA], n_included: 2, excluded: {}` beside a
+        BLANK premium sum and no reason anywhere: "2 of 2 symbols" and no
+        number. The plan's rule is that an absence is named.
+
+        The rule now: each basis sums the included symbols that HAVE it, and
+        names the ones it dropped in `excluded_by_basis[basis]`.
+
+        MUTATION CHECK: drop `excluded_by_basis` (or go back to returning
+        `None` for the whole basis) and this fails on both halves.
+        """
+        rows = self._two_symbols()
+        for row in rows:
+            if row["symbol"] == "NVDA":
+                row["option_pnl"] = None
+        arm = self._shaped(rows)["forecast"]["by_scenario"]["tighter"]
+        portfolio = arm["portfolio"]
+
+        # The symbol is still INCLUDED — its total basis computed fine.
+        assert portfolio["included"] == ["AAPL", "NVDA"]
+        assert portfolio["n_included"] == 2
+        assert portfolio["excluded"] == {}
+
+        # ...and the premium sum says, for itself, which symbol it is missing.
+        assert portfolio["excluded_by_basis"]["net_option_pnl"] == {
+            "NVDA": "null_inputs"}
+        assert portfolio["excluded_by_basis"]["total_pnl"] == {}
+
+        premium = portfolio["net_option_pnl"]
+        assert premium is not None, "the premium sum was withheld with no reason"
+        assert premium["n_summed"] == 1
+        only = arm["symbols"]["AAPL"]["net_option_pnl"]
+        assert premium["low_per_day"] == pytest.approx(only["low_per_day"])
+        assert premium["high_per_day"] == pytest.approx(only["high_per_day"])
+        # The TOTAL sum is over both, so the two sums are over different symbol
+        # sets — which is exactly why the exclusions are keyed by basis.
+        assert portfolio["total_pnl"]["n_summed"] == 2
+
+    def test_a_basis_missing_on_EVERY_included_symbol_is_null_and_named(self):
+        """The absence is still named symbol by symbol, rather than being a
+        bare `null` the reader has to explain to themselves."""
+        rows = self._two_symbols()
+        for row in rows:
+            row["option_pnl"] = None
+        portfolio = self._shaped(rows)["forecast"][
+            "by_scenario"]["tighter"]["portfolio"]
+        assert portfolio["net_option_pnl"] is None
+        assert portfolio["excluded_by_basis"]["net_option_pnl"] == {
+            "AAPL": "null_inputs", "NVDA": "null_inputs"}
+        assert portfolio["included"] == ["AAPL", "NVDA"]
+
+    def test_a_fully_covered_basis_names_nobody(self):
+        """The ordinary run: both bases over both symbols, both exclusion maps
+        empty. A map that was never empty would be noise the panel learns to
+        ignore."""
+        portfolio = self._shaped(self._two_symbols())["forecast"][
+            "by_scenario"]["tighter"]["portfolio"]
+        assert portfolio["excluded_by_basis"] == {
+            "net_option_pnl": {}, "total_pnl": {}}
+        assert portfolio["net_option_pnl"]["n_summed"] == 2
+        assert portfolio["total_pnl"]["n_summed"] == 2
+
     def test_an_arm_with_no_included_symbol_refuses_with_a_reason(self):
         arm = self._shaped(self._two_symbols("error"))["forecast"][
             "by_scenario"]["tighter"]["portfolio"]
@@ -4288,6 +4503,20 @@ class TestTheForecastSuppressesTotalPnlWithoutACapitalBase:
         assert portfolio["total_pnl"] is None
         assert portfolio["net_option_pnl"] is not None
         assert portfolio["included"] == ["AAPL"]
+
+    def test_the_suppression_is_named_per_symbol_and_distinguishable(self):
+        """`basis_suppressed` is the whole-run refusal (no capital base exists);
+        `null_inputs` is one symbol's own missing number. An operator chases the
+        two in different places, so a single string for both would send them to
+        the wrong one.
+
+        MUTATION CHECK: use `null_inputs` for the suppressed basis and this
+        fails — a CC run would read as six symbols with corrupt data.
+        """
+        portfolio = self._cc()["forecast"]["by_scenario"]["tighter"]["portfolio"]
+        assert portfolio["excluded_by_basis"]["total_pnl"] == {
+            "AAPL": "basis_suppressed"}
+        assert portfolio["excluded_by_basis"]["net_option_pnl"] == {}
 
     def test_an_absent_strategy_is_the_WHEEL_canonical_by_omission(self):
         """Every stored spec today omits it. Treating absence as anything but

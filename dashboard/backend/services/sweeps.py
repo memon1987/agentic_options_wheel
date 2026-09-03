@@ -60,8 +60,8 @@ from services.sweep_report_text import (
 # this silently importing something else.
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
-        DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
-        canonical_spec, sweep_key, validate_scenario_name,
+        DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
+        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -69,8 +69,8 @@ try:  # repo / test environment
     )
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
-        DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS, SCENARIO_NAME_RE,
-        canonical_spec, sweep_key, validate_scenario_name,
+        DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
+        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -1668,15 +1668,30 @@ def _cell_sign_agrees(index, scenario: str, symbol: str) -> Optional[bool]:
     """Whether THIS symbol's fit and holdout deltas vs base share a sign.
 
     ``True``/``False`` only when all FOUR cells are measured (arm fit, arm
-    holdout, base fit, base holdout) — the same condition ``_sign_agreement``
-    counts a symbol as `comparable` under, and the same delta-not-raw-return
-    definition: an arm whose raw return is positive in both windows has shown
-    nothing about itself, only that the market went up.
+    holdout, base fit, base holdout) — the measurement condition
+    ``_sign_agreement`` counts a symbol as `comparable` under, and the same
+    delta-not-raw-return definition: an arm whose raw return is positive in
+    both windows has shown nothing about itself, only that the market went up.
 
     ``None`` when the symbol is not comparable — which includes every cell of an
     `all`-split run, since there is no holdout to agree with. A ``False`` there
     would say "the arm disagreed with itself", which is a finding; "we cannot
     tell" is not.
+
+    **``None`` on the base arm itself, never ``True``.** Base's two deltas are
+    identically ``0.0`` — it is being compared with itself — so the predicate is
+    vacuously satisfied, and a served ``True`` would put the strongest possible
+    "this arm reproduced out of sample" marker on the one cell where the
+    question is meaningless. Decision 13 defines the scalar as
+    ``true|false|null``; this is the same rule ``delta_vs_base_annualized``
+    already applies to the base cell, for the same reason.
+
+    This is therefore NOT identical to ``_sign_agreement``, which is the
+    scenario-level count pinned equal to ``report.py``'s and counts base's
+    trivially-agreeing symbols. The count is left alone deliberately: it is a
+    fork-guarded copy of a CLI number, and changing it here would drift the two.
+    A test pins the per-cell values against that count over the NON-base arms,
+    where the two definitions do coincide.
 
     It is a property of (scenario, symbol), so both splits' cells carry the same
     answer. Deliberate: the console shows it beside the scenario-level
@@ -1684,6 +1699,8 @@ def _cell_sign_agrees(index, scenario: str, symbol: str) -> Optional[bool]:
     between the two splits of one symbol would imply a per-split notion of
     agreement that does not exist.
     """
+    if scenario == BASE_SCENARIO_NAME:
+        return None
     cells = [
         _measured_value(index.get((scenario, symbol, "fit"))),
         _measured_value(index.get((scenario, symbol, "holdout"))),
@@ -1868,6 +1885,44 @@ def _rate(numerator: Optional[float], days: Optional[int]) -> Optional[float]:
     return value / days
 
 
+def _resolved_haircut(row: Optional[Dict[str, Any]]) -> Tuple[float, bool]:
+    """``(the haircut the replay actually ran at, whether it was the default)``.
+
+    FC-096 Phase E PR-1, round 1. ``persist.py`` stores ``Scenario.fill_haircut``
+    VERBATIM: an arm that does not declare one — which is every ``base`` arm and
+    most others — persists ``NULL``. The runner substitutes
+    ``DEFAULT_FILL_HAIRCUT`` for that ``None`` before replaying
+    (``runner.py:_replay_one``) and the cell ARTIFACT stamps the resolved value,
+    so serving the column verbatim would tell the panel "unknown fill" about a
+    replay whose fill is known exactly, and would disagree with the artifact
+    beside it.
+
+    ``is_engine_default`` keeps the two facts apart. "0.25 because the arm asked
+    for it" and "0.25 because nothing asked" are the same number and not the
+    same statement, and only the second one moves if the engine's default ever
+    does.
+
+    ``DEFAULT_FILL_HAIRCUT`` is IMPORTED from ``identity.py`` — the module
+    ``dashboard/Dockerfile`` copies into the image as ``scenario_identity.py``,
+    already the source of ``DEFAULT_STARTING_CASH`` here — rather than restated,
+    and ``identity``'s copy is itself pinned equal to ``evaluate``'s by
+    ``tests/test_scenario_persist.py``. A local ``0.25`` would be a third copy
+    with no guard at all.
+
+    An unparseable value is treated as undeclared rather than crashing the whole
+    shape: the column is a BigQuery ``FLOAT``, so this is unreachable today, and
+    a forecast that 500s because one row holds a string is worse than one that
+    reports the default it would have replayed at.
+    """
+    raw = (row or {}).get("fill_haircut")
+    if raw is None:
+        return float(DEFAULT_FILL_HAIRCUT), True
+    try:
+        return float(raw), False
+    except (TypeError, ValueError):
+        return float(DEFAULT_FILL_HAIRCUT), True
+
+
 def _basis_block(fit_per_day: Optional[float],
                  holdout_per_day: Optional[float]) -> Optional[Dict[str, Any]]:
     """One basis's range, or ``None`` when either window's rate is missing.
@@ -1890,19 +1945,48 @@ def _basis_block(fit_per_day: Optional[float],
     }
 
 
-def _portfolio_sum(entries: Sequence[Dict[str, Any]], basis: str
-                   ) -> Optional[Dict[str, Any]]:
-    """The sum of one basis over the INCLUDED symbols, or ``None``.
+def _portfolio_sum(entries: Sequence[Tuple[str, Dict[str, Any]]], basis: str,
+                   missing_reason: str,
+                   ) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+    """``(the sum of one basis, the symbols that basis left out and why)``.
 
-    ``None`` when any included symbol lacks that basis — a covered-call run with
-    no stamped capital base is the live case, where every `total_pnl` is
-    suppressed. Summing the subset that happens to have it would produce a
-    portfolio line over a different symbol set from the one named beside it,
-    which is precisely the comparison the "n of N" label exists to prevent.
+    **The sum is over the included symbols that HAVE this basis, and every
+    symbol it drops is NAMED** — round 1's finding. ``included`` /
+    ``n_included`` / ``excluded`` are per SYMBOL: a symbol is included when
+    EITHER basis computes. So a basis can be missing on a symbol the label
+    counts, and the previous rule (return ``None`` if any included symbol lacks
+    it) served ``included: [A, B], n_included: 2`` beside a blank premium sum
+    with nothing anywhere saying why — "2 of 2 symbols" and no number. That is
+    the one thing the plan's rule ("an absence is named") forbids.
+
+    Two options were on the table and this is the one taken: **sum the
+    remainder and name the exclusions**, per basis, in
+    ``portfolio.excluded_by_basis[basis]``. Rejected alternative: keep
+    withholding the whole sum and add a refusal sentence. It is strictly less
+    useful — a wheel run whose one bad symbol NULLs ``option_pnl`` would report
+    no premium at all for the other five — and it still needs the per-symbol
+    list to say WHICH symbol, so it is the same payload minus a number.
+
+    The consequence a reader must keep straight, and the docstring states it so
+    the panel can too: **a basis sum can be over fewer symbols than
+    ``n_included``.** The symbol set behind each sum is
+    ``included − excluded_by_basis[basis].keys()``, and its size is served as
+    ``n_summed`` so the panel never has to infer it.
+
+    ``None`` only when NO included symbol carries the basis — the covered-call
+    case, where every symbol appears in ``excluded_by_basis["total_pnl"]`` with
+    ``basis_suppressed``. The absence is still named, symbol by symbol.
     """
-    blocks = [e[basis] for e in entries]
-    if not blocks or any(b is None for b in blocks):
-        return None
+    blocks: List[Dict[str, Any]] = []
+    excluded: Dict[str, str] = {}
+    for symbol, entry in entries:
+        block = entry.get(basis)
+        if block is None:
+            excluded[symbol] = missing_reason
+            continue
+        blocks.append(block)
+    if not blocks:
+        return None, excluded
     low = sum(b["low_per_day"] for b in blocks)
     high = sum(b["high_per_day"] for b in blocks)
     return {
@@ -1912,7 +1996,10 @@ def _portfolio_sum(entries: Sequence[Dict[str, Any]], basis: str
         "high_per_day": high,
         "annual_low": low * FORECAST_ANNUAL_DAYS,
         "annual_high": high * FORECAST_ANNUAL_DAYS,
-    }
+        # The symbol set this sum is actually over — never inferred from
+        # `n_included`, which counts symbols, not per-basis coverage.
+        "n_summed": len(blocks),
+    }, excluded
 
 
 def _forecast(index, scenarios: Sequence[str], symbols: Sequence[str],
@@ -1971,13 +2058,17 @@ def _forecast(index, scenarios: Sequence[str], symbols: Sequence[str],
                 excluded[symbol] = "null_inputs"
                 continue
 
+            haircut, haircut_is_default = _resolved_haircut(fit)
             entries[symbol] = {
-                # The fill assumption these rates were measured under. The row's
-                # `bid_fill_return` comes from a SECOND replay, and a rate read
-                # off one basis beside a scalar from the other is the pairing
-                # this stamp exists to prevent.
+                # The fill assumption these rates were measured under, RESOLVED:
+                # the value the replay actually ran at, never the NULL an arm
+                # that did not declare one persists. The row's `bid_fill_return`
+                # comes from a SECOND replay, and a rate read off one basis
+                # beside a scalar from the other is the pairing this stamp
+                # exists to prevent.
                 "fill": {"basis": "mid",
-                         "fill_haircut": fit.get("fill_haircut")},
+                         "fill_haircut": haircut,
+                         "is_engine_default": haircut_is_default},
                 "days": {"fit": days_fit, "holdout": days_holdout},
                 "capital_base": capital_base,
                 "net_option_pnl": premium,
@@ -1985,14 +2076,31 @@ def _forecast(index, scenarios: Sequence[str], symbols: Sequence[str],
             }
 
         included = [s for s in symbols if s in entries]
-        rows = [entries[s] for s in included]
+        rows = [(s, entries[s]) for s in included]
+        # Per BASIS, not per symbol. `included` counts a symbol when EITHER
+        # basis computes, so each sum has to say for itself which of those
+        # symbols it could not use, and why.
+        sums: Dict[str, Any] = {}
+        excluded_by_basis: Dict[str, Dict[str, str]] = {}
+        for basis in FORECAST_BASES:
+            # `basis_suppressed` is the whole-run refusal (a covered-call spec
+            # carries no capital base, so the TOTAL basis exists for no symbol);
+            # `null_inputs` is this symbol's own missing number, which
+            # `persist._finite` NULLed on the way in. An operator chases the two
+            # in different places, so they are not one string.
+            reason = ("basis_suppressed"
+                      if basis == "total_pnl" and capital_base is None
+                      else "null_inputs")
+            sums[basis], excluded_by_basis[basis] = _portfolio_sum(
+                rows, basis, reason)
         portfolio: Dict[str, Any] = {
             "included": included,
             "excluded": excluded,
+            "excluded_by_basis": excluded_by_basis,
             "n_included": len(included),
             "n_symbols": len(symbols),
-            "net_option_pnl": _portfolio_sum(rows, "net_option_pnl"),
-            "total_pnl": _portfolio_sum(rows, "total_pnl"),
+            "net_option_pnl": sums["net_option_pnl"],
+            "total_pnl": sums["total_pnl"],
             "refusal": None,
         }
         if not included:

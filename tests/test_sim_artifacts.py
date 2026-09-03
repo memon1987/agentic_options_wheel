@@ -1188,6 +1188,52 @@ class TestTheBarsSidecarIsTheEnginesOwnBenchmark:
         assert curve[-1]["value"] == pytest.approx(report.benchmark.final_value)
         assert curve[-1]["date"] == result.daily[-1].day.isoformat()
 
+    def test_the_clip_IS_the_window_the_report_was_scored_over(self):
+        """The unstated simulator invariant the whole construction rests on.
+
+        `bars_artifact` clips to `daily[0].day`/`daily[-1].day`;
+        `compute_fitness` takes `report.start`/`report.end` from the same two
+        values of the `daily` it is handed. Nothing in `SimulationResult`'s
+        contract promises those are the same list — so if a future change
+        filtered `daily` on the way into scoring, or handed the artifact a
+        padded curve, the sidecar would draw one window while the row's `days`
+        denominator measured another, and every parity test above would still
+        pass because they all read the same `daily` twice.
+
+        Pinned on the REAL scored replay rather than a fixture, because that is
+        where the two producers actually meet.
+
+        **What this does and does not catch, honestly.** On the golden window
+        the REQUESTED bounds and the decision-day bounds happen to coincide, so
+        a mutation that clipped to the requested window would slip past this
+        assertion here — `TestTheClipIsTheDecisionDayBounds` is the test that
+        catches that one, on a fixture built with a warm-up tail. What this test
+        uniquely covers is the CROSS-PRODUCER equality: the sidecar's stamp
+        against a `FitnessReport` the engine scored, which no other test
+        compares. The change it exists to fail on is a future divergence between
+        "the `daily` the artifact clips to" and "the `daily` the report was
+        scored over", which is not expressible as a one-line edit to either
+        producer today — that is exactly why it is worth pinning before it is.
+        """
+        result, bars, report, days = _golden_scored()
+        payload = bars_artifact(
+            bars, "XYZ", ("all", days[0], days[-1]),
+            daily=result.daily, benchmark=report.benchmark, dividends=None)
+        prov = payload["provenance"]
+        assert prov["first_decision_day"] == report.start.isoformat()
+        assert prov["last_decision_day"] == report.end.isoformat()
+        # ...and the benchmark the curve is built from entered and exited on
+        # exactly that pair, which is what makes the last point reconcile.
+        bh = payload["buy_and_hold"]
+        assert bh["entry_day"] == report.start.isoformat()
+        assert bh["exit_day"] == report.end.isoformat()
+        # The equality is a real NARROWING, not "the clip took everything": the
+        # materialised span starts months before the first decision day. Without
+        # this the assertions above would still pass on a build that had stopped
+        # clipping at all.
+        assert prov["data_from"] < prov["first_decision_day"]
+        assert prov["bars_in_window"] < len(bars)
+
     def test_the_final_value_is_the_rows_benchmark_return_over_capital(self):
         """The other half of parity (i): the curve reconciles to the SCALAR the
         ``scenario_runs`` row carries, so a console showing both cannot disagree
@@ -1525,7 +1571,37 @@ class TestTheBarsWriter:
             {"provenance": {"run_id": "r1", "symbol": "AAA",
                             "split": "fit"}}) is False
         assert writer.bars_failed == 1 and writer.bars_written == 0
-        assert "503" in writer.last_error
+        assert "503" in writer.last_bars_error
+
+    def test_a_bars_failure_does_not_overwrite_the_CELL_error(self):
+        """`main.py`'s `sim_artifacts_incomplete` warning reports `last_error`
+        beside the CELL counts, and it is the only place an operator sees WHY a
+        cell artifact is missing. A sidecar failing afterwards — the ordinary
+        case, since the sidecar is written after the base cell — must not
+        replace that message with an unrelated one, especially as a sidecar
+        failure never makes a run's artifacts incomplete.
+
+        MUTATION CHECK: alias `last_bars_error` back to `last_error` in
+        `write_bars` and the cell's message is gone by the time the warning
+        fires.
+        """
+        gcs = FakeGCS(raises=RuntimeError("CELL upload exploded"))
+        writer = ArtifactWriter("r1", bucket="test-bucket", client=gcs)
+        writer.write({"provenance": {"run_id": "r1", "scenario": "base",
+                                     "symbol": "AAA", "split": "fit"}})
+        assert "CELL upload exploded" in writer.last_error
+        assert writer.last_bars_error is None
+
+        # The FakeBucket is cached on first use, so the second failure has to
+        # be set on the bucket rather than on the client.
+        gcs.buckets["test-bucket"].raises = RuntimeError("BARS upload exploded")
+        writer.write_bars({"provenance": {"run_id": "r1", "symbol": "AAA",
+                                          "split": "fit"}})
+        assert "CELL upload exploded" in writer.last_error, (
+            "the sidecar failure overwrote the cell failure the incomplete-"
+            "artifacts warning quotes")
+        assert "BARS upload exploded" in writer.last_bars_error
+        assert (writer.failed, writer.bars_failed) == (1, 1)
 
     def test_an_empty_bucket_env_disables_it(self, monkeypatch):
         monkeypatch.setenv(store_module.ARTIFACT_BUCKET_ENV, "")

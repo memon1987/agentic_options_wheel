@@ -138,6 +138,13 @@ class ArtifactWriter:
         self.bars_written = 0
         self.bars_failed = 0
         self.last_error: Optional[str] = None
+        # And so is the last BARS error, for the same arithmetic reason one
+        # level down: `main.py`'s `sim_artifacts_incomplete` warning reports
+        # `last_error` beside the CELL counts, so a sidecar failure landing
+        # after a cell failure would replace the message that log line exists to
+        # carry — and a sidecar failure never makes a run's artifacts
+        # incomplete, so it would be an unrelated error under a cell heading.
+        self.last_bars_error: Optional[str] = None
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"ArtifactWriter(run_id={self.run_id!r}, "
@@ -208,9 +215,11 @@ class ArtifactWriter:
 
         * the address is ``bars_object_name`` (no scenario field): one sidecar
           per (run, symbol, split), written from the BASE arm only;
-        * the counters are ``bars_written``/``bars_failed``, kept apart from the
-          cell counters so ``artifacts_complete``'s "one artifact per
-          non-errored cell" arithmetic still holds.
+        * the counters are ``bars_written``/``bars_failed``, and the message is
+          ``last_bars_error``, all three kept apart from the cell equivalents so
+          ``artifacts_complete``'s "one artifact per non-errored cell"
+          arithmetic still holds AND the ``sim_artifacts_incomplete`` warning
+          still quotes the cell failure it is about.
 
         The coordinates come out of the payload's own provenance, exactly as
         ``write`` takes them, so the object name and the object's contents
@@ -235,7 +244,7 @@ class ArtifactWriter:
             )
         except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
             self.bars_failed += 1
-            self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+            self.last_bars_error = f"{type(exc).__name__}: {exc}"[:300]
             logger.warning(
                 "Bars sidecar could not be written — the window's results are "
                 "unaffected, but its price series and buy-and-hold curve are "
@@ -243,7 +252,7 @@ class ArtifactWriter:
                 event_category="backtest",
                 event_type="sim_bars_write_failed",
                 run_id=self.run_id, symbol=symbol, split=split,
-                bucket=self.bucket_name, error=self.last_error,
+                bucket=self.bucket_name, error=self.last_bars_error,
             )
             return False
         self.bars_written += 1

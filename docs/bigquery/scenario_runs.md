@@ -230,7 +230,7 @@ the summary row stops adding up.
 | group | columns |
 |---|---|
 | identity | `run_id`, `submitted_at` (partition), `written_at` |
-| arm | `scenario_name`, `scenario_hash`, `config_hash`, `overrides_json`, `fill_haircut` |
+| arm | `scenario_name`, `scenario_hash`, `config_hash`, `overrides_json`, `fill_haircut` (**NULL = the engine default, 0.25** — stored verbatim, see the artifact section) |
 | cell | `symbol`, `split` (`all` \| `fit` \| `holdout`), `window_start`, `window_end` |
 | verdict | `verdict`, `demote`, `insufficient`, `low_activity`, `measured` |
 | performance | `total_return`, `annualized_return`, `annualized_return_on_collateral`, `benchmark_return`, `excess_return`, `option_pnl`, `stock_pnl_realized`, `stock_pnl_unrealized`, `max_drawdown`, `win_rate`, `assignment_rate` |
@@ -416,10 +416,20 @@ Four things on the object exist so a correct artifact cannot tell a reader
 something false, and all four are worth knowing before querying one:
 
 - **`provenance.fill`** — the fill assumption of the SERIALISED replay, always
-  `{"basis": "mid", "fill_haircut": <arm's haircut>}`. The row's
+  `{"basis": "mid", "fill_haircut": <the RESOLVED haircut>}`. The row's
   `bid_fill_return` comes from a SECOND replay at the bid that deliberately gets
   no artifact; without this stamp, comparing the two would be comparing two
   different runs.
+
+  **This is not the same value as the row's `fill_haircut` column.** The column
+  is `Scenario.fill_haircut` stored verbatim, so it is **NULL for every arm that
+  did not declare one** — which is every `base` arm and most others. NULL there
+  means "the engine default", not "unknown": the runner substitutes
+  `evaluate.DEFAULT_FILL_HAIRCUT` (0.25) before replaying, and the artifact
+  stamps that resolved number. A query that reads the column as the fill the
+  replay ran at must coalesce it. The sweep API's `forecast` block does exactly
+  that and additionally serves `fill.is_engine_default`, so a reader can tell a
+  declared 0.25 from a defaulted one.
 - **`provenance.masked_reach`** — this ARM's DTE reach and the chain cutoff it
   implies (`max_dte + UNIVERSE_DTE_BUFFER`, carried alongside as `dte_buffer` so
   a reader never has to know the constant's current value), never the sweep-wide
