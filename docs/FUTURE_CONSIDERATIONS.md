@@ -1061,6 +1061,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** the ambient-environment class (memory `session_2026_08_28_program.md`), FC-096 Phase E PR-1 #121.
 
+### FC-103: `annualized_return_on_collateral` divides share P&L by a denominator that excludes the shares
+
+**Scope:** shared
+**Status:** Filed 2026-09-03 (found by the FC-096 Phase E PR-2 quant-PM review, recomputed to 17 significant digits on run `13cc2729d1c74211`)
+**Size estimate:** S (decision) / S–M (build: engine metric + report + console labels)
+
+**Problem:** `fitness.py` `avg_collateral` is the mean of RESERVED PUT COLLATERAL over the days it is > 0 (live GOOGL cell: $29,758 over 91 of 189 days). On the 64 days the wheel held ~$29.8k of assigned shares, reserved collateral was $0 — the shares sit outside the denominator while their P&L (stock leg + the calls written on them) sits inside the numerator. RoC therefore overstates the return on capital actually at risk for any cycle that took assignment, and the Phase E console is about to crown it "the engine's headline RoC" beside a deployment tile computed on the opposite definition (all decision days, shares at close: $24,411 mean, 24.4%). Two "deployed capital" denominators on one strip.
+
+**Proposal:** define one dollar-weighted capital-at-risk series `(reserved_collateral + shares_value)` over ALL decision days (the Phase E §D-4 deployment definition), serve `avg_capital_at_risk` and a `return_on_capital_at_risk` beside the legacy RoC (do not silently redefine a persisted column — add, label, and let the console headline the new one with the old one in a tooltip), and add both as artifact-reconcile equalities. Decide whether `backtest_runs` / screening rankings should move to the new metric (they rank on RoC today — a change to a demotion input is plan-driven).
+
+**Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §D-4; PR-2 #122 review), FC-060 guardrails, `docs/BACKTEST_ENGINE.md`.
+
 
 ## Completed
 
