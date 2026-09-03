@@ -739,10 +739,18 @@ def cell_count(spec: Dict[str, Any]) -> int:
 # The secret's own lifecycle is an OPERATOR step, in this order and no other:
 # this revision deploys first, THEN `gcloud run services update
 # --remove-secrets=SWEEP_SUBMIT_TOKEN`, THEN the `sweep-submit-token` secret is
-# deleted. Deleting it first bricks the next revision's startup, because a
-# Cloud Run service whose `--set-secrets` names a secret that no longer exists
-# does not come up — a red build with a smoke failure that reads like anything
-# but its cause.
+# deleted.
+#
+# DELETING IT FIRST DOES NOT BREAK "THE NEXT REVISION" - IT BREAKS THIS ONE.
+# The binding is a PINNED SECRET VERSION on the LIVE revision's spec, and the
+# dashboard runs `--min-instances=0`: there is no container most of the time, so
+# the next request is a COLD START, and a cold start whose `--set-secrets`/
+# `--update-secrets` names a secret that no longer exists cannot resolve it and
+# the instance never comes up. The dashboard goes down on the next page load,
+# not at the next merge, and the symptom is a 5xx with nothing in the
+# application logs - because the application never started. The unbind is what
+# makes the deletion safe: it creates a NEW revision with no such binding, and
+# only then is the secret unreferenced.
 # ============================================================================ #
 
 

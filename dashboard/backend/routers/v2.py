@@ -512,11 +512,20 @@ def _require_write_access(assertion: Optional[str]):
 
     * **No assertion** -> **401** (`NO_ASSERTION_DETAIL`). PR-1's third branch
       — fall through to `SWEEP_SUBMIT_TOKEN` — is deleted, not disabled. The
-      env var may still be bound to this revision (the operator unbinds the
-      secret AFTER this deploys, in that order, because deleting it first
-      bricks the next revision's startup) and this file must not read it: a
-      code path that revives itself when a variable reappears is not a retired
-      code path.
+      env var may still be bound to this revision, and this file must not read
+      it: a code path that revives itself when a variable reappears is not a
+      retired code path. The operator unbinds the secret AFTER this deploys and
+      deletes it only after that, in exactly that order — deleting a secret
+      that a LIVE revision still binds breaks THAT revision, not the next one.
+      The binding is a pinned version and the service runs `--min-instances=0`,
+      so the next request is a cold start, the cold start cannot resolve the
+      secret, and the dashboard goes down on the next page load with nothing in
+      the application logs (the application never started).
+
+      **Local dev.** `vite` proxies `/api` to a bare `uvicorn` with no IAP in
+      front of it, so no request carries an assertion and every write answers
+      this 401. That is correct, not a broken checkout: the gate is the
+      perimeter, and the perimeter is not something a laptop has.
     * **Assertion present but invalid** -> 401 with a distinct log event,
       emitted by `services/auth.py`. A forged header or a broken `IAP_AUDIENCE`
       has to be loud, and post-flip it is also what an expired session looks

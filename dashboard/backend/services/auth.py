@@ -10,11 +10,15 @@ this migration:**
 
 1. **The signed assertion, never the plain email header.** IAP also sets
    ``X-Goog-Authenticated-User-Email``, which is *not* signed. Any client that
-   can reach the origin directly — and today's origin is world-reachable
-   (``allUsers`` invoker, FC-094) — can set it to anything. It is not read here
-   and must not be: a header-spoof would hand an anonymous caller the operator
-   role. The assertion is verified cryptographically, so forging it requires
-   Google's private key.
+   reaches the origin directly can set it to anything. The origin is behind IAP
+   now — ``allUsers`` came off the invoker policy at the console session on
+   2026-09-02, which is what closed FC-094 — so "directly" means an identity
+   IAP already admitted, or a future misconfiguration that re-opens the door.
+   Neither is a reason to trust it: a header-spoof would hand a viewer, or an
+   anonymous caller on the day someone re-adds ``allUsers``, the operator role,
+   and the perimeter would be the only thing standing between them and the
+   write routes. The assertion is verified cryptographically, so forging it
+   requires Google's private key.
 
 2. **ES256, and `cryptography` must be installed.** IAP signs with ES256.
    ``google/auth/crypt/__init__.py`` does ``try: from google.auth.crypt import
@@ -32,23 +36,23 @@ this migration:**
    token gate, because a forged header or a broken audience configuration must
    surface as an alertable event rather than as "the token still works".
 
-**The PR-1 no-op property, stated precisely.** For a request that carries **no
-assertion** — which is every request until the operator flips IAP on —
-``authorize_write`` returns ``None``, the caller falls straight through to the
-pre-existing ``SWEEP_SUBMIT_TOKEN`` gate, and **the API routes answer
-byte-identically to the revision before this change**. That is what makes this
-PR deployable ahead of the console session, and it is probed
-(``TestThePr1NoOpProbe`` in ``tests/test_dashboard_iap_auth.py``).
+**"No assertion" is a refusal, not a fall-through** (PR-2). ``authorize_write``
+still answers ``None`` for a request that carries no assertion, but that now
+means only one thing: *nobody claimed to be anybody*. The **router** turns it
+into a **401 naming IAP** and carrying both remedies — reload the page, or mint
+an OIDC id-token for the IAP OAuth client. There is nothing behind it. PR-1's
+third branch fell through to the legacy shared-bearer gate; PR-2 deleted that
+gate, and this module reads no environment credential of any kind — the name of
+the retired variable does not appear in this file, which is checkable by grep
+and is checked by a test. The distinction is deliberate, and it is why the 401
+lives in the router rather than here: on the
+four write routes "nobody claimed to be anybody" is a refusal, and on
+``pause-alert-check`` — where IAP admission *is* the authorization — it is a
+pass. That is a route-class decision, which is not a thing this module knows.
 
-Two things this claim deliberately does NOT cover, both intended:
-
-* **``/openapi.json`` changes.** The write routes gain an
-  ``x-goog-iap-jwt-assertion`` header parameter, and the generated schema shows
-  it. Nothing consumes that schema in this project, but the bytes differ.
-* **An assertion-bearing request now behaves differently.** ``main`` ignored the
-  header entirely; this revision verifies it and can answer 401/403 where
-  ``main`` answered 503/401/200. Pre-flip nobody sends one except a prober —
-  and a prober getting a loud 401 instead of silence is the point.
+Why ``None`` rather than raising: the two exempt routes share
+``authenticate_only`` with the gated ones precisely so that what "invalid"
+means, and what is safe to log when it happens, cannot drift between them.
 
 **FastAPI-free on purpose.** This module raises its own ``IapAuthError`` and the
 router translates it into an ``HTTPException``. The rules that decide who may
@@ -433,10 +437,14 @@ def authenticate_only(assertion: Optional[str]) -> Optional[Identity]:
 def authorize_write(assertion: Optional[str]) -> Optional[Identity]:
     """The Phase D write gate. Three outcomes, pinned by the plan:
 
-    * **assertion ABSENT** → ``None``. The caller falls through to the existing
-      ``SWEEP_SUBMIT_TOKEN`` gate, unchanged. This is the whole of the PR-1
-      no-op property: before the console flip, nothing carries an assertion, so
-      nothing takes any other branch.
+    * **assertion ABSENT** → ``None``, meaning "nobody claimed to be anybody".
+      The ROUTER answers that with a **401 naming IAP** on every write route —
+      there is nothing to fall through to, and this module reads no credential
+      of any other kind. (PR-1 fell through here to the legacy shared-bearer
+      gate; PR-2 deleted it. A retired credential path that still compiles is
+      a path something can call again.) It is returned rather than raised because the
+      two exempt routes answer the same fact by proceeding, and which of those
+      is right is a route-class decision the router makes.
     * **assertion PRESENT and INVALID** → ``AssertionInvalid`` (401). Never the
       token path.
     * **assertion PRESENT and VALID** → the ``OPERATORS`` check. A non-operator
