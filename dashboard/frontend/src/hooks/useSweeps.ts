@@ -242,7 +242,38 @@ interface PollState<T> {
   sessionExpired: boolean;
 }
 
-async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
+/**
+ * A non-401 HTTP failure, carrying the STATUS as well as the server's words.
+ *
+ * FC-096 Phase E PR-2 (§D-3, review item B3). `getJson` used to throw a bare
+ * `Error` whose message was the detail, which was enough for a banner and not
+ * enough for the artifact cache: "no artifact for this cell" (404, a normal
+ * answer for an errored cell or a pre-Phase-B run, worth memoising on a
+ * finished run) and "the bucket grant is missing" (502, must be retried on the
+ * next mount) arrived indistinguishable. `message` is still the detail, so
+ * every existing `catch (e) { e.message }` renders exactly what it did before.
+ *
+ * `SessionExpiredError` and `UnauthorizedError` are NOT subclasses of this and
+ * are thrown ahead of it, unchanged — the 401 family has its own remedy and
+ * `isSessionExpired`/`isNoRetry` must keep classifying them.
+ */
+export class HttpError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.name = 'HttpError';
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+/** `true` for an `HttpError` with this exact status. Narrows for the caller. */
+export const isHttpStatus = (err: unknown, status: number): boolean =>
+  err instanceof HttpError && err.status === status;
+
+export async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, headers: IAP_XHR_HEADERS });
   // Body first, verdict second — see `submitSweep`. IAP's 401 is a sign-out;
   // the backend's carries a diagnostic that must reach the screen intact.
@@ -251,7 +282,10 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   }
   if (!response.ok) {
     const body = await readBody(response);
-    throw new Error(detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim()));
+    throw new HttpError(
+      response.status,
+      detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim()),
+    );
   }
   // NOT `response.json()`: an expired IAP session can answer 200 with the
   // sign-in page's HTML, and `json()` would report that as a syntax error at
