@@ -20,13 +20,14 @@
 // leave the page.
 
 import { useEffect, useMemo } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
 import type { LiveStrategyConfig, SweepDetail, SweepReport } from '../../types/v2';
 import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
 import SweepResults from '../../components/v2/sims/SweepResults';
+import BiasFooter from '../../components/v2/sims/BiasFooter';
 import Console from '../../components/v2/console/Console';
 
 /** Where the console opens when nobody has chosen a cell. */
@@ -76,6 +77,17 @@ export function cellExists(report: SweepReport, cell: CellSelection): boolean {
   );
 }
 
+/**
+ * The run a `deduplicated` row auto-followed FROM, off the history entry's own
+ * state. Anything else -- a typed URL, a bookmark, a reload of a plain cell --
+ * is `null`, and the destination says nothing about dedup.
+ */
+export function readDedupFrom(state: unknown): string | null {
+  if (!state || typeof state !== 'object') return null;
+  const value = (state as { dedupFrom?: unknown }).dedupFrom;
+  return typeof value === 'string' && value ? value : null;
+}
+
 export const cellPath = (runId: string, cell: CellSelection): string =>
   `/sims/${encodeURIComponent(runId)}/${encodeURIComponent(cell.scenario)}/` +
   `${encodeURIComponent(cell.symbol)}/${encodeURIComponent(cell.split)}`;
@@ -88,7 +100,12 @@ export default function Simulations() {
     split?: string;
   }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const selectedRunId = runId ?? null;
+  // Set by the dedup auto-follow below, so the destination can say which run it
+  // was reached from. Absent on a typed or bookmarked URL, which is exactly the
+  // notice's scope.
+  const dedupFrom = readDedupFrom(location.state);
 
   // The universe checkboxes track the LIVE strategy config rather than a
   // hardcoded list — a symbol added to `stocks.symbols` shows up here without a
@@ -128,7 +145,21 @@ export default function Simulations() {
     }
   }, [selectedRunId, list, navigate]);
 
-  const report = detail?.results ?? null;
+  // F1 (review round 1): the report on screen must belong to the URL's run.
+  //
+  // `usePolledGet` clears the previous run's data inside an EFFECT, so the first
+  // committed render after a run switch carries the NEW `selectedRunId` and the
+  // OLD `detail`. Two things went wrong in that one frame: the default/repair
+  // effect below read the stale report, decided the new run "does not have" the
+  // URL's cell, and `navigate(replace)`d to a cell of run A under run B's id --
+  // destroying the operator's own history entry, so Back landed on the wrong
+  // cell; and `ResultsRegion` rendered run A's grid under run B's URL.
+  //
+  // So everything downstream is gated on the IDENTITY, not on presence. A
+  // mismatch renders the loading state, which is what it actually is.
+  const detailMatchesUrl = !!detail && detail.sweep.run_id === selectedRunId;
+  const matchedDetail = detailMatchesUrl ? detail : null;
+  const report = matchedDetail?.results ?? null;
   const selection = useMemo<CellSelection | null>(
     () => (scenario && symbol && split ? { scenario, symbol, split } : null),
     [scenario, symbol, split],
@@ -143,6 +174,25 @@ export default function Simulations() {
     const fallback = defaultCell(report);
     if (fallback) navigate(cellPath(selectedRunId, fallback), { replace: true });
   }, [selectedRunId, report, selection, navigate]);
+
+  // F5 (review round 1): a `deduplicated` row stored NOTHING under its own id --
+  // the whole point of dedup is that nothing was replayed. Sec D-3 says the page
+  // "opens X", so it does: the same cell under `deduplicated_to`, REPLACING,
+  // because a run that holds no evidence is not a screen worth keeping in the
+  // operator's history. The run it was reached from travels in the history
+  // entry's state, so the destination can say so rather than pretending the
+  // operator asked for it.
+  const dedupTarget =
+    matchedDetail && matchedDetail.sweep.status === 'deduplicated'
+      ? (matchedDetail.sweep.deduplicated_to ?? null)
+      : null;
+  useEffect(() => {
+    if (!dedupTarget || !selectedRunId) return;
+    const path = selection
+      ? cellPath(dedupTarget, selection)
+      : `/sims/${encodeURIComponent(dedupTarget)}`;
+    navigate(path, { replace: true, state: { dedupFrom: selectedRunId } });
+  }, [dedupTarget, selectedRunId, selection, navigate]);
 
   return (
     <div className="space-y-6">
@@ -176,11 +226,13 @@ export default function Simulations() {
 
       {selectedRunId && (
         <ResultsRegion
-          detail={detail}
-          detailError={detailError}
-          onSelect={selectRun}
+          detail={matchedDetail}
+          // A read error belongs to the run that produced it. While the URL and
+          // the loaded detail disagree there is no error to attribute yet.
+          detailError={detail && !detailMatchesUrl ? null : detailError}
           selection={selection}
           onSelectCell={selectCell}
+          dedupFrom={dedupFrom}
         />
       )}
     </div>
@@ -280,16 +332,17 @@ function CellSelector({
 function ResultsRegion({
   detail,
   detailError,
-  onSelect,
   selection,
   onSelectCell,
+  dedupFrom,
 }: {
   detail: SweepDetail | null;
   detailError: string | null;
-  onSelect: (runId: string) => void;
   /** The cell in the URL, or `null` until the default effect has replaced it. */
   selection: CellSelection | null;
   onSelectCell: (cell: CellSelection) => void;
+  /** The deduplicated run this screen was auto-opened from, if any. */
+  dedupFrom: string | null;
 }) {
   if (detailError && !detail) {
     return (
@@ -370,22 +423,16 @@ function ResultsRegion({
     );
   }
 
+  // A `deduplicated` row WITH a pointer never reaches here: the page follows it
+  // (see the auto-follow effect above) rather than parking the operator on a run
+  // that stored nothing. Only the dead end is rendered -- a dedup row whose
+  // pointer was never recorded, which is unopenable and has to say so.
   if (sweep.status === 'deduplicated') {
     return shell(
       <p className="text-sm text-gray-400 mt-2">
         {id} was deduplicated: this exact spec had already completed on this engine and commit, so
-        nothing was replayed.{' '}
-        {sweep.deduplicated_to ? (
-          <button
-            type="button"
-            onClick={() => onSelect(sweep.deduplicated_to as string)}
-            className="text-blue-400 hover:text-blue-300 underline font-mono"
-          >
-            Open {sweep.deduplicated_to}
-          </button>
-        ) : (
-          'The original run is not recorded on this row.'
-        )}
+        nothing was replayed. The original run is not recorded on this row, so there is nothing to
+        open — find it by its spec in the runs list.
       </p>,
     );
   }
@@ -404,7 +451,14 @@ function ResultsRegion({
   // FC-096 Phase E PR-2: the grid stays exactly where it was, and the console
   // mounts UNDER it. The grid is how a run is read across arms and symbols; the
   // console is how one cell of it is read in depth, and neither replaces the
-  // other. `SweepResults`'s bias footer stays below everything.
+  // other.
+  //
+  // The bias footer is LAST, below the console (review round 1, F2). It used to
+  // be `SweepResults`'s own final child, which put "how far to trust these
+  // numbers" in the MIDDLE of the page the moment the console mounted beneath
+  // it — the caveats above half the evidence they qualify, and the operator's
+  // last word on the screen a provenance table. The order is asserted with
+  // `compareDocumentPosition` rather than left to whoever edits this JSX next.
   return (
     <div className="space-y-6">
       {detailError && (
@@ -423,9 +477,11 @@ function ResultsRegion({
             scenario={selection.scenario}
             symbol={selection.symbol}
             split={selection.split}
+            dedupFrom={dedupFrom}
           />
         </section>
       )}
+      <BiasFooter report={results} />
     </div>
   );
 }

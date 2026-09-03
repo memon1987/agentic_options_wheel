@@ -149,19 +149,25 @@ describe('Simulations — a run that has not finished never renders as a report'
     expect(screen.queryByTestId('sweep-results')).toBeNull();
   });
 
-  it('links a deduplicated run at the original rather than showing a report', async () => {
+  it('a deduplicated run with NO pointer says so, and offers nothing to open', async () => {
+    // The pointer-bearing case never reaches this shell any more: the page
+    // follows it (review round 1, F5; asserted in `SimsRouting.test.tsx`). What
+    // is left is the dead end — a dedup row whose original was never recorded,
+    // which is unopenable and has to say that rather than render a button that
+    // navigates nowhere.
     serve(
       {
         ...shapedPending,
         status: 'deduplicated',
-        run: { ...shapedPending.run, status: 'deduplicated', deduplicated_to: 'older-run' },
+        run: { ...shapedPending.run, status: 'deduplicated', deduplicated_to: null },
       },
-      { status: 'deduplicated', deduplicated_to: 'older-run' },
+      { status: 'deduplicated', deduplicated_to: null },
     );
     show();
     const region = await statusRegion();
     expect(region.textContent).toMatch(/nothing was replayed/);
-    expect(screen.getByRole('button', { name: /Open older-run/ })).toBeInTheDocument();
+    expect(region.textContent).toMatch(/not recorded on this row/);
+    expect(screen.queryByRole('button', { name: /^Open / })).toBeNull();
     expect(screen.queryByTestId('sweep-results')).toBeNull();
   });
 

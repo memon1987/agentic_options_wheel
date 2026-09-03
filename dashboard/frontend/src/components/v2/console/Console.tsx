@@ -21,6 +21,7 @@ import { computeDigest } from './artifactDigest';
 import { artifactStrategy } from './normaliseArtifact';
 import VerdictStrip from './VerdictStrip';
 import ProvenanceFooter from './ProvenanceFooter';
+import { IN_SAMPLE_FALLBACK } from '../sims/SweepResults';
 
 /** A panel PR-3 will fill. Named so its absence is legible, not a gap. */
 function Placeholder({ title, testId }: { title: string; testId: string }) {
@@ -69,30 +70,45 @@ export interface ConsoleProps {
   scenario: string;
   symbol: string;
   split: string;
+  /**
+   * The `deduplicated` run this screen was auto-opened FROM (review round 1,
+   * F5). The page follows `deduplicated_to` rather than parking the operator on
+   * a run that stored nothing, and this is how the destination says so.
+   */
+  dedupFrom?: string | null;
 }
 
-export default function Console({ sweep, report, scenario, symbol, split }: ConsoleProps) {
+export default function Console({
+  sweep,
+  report,
+  scenario,
+  symbol,
+  split,
+  dedupFrom = null,
+}: ConsoleProps) {
   const cell = useMemo(() => ({ scenario, symbol, split }), [scenario, symbol, split]);
   const artifactState = useArtifact(sweep, cell);
   const barsState = useBars(sweep, symbol, split);
+
+  // Both are JSON STRINGS on the row and both are parsed exactly once per row,
+  // not once per render and not three times per render (review round 1, F9).
+  const specStrategyValue = useMemo(() => specStrategy(sweep), [sweep]);
+  const baseEffective = useMemo(() => parseBaseEffective(sweep.base_config_json), [sweep]);
 
   const row = useMemo(
     () => lookupCell(indexRows(report.rows), scenario, symbol, split) ?? null,
     [report.rows, scenario, symbol, split],
   );
 
-  const strategy = artifactStrategy(specStrategy(sweep), artifactState.data);
+  const strategy = artifactStrategy(specStrategyValue, artifactState.data);
   const digest = useMemo(
     () =>
       artifactState.data
         ? computeDigest(artifactState.data, barsState.data as SimBars | null, {
-            specStrategy: specStrategy(sweep),
+            specStrategy: specStrategyValue,
           })
         : null,
-    // `sweep` is stable per poll; the digest is cheap (72 events, 189 days) and
-    // re-running it on a poll tick is cheaper than memoising it wrongly.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [artifactState.data, barsState.data, sweep.spec_json],
+    [artifactState.data, barsState.data, specStrategyValue],
   );
 
   const digestAbsence =
@@ -103,12 +119,18 @@ export default function Console({ sweep, report, scenario, symbol, split }: Cons
 
   return (
     <section data-testid="sim-console" className="space-y-4">
-      {report.in_sample_only && report.in_sample_banner && (
+      {/* Keyed on the FLAG alone (review round 1, F8). A payload that set
+          `in_sample_only` and carried no banner string used to render nothing
+          at all — a missing string silently suppressing the warning it is the
+          text OF. The grid's own fallback copy is reused rather than reworded:
+          two spellings of the same warning on one page invite the reader to
+          look for a difference between them. */}
+      {report.in_sample_only && (
         <p
           data-testid="console-in-sample-banner"
-          className="rounded border border-amber-700/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-300"
+          className="rounded border border-amber-700/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-300 whitespace-pre-wrap"
         >
-          {report.in_sample_banner}
+          {report.in_sample_banner ?? IN_SAMPLE_FALLBACK}
         </p>
       )}
 
@@ -120,10 +142,11 @@ export default function Console({ sweep, report, scenario, symbol, split }: Cons
         </p>
       )}
 
-      {artifactState.followedDedup && artifactState.runId && (
+      {(dedupFrom || (artifactState.followedDedup && artifactState.runId)) && (
         <p data-testid="followed-dedup" className="text-sm text-gray-400">
-          This run was deduplicated — nothing was replayed under its own id. The evidence below is
-          answered by run <span className="font-mono">{artifactState.runId}</span>.
+          Run <span className="font-mono">{dedupFrom ?? sweep.run_id}</span> was deduplicated —
+          nothing was replayed under its own id. The evidence below is answered by run{' '}
+          <span className="font-mono">{dedupFrom ? sweep.run_id : artifactState.runId}</span>.
         </p>
       )}
 
@@ -153,7 +176,8 @@ export default function Console({ sweep, report, scenario, symbol, split }: Cons
         bars={barsState.data}
         barsAbsence={barsState.absent ?? barsState.error}
         artifactRunId={artifactState.runId}
-        baseEffective={parseBaseEffective(sweep.base_config_json)}
+        dedupFrom={dedupFrom}
+        baseEffective={baseEffective}
         strategy={strategy}
       />
     </section>

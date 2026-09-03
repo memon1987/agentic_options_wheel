@@ -11,6 +11,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import SweepResults from './SweepResults';
+import BiasFooter from './BiasFooter';
 import { normaliseReport } from './normaliseReport';
 import type { SweepReport, SweepRow } from '../../../types/v2';
 import shapedHoldout from '../../../test/fixtures/sweep_shaped_holdout.json';
@@ -53,8 +54,18 @@ const holdout = () => normaliseReport(shapedHoldout, sweep())!;
 const insample = () => normaliseReport(shapedInsample, sweep({ in_sample_only: true }))!;
 const unknownReport = () => normaliseReport(shapedUnknown, sweep())!;
 
+// The bias footer moved OUT of `SweepResults` in FC-096 Phase E PR-2 (review
+// round 1, F2) and is rendered by the page, after the console. These tests mount
+// the same pair the page does, so the byte-for-byte prose assertions below keep
+// testing what they always tested — and `SimsRouting.test.tsx` is what asserts
+// the footer is genuinely last on the real page.
 const show = (report: SweepReport, row: SweepRow = sweep(), raw?: unknown) =>
-  render(<SweepResults sweep={row} report={report} raw={raw} />);
+  render(
+    <>
+      <SweepResults sweep={row} report={report} raw={raw} />
+      <BiasFooter report={report} />
+    </>,
+  );
 
 const cell = (scenario: string, symbol: string, split: string) =>
   screen.getByTestId(`cell-${scenario}-${symbol}-${split}`);

@@ -60,6 +60,12 @@ export interface ProvenanceFooterProps {
   /** The run whose objects were read — differs from `sweep.run_id` under dedup. */
   artifactRunId: string | null;
   /**
+   * The `deduplicated` run this screen was auto-opened FROM (review round 1,
+   * F5). The evidence on screen answers that run's spec as well as this one's,
+   * and an operator who followed a link from it needs the chain written down.
+   */
+  dedupFrom?: string | null;
+  /**
    * `base_config_json.effective` — the base arm's value per DOTTED key, so an
    * override can be shown beside the value it replaced. `null` on a run written
    * before the snapshot existed, and the block prints `—` rather than pretending
@@ -79,6 +85,7 @@ export default function ProvenanceFooter({
   bars,
   barsAbsence,
   artifactRunId,
+  dedupFrom = null,
   baseEffective,
   strategy,
 }: ProvenanceFooterProps) {
@@ -96,6 +103,13 @@ export default function ProvenanceFooter({
     >
       <Block heading="Run">
         <Row label="run_id" value={sweep.run_id} />
+        {dedupFrom && (
+          <Row
+            label="reached from"
+            value={`${dedupFrom} (deduplicated)`}
+            title="That run was deduplicated: nothing was replayed under its own id, so the page opened the run that answered it. The evidence below is this run's."
+          />
+        )}
         {artifactRunId && artifactRunId !== sweep.run_id && (
           <Row
             label="evidence read from"
@@ -157,9 +171,10 @@ export default function ProvenanceFooter({
           value={
             report.scenario_fill_haircuts?.[scenario] === null ||
             report.scenario_fill_haircuts?.[scenario] === undefined
-              ? DASH
+              ? 'not declared — engine default (see cell)'
               : String(report.scenario_fill_haircuts[scenario])
           }
+          title="What the SPEC declared for this arm. `null` or absent does not mean 'no haircut': it means the arm declared none and the engine applied its own default, which the cell block below shows as the replay actually used it."
         />
         <Row label="scenario_hash" value={report.scenario_hashes?.[scenario] ?? DASH} />
         <Row
@@ -196,7 +211,7 @@ export default function ProvenanceFooter({
                   {identityMismatch ? '  ≠ run' : ''}
                 </span>
               }
-              title="A stored object written by a different engine build than the run row claims. The numbers on screen came from the object; the row's identity is what dedup keys on."
+              title="A stored object written by a different engine build than the run row claims. Only the three digest tiles came from this object — every verdict number on the strip is the ROW's, and the row is what dedup keys on."
             />
             <Row label="git_commit" value={artifact.provenance.git_commit ?? DASH} />
             <Row
@@ -237,7 +252,9 @@ export default function ProvenanceFooter({
               <Row
                 label="benchmark"
                 value={`${artifact.benchmark.shares} sh · ${artifact.benchmark.entry_day} @ ${artifact.benchmark.entry_price} → ${artifact.benchmark.exit_day} @ ${artifact.benchmark.exit_price} · div/sh ${artifact.benchmark.dividends_per_share_total} · final ${fmtCurrency(artifact.benchmark.final_value)}`}
-                title="Full investment of $capital_base at the first close, held to the last close, dividends included."
+                title={`Whole shares bought with ${fmtCurrency(
+                  artifact.provenance.capital_base,
+                )} at the first close and held to the last, dividends included. Whole shares only: the remainder stays idle cash, so the benchmark is not quite fully invested.`}
               />
             )}
           </>

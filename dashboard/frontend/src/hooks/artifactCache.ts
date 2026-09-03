@@ -47,7 +47,12 @@ export type ArtifactResult<T> =
   | { kind: 'ok'; value: T }
   | { kind: 'absent'; detail: string };
 
-/** The statuses under which a cell may be fetched at all (§D-3, review B5). */
+/**
+ * The one status whose 404 is a DURABLE answer, and so the only one under which
+ * a 404 may be memoised (§D-3, review B5). Never inferred here: the caller
+ * passes the status it resolved (`resolveArtifactRun`), because inferring it is
+ * how a cache ends up memoising a 404 against a run that had not finished.
+ */
 export const FETCHABLE_STATUS = 'done';
 
 const cache = new Map<string, Promise<ArtifactResult<unknown>>>();
@@ -151,11 +156,18 @@ export function resolveArtifactRun(
   runId: string | null | undefined,
   status: string | null | undefined,
   deduplicatedTo: string | null | undefined,
-): { runId: string; followed: boolean } | null {
+): { runId: string; followed: boolean; status: string } | null {
   if (!runId) return null;
-  if (status === 'done') return { runId, followed: false };
+  if (status === 'done') return { runId, followed: false, status };
   if (status === 'deduplicated' && deduplicatedTo) {
-    return { runId: deduplicatedTo, followed: true };
+    // The ROW's status travels with the target, not a `'done'` this module
+    // invented (review round 1, F6). All this row proves is that a pointer
+    // exists; whether the run it points at finished writing is a fact about
+    // THAT row, which nobody here has read. So a 404 under a followed pointer
+    // is reported and retried rather than memoised -- one extra request per
+    // mount on a dedup'd run's missing cells, against never showing a cell
+    // that appeared a moment later.
+    return { runId: deduplicatedTo, followed: true, status };
   }
   return null;
 }

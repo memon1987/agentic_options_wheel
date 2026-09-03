@@ -137,14 +137,22 @@ describe('fetchArtifact — memoisation', () => {
 });
 
 describe('resolveArtifactRun — which run holds the evidence', () => {
-  it('reads a done run under its own id', () => {
-    expect(resolveArtifactRun('abc', 'done', null)).toEqual({ runId: 'abc', followed: false });
+  it('reads a done run under its own id, and hands the caller its status', () => {
+    expect(resolveArtifactRun('abc', 'done', null)).toEqual({
+      runId: 'abc',
+      followed: false,
+      status: 'done',
+    });
   });
 
   it('follows `deduplicated_to` — a deduplicated run stored nothing itself', () => {
+    // The ROW's status travels with the target (review round 1, F6). All this
+    // row proves is that a pointer exists; whether the run it points at
+    // finished writing is a fact about THAT row, which nobody here has read.
     expect(resolveArtifactRun('abc', 'deduplicated', 'xyz')).toEqual({
       runId: 'xyz',
       followed: true,
+      status: 'deduplicated',
     });
   });
 
@@ -216,6 +224,34 @@ describe('useArtifact / useBars', () => {
     const second = renderHook(() => useArtifact(row(), cell));
     await waitFor(() => expect(second.result.current.data).not.toBeNull());
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('takes the memoisation status from the resolver, never a hardcoded `done`', async () => {
+    // The mutation this kills: `useStoredObject` passing the literal `'done'`
+    // to `fetchArtifact` (which is what it did). Under that literal a
+    // `deduplicated` row's 404 is memoised on the strength of an assumption
+    // about a run this row never proved anything about; with the resolver's
+    // status it is retried, so a cell written a moment later still appears.
+    fetchMock.mockResolvedValue(err(404, 'nothing stored under the pointer'));
+    const dedup = row({ status: 'deduplicated', deduplicated_to: 'aaaa1111bbbb2222' });
+    const first = renderHook(() => useArtifact(dedup, cell));
+    await waitFor(() => expect(first.result.current.absent).not.toBeNull());
+    first.unmount();
+    const second = renderHook(() => useArtifact(dedup, cell));
+    await waitFor(() => expect(second.result.current.absent).not.toBeNull());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(artifactCacheSize()).toBe(0);
+
+    // The same cell on a `done` row memoises, so this is a statement about the
+    // STATUS rather than about 404s in general.
+    resetArtifactCacheForTests();
+    fetchMock.mockClear();
+    const done = renderHook(() => useArtifact(row(), cell));
+    await waitFor(() => expect(done.result.current.absent).not.toBeNull());
+    done.unmount();
+    const again = renderHook(() => useArtifact(row(), cell));
+    await waitFor(() => expect(again.result.current.absent).not.toBeNull());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('two mounts of the same cell share one request', async () => {

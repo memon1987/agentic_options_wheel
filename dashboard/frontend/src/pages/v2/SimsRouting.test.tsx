@@ -30,6 +30,10 @@ import { resetArtifactCacheForTests } from '../../hooks/artifactCache';
 import { resetSessionExpiredSignal } from '../../hooks/iapSession';
 
 const RUN = '13cc2729d1c74211';
+/** A second, structurally identical run — what a run SWITCH switches to. */
+const RUN_B = 'b0b0b0b0b0b0b0b0';
+/** The run a `deduplicated` row points at. */
+const RUN_ORIG = 'a48d7bb064194e0f';
 
 const ok = (body: unknown) =>
   ({
@@ -49,6 +53,13 @@ const notFound = (detail: string) =>
     json: async () => ({ detail }),
   }) as unknown as Response;
 
+const shapedFor = (runId: string, over: Record<string, unknown> = {}) => ({
+  ...shaped13cc,
+  run_id: runId,
+  run: { ...shaped13cc.run, run_id: runId, ...((over.run as object) ?? {}) },
+  ...over,
+});
+
 const listRow = {
   run_id: RUN,
   status: 'done',
@@ -64,6 +75,10 @@ const listRow = {
 };
 
 let fetchMock: ReturnType<typeof vi.fn>;
+/** Per-run detail overrides, keyed by run id. Empty ⇒ every run is the 13cc shape. */
+let detailByRun: Record<string, unknown> = {};
+/** What `GET /api/v2/sweeps` answers. The FIRST row is the newest run. */
+let listRows: unknown[] = [];
 let seen: { pathname: string } = { pathname: '' };
 /** Every navigation this render performed, in order: PUSH / REPLACE / POP. */
 let navLog: Array<{ pathname: string; type: string }> = [];
@@ -115,6 +130,8 @@ beforeEach(() => {
   resetSessionExpiredSignal();
   seen = { pathname: '' };
   navLog = [];
+  detailByRun = {};
+  listRows = [listRow];
   fetchMock = vi.fn();
   fetchMock.mockImplementation((url: string) => {
     const target = url;
@@ -139,8 +156,13 @@ beforeEach(() => {
     if (/\/artifacts\/|\/bars\//.test(target)) {
       return Promise.resolve(notFound('No detail artifact for this cell in this run.'));
     }
-    if (target.startsWith('/api/v2/sweeps/')) return Promise.resolve(ok(shaped13cc));
-    if (target === '/api/v2/sweeps') return Promise.resolve(ok([listRow]));
+    if (target.startsWith('/api/v2/sweeps/')) {
+      const id = target.slice('/api/v2/sweeps/'.length);
+      const custom = detailByRun[id];
+      if (custom) return Promise.resolve(ok(custom));
+      return Promise.resolve(ok(shapedFor(id)));
+    }
+    if (target === '/api/v2/sweeps') return Promise.resolve(ok(listRows));
     return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -236,6 +258,91 @@ describe('deep links and navigation', () => {
     expect(seen.pathname).toBe(`/sims/${RUN}/base/GOOGL/holdout`);
     await back();
     expect(seen.pathname).toBe(`/sims/${RUN}/base/GOOGL/fit`);
+  });
+
+  it('a run switch never replaces a cell out of the user’s history (F1)', async () => {
+    // The bug: `usePolledGet` clears the previous run's data inside an EFFECT,
+    // so the first committed render after the switch carried run B's id and run
+    // A's report. The default/repair effect read that stale report, decided run
+    // B "does not have" the URL's cell and REPLACED it — overwriting the entry
+    // the user had just pushed, so Back landed on the wrong cell and their own
+    // history entry was gone.
+    //
+    // Run B here has a DIFFERENT arm set, which is what makes the stale read
+    // decide to repair: under run A's report `arm_b` does not exist.
+    detailByRun[RUN_B] = shapedFor(RUN_B, {
+      scenarios: ['base', 'arm_b'],
+      grid: {
+        fit: { base: shaped13cc.grid.fit.base, arm_b: shaped13cc.grid.fit.position_20pct },
+        holdout: {
+          base: shaped13cc.grid.holdout.base,
+          arm_b: shaped13cc.grid.holdout.position_20pct,
+        },
+      },
+    });
+
+    listRows = [listRow, { ...listRow, run_id: RUN_B }];
+
+    show(`/sims/${RUN}/base/GOOGL/fit`);
+    await screen.findByTestId('cell-selector');
+    const mine = `/sims/${RUN}/base/GOOGL/holdout`;
+
+    fireEvent.click(screen.getByRole('button', { name: 'holdout' }));
+    await waitFor(() => expect(seen.pathname).toBe(mine));
+
+    // The user selects run B — one PUSH, and then whatever the page decides.
+    const before = navLog.length;
+    fireEvent.click(await screen.findByTestId(`run-row-${RUN_B}`));
+    await waitFor(() => expect(seen.pathname).toBe(`/sims/${RUN_B}/arm_b/GOOGL/holdout`));
+
+    // Exactly one PUSH (the click) and one REPLACE (run B's OWN default cell,
+    // chosen from run B's OWN report). No replace fired off the stale report.
+    const after = navLog.slice(before).map((n) => n.type);
+    expect(after).toEqual(['PUSH', 'REPLACE']);
+
+    // And Back lands on the cell the user was actually looking at.
+    await back();
+    expect(seen.pathname).toBe(mine);
+    expect(navLog[navLog.length - 1].type).toBe('POP');
+  });
+
+  it('a deduplicated run auto-opens the run that answered it, by REPLACING (F5)', async () => {
+    detailByRun[RUN] = shapedFor(RUN, {
+      status: 'deduplicated',
+      run: { status: 'deduplicated', deduplicated_to: RUN_ORIG },
+    });
+    show(`/sims/${RUN}/base/GOOGL/fit`);
+    await waitFor(() => expect(seen.pathname).toBe(`/sims/${RUN_ORIG}/base/GOOGL/fit`));
+    // REPLACE, not PUSH: a run that stored nothing is not a screen worth keeping
+    // in the operator's history, and Back must leave rather than bounce back
+    // onto the redirect.
+    expect(navLog.map((n) => n.type)).toEqual(['POP', 'REPLACE']);
+    // The console mounts on the destination and says where the question came
+    // from — the notice, `followedDedup` and the footer row were all dead while
+    // this path returned the "Open X" shell instead.
+    const notice = await screen.findByTestId('followed-dedup');
+    expect(notice.textContent).toMatch(new RegExp(RUN));
+    expect(notice.textContent).toMatch(new RegExp(RUN_ORIG));
+    expect(screen.getByTestId('provenance-footer').textContent).toMatch(/reached from/);
+  });
+
+  it('the bias footer is the LAST thing on the page, below the console (F2)', async () => {
+    show(`/sims/${RUN}/base/GOOGL/fit`);
+    await screen.findByTestId('sim-console');
+    const grid = screen.getByTestId('sweep-results');
+    const console_ = screen.getByTestId('sim-console');
+    const footer = screen.getByTestId('bias-footer');
+    // `compareDocumentPosition` & DOCUMENT_POSITION_FOLLOWING === "b comes after
+    // a in document order". Asserted on the real page rather than on
+    // `SweepResults` alone, because the bug was one of COMPOSITION: the footer
+    // was that component's last child and the console was rendered below it.
+    const follows = (a: Element, b: Element) =>
+      !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(grid, console_)).toBe(true);
+    expect(follows(console_, footer)).toBe(true);
+    expect(follows(footer, grid)).toBe(false);
+    // Exactly one of it — the extraction must not leave a second copy behind.
+    expect(screen.getAllByTestId('bias-footer')).toHaveLength(1);
   });
 
   it('the split switch offers exactly the run’s splits', async () => {

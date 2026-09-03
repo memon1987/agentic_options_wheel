@@ -65,6 +65,7 @@ export function useStoredObject<T>(
 ): ArtifactState<T> {
   const target = resolveArtifactRun(sweep?.run_id, sweep?.status, sweep?.deduplicated_to);
   const url = target && urlFor ? urlFor(target.runId) : null;
+  const status = target?.status ?? '';
 
   const [state, setState] = useState<Omit<ArtifactState<T>, 'runId' | 'followedDedup'>>({
     ...IDLE,
@@ -78,11 +79,13 @@ export function useStoredObject<T>(
     }
     let live = true;
     setState({ ...IDLE, loading: true });
-    // The followed run completed by construction — dedup only ever points at a
-    // run that finished — so the cache may memoise its 404s.
+    // The status is the RESOLVER's, never a literal (review round 1, F6): §D-3
+    // puts the memoisation rule in one place, and a hook that hardcodes `'done'`
+    // silently re-decides it — a `deduplicated` row's 404 would be memoised on
+    // the strength of an assumption about a run nobody read.
     fetchArtifact<T>(
       url,
-      'done',
+      status,
       (raw) => parse(raw).value,
       (raw) => parse(raw).reason ?? 'This object could not be read.',
     )
@@ -102,7 +105,7 @@ export function useStoredObject<T>(
     // `parse` is a stable module-level function at every call site; depending
     // on it would refetch on every render for no gain.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url]);
+  }, [url, status]);
 
   return { ...state, runId: target?.runId ?? null, followedDedup: target?.followed ?? false };
 }
