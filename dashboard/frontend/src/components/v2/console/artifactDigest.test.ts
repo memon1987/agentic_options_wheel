@@ -1,11 +1,18 @@
 // FC-096 Phase E PR-2 (§D-4): the digest, reconciled to the ENGINE'S OWN ROW.
 //
-// The six `reconcile` equalities are the point of this file. Each one recomputes
-// from the stored artifact a quantity `scenario_runs` already persists, and
-// asserts the two agree on a REAL captured cell — `13cc2729d1c74211` / base /
-// GOOGL / fit, the run the operator verified live in rollout step 1. That is
-// what stops this module quietly becoming a second engine: a drift in any of
-// the six shows up here rather than as two different numbers on one screen.
+// The eight `reconcile` equalities are the point of this file. Each one
+// recomputes from the stored artifact a quantity `scenario_runs` already
+// persists, and asserts the two agree on a REAL captured cell —
+// `13cc2729d1c74211` / base / GOOGL / fit, the run the operator verified live in
+// rollout step 1. That is what stops this module quietly becoming a second
+// engine: a drift in any of the eight shows up here rather than as two different
+// numbers on one screen.
+//
+// Seven and eight (average collateral, annualised return on it) were added in
+// review round 1 (F7). They exist because the strip's RoC tooltip now STATES the
+// engine's denominator — mean reserved collateral over the days it was above
+// zero, annualised over calendar days — and a claim about a definition is worth
+// making only if something fails when the definition moves.
 //
 // The row is read out of the captured `shape_results` payload rather than
 // retyped, so "the digest agrees with the row" is a statement about the server's
@@ -23,7 +30,7 @@ const artifact = normaliseArtifact(artifact13cc)!;
 const sidecar = parseBars(bars13cc).value!;
 const row = sweep13cc.grid.fit.base.GOOGL;
 
-describe('the six reconcile equalities, against the served row', () => {
+describe('the eight reconcile equalities, against the served row', () => {
   const { reconcile } = computeDigest(artifact, sidecar);
 
   it('option P&L: Σ cycles[].option_pnl === row.option_pnl', () => {
@@ -56,6 +63,37 @@ describe('the six reconcile equalities, against the served row', () => {
     // …and the row's `total_return` over the stamped capital base is the same
     // dollar figure, which is the equality that ties the artifact to the grid.
     expect(reconcile.finalEquity).toBeCloseTo(100_000 * (1 + row.total_return), 6);
+  });
+
+  it('average collateral: the DEPLOYED-day mean of reserved_collateral', () => {
+    // `fitness.py:427` averages only the days collateral was ABOVE ZERO — 91 of
+    // the 189 decision days on this cell. The all-days mean is $14,328.04, and
+    // the mutation that swaps one for the other doubles the number while
+    // leaving the label untouched.
+    expect(reconcile.avgCollateral).toBeCloseTo(29_758.2417582, 6);
+    expect(reconcile.avgCollateral).not.toBeCloseTo(14_328.04, 1);
+  });
+
+  it('annualised RoC: total_pnl ÷ avg collateral × 365/calendar days === the row', () => {
+    // 6,751.4885 ÷ 29,758.2418 × 365/273 = 0.30333497216… — the row's
+    // `annualized_return_on_collateral` to every digit it carries.
+    expect(reconcile.calendarDays).toBe(273);
+    expect(reconcile.annualizedReturnOnCollateral).toBeCloseTo(
+      row.annualized_return_on_collateral,
+      12,
+    );
+    expect(reconcile.annualizedReturnOnCollateral).toBeCloseTo(0.30333497216357186, 15);
+    // The annualisation divisor is CALENDAR days (273), not decision days
+    // (189). Using the wrong one moves the headline by 44%.
+    expect(reconcile.calendarDays).not.toBe(row.decision_days);
+  });
+
+  it('the same divisor reproduces the row’s annualised RETURN', () => {
+    // The tooltip claims `total_return × 365 / calendar days`. This is the
+    // assertion that makes the claim falsifiable.
+    const totalReturn = (reconcile.finalEquity - 100_000) / 100_000;
+    expect(totalReturn * (365 / reconcile.calendarDays!)).toBeCloseTo(row.annualized_return, 12);
+    expect(totalReturn * (365 / row.decision_days)).not.toBeCloseTo(row.annualized_return, 4);
   });
 });
 

@@ -180,3 +180,29 @@ describe('the arm block and dedup', () => {
     expect(text()).toMatch(/13cc2729d1c74211/);
   });
 });
+
+describe('review round 1 additions', () => {
+  it('an undeclared fill_haircut says "engine default", not "—" (F4)', () => {
+    show();
+    const footer = screen.getByTestId('provenance-footer');
+    // `null` or absent does NOT mean "no haircut": it means the arm declared
+    // none and the engine applied its own. An em dash reads as "unknown" and
+    // sends the operator looking for a field that was never going to be there.
+    expect(footer.textContent).toMatch(/not declared — engine default \(see cell\)/);
+  });
+
+  it('the identity-mismatch hover names only what came from the object (F9)', () => {
+    show({
+      artifact: { ...artifact, provenance: { ...artifact.provenance, engine_identity: 'other' } },
+    });
+    const rows = screen.getByTestId('provenance-footer').querySelectorAll('[title]');
+    const hover = Array.from(rows)
+      .map((r) => r.getAttribute('title') ?? '')
+      .find((t) => t.includes('different engine build'))!;
+    // The strip's verdict numbers are the ROW's; only the three digest tiles
+    // are read out of the stored object. "The numbers on screen came from the
+    // object" was wrong about most of them.
+    expect(hover).toMatch(/Only the three digest tiles/);
+    expect(hover).not.toMatch(/The numbers on screen came from the object/);
+  });
+});

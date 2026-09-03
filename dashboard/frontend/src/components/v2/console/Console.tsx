@@ -158,6 +158,7 @@ export default function Console({
         split={split}
         digest={digest}
         digestAbsence={digestAbsence}
+        artifact={artifactState.data}
       />
 
       <Placeholder testId="placeholder-price" title="Price + event markers (component 2)" />

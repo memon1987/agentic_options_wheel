@@ -20,9 +20,9 @@
 // screen for a window that measured nothing.
 
 import type { ReactNode } from 'react';
-import type { SweepReport, SweepResultRow } from '../../../types/v2';
+import type { SimArtifact, SweepReport, SweepResultRow } from '../../../types/v2';
 import { pctOrDash, renderCell } from '../sims/resultCells';
-import { fmtCurrency, fmtNumber } from '../../../utils/format';
+import { fmtCurrency, fmtCurrencyDetail, fmtNumber, fmtPercent } from '../../../utils/format';
 import type { ArtifactDigest } from './artifactDigest';
 
 /** One tile. `tone` is the only place a sign becomes a colour. */
@@ -64,6 +64,36 @@ function Tile({
   );
 }
 
+/**
+ * A fraction that has NO sign to report — a share of something, not a return.
+ *
+ * `pctOrDash` prefixes `+` because the numbers it was written for are signed
+ * returns where the sign is the headline. "+82% of decision days", "+100% win
+ * rate" and "+24.4% deployed" borrow that headline for a quantity that cannot
+ * be negative, which reads as a gain (review round 1, F9).
+ */
+const shareOrDash = (value: number | null | undefined, digits = 0): string =>
+  value === null || value === undefined || Number.isNaN(value) ? '—' : fmtPercent(value, digits);
+
+/**
+ * What the engine's benchmark actually is, with the number rather than the
+ * variable name (review round 1, F9).
+ *
+ * `$capital_base` on screen is a literal that only the person who wrote the
+ * code can read. And "full investment" is not quite what the engine does: it
+ * buys WHOLE shares at the first close, so the remainder stays idle cash — 473
+ * shares and about $31 idle on the captured fixture.
+ */
+function benchmarkTitle(digest: ArtifactDigest | null): string {
+  const base = digest?.capitalBase ?? null;
+  const amount = base === null ? 'the run’s capital base' : fmtCurrency(base);
+  return (
+    `Whole shares bought with ${amount} at the first close and held to the last, ` +
+    'dividends included. Whole shares only — the remainder stays idle cash, so this is ' +
+    'not quite a full investment.'
+  );
+}
+
 /** Sign → tone, for the row's own numbers only. Null is never coloured. */
 const toneOf = (n: number | null | undefined): 'plain' | 'signed-positive' | 'signed-negative' =>
   n === null || n === undefined || n === 0
@@ -82,6 +112,8 @@ export interface VerdictStripProps {
   digest: ArtifactDigest | null;
   /** Why there is no digest, in the endpoint's words. Rendered on the tiles. */
   digestAbsence: string | null;
+  /** The cell's stored object — the fill label's first and best source (F4). */
+  artifact: SimArtifact | null;
 }
 
 /**
@@ -92,6 +124,11 @@ export interface VerdictStripProps {
  * are shown side by side precisely so one is never read as the other.
  */
 function scenarioAgreement(report: SweepReport, scenario: string): string {
+  // On BASE the count is base against itself, so it is 1/1 across every symbol
+  // by construction (review round 1, F9). Printed as a figure it looks like
+  // evidence of stability and is evidence of nothing; the arm it would qualify
+  // is the comparator.
+  if (scenario === 'base') return 'n/a — base is the comparator';
   const entry = report.sign_agreement?.[scenario];
   if (!entry) return '—';
   const { agreeing, comparable } = entry;
@@ -99,14 +136,60 @@ function scenarioAgreement(report: SweepReport, scenario: string): string {
   return `${agreeing ?? 0}/${comparable} across ${comparable} symbols`;
 }
 
-/** The effective fill assumption — read from `forecast.fill` (PR-1 §Execution). */
-function fillLabel(report: SweepReport, scenario: string, symbol: string): string {
-  const fill = report.forecast?.by_scenario?.[scenario]?.symbols?.[symbol]?.fill;
+/**
+ * The effective fill assumption for THIS cell, in the order the sources are
+ * actually authoritative (review round 1, F4).
+ *
+ *   1. **The cell artifact's own `provenance.fill`.** This is the fill the
+ *      ledger on screen was replayed under — the truth about the object being
+ *      read, not about the run in general.
+ *   2. `forecast.by_scenario[arm].symbols[symbol].fill`. Present only for a
+ *      symbol the forecast could include: an arm that is `insufficient` in
+ *      either window is EXCLUDED from the forecast entirely, which is why
+ *      reading this first printed a dash for exactly the arms whose fill an
+ *      operator is most likely to be interrogating.
+ *   3. The spec's declared haircut for the arm.
+ *
+ * Two rules on top of the order:
+ *
+ *   * **The basis is never invented.** The old code defaulted it to `'mid'`,
+ *     which is the engine's current default and therefore right until the day
+ *     it is not — a label that is right by coincidence is a label that lies
+ *     silently. No source ⇒ `—`.
+ *   * **An undeclared haircut is "engine default", never `—`.** A spec that
+ *     declares no haircut did not ask for "no haircut"; it accepted the
+ *     engine's. `—` reads as "unknown" and sends the operator looking for a
+ *     missing field.
+ */
+export function fillLabel(
+  report: SweepReport,
+  scenario: string,
+  symbol: string,
+  artifact: SimArtifact | null,
+): string {
+  const fromArtifact = artifact?.provenance.fill ?? null;
+  const fromForecast = report.forecast?.by_scenario?.[scenario]?.symbols?.[symbol]?.fill ?? null;
   const declared = report.scenario_fill_haircuts?.[scenario];
-  const basis = fill?.basis ?? 'mid';
-  const haircut = fill?.fill_haircut ?? declared ?? null;
-  const pct = haircut === null ? '—' : `${(haircut * 100).toFixed(0)}%`;
-  return `${basis} · haircut ${pct}${fill?.is_engine_default ? ' (engine default)' : ''}`;
+  const undeclared = declared === null || declared === undefined;
+
+  const basis = fromArtifact?.basis ?? fromForecast?.basis ?? null;
+  const number = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isFinite(v) ? v : null;
+  const haircut =
+    number(fromArtifact?.fill_haircut) ??
+    number(fromForecast?.fill_haircut) ??
+    (undeclared ? null : number(declared));
+
+  // The engine's own default is what applied whenever the spec declared
+  // nothing; the forecast says so outright when it can.
+  const engineDefault = fromForecast?.is_engine_default === true || undeclared;
+  const haircutText =
+    haircut === null
+      ? undeclared
+        ? 'engine default'
+        : '—'
+      : `${(haircut * 100).toFixed(0)}%${engineDefault ? ' (engine default)' : ''}`;
+  return `${basis ?? '—'} · haircut ${haircutText}`;
 }
 
 export default function VerdictStrip({
@@ -117,9 +200,21 @@ export default function VerdictStrip({
   split,
   digest,
   digestAbsence,
+  artifact,
 }: VerdictStripProps) {
   const rendered = renderCell(row);
   const measured = rendered.kind === 'return';
+  // Straight off the artifact, for the hover only — never rendered as a tile
+  // and never compared with the row. `reconcile` is where it is pinned against
+  // the engine's own `annualized_return_on_collateral`.
+  const roc =
+    digest && digest.reconcile.avgCollateral !== null
+      ? {
+          avgCollateral: digest.reconcile.avgCollateral,
+          days: digest.deploymentSeries.filter((d) => d.reserved > 0).length,
+          decisionDays: digest.deployment.days,
+        }
+      : null;
   const delta = row?.delta_vs_base_annualized ?? null;
   const isBase = scenario === 'base';
 
@@ -137,8 +232,16 @@ export default function VerdictStrip({
         >
           {rendered.text}
         </span>
-        <span className="text-xs text-gray-500" data-testid="fill-label">
-          fill: {fillLabel(report, scenario, symbol)}
+        {/* Amber, like the grid's own fill-model label (`SweepResults.tsx`): a
+            result that depends on an assumed fill price is qualified in the
+            same colour wherever it is shown, so the two cannot be read as
+            different kinds of statement. */}
+        <span
+          className="text-xs text-amber-400/80"
+          data-testid="fill-label"
+          title="The fill this cell's ledger was replayed under: the stored artifact's own stamp where there is one, then the forecast's, then what the spec declared. `engine default` means the spec declared no haircut and the engine applied its own."
+        >
+          fill: {fillLabel(report, scenario, symbol, artifact)}
         </span>
       </header>
 
@@ -159,7 +262,7 @@ export default function VerdictStrip({
               value={pctOrDash(row?.annualized_return)}
               sub={`total ${pctOrDash(row?.total_return)}`}
               tone={toneOf(row?.annualized_return)}
-              title="The engine's `annualized_return`: total_return × 365 / decision-day span (fitness.py:148)."
+              title="The engine's `annualized_return` (fitness.py:143-152): total_return × 365 ÷ the CALENDAR days between the first and last decision day — not ÷ decision days. On this run that is 365/273, not 365/189: the two differ by 44%."
             />
             <Tile
               testId="tile-roc"
@@ -167,7 +270,19 @@ export default function VerdictStrip({
               value={pctOrDash(row?.annualized_return_on_collateral)}
               sub="the engine's headline RoC"
               tone={toneOf(row?.annualized_return_on_collateral)}
-              title="Return annualised over capital actually put at risk, not the whole account. The engine's number, not a ratio computed here."
+              title={
+                'The engine\'s number (fitness.py:240-259), not a ratio computed here: ' +
+                'TOTAL P&L ÷ the mean reserved PUT collateral over the days collateral was ' +
+                'above zero, × 365 ÷ calendar days. ' +
+                (roc === null
+                  ? ''
+                  : `On this cell: ${roc.days} of ${roc.decisionDays} days carried collateral, averaging ${fmtCurrencyDetail(roc.avgCollateral)}. `) +
+                'Shares held after assignment are NOT in that denominator even though the ' +
+                'cash that bought them is committed, so the ratio reads high on an assigned ' +
+                'cycle (FC-103 owns the fix). The deployment tile below uses a DIFFERENT ' +
+                'denominator — dollar-weighted over ALL decision days — so the two are not ' +
+                'two readings of one number.'
+              }
             />
             {!isBase && delta !== null && (
               <Tile
@@ -185,7 +300,7 @@ export default function VerdictStrip({
               value={pctOrDash(row?.benchmark_return)}
               sub={`excess ${pctOrDash(row?.excess_return)}`}
               tone={toneOf(row?.excess_return)}
-              title="Full investment of $capital_base at the first close, held to the last, dividends included."
+              title={benchmarkTitle(digest)}
             />
           </>
         )}
@@ -194,13 +309,16 @@ export default function VerdictStrip({
           label="Net option P&L"
           value={fmtCurrency(row?.option_pnl)}
           sub="engine, cash basis"
-          tone={toneOf(row?.option_pnl)}
+          // Sign colour only on a MEASURED cell (review round 1, F9). A green
+          // +$40 of premium on an `insuf` or `low-act` cell reads as a verdict
+          // on a window whose whole point is that it produced none.
+          tone={measured ? toneOf(row?.option_pnl) : 'plain'}
         />
         <Tile
           testId="tile-win-rate"
           label="Win rate"
-          value={row?.win_rate === null || row?.win_rate === undefined ? '—' : pctOrDash(row.win_rate, 0)}
-          sub={`assignment ${row?.assignment_rate === null || row?.assignment_rate === undefined ? '—' : pctOrDash(row.assignment_rate, 0)}`}
+          value={shareOrDash(row?.win_rate)}
+          sub={`assignment ${shareOrDash(row?.assignment_rate)}`}
           title="The engine's definition (fitness.py:200): the share of completed cycles with a positive total P&L."
         />
         <Tile
@@ -208,7 +326,7 @@ export default function VerdictStrip({
           label="Max drawdown"
           value={pctOrDash(row?.max_drawdown)}
           sub="peak-to-trough on equity"
-          tone={toneOf(row?.max_drawdown)}
+          tone={measured ? toneOf(row?.max_drawdown) : 'plain'}
         />
         <Tile
           testId="tile-cycles"
@@ -219,11 +337,7 @@ export default function VerdictStrip({
         <Tile
           testId="tile-time-in-position"
           label="Time in position"
-          value={
-            row?.days_in_position_fraction === null || row?.days_in_position_fraction === undefined
-              ? '—'
-              : pctOrDash(row.days_in_position_fraction, 0)
-          }
+          value={shareOrDash(row?.days_in_position_fraction)}
           sub={`${fmtNumber(row?.decision_days)} decision days`}
         />
         <Tile
@@ -257,7 +371,9 @@ export default function VerdictStrip({
               <Tile
                 testId="tile-fees"
                 label="Fees"
-                value={fmtCurrency(digest.fees)}
+                // Two decimals (review round 1, F9): "$2" printed beside
+                // "$0.040/contract" is not a rounding, it is a contradiction.
+                value={fmtCurrencyDetail(digest.fees)}
                 sub={
                   digest.feeRatePerContract === null
                     ? 'from ledger'
@@ -282,7 +398,7 @@ export default function VerdictStrip({
             <Tile
               testId="tile-fees"
               label="Fees"
-              value={fmtCurrency(digest.fees)}
+              value={fmtCurrencyDetail(digest.fees)}
               sub={
                 digest.feeRatePerContract === null
                   ? 'from ledger'
@@ -293,7 +409,7 @@ export default function VerdictStrip({
             <Tile
               testId="tile-deployment"
               label="Deployment (dollar-weighted)"
-              value={digest.deployment.ratio === null ? '—' : pctOrDash(digest.deployment.ratio, 1)}
+              value={shareOrDash(digest.deployment.ratio, 1)}
               sub={`from daily state, ${digest.deployment.basis}, over ${digest.deployment.days} decision days`}
               tone="digest"
               title="Mean over ALL decision days of (reserved collateral + share value) / capital base. Averaging only the days with a position answers a different question and gives roughly twice the number."
