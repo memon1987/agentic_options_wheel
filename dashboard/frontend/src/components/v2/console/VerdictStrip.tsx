@@ -410,9 +410,12 @@ export default function VerdictStrip({
               testId="tile-deployment"
               label="Deployment (dollar-weighted)"
               value={shareOrDash(digest.deployment.ratio, 1)}
-              sub={`from daily state, ${digest.deployment.basis}, over ${digest.deployment.days} decision days`}
+              sub={
+                digest.deployment.unresolvedReason ??
+                `from daily state, ${digest.deployment.basis}, over ${digest.deployment.days} decision days`
+              }
               tone="digest"
-              title="Mean over ALL decision days of (reserved collateral + share value) / capital base. Averaging only the days with a position answers a different question and gives roughly twice the number."
+              title="Mean over ALL decision days of (reserved collateral + share value) / capital base. Averaging only the days with a position answers a different question and gives roughly twice the number — which is the denominator the RoC tile above uses."
             />
           </div>
         )}

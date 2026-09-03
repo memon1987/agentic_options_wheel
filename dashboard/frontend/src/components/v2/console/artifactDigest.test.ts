@@ -228,3 +228,41 @@ describe('maxDrawdownOf', () => {
     expect(maxDrawdownOf([])).toBe(0);
   });
 });
+
+describe('shares are never valued at another symbol’s close (review round 1, F9)', () => {
+  it('uses the sidecar close only for the sidecar’s OWN symbol', () => {
+    // The sidecar is ONE symbol's bars. Applied to every underlying in
+    // `shares_held`, a cell holding MSFT would have been priced at GOOGL's
+    // close — a plausible ratio under a correct-looking label, which is the
+    // exact failure §D-4 suppresses ratios to avoid.
+    const withGoogl = computeDigest(artifact, sidecar);
+    expect(withGoogl.deployment.basis).toBe('closes');
+    expect(withGoogl.deployment.unresolvedReason).toBeNull();
+
+    const foreign = parseBars({
+      ...bars13cc,
+      provenance: { ...bars13cc.provenance, symbol: 'MSFT' },
+    }).value!;
+    const mismatched = computeDigest(artifact, foreign);
+    // The closes are still there and still 189 of them — but they are not this
+    // cell's symbol, so the share days fall back to the lot's cost basis and
+    // the tile says "at cost" instead of claiming market closes.
+    expect(mismatched.deployment.basis).toBe('at cost');
+    expect(mismatched.deployment.ratio).not.toBeCloseTo(withGoogl.deployment.ratio!, 6);
+  });
+
+  it('withholds the ratio WITH a reason when a share day cannot be valued', () => {
+    // No sidecar and no cycle cost basis covering the day: the ratio is not
+    // computable, and an absent ratio with no reason beside it reads as "not
+    // computed yet" rather than "cannot be computed".
+    const noBasis = normaliseArtifact({
+      ...artifact13cc,
+      cycles: artifact13cc.cycles.map((c) => ({ ...c, cost_basis: null })),
+    })!;
+    const digest = computeDigest(noBasis, null);
+    expect(digest.deployment.ratio).toBeNull();
+    expect(digest.deployment.unresolvedShareDays).toBeGreaterThan(0);
+    expect(digest.deployment.unresolvedReason).toMatch(/GOOGL/);
+    expect(digest.deployment.unresolvedReason).toMatch(/withheld rather than computed/);
+  });
+});

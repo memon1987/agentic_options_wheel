@@ -20,6 +20,7 @@ import shapedHoldout from '../../../test/fixtures/sweep_shaped_holdout.json';
 import shapedInsample from '../../../test/fixtures/sweep_shaped_insample.json';
 import shapedPending from '../../../test/fixtures/sweep_shaped_pending.json';
 import shapedUnknown from '../../../test/fixtures/sweep_shaped_unknown.json';
+import shaped13cc from '../../../test/fixtures/sweep_shaped_13cc.json';
 
 const sweep = (over: Partial<SweepRow> = {}): SweepRow =>
   ({
@@ -246,5 +247,83 @@ describe('normaliseSweepList — the list endpoint is a BARE ARRAY', () => {
     expect(normaliseSweepList(null)).toEqual([]);
     expect(normaliseSweepList('nope')).toEqual([]);
     expect(normaliseSweepList({ items: [] })).toEqual([]);
+  });
+});
+
+describe('the forecast is coerced, not cast (review round 1, F9)', () => {
+  it('passes a real forecast through with its numbers intact', () => {
+    const report = normaliseSweepDetail(shaped13cc)!.results!;
+    const base = report.forecast!.by_scenario.base;
+    expect(report.forecast!.capital_base).toBe(100000);
+    expect(base.symbols.GOOGL.fill).toEqual({
+      basis: 'mid',
+      fill_haircut: 0.25,
+      is_engine_default: true,
+    });
+    expect(base.portfolio.net_option_pnl!.annual_low).toBeCloseTo(5932.5668389, 6);
+    expect(base.portfolio.included).toEqual(['GOOGL']);
+    // `position_20pct` was excluded in both windows: refusal string, null sums.
+    const arm = report.forecast!.by_scenario.position_20pct;
+    expect(arm.portfolio.net_option_pnl).toBeNull();
+    expect(arm.portfolio.refusal).toMatch(/nothing to sum/);
+    expect(arm.portfolio.excluded).toEqual({ GOOGL: 'fit: insufficient' });
+  });
+
+  it('turns a non-number into null rather than letting NaN reach the screen', () => {
+    // This used to be a bare cast, so every rate the panel divides, multiplies
+    // or formats arrived unchecked — a string, a `"NaN"` or a missing key would
+    // have rendered as `NaN%` with no way to tell an unreadable forecast from a
+    // refused one.
+    const poisoned = {
+      ...shaped13cc,
+      forecast: {
+        ...shaped13cc.forecast,
+        capital_base: 'one hundred thousand',
+        days: { fit: '189', holdout: null },
+        by_scenario: {
+          base: {
+            symbols: {
+              GOOGL: {
+                fill: { basis: 42, fill_haircut: 'a quarter' },
+                days: {},
+                capital_base: Number.NaN,
+                net_option_pnl: { annual_low: 'lots', annual_high: null },
+                total_pnl: null,
+              },
+            },
+            portfolio: {
+              included: ['GOOGL', 7],
+              excluded: { GOOGL: 3 },
+              n_included: 'one',
+              net_option_pnl: { annual_low: {} },
+            },
+          },
+        },
+      },
+    };
+    const forecast = normaliseSweepDetail(poisoned)!.results!.forecast!;
+    expect(forecast.capital_base).toBeNull();
+    expect(forecast.days).toEqual({ fit: null, holdout: null });
+    const cell = forecast.by_scenario.base.symbols.GOOGL;
+    expect(cell.fill).toEqual({ basis: null, fill_haircut: null });
+    expect(cell.capital_base).toBeNull();
+    expect(cell.net_option_pnl.annual_low).toBeNull();
+    // `total_pnl: null` still yields the all-null shape the panel can render,
+    // never `undefined.annual_low`.
+    expect(cell.total_pnl.annual_high).toBeNull();
+    const portfolio = forecast.by_scenario.base.portfolio;
+    expect(portfolio.included).toEqual(['GOOGL']);
+    expect(portfolio.excluded).toEqual({});
+    expect(portfolio.n_included).toBe(0);
+    expect(portfolio.net_option_pnl!.annual_low).toBeNull();
+    // Nothing anywhere in the tree is NaN.
+    expect(JSON.stringify(forecast)).not.toMatch(/NaN/);
+  });
+
+  it('a forecast that is not an object is null, not an empty shell', () => {
+    for (const bad of [null, 'no', 7, []]) {
+      const out = normaliseSweepDetail({ ...shaped13cc, forecast: bad })!.results!.forecast;
+      expect(out).toBeNull();
+    }
   });
 });

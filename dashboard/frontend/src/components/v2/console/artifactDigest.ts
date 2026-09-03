@@ -107,6 +107,12 @@ export interface DeploymentReading {
   sharesValueMeanDollars: number | null;
   /** Days holding shares this module could not value. Non-zero ⇒ `ratio` null. */
   unresolvedShareDays: number;
+  /**
+   * Why those days could not be valued, for the tile (review round 1, F9).
+   * `null` when there are none. An absent ratio with no reason beside it reads
+   * as "not computed yet".
+   */
+  unresolvedReason: string | null;
 }
 
 export interface DigestReconcile {
@@ -348,26 +354,42 @@ export function computeDigest(
   }
 
   // --- deployment -------------------------------------------------------- //
+  //
+  // The sidecar is ONE symbol's bars (review round 1, F9). It was being applied
+  // to every underlying in `shares_held`: on a cell holding shares of anything
+  // but the sidecar's symbol, the deployment ratio was that symbol's share count
+  // priced at a DIFFERENT company's close — a plausible number under a
+  // correct-looking label, which is the exact failure §D-4 suppresses ratios to
+  // avoid. Today `shares_held` carries one underlying per cell, so this was
+  // latent; a portfolio-level artifact would have made it wrong on arrival.
   const closes = new Map<string, number>();
   for (const bar of sidecar?.bars ?? []) closes.set(bar.date, bar.close);
+  const sidecarSymbol = sidecar?.provenance.symbol ?? null;
   const hasCloses = closes.size > 0;
 
   const deploymentSeries: ArtifactDigest['deploymentSeries'] = [];
   let reservedSum = 0;
   let sharesValueSum = 0;
   let unresolvedShareDays = 0;
+  let valuedAtCost = 0;
+  const unvaluable = new Set<string>();
   for (const day of artifact.daily) {
     reservedSum += day.reserved_collateral;
     let sharesValue: number | null = 0;
     for (const [underlying, shares] of Object.entries(day.shares_held)) {
       if (shares === 0) continue;
-      const price = hasCloses
-        ? (closes.get(day.date) ?? null)
-        : costBasisOn(artifact.cycles, underlying, day.date);
+      // The sidecar's close ONLY for the sidecar's own symbol. Anything else
+      // falls back to the lot's cost basis, which is a stated approximation
+      // ("at cost") rather than another company's price.
+      const close =
+        hasCloses && underlying === sidecarSymbol ? (closes.get(day.date) ?? null) : null;
+      const price = close ?? costBasisOn(artifact.cycles, underlying, day.date);
       if (price === null) {
         sharesValue = null;
+        unvaluable.add(underlying);
         break;
       }
+      if (close === null) valuedAtCost += 1;
       sharesValue += shares * price;
     }
     if (sharesValue === null) unresolvedShareDays += 1;
@@ -386,11 +408,17 @@ export function computeDigest(
   const valuable = days > 0 && unresolvedShareDays === 0;
   const deployment: DeploymentReading = {
     ratio: valuable && capitalBase ? (reservedSum + sharesValueSum) / days / capitalBase : null,
-    basis: days === 0 ? 'none' : hasCloses ? 'closes' : 'at cost',
+    basis: days === 0 ? 'none' : !hasCloses || valuedAtCost > 0 ? 'at cost' : 'closes',
     days,
     reservedMeanDollars: days > 0 ? reservedSum / days : 0,
     sharesValueMeanDollars: valuable ? sharesValueSum / days : null,
     unresolvedShareDays,
+    unresolvedReason: unresolvedShareDays
+      ? `${unresolvedShareDays} day${unresolvedShareDays === 1 ? '' : 's'} held ` +
+        `${[...unvaluable].sort().join(', ')} at a price this console could not establish — ` +
+        'no bar in the sidecar for that symbol and no cycle cost basis covering the day. ' +
+        'The ratio is withheld rather than computed over a partial position.'
+      : null,
   };
 
   // --- reconcile (test-only; see the header) ------------------------------ //

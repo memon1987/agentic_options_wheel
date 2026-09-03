@@ -127,6 +127,28 @@ describe('fetchArtifact — memoisation', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('is a real LRU: a HIT moves an entry to the back (F9)', async () => {
+    // The mutation this kills: dropping the `remember` call on the hit path,
+    // which makes this a FIFO wearing an LRU's name — the cell the operator
+    // keeps coming back to becomes the one it evicts.
+    fetchMock.mockResolvedValue(ok(artifact13cc));
+    for (let i = 0; i < ARTIFACT_CACHE_MAX; i += 1) {
+      await fetchArtifact(`/api/cell/${i}`, 'done', passthrough, () => 'no');
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(ARTIFACT_CACHE_MAX);
+
+    // Touch the OLDEST entry, then insert one more. Under an LRU the entry we
+    // just used survives and entry 1 is evicted instead.
+    await fetchArtifact('/api/cell/0', 'done', passthrough, () => 'no');
+    await fetchArtifact('/api/cell/new', 'done', passthrough, () => 'no');
+    expect(artifactCacheSize()).toBe(ARTIFACT_CACHE_MAX);
+
+    await fetchArtifact('/api/cell/0', 'done', passthrough, () => 'no');
+    expect(fetchMock).toHaveBeenCalledTimes(ARTIFACT_CACHE_MAX + 1); // still cached
+    await fetchArtifact('/api/cell/1', 'done', passthrough, () => 'no');
+    expect(fetchMock).toHaveBeenCalledTimes(ARTIFACT_CACHE_MAX + 2); // evicted
+  });
+
   it('is bounded — the oldest entry falls out past the cap', async () => {
     fetchMock.mockResolvedValue(ok(artifact13cc));
     for (let i = 0; i < ARTIFACT_CACHE_MAX + 3; i += 1) {

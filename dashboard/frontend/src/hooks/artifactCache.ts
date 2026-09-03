@@ -57,7 +57,14 @@ export const FETCHABLE_STATUS = 'done';
 
 const cache = new Map<string, Promise<ArtifactResult<unknown>>>();
 
-/** Cheapest possible LRU: `Map` iterates in insertion order. */
+/**
+ * Insert or refresh an entry, evicting the least recently USED past the cap.
+ *
+ * `Map` iterates in insertion order, so deleting and re-setting a key moves it
+ * to the back. Called on every hit as well as on every insert (review round 1,
+ * F9) — without the hit path this was a FIFO wearing an LRU's name, and the
+ * cell an operator kept coming back to was the one it evicted.
+ */
 function remember(url: string, promise: Promise<ArtifactResult<unknown>>): void {
   cache.delete(url);
   cache.set(url, promise);
@@ -90,7 +97,10 @@ export function fetchArtifact<T>(
   parseFailureDetail: (raw: unknown) => string,
 ): Promise<ArtifactResult<T>> {
   const hit = cache.get(url);
-  if (hit) return hit as Promise<ArtifactResult<T>>;
+  if (hit) {
+    remember(url, hit);
+    return hit as Promise<ArtifactResult<T>>;
+  }
 
   const promise = (async (): Promise<ArtifactResult<T>> => {
     const controller = new AbortController();

@@ -19,6 +19,10 @@
 // untested branch as the one that shipped.
 
 import type {
+  SimForecast,
+  SimForecastBasis,
+  SimForecastPortfolio,
+  SimForecastSymbol,
   SweepDetail,
   SweepReport,
   SweepResultRow,
@@ -40,6 +44,112 @@ export type CellState = 'measured' | 'insufficient' | 'low_activity' | 'error' |
 
 /** Only a `done` run can carry a readable report. */
 const REPORTABLE_STATUS = 'done';
+
+// --------------------------------------------------------------------------- //
+// The forecast (review round 1, F9)
+// --------------------------------------------------------------------------- //
+//
+// This used to be a bare cast: `isRecord(payload.forecast) ? payload.forecast as
+// SimForecast : null`. Every field the panel divides, multiplies or formats
+// therefore arrived unchecked, and a JSON `"NaN"`, a `null` the type says is a
+// number, or a string where a rate belongs would reach the screen as `NaN%` or
+// `$undefined` — with no way to tell from the page whether the forecast was
+// refused or merely unreadable.
+//
+// The numerics go through the same `num` helper as every other scalar on this
+// page, so a non-number becomes `null` and the panel's existing "no rate"
+// rendering takes over. NOTHING is computed here.
+
+/** One basis' run-rate pair, with every numeric coerced or nulled. */
+function forecastBasis(raw: unknown): SimForecastBasis | null {
+  if (!isRecord(raw)) return null;
+  const basis: SimForecastBasis = {
+    fit_per_day: num(raw.fit_per_day),
+    holdout_per_day: num(raw.holdout_per_day),
+    low_per_day: num(raw.low_per_day),
+    high_per_day: num(raw.high_per_day),
+    annual_low: num(raw.annual_low),
+    annual_high: num(raw.annual_high),
+  };
+  const summed = num(raw.n_summed);
+  if (summed !== null) basis.n_summed = summed;
+  return basis;
+}
+
+function forecastSymbol(raw: unknown): SimForecastSymbol | null {
+  if (!isRecord(raw)) return null;
+  const fill = isRecord(raw.fill) ? raw.fill : {};
+  const days = isRecord(raw.days) ? raw.days : {};
+  return {
+    fill: {
+      basis: typeof fill.basis === 'string' ? fill.basis : null,
+      fill_haircut: num(fill.fill_haircut),
+      ...(typeof fill.is_engine_default === 'boolean'
+        ? { is_engine_default: fill.is_engine_default }
+        : {}),
+    },
+    days: { fit: num(days.fit), holdout: num(days.holdout) },
+    capital_base: num(raw.capital_base),
+    net_option_pnl: forecastBasis(raw.net_option_pnl) ?? forecastBasis({})!,
+    total_pnl: forecastBasis(raw.total_pnl) ?? forecastBasis({})!,
+  };
+}
+
+/** `Record<string, string>` with everything else dropped, not stringified. */
+const stringMap = (raw: unknown): Record<string, string> => {
+  const out: Record<string, string> = {};
+  if (!isRecord(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) if (typeof v === 'string') out[k] = v;
+  return out;
+};
+
+function forecastPortfolio(raw: unknown): SimForecastPortfolio {
+  const r = isRecord(raw) ? raw : {};
+  const byBasis: Record<string, Record<string, string>> = {};
+  if (isRecord(r.excluded_by_basis)) {
+    for (const [k, v] of Object.entries(r.excluded_by_basis)) byBasis[k] = stringMap(v);
+  }
+  return {
+    included: Array.isArray(r.included) ? r.included.filter((x): x is string => typeof x === 'string') : [],
+    excluded: stringMap(r.excluded),
+    excluded_by_basis: byBasis,
+    n_included: int(r.n_included),
+    n_symbols: int(r.n_symbols),
+    net_option_pnl: forecastBasis(r.net_option_pnl),
+    total_pnl: forecastBasis(r.total_pnl),
+    refusal: typeof r.refusal === 'string' ? r.refusal : null,
+  };
+}
+
+export function normaliseForecast(raw: unknown): SimForecast | null {
+  if (!isRecord(raw)) return null;
+  const days = isRecord(raw.days) ? raw.days : {};
+  const byScenario: SimForecast['by_scenario'] = {};
+  if (isRecord(raw.by_scenario)) {
+    for (const [scenario, entry] of Object.entries(raw.by_scenario)) {
+      const e = isRecord(entry) ? entry : {};
+      const symbols: Record<string, SimForecastSymbol> = {};
+      if (isRecord(e.symbols)) {
+        for (const [symbol, value] of Object.entries(e.symbols)) {
+          const parsed = forecastSymbol(value);
+          if (parsed) symbols[symbol] = parsed;
+        }
+      }
+      byScenario[scenario] = { symbols, portfolio: forecastPortfolio(e.portfolio) };
+    }
+  }
+  return {
+    default_horizon_days: int(raw.default_horizon_days),
+    horizon_choices: Array.isArray(raw.horizon_choices)
+      ? raw.horizon_choices.filter((x): x is number => typeof x === 'number' && !Number.isNaN(x))
+      : [],
+    annual_days: int(raw.annual_days),
+    capital_base: num(raw.capital_base),
+    strategy: typeof raw.strategy === 'string' ? raw.strategy : null,
+    days: { fit: num(days.fit), holdout: num(days.holdout) },
+    by_scenario: byScenario,
+  };
+}
 
 /**
  * Rebuild a flat row from one grid cell.
@@ -243,7 +353,7 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
       : [],
     effective_max_dte: num(payload.effective_max_dte),
     artifacts_complete: bool(payload.artifacts_complete),
-    forecast: isRecord(payload.forecast) ? (payload.forecast as unknown as SweepReport['forecast']) : null,
+    forecast: normaliseForecast(payload.forecast),
     forecast_caveat:
       typeof payload.forecast_caveat === 'string' ? payload.forecast_caveat : null,
     forecast_refusal:

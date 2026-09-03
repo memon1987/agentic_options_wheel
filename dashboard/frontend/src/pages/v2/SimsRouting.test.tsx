@@ -345,6 +345,19 @@ describe('deep links and navigation', () => {
     expect(screen.getAllByTestId('bias-footer')).toHaveLength(1);
   });
 
+  it('clicking the run already on screen does nothing at all (F9)', async () => {
+    show(`/sims/${RUN}/base/GOOGL/fit`);
+    await screen.findByTestId('cell-selector');
+    const before = navLog.length;
+    fireEvent.click(await screen.findByTestId(`run-row-${RUN}`));
+    // It used to push `/sims/<same run>`, dropping the cell out of the URL and
+    // letting the default-cell effect replace it — so clicking the highlighted
+    // row silently threw away the cell being read, and left a history entry
+    // that does nothing but undo itself.
+    await waitFor(() => expect(seen.pathname).toBe(`/sims/${RUN}/base/GOOGL/fit`));
+    expect(navLog.length).toBe(before);
+  });
+
   it('the split switch offers exactly the run’s splits', async () => {
     show(`/sims/${RUN}/base/GOOGL/fit`);
     const swi = await screen.findByTestId('split-switch');

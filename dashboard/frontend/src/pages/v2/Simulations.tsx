@@ -128,8 +128,19 @@ export default function Simulations() {
   // own 60-second poll. Two banners on one screen would say the same thing
   // twice and disagree about which of them owns the reload button.
 
-  /** A user's choice. PUSHES, so Back returns to what they were looking at. */
-  const selectRun = (id: string) => navigate(`/sims/${encodeURIComponent(id)}`);
+  /**
+   * A user's choice. PUSHES, so Back returns to what they were looking at.
+   *
+   * Re-selecting the run already on screen is a NO-OP (review round 1, F9). It
+   * used to push `/sims/<same run>`, which dropped the cell out of the URL and
+   * let the default-cell effect replace it — so clicking the highlighted row
+   * silently threw away the cell the operator was reading, and left a history
+   * entry that does nothing but undo itself.
+   */
+  const selectRun = (id: string) => {
+    if (id === selectedRunId) return;
+    navigate(`/sims/${encodeURIComponent(id)}`);
+  };
   const selectCell = (cell: CellSelection) => {
     if (selectedRunId) navigate(cellPath(selectedRunId, cell));
   };
