@@ -167,14 +167,16 @@ describe('resolveArtifactRun — which run holds the evidence', () => {
     });
   });
 
-  it('follows `deduplicated_to` — a deduplicated run stored nothing itself', () => {
-    // The ROW's status travels with the target (review round 1, F6). All this
-    // row proves is that a pointer exists; whether the run it points at
-    // finished writing is a fact about THAT row, which nobody here has read.
+  it('follows `deduplicated_to`, and resolves the TARGET’s status', () => {
+    // `deduplicated` is only ever written against a run that ALREADY COMPLETED
+    // — that is what dedup means, and why nothing was replayed — so the run
+    // being read is `done`. The status resolved here is the one the hooks
+    // forward; F6's rule is that it is decided ONCE, beside the run id it
+    // belongs to, never re-decided by a hook.
     expect(resolveArtifactRun('abc', 'deduplicated', 'xyz')).toEqual({
       runId: 'xyz',
       followed: true,
-      status: 'deduplicated',
+      status: 'done',
     });
   });
 
@@ -248,12 +250,13 @@ describe('useArtifact / useBars', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('takes the memoisation status from the resolver, never a hardcoded `done`', async () => {
-    // The mutation this kills: `useStoredObject` passing the literal `'done'`
-    // to `fetchArtifact` (which is what it did). Under that literal a
-    // `deduplicated` row's 404 is memoised on the strength of an assumption
-    // about a run this row never proved anything about; with the resolver's
-    // status it is retried, so a cell written a moment later still appears.
+  it('a followed dedup read MEMOISES its 404 — the target completed by construction', async () => {
+    // The mutation this kills: `resolveArtifactRun` handing back the ROW's own
+    // `'deduplicated'` for the followed case. That is not the status of the run
+    // being read, and under it every missing cell of a dedup'd run costs one
+    // request per mount for a fact that cannot change. (The rule it must not
+    // break — a genuinely unfinished run's 404 is never memoised — is pinned
+    // directly against `fetchArtifact` above, where the status is an argument.)
     fetchMock.mockResolvedValue(err(404, 'nothing stored under the pointer'));
     const dedup = row({ status: 'deduplicated', deduplicated_to: 'aaaa1111bbbb2222' });
     const first = renderHook(() => useArtifact(dedup, cell));
@@ -261,19 +264,9 @@ describe('useArtifact / useBars', () => {
     first.unmount();
     const second = renderHook(() => useArtifact(dedup, cell));
     await waitFor(() => expect(second.result.current.absent).not.toBeNull());
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(artifactCacheSize()).toBe(0);
-
-    // The same cell on a `done` row memoises, so this is a statement about the
-    // STATUS rather than about 404s in general.
-    resetArtifactCacheForTests();
-    fetchMock.mockClear();
-    const done = renderHook(() => useArtifact(row(), cell));
-    await waitFor(() => expect(done.result.current.absent).not.toBeNull());
-    done.unmount();
-    const again = renderHook(() => useArtifact(row(), cell));
-    await waitFor(() => expect(again.result.current.absent).not.toBeNull());
+    expect(second.result.current.absent).toBe('nothing stored under the pointer');
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(artifactCacheSize()).toBe(1);
   });
 
   it('two mounts of the same cell share one request', async () => {

@@ -170,14 +170,18 @@ export function resolveArtifactRun(
   if (!runId) return null;
   if (status === 'done') return { runId, followed: false, status };
   if (status === 'deduplicated' && deduplicatedTo) {
-    // The ROW's status travels with the target, not a `'done'` this module
-    // invented (review round 1, F6). All this row proves is that a pointer
-    // exists; whether the run it points at finished writing is a fact about
-    // THAT row, which nobody here has read. So a 404 under a followed pointer
-    // is reported and retried rather than memoised -- one extra request per
-    // mount on a dedup'd run's missing cells, against never showing a cell
-    // that appeared a moment later.
-    return { runId: deduplicatedTo, followed: true, status };
+    // The status returned is the TARGET's, not the row's (confirmation pass,
+    // item 2). `deduplicated` is only ever written against a run that ALREADY
+    // COMPLETED -- that is what dedup means, and it is why nothing was
+    // replayed -- so the run being read is `done` and its 404s are the durable
+    // answer they would be under any other finished run. Returning the row's
+    // own `'deduplicated'` here made every missing cell of such a run cost one
+    // request per mount for a fact that cannot change.
+    //
+    // What F6 asked for stands: the STATUS IS RESOLVED HERE, once, beside the
+    // run id it belongs to, and the hooks forward whatever this returns. The
+    // bug was a hook deciding the memoisation rule for itself.
+    return { runId: deduplicatedTo, followed: true, status: FETCHABLE_STATUS };
   }
   return null;
 }

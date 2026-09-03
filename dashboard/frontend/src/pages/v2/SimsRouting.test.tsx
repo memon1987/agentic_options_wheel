@@ -326,6 +326,49 @@ describe('deep links and navigation', () => {
     expect(screen.getByTestId('provenance-footer').textContent).toMatch(/reached from/);
   });
 
+  it('entering a dedup run with NO cell keeps the origin across the second replace', async () => {
+    // The confirmation pass's FIXES-INCOMPLETE. Arriving from the runs list is
+    // TWO replaces on one history entry: the auto-follow writes `{dedupFrom}`
+    // onto it, and the default-cell effect immediately replaced it away — so
+    // the destination lost the only record of where it was reached from, and
+    // neither the notice nor the footer's "reached from" row rendered. The
+    // deep-link case above never caught it because it arrives WITH a cell, so
+    // the second replace never fires.
+    detailByRun[RUN] = shapedFor(RUN, {
+      status: 'deduplicated',
+      run: { status: 'deduplicated', deduplicated_to: RUN_ORIG },
+    });
+    show(`/sims/${RUN}`);
+    await waitFor(() =>
+      expect(seen.pathname).toBe(`/sims/${RUN_ORIG}/position_20pct/GOOGL/holdout`),
+    );
+    // Both automatic steps replace, so Back still leaves rather than walking
+    // back through the redirect.
+    expect(navLog.map((n) => n.type)).toEqual(['POP', 'REPLACE', 'REPLACE']);
+
+    const notice = await screen.findByTestId('followed-dedup');
+    expect(notice.textContent).toMatch(new RegExp(RUN));
+    expect(notice.textContent).toMatch(new RegExp(RUN_ORIG));
+    expect(screen.getByTestId('provenance-footer').textContent).toMatch(
+      new RegExp(`reached from.*${RUN}`),
+    );
+  });
+
+  it('a dedup row pointing at ITSELF is not followed, and says so', async () => {
+    // Corrupt data, not a missing pointer: following it would navigate to the
+    // screen already on display. "The original run is not recorded" would send
+    // an operator looking for a column that is populated.
+    detailByRun[RUN] = shapedFor(RUN, {
+      status: 'deduplicated',
+      run: { status: 'deduplicated', deduplicated_to: RUN },
+    });
+    show(`/sims/${RUN}/base/GOOGL/fit`);
+    const region = await screen.findByTestId('results-status');
+    expect(region.textContent).toMatch(/points at ITSELF/);
+    expect(region.textContent).not.toMatch(/not recorded on this row/);
+    expect(seen.pathname).toBe(`/sims/${RUN}/base/GOOGL/fit`);
+  });
+
   it('the bias footer is the LAST thing on the page, below the console (F2)', async () => {
     show(`/sims/${RUN}/base/GOOGL/fit`);
     await screen.findByTestId('sim-console');

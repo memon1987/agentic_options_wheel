@@ -183,8 +183,16 @@ export default function Simulations() {
     if (!selectedRunId || !report) return;
     if (selection && cellExists(report, selection)) return;
     const fallback = defaultCell(report);
-    if (fallback) navigate(cellPath(selectedRunId, fallback), { replace: true });
-  }, [selectedRunId, report, selection, navigate]);
+    // `state` is CARRIED, not dropped (confirmation pass, F5 gap). Entering a
+    // deduplicated run from the runs list is two replaces: the auto-follow puts
+    // `{dedupFrom}` on the entry, and this one immediately replaced it away —
+    // so the destination lost the only record of where it was reached from and
+    // neither the notice nor the footer's "reached from" row rendered. Both
+    // replaces edit the SAME history entry, so its state has to survive them.
+    if (fallback) {
+      navigate(cellPath(selectedRunId, fallback), { replace: true, state: location.state });
+    }
+  }, [selectedRunId, report, selection, navigate, location.state]);
 
   // F5 (review round 1): a `deduplicated` row stored NOTHING under its own id --
   // the whole point of dedup is that nothing was replayed. Sec D-3 says the page
@@ -193,10 +201,14 @@ export default function Simulations() {
   // operator's history. The run it was reached from travels in the history
   // entry's state, so the destination can say so rather than pretending the
   // operator asked for it.
-  const dedupTarget =
+  const dedupPointer =
     matchedDetail && matchedDetail.sweep.status === 'deduplicated'
       ? (matchedDetail.sweep.deduplicated_to ?? null)
       : null;
+  // A row pointing at ITSELF is corrupt, not resolvable: following it would
+  // navigate to the screen already on display, for ever. Not followed, and said
+  // in its own words below rather than reported as a missing pointer.
+  const dedupTarget = dedupPointer && dedupPointer !== selectedRunId ? dedupPointer : null;
   useEffect(() => {
     if (!dedupTarget || !selectedRunId) return;
     const path = selection
@@ -442,8 +454,10 @@ function ResultsRegion({
     return shell(
       <p className="text-sm text-gray-400 mt-2">
         {id} was deduplicated: this exact spec had already completed on this engine and commit, so
-        nothing was replayed. The original run is not recorded on this row, so there is nothing to
-        open — find it by its spec in the runs list.
+        nothing was replayed.{' '}
+        {sweep.deduplicated_to === sweep.run_id
+          ? 'This row points at ITSELF, which cannot be true — the pointer is corrupt, not missing. The run that answered this spec has to be found by its spec in the runs list.'
+          : 'The original run is not recorded on this row, so there is nothing to open — find it by its spec in the runs list.'}
       </p>,
     );
   }
