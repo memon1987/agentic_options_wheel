@@ -758,8 +758,16 @@ export const KNOWN_LEDGER_KINDS = [
 
 export type KnownLedgerKind = (typeof KNOWN_LEDGER_KINDS)[number];
 
-/** A known kind, or any other string the engine may write later. */
-export type SimLedgerKind = KnownLedgerKind | (string & {});
+/**
+ * A known kind, or any other string the engine may write later.
+ *
+ * `string & Record<never, never>` rather than a bare `string`: the intersection
+ * is the idiom that keeps editor completion offering the seven literals while
+ * still ACCEPTING any string, so a build that predates Phase C's
+ * `synthetic_lot_open` can carry it rather than drop it. (`string & {}` is the
+ * more familiar spelling of the same trick and is what `ban-types` objects to.)
+ */
+export type SimLedgerKind = KnownLedgerKind | (string & Record<never, never>);
 
 export interface SimLedgerEvent {
   date: string;
