@@ -173,9 +173,43 @@ def deploy_flags(step):
         i += 1
 
     command = " ".join(joined)
-    # `;` / `then` / redirects tail the last line; shlex copes, we only keep flags.
-    tokens = shlex.split(command, comments=False, posix=False)
-    return sorted(t for t in tokens if t.startswith("--"))
+    # `;` / `then` / redirects tail the last line; the tokeniser copes, and we
+    # only keep flags.
+    return sorted(t for t in _tokenise_command(command) if t.startswith("--"))
+
+
+#: A quoted span inside a deploy command.
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+#: Stands in for a space INSIDE a quoted span while shlex runs. It never appears
+#: in cloudbuild.yaml, and it is put back immediately afterwards.
+_SPACE_SENTINEL = "\x01"
+
+
+def _tokenise_command(command):
+    """Split a `gcloud run deploy` command into shell words, quotes RETAINED.
+
+    Why not plain `shlex.split(..., posix=False)`, which is what this was:
+    FC-096 Phase D PR-1 asserted -- here, in cloudbuild.yaml's comment and in
+    the fixture's deviation ledger -- that non-posix shlex "handles the quoted
+    form". **It does not.** In non-posix mode a quote that OPENS MID-WORD is an
+    ordinary character, so `shlex.split("--x='a b'", posix=False)` returns
+    `["--x='a", "b'"]`: the flag silently loses everything after the first
+    space, and the fixture would freeze a truncated `OPERATORS` while every
+    assertion below still passed. The claim was written while the value had no
+    space in it yet, and the second operator falsified it (review round 1, F4).
+
+    `posix=True` groups correctly but also STRIPS the quotes and consumes
+    backslashes, which would rewrite every flag string already frozen in the
+    fixture -- a large unreviewable diff for a parser fix, and it would start
+    admitting flags this helper has always dropped. So instead: hide the spaces
+    inside quoted spans, run the SAME tokeniser as before (byte-identical output
+    for every unquoted flag), and put the spaces back.
+    """
+    protected = _QUOTED_SPAN.sub(
+        lambda m: m.group(0).replace(" ", _SPACE_SENTINEL), command)
+    return [t.replace(_SPACE_SENTINEL, " ")
+            for t in shlex.split(protected, comments=False, posix=False)]
 
 
 def simulate_substitution(text):

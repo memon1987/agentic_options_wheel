@@ -65,6 +65,11 @@ VIEWER = "someone.else@example.com"
 #: The scheduler's identity once IAP is on: admitted by IAM, never on an
 #: allowlist of human operators.
 SCHEDULER_SA = "799970961417-compute@developer.gserviceaccount.com"
+#: The automation service account. It IS an operator (FC-096 Phase D PR-2,
+#: review round 1 F4): `POST /sims/run`, `POST /sims/pins` and
+#: `DELETE /sims/pins/{id}` have no frontend caller, so after the bearer token
+#: is retired an impersonated id-token for this SA is their only credential.
+AUTOMATION_SA = "claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com"
 
 
 # --------------------------------------------------------------------------- #
@@ -1074,6 +1079,30 @@ class TestTheTokenIsRetired:
         assert "_require_sweep_token" not in text
         assert "_sweep_token" not in text
 
+    def test_the_auth_module_does_not_even_NAME_the_retired_variable(self):
+        """Not `getenv`, not a comment, not a docstring — the string is gone.
+
+        Stricter than the router check above on purpose (review round 1, F5).
+        `services/auth.py` is the module that decides who may spend money, and
+        until this round its module docstring and `authorize_write`'s docstring
+        both described a fall-through "to the pre-existing SWEEP_SUBMIT_TOKEN
+        gate ... byte-identically". That branch does not exist any more. A false
+        contract in the one file a reader opens to learn the contract is worse
+        than no comment: the next person to touch this code would have written
+        against a gate that was deleted, and the grep that would have caught
+        them ("is the token really gone?") comes back positive on the prose.
+
+        So the bar here is the whole file, not just its `getenv` calls. If a
+        future change genuinely needs to discuss the retired credential, it says
+        "the legacy shared-bearer gate" — as this module now does.
+        """
+        text = (REPO_ROOT / "dashboard" / "backend" / "services"
+                / "auth.py").read_text()
+        assert TOKEN_ENV not in text, (
+            f"{TOKEN_ENV} appears in services/auth.py. The gate it names was "
+            f"deleted in PR-2; anything this file says about it is a contract "
+            f"that no code honours.")
+
     def test_the_service_layer_has_no_token_helpers_left(self):
         """`extract_bearer` / `token_matches` are DELETED, not unused.
 
@@ -1454,11 +1483,11 @@ class TestTheDeployConfigCarriesTheRolesEnv:
     def _parse_env_value(raw):
         """Handle BOTH the comma form and gcloud's `^<delim>^` alternate form.
 
-        Written to survive the delimiter switch that invite day forces: a second
-        operator puts a SPACE in `OPERATORS`, which the comma form cannot carry
-        through an unquoted bash line. When that lands, this parser already
-        reads it and the assertions below keep their meaning - which is the
-        point of writing it now rather than discovering it in a red build.
+        The `^;^` form is the one IN USE since PR-2's review round: a second
+        operator put a SPACE in `OPERATORS`, which the comma form cannot carry
+        through an unquoted bash line. Both branches are kept because a future
+        edit could go either way and a parser that only reads today's shape
+        turns a delimiter change into an unrelated-looking failure.
         """
         sep = ","
         if len(raw) > 2 and raw[0] == "^":
@@ -1467,8 +1496,8 @@ class TestTheDeployConfigCarriesTheRolesEnv:
             raw = raw[end + 1:]
         return dict(kv.split("=", 1) for kv in raw.split(sep))
 
-    def test_the_parser_reads_the_future_delimiter_form(self):
-        """The switch is documented in three places; here it is executable."""
+    def test_the_parser_reads_the_alternate_delimiter_form(self):
+        """The form the deploy actually uses; documented in three places."""
         parsed = self._parse_env_value(
             "^;^GCP_PROJECT=p;OPERATORS=a@x.com b@x.com")
         assert parsed["GCP_PROJECT"] == "p"
@@ -1494,6 +1523,41 @@ class TestTheDeployConfigCarriesTheRolesEnv:
             "a comma in OPERATORS would be parsed by --set-env-vars as the "
             "separator between VARIABLES, silently creating a second env var")
         assert OPERATOR in value.split()
+
+    def test_the_automation_service_account_is_an_operator(self, env):
+        """`POST /sims/run` and the two pin routes have NO frontend caller.
+
+        They are curl-only surfaces. Once PR-2 retires the SWEEP_SUBMIT_TOKEN
+        bearer, an impersonated id-token for this service account is the ONLY
+        credential that can reach them - so dropping it from OPERATORS is not a
+        tidy-up, it makes three write routes unreachable by anything. (The SA
+        must ALSO hold roles/iap.httpsResourceAccessor on the service; that is
+        an IAM grant, not a repo artifact, and it is step 1 of the PR body's
+        operator sequence.)
+        """
+        assert AUTOMATION_SA in env[A.OPERATORS_ENV].split(), (
+            f"{AUTOMATION_SA} must be in OPERATORS: it is the only identity "
+            f"that can call the three curl-only write routes post-retirement")
+
+    def test_the_multi_operator_value_survives_the_bash_line_it_lives_in(self, env):
+        """A value with a space MUST be inside the `^;^` quoted form.
+
+        The trap this pins: the deploy line sits in an unquoted `bash -c`
+        script. Unquoted, bash word-splits `OPERATORS=a@x.com b@x.com` and
+        gcloud receives the second address as a POSITIONAL argument - a red
+        build. `deploy_flags()` reproduces the grouping, so if the quoting were
+        dropped this fixture would parse a truncated value and the operator
+        assertions above would fail rather than passing on a half-read flag.
+        """
+        from tests.test_cloudbuild_contract import deploy_flags, load_steps
+
+        step = next(s for s in load_steps() if s["id"] == "deploy-dashboard-canary")
+        flag = next(f for f in deploy_flags(step) if f.startswith("--set-env-vars="))
+        raw = flag[len("--set-env-vars="):]
+        if " " in env[A.OPERATORS_ENV]:
+            assert raw.startswith("'^") and raw.endswith("'"), (
+                "OPERATORS contains a space, so the whole --set-env-vars flag "
+                "must be ONE quoted argument in gcloud's ^<delim>^ form")
 
     def test_the_seed_operator_would_be_admitted(self, env, monkeypatch):
         """The value as deployed actually authorises the operator's own email."""
