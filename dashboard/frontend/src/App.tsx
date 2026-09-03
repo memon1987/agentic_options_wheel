@@ -20,6 +20,18 @@ export default function App() {
             <Route path="/bot-health"          element={<BotHealthV2 />} />
             {/* FC-060 Layer 4: scenario sweeps. Simulations, not the live book. */}
             <Route path="/sims"                element={<SimulationsV2 />} />
+            {/* FC-096 Phase E (decision 4): the URL is the state. A deep link
+                addresses a run, or one cell of it; `main.py:72` serves
+                index.html for every non-`api/` path, so a reload lands on the
+                same screen with no backend change. */}
+            <Route path="/sims/:runId"         element={<SimulationsV2 />} />
+            <Route
+              path="/sims/:runId/:scenario/:symbol/:split"
+              element={<SimulationsV2 />}
+            />
+            {/* PR-5 builds the compare view. Until then the query string is
+                dropped deliberately rather than half-rendered. */}
+            <Route path="/sims/compare"        element={<Navigate to="/sims" replace />} />
           </Route>
 
           {/* Bookmark redirects: every old path lands on the new equivalent. */}
