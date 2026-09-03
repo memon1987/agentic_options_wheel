@@ -1037,6 +1037,19 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-101: annualised run-rates have no minimum-span floor — a 1-day window annualises ×365 with nothing refusing it
+
+**Scope:** shared
+**Status:** Filed 2026-09-03 (raised by the FC-096 Phase E PR-1 build and both of its reviews; deferred out of PR-1 because the threshold is a policy number, not a console fix)
+**Size estimate:** S
+
+**Problem:** The Phase E forecast serves `annual_low/high` for the premium and total-P&L bases as `per_day × 365`, and the engine's `annualized_return` / `annualized_return_on_collateral` extrapolate the same way. Nothing floors the span: a 1-day holdout serves `$100 → $36,500/yr` with the same field names as a 90-day one. The console's default horizon (= holdout length) and the "extrapolated ×N" line protect the DEFAULT view only; the `annual_*` pair and the CLI report print the raw number.
+
+**Proposal:** one policy constant (e.g. `MIN_ANNUALISATION_DAYS`, candidate 20 decision days) that lives beside `MIN_DAYS_IN_POSITION` in the engine and is imported (not restated) by `shape_results`; below it the server serves `annual_* = null` with a named refusal (`span_below_minimum`) and the CLI report prints the same refusal. Must bind both readers or the two disagree. Test: a 19-day window refuses, a 20-day one serves; byte-equality between the console's and the report's refusal text.
+
+**Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §Forecast range; PR-1 #121 PR body "deferred"), FC-060 guardrails.
+
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
