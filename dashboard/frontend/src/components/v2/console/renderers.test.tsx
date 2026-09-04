@@ -21,6 +21,7 @@ import { equityOverlay } from './series';
 import PriceChart from './PriceChart';
 import EquityChart from './EquityChart';
 import DrawdownChart from './DrawdownChart';
+import PremiumCharts from './PremiumCharts';
 import DeploymentChart from './DeploymentChart';
 import LedgerTable from './LedgerTable';
 import SimCycleTable from './SimCycleTable';
@@ -131,6 +132,71 @@ describe('PriceChart', () => {
         'No bars sidecar was stored for this run.',
       ),
     );
+    vi.unstubAllGlobals();
+  });
+});
+
+describe('PriceChart — the fallback is gated on the sidecar settling (R5)', () => {
+  it('issues NO stock-history request while the sidecar fetch is in flight', async () => {
+    // The bug: `useBars` reports `data: null` while loading, so a fallback
+    // gated on "no sidecar yet" fired a BigQuery query on every cell open —
+    // including for every run that HAS a sidecar — and discarded the answer.
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const { rerender } = render(
+      <PriceChart
+        symbol="GOOGL"
+        bars={null}
+        barsAbsence={null}
+        barsLoading
+        artifact={artifact}
+        artifactAbsence={null}
+        window={WINDOW}
+        strategy="wheel"
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('price-chart-absent')).toBeInTheDocument());
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Settled WITH a sidecar: still nothing.
+    rerender(
+      <PriceChart
+        symbol="GOOGL"
+        bars={bars}
+        barsAbsence={null}
+        barsLoading={false}
+        artifact={artifact}
+        artifactAbsence={null}
+        window={WINDOW}
+        strategy="wheel"
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('price-caption-replay')).toBeInTheDocument());
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('issues exactly ONE once the sidecar has settled absent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: '',
+      text: async () => '[]',
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <PriceChart
+        symbol="GOOGL"
+        bars={null}
+        barsAbsence="No bars sidecar was stored for this run."
+        barsLoading={false}
+        artifact={artifact}
+        artifactAbsence={null}
+        window={WINDOW}
+        strategy="wheel"
+      />,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     vi.unstubAllGlobals();
   });
 });
@@ -335,6 +401,44 @@ describe('SimCycleTable', () => {
   });
 });
 
+describe('SimCycleTable — the open cycle (R3)', () => {
+  it('labels the realised columns and refuses the engine’s 0 sentinels', () => {
+    render(<SimCycleTable artifact={artifact} absence={null} row={row} />);
+    const card = screen.getByTestId('cycle-table');
+    expect(card.textContent).toMatch(/Stock P&L \(realised\)/);
+    expect(card.textContent).toMatch(/Total \(realised; open lot unmarked\)/);
+
+    // The open cycle is the LAST row and carries days 0, RoC 0.83%, annualised
+    // 0.0 — sentinels for a cycle that has not finished, which rendered as a
+    // measured 0% over 0 days.
+    const cells = Array.from(
+      card.querySelectorAll('tbody tr:last-child td'),
+    ).map((td) => td.textContent);
+    expect(cells[1]).toBe('open');
+    expect(cells[2]).toBe('—'); // days
+    expect(cells[cells.length - 2]).toBe('—'); // return on capital
+    expect(cells[cells.length - 1]).toBe('—'); // annualised
+  });
+
+  it('names the unrealised leg and why the Total column does not add up', () => {
+    render(<SimCycleTable artifact={artifact} absence={null} row={row} />);
+    const caveat = screen.getByTestId('cycle-open-caveat').textContent!;
+    expect(caveat).toMatch(/1 open cycle/);
+    expect(caveat).toMatch(/-\$1,565/); // the row's stock_pnl_unrealized
+    expect(caveat).toMatch(/\$8,474/); // the column's sum
+    expect(caveat).toMatch(/\$6,751/); // the cell's total P&L
+  });
+
+  it('says nothing about open cycles when every cycle closed', () => {
+    const closed = {
+      ...artifact,
+      cycles: artifact.cycles.filter((c) => !c.is_open),
+    } as SimArtifact;
+    render(<SimCycleTable artifact={closed} absence={null} row={row} />);
+    expect(screen.queryByTestId('cycle-open-caveat')).toBeNull();
+  });
+});
+
 describe('RejectionPanel', () => {
   it('preserves the SERVED order and highlights the binding constraint', () => {
     render(
@@ -359,6 +463,35 @@ describe('RejectionPanel', () => {
     );
   });
 
+  it('does NOT claim the reasons partition the decision days (R4)', () => {
+    render(
+      <RejectionPanel
+        artifact={artifact}
+        absence={null}
+        earningsSymbolsWithoutData={[]}
+        caveat={report.rejection_tally_caveat}
+      />,
+    );
+    const card = screen.getByTestId('rejection-panel').textContent!;
+    expect(card).not.toMatch(/the rest were rejected/);
+    // 252 reason-days over 189 decision days: the tally OVERLAPS, so it cannot
+    // be the complement of `candidate_days`.
+    const sum = artifact.rejections.reduce((total, r) => total + r.days, 0);
+    expect(sum).toBe(252);
+    expect(sum).toBeGreaterThan(artifact.counters.decision_days as number);
+    expect(screen.getByTestId('rejection-sum').textContent).toMatch(
+      /sum to 252 reason-days over 189 decision days/,
+    );
+    expect(card).toMatch(/BEFORE selection and sizing had their say/);
+    expect(card).toMatch(/one day can be counted under several/);
+    expect(screen.getByTestId('rejection-in-position').textContent).toMatch(
+      /the wheel being IN POSITION/,
+    );
+    expect(screen.getByTestId('rejection-binding-note').textContent).toMatch(
+      /stamped on THIS cell’s artifact/,
+    );
+  });
+
   it('reverses when the served order reverses — it does not re-rank', () => {
     const reversed = { ...artifact, rejections: [...artifact.rejections].reverse() } as SimArtifact;
     render(
@@ -376,5 +509,82 @@ describe('RejectionPanel', () => {
       }d`,
     );
     expect(screen.getByTestId('rejection-earnings-run').textContent).toMatch(/PFE/);
+  });
+});
+
+describe('the synthetic-lot premise (R8)', () => {
+  /** The Phase C shape: a `covered_call` artifact with a lot-based base. */
+  const cc = {
+    ...artifact,
+    provenance: { ...artifact.provenance, strategy: 'covered_call' },
+  } as SimArtifact;
+  const ccDigest = computeDigest(cc, bars, { specStrategy: 'covered_call' });
+
+  const renderers: Array<[string, (strategy: string) => JSX.Element]> = [
+    ['price', (strategy) => (
+      <PriceChart symbol="GOOGL" bars={bars} barsAbsence={null} artifact={cc}
+        artifactAbsence={null} window={WINDOW} strategy={strategy} />
+    )],
+    ['equity', (strategy) => (
+      <EquityChart overlay={equityOverlay(cc, null, bars)} row={row} isBase baseAbsence={null}
+        artifactAbsence={null} capitalBase={100000} strategy={strategy} />
+    )],
+    ['premium', (strategy) => <PremiumCharts digest={ccDigest} absence={null} strategy={strategy} />],
+    ['drawdown', (strategy) => (
+      <DrawdownChart series={ccDigest.drawdownSeries} row={row} absence={null} strategy={strategy} />
+    )],
+    ['deployment', (strategy) => (
+      <DeploymentChart series={ccDigest.deploymentSeries} reading={ccDigest.deployment}
+        capitalBase={100000} suppressionReason={null} absence={null} strategy={strategy} />
+    )],
+    ['ledger', (strategy) => (
+      <LedgerTable artifact={cc} absence={null} context={{ ...context, strategy }} />
+    )],
+    ['cycles', (strategy) => (
+      <SimCycleTable artifact={cc} absence={null} row={row} strategy={strategy} />
+    )],
+    ['rejections', (strategy) => (
+      <RejectionPanel artifact={cc} absence={null} earningsSymbolsWithoutData={[]}
+        caveat={null} strategy={strategy} />
+    )],
+  ];
+
+  it.each(renderers)('%s renders the premise on a covered-call cell', (_name, build) => {
+    render(build('covered_call'));
+    expect(screen.getAllByTestId('cc-lot-banner')[0].textContent).toMatch(
+      /Synthetic lot — 100 shares at the window-start close \(D2\)/,
+    );
+  });
+
+  it.each(renderers)('%s renders NOTHING of the kind on a wheel cell', (_name, build) => {
+    render(build('wheel'));
+    expect(screen.queryByTestId('cc-lot-banner')).toBeNull();
+  });
+});
+
+describe('a stored artifact with no ledger at all (R9)', () => {
+  // The live `position_20pct` cell: 189 daily rows, zero events. An empty
+  // AreaChart and "0 of 0 events" read as broken; the finding is that the arm
+  // never opened anything.
+  const empty = { ...artifact, ledger: [], cycles: [] } as SimArtifact;
+  const emptyDigest = computeDigest(empty, bars, { specStrategy: null });
+
+  it('the premium panel says so instead of drawing an empty chart', () => {
+    render(<PremiumCharts digest={emptyDigest} absence={null} stateLabel="insuf" />);
+    expect(screen.getByTestId('premium-no-events').textContent).toMatch(
+      /No option event in this window — the engine opened nothing/,
+    );
+    expect(screen.getByTestId('premium-no-events').textContent).toMatch(/this cell is insuf/);
+  });
+
+  it('the ledger table says so instead of an empty table', () => {
+    render(<LedgerTable artifact={empty} absence={null} context={context} stateLabel="insuf" />);
+    expect(screen.getByTestId('ledger-no-events').textContent).toMatch(
+      /No option event in this window/,
+    );
+    expect(screen.getByTestId('ledger-no-events').textContent).toMatch(
+      /a stored result, not a missing artifact/,
+    );
+    expect(screen.queryByTestId('ledger-export-csv')).toBeNull();
   });
 });

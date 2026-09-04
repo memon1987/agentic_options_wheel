@@ -72,6 +72,76 @@ describe('ForecastPanel — refusals', () => {
   });
 });
 
+describe('ForecastPanel — a suppressed basis (R6)', () => {
+  it('prints the REASON, never “not served”', () => {
+    // A covered-call symbol with no stamped capital base has a premium rate and
+    // no total-P&L rate. "not served" reads as a server fault; it is a
+    // suppression the server explains.
+    const base = report.forecast!.by_scenario.base;
+    const suppressed = {
+      ...report.forecast!,
+      by_scenario: {
+        base: {
+          ...base,
+          symbols: {
+            GOOGL: {
+              ...base.symbols.GOOGL,
+              capital_base: null,
+              total_pnl: {
+                fit_per_day: null,
+                holdout_per_day: null,
+                low_per_day: null,
+                high_per_day: null,
+                annual_low: null,
+                annual_high: null,
+              },
+            },
+          },
+        },
+      },
+    };
+    show({ forecast: suppressed });
+    const cell = screen.getByTestId('forecast-null-symbol-total_pnl').textContent!;
+    expect(cell).toMatch(/no stamped capital base/);
+    expect(cell).not.toMatch(/not served/);
+    // The premium basis is untouched and still prints its range.
+    expect(screen.queryByTestId('forecast-null-symbol-net_option_pnl')).toBeNull();
+  });
+
+  it('prefers the server’s own excluded_by_basis wording when it has one', () => {
+    const base = report.forecast!.by_scenario.base;
+    const suppressed = {
+      ...report.forecast!,
+      by_scenario: {
+        base: {
+          ...base,
+          portfolio: {
+            ...base.portfolio,
+            excluded_by_basis: { net_option_pnl: {}, total_pnl: { GOOGL: 'fit: low activity' } },
+          },
+          symbols: {
+            GOOGL: {
+              ...base.symbols.GOOGL,
+              total_pnl: {
+                fit_per_day: null,
+                holdout_per_day: null,
+                low_per_day: null,
+                high_per_day: null,
+                annual_low: null,
+                annual_high: null,
+              },
+            },
+          },
+        },
+      },
+    };
+    show({ forecast: suppressed });
+    expect(screen.getByTestId('forecast-null-symbol-total_pnl').textContent).toBe(
+      'fit: low activity',
+    );
+  });
+});
+
 describe('ForecastPanel — both bases and the horizon', () => {
   it('renders premium AND total, never one alone', () => {
     show();
