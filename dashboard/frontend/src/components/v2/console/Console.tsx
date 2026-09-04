@@ -13,7 +13,7 @@
 // base" number is served per cell by PR-1 rather than derived from two objects.
 
 import { useMemo, useState } from 'react';
-import type { SimBars, SweepReport, SweepRow } from '../../../types/v2';
+import type { SimBars, SweepAllowlist, SweepReport, SweepRow } from '../../../types/v2';
 import { useArtifact } from '../../../hooks/useArtifact';
 import { useBars } from '../../../hooks/useBars';
 import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
@@ -22,6 +22,7 @@ import { artifactStrategy } from './normaliseArtifact';
 import { equityOverlay } from './series';
 import VerdictStrip from './VerdictStrip';
 import ProvenanceFooter from './ProvenanceFooter';
+import TweakBar from './TweakBar';
 import PriceChart from './PriceChart';
 import PortfolioEquityView from './PortfolioEquityView';
 import EquityChart from './EquityChart';
@@ -85,6 +86,19 @@ export interface ConsoleProps {
    * the address bar knows nothing about. The tabs are inert without it.
    */
   onSelectSymbol?: (symbol: string) => void;
+  /**
+   * PR-4. The allowlist types the tweak bar's controls; `null` while it loads
+   * and an error string when it could not be read. Both are passed down rather
+   * than fetched here: `Simulations` already holds one `useSweepAllowlist`, and
+   * a second call would be a second poll of a payload that is static per deploy.
+   */
+  allowlist?: SweepAllowlist | null;
+  allowlistError?: string | null;
+  /**
+   * Where a submitted tweak lands. Absent ⇒ the bar is not rendered at all,
+   * which is what keeps `Console` usable from a screen with no router.
+   */
+  onTweakSubmitted?: (target: { runId: string; scenario: string; notice: string }) => void;
 }
 
 export default function Console({
@@ -95,6 +109,9 @@ export default function Console({
   split,
   dedupFrom = null,
   onSelectSymbol,
+  allowlist = null,
+  allowlistError = null,
+  onTweakSubmitted,
 }: ConsoleProps) {
   const cell = useMemo(() => ({ scenario, symbol, split }), [scenario, symbol, split]);
   const artifactState = useArtifact(sweep, cell);
@@ -352,6 +369,22 @@ export default function Console({
         caveat={report.rejection_tally_caveat}
         strategy={strategy}
       />
+
+      {onTweakSubmitted && (
+        <TweakBar
+          // Keyed on the RUN: the controls are prefilled from this run's
+          // effective config, so carrying a half-typed field across a run
+          // switch would show one run's number under another run's key.
+          key={sweep.run_id}
+          sweep={sweep}
+          allowlist={allowlist}
+          allowlistError={allowlistError}
+          baseEffective={baseEffective}
+          symbol={symbol}
+          split={split}
+          onSubmitted={onTweakSubmitted}
+        />
+      )}
 
       <ProvenanceFooter
         sweep={sweep}

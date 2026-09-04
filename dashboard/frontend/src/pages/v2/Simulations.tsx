@@ -19,10 +19,10 @@
 // when a run resolves — replace, so Back never has to fight an auto-select to
 // leave the page.
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
-import type { LiveStrategyConfig, SweepDetail, SweepReport } from '../../types/v2';
+import type { LiveStrategyConfig, SweepAllowlist, SweepDetail, SweepReport } from '../../types/v2';
 import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
@@ -139,10 +139,38 @@ export default function Simulations() {
    */
   const selectRun = (id: string) => {
     if (id === selectedRunId) return;
+    setTweakNotice(null);
     navigate(`/sims/${encodeURIComponent(id)}`);
   };
   const selectCell = (cell: CellSelection) => {
     if (selectedRunId) navigate(cellPath(selectedRunId, cell));
+  };
+
+  /**
+   * PR-4. A tweak's answer is a CELL of another run, so submitting navigates
+   * exactly like any other user selection: it PUSHES, and Back returns the
+   * operator to the cell they tweaked from.
+   *
+   * The notice lives HERE and not in the bar, because the bar unmounts on the
+   * way: the destination run's detail has to load, and `ResultsRegion` renders
+   * its loading shell in between. It is cleared by the next run selection so
+   * "answered from a stored run" cannot outlive the run it describes.
+   */
+  const [tweakNotice, setTweakNotice] = useState<{ runId: string; text: string } | null>(null);
+  const onTweakSubmitted = (target: { runId: string; scenario: string; notice: string }) => {
+    setTweakNotice({ runId: target.runId, text: target.notice });
+    // The symbol and the split are the ones on screen; the SCENARIO is the arm
+    // the tweak just built — which for a 200 dedup is an arm the prior run
+    // already carries under exactly this name, because the name is derived from
+    // the spec and the spec is what deduplicated.
+    navigate(
+      cellPath(target.runId, {
+        scenario: target.scenario,
+        symbol: symbol ?? '',
+        split: split ?? '',
+      }),
+    );
+    refetchList();
   };
 
   // Land on the newest run so the page is not empty on arrival — REPLACING, so
@@ -256,6 +284,10 @@ export default function Simulations() {
           selection={selection}
           onSelectCell={selectCell}
           dedupFrom={dedupFrom}
+          allowlist={allowlist}
+          allowlistError={allowlistError}
+          onTweakSubmitted={onTweakSubmitted}
+          tweakNotice={tweakNotice && tweakNotice.runId === selectedRunId ? tweakNotice.text : null}
         />
       )}
     </div>
@@ -358,6 +390,10 @@ function ResultsRegion({
   selection,
   onSelectCell,
   dedupFrom,
+  allowlist,
+  allowlistError,
+  onTweakSubmitted,
+  tweakNotice,
 }: {
   detail: SweepDetail | null;
   detailError: string | null;
@@ -366,6 +402,12 @@ function ResultsRegion({
   onSelectCell: (cell: CellSelection) => void;
   /** The deduplicated run this screen was auto-opened from, if any. */
   dedupFrom: string | null;
+  /** PR-4: the tweak bar's control types, and where a submit lands. */
+  allowlist: SweepAllowlist | null;
+  allowlistError: string | null;
+  onTweakSubmitted: (target: { runId: string; scenario: string; notice: string }) => void;
+  /** What the submit that brought us here said, or `null`. */
+  tweakNotice: string | null;
 }) {
   if (detailError && !detail) {
     return (
@@ -491,6 +533,14 @@ function ResultsRegion({
           ⚠ Could not refresh this run ({detailError}) — showing the last good read.
         </p>
       )}
+      {tweakNotice && (
+        <p
+          data-testid="tweak-notice"
+          className="rounded border border-blue-800/60 bg-blue-950/30 px-3 py-2 text-sm text-blue-200"
+        >
+          {tweakNotice}
+        </p>
+      )}
       <SweepResults sweep={sweep} report={results} raw={raw} />
       {selection && cellExists(results, selection) && (
         <section className="rounded-lg border border-gray-700 bg-gray-800 p-5 space-y-4">
@@ -506,6 +556,9 @@ function ResultsRegion({
             // A symbol TAB is a cell selection like any other: it pushes, so
             // Back walks the operator's own history through it.
             onSelectSymbol={(symbol) => onSelectCell({ ...selection, symbol })}
+            allowlist={allowlist}
+            allowlistError={allowlistError}
+            onTweakSubmitted={onTweakSubmitted}
           />
         </section>
       )}
