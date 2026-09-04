@@ -43,14 +43,23 @@ function Shell({ children }: { children: React.ReactNode }) {
   );
 }
 
-function RangeRow({ range, horizon }: { range: ForecastRange; horizon: number }) {
+function RangeRow({
+  range,
+  horizon,
+  scope,
+}: {
+  range: ForecastRange;
+  horizon: number;
+  /** `symbol` or `portfolio` — the two ranges are never interchangeable. */
+  scope: 'symbol' | 'portfolio';
+}) {
   return (
-    <div data-testid={`forecast-range-${range.basis}`} className="py-2 border-t border-gray-700/60">
+    <div data-testid={`forecast-range-${scope}-${range.basis}`} className="py-2 border-t border-gray-700/60">
       <div className="flex items-baseline justify-between gap-3 flex-wrap">
         <span className="text-xs text-gray-400">{range.label}</span>
         <span className="text-lg font-semibold text-gray-200">
           {range.low === null || range.high === null ? (
-            <span data-testid={`forecast-null-${range.basis}`}>not served</span>
+            <span data-testid={`forecast-null-${scope}-${range.basis}`}>not served</span>
           ) : (
             `${fmtCurrency(range.low)} – ${fmtCurrency(range.high)}`
           )}
@@ -66,14 +75,14 @@ function RangeRow({ range, horizon }: { range: ForecastRange; horizon: number })
           </>
         )}
         {range.nSummed !== null && (
-          <span data-testid={`forecast-n-summed-${range.basis}`}>
+          <span data-testid={`forecast-n-summed-${scope}-${range.basis}`}>
             {' '}
             · summed over {range.nSummed} symbol{range.nSummed === 1 ? '' : 's'}
           </span>
         )}
       </div>
       {range.excluded.length > 0 && (
-        <div data-testid={`forecast-excluded-${range.basis}`} className="text-[11px] text-gray-500">
+        <div data-testid={`forecast-excluded-${scope}-${range.basis}`} className="text-[11px] text-gray-500">
           not in this sum:{' '}
           {range.excluded.map((e) => `${e.symbol} (${e.reason})`).join(', ')}
         </div>
@@ -159,7 +168,7 @@ export default function ForecastPanel({ report, scenario, symbol }: ForecastPane
             {symbol} · {scenario}
           </h4>
           {view.symbol.ranges.map((range) => (
-            <RangeRow key={range.basis} range={range} horizon={chosen} />
+            <RangeRow key={range.basis} range={range} horizon={chosen} scope="symbol" />
           ))}
           <p className="text-[11px] text-gray-500 mt-1">
             Fill: {view.symbol.fill?.basis ?? '—'}
@@ -190,7 +199,7 @@ export default function ForecastPanel({ report, scenario, symbol }: ForecastPane
             </p>
           ) : (
             view.portfolio.ranges.map((range) => (
-              <RangeRow key={range.basis} range={range} horizon={chosen} />
+              <RangeRow key={range.basis} range={range} horizon={chosen} scope="portfolio" />
             ))
           )}
           <p className="text-[11px] text-gray-500 mt-1">
