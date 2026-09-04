@@ -128,14 +128,17 @@ function useSide(ref: CompareRef | null): CompareSideData | null {
  */
 function SidePicker({
   tag,
-  ref: cellRef,
+  // NOT `ref`: React reserves that name and strips it from a function
+  // component's props, so a picker prop called `ref` arrives `undefined` and
+  // every side renders as "no cell chosen".
+  cellRef,
   runs,
   side,
   onChange,
   onClear,
 }: {
   tag: 'A' | 'B';
-  ref: CompareRef | null;
+  cellRef: CompareRef | null;
   runs: SweepRow[];
   side: CompareSideData | null;
   onChange: (next: CompareRef) => void;
@@ -382,14 +385,14 @@ export default function SimsCompare() {
         <div className="grid gap-6 lg:grid-cols-2">
           <SidePicker
             tag="A"
-            ref={refA}
+            cellRef={refA}
             runs={runs ?? []}
             side={sideA}
             onChange={(next) => setSide('a', next)}
           />
           <SidePicker
             tag="B"
-            ref={refB}
+            cellRef={refB}
             runs={runs ?? []}
             side={sideB}
             onChange={(next) => setSide('b', next)}
