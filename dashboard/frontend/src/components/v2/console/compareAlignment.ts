@@ -156,7 +156,7 @@ const show = (value: unknown): string => {
 };
 
 const windowOf = (side: CompareSide): { start: string; end: string } | null => {
-  const w = side.report?.windows.find((x) => x.split === side.ref.split);
+  const w = side.report?.windows?.find((x) => x.split === side.ref.split);
   return w ? { start: w.start, end: w.end } : null;
 };
 
