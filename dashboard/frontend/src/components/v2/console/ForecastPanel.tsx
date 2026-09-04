@@ -24,6 +24,7 @@ import { useState } from 'react';
 import type { SweepReport } from '../../../types/v2';
 import { fmtCurrency } from '../../../utils/format';
 import { defaultHorizon, forecastRows, type ForecastRange } from './forecastRows';
+import StrategyBanner from './StrategyBanner';
 
 export interface ForecastPanelProps {
   report: SweepReport;
@@ -31,13 +32,20 @@ export interface ForecastPanelProps {
   symbol: string;
 }
 
-function Shell({ children }: { children: React.ReactNode }) {
+function Shell({
+  children,
+  strategy,
+}: {
+  children: React.ReactNode;
+  strategy?: string | null;
+}) {
   return (
     <section
       data-testid="forecast-panel"
       className="rounded-lg border border-gray-700 bg-gray-800 p-5"
     >
       <h3 className="text-base font-semibold text-white">Forecast range</h3>
+      <StrategyBanner strategy={strategy} />
       {children}
     </section>
   );
@@ -59,7 +67,13 @@ function RangeRow({
         <span className="text-xs text-gray-400">{range.label}</span>
         <span className="text-lg font-semibold text-gray-200">
           {range.low === null || range.high === null ? (
-            <span data-testid={`forecast-null-${scope}-${range.basis}`}>not served</span>
+            // R6: "not served" reads as a server fault. The usual cause is a
+            // basis the server SUPPRESSED for a stated reason — a covered-call
+            // symbol with no stamped capital base has a premium rate and no
+            // total-P&L one — and that reason is on the payload.
+            <span data-testid={`forecast-null-${scope}-${range.basis}`} className="text-sm">
+              {range.suppression ?? 'no rate served for this basis'}
+            </span>
           ) : (
             `${fmtCurrency(range.low)} – ${fmtCurrency(range.high)}`
           )}
@@ -95,11 +109,14 @@ export default function ForecastPanel({ report, scenario, symbol }: ForecastPane
   const forecast = report.forecast;
   const [horizon, setHorizon] = useState<number | null>(null);
   const caveat = (report.forecast_caveat ?? '').trim();
+  // §Degrading for CC: the premise banner belongs on this panel too — every
+  // number in it is a rate per day on a lot the engine invented.
+  const strategy = forecast?.strategy ?? null;
 
   // Rule 1, first and unconditionally: a range without its caveat is not shown.
   if (!caveat) {
     return (
-      <Shell>
+      <Shell strategy={strategy}>
         <p data-testid="forecast-no-caveat" className="text-sm text-amber-400 mt-2">
           This run served no forecast caveat, so no range is rendered. The caveat is what says the
           bounds are two run-rates rather than a confidence interval; a range without it would be
@@ -111,7 +128,7 @@ export default function ForecastPanel({ report, scenario, symbol }: ForecastPane
 
   if (!forecast || report.forecast_refusal) {
     return (
-      <Shell>
+      <Shell strategy={strategy}>
         <p data-testid="forecast-refusal" className="text-sm text-gray-300 mt-2 whitespace-pre-wrap">
           {report.forecast_refusal ?? 'This run carries no forecast.'}
         </p>
@@ -129,7 +146,7 @@ export default function ForecastPanel({ report, scenario, symbol }: ForecastPane
     : [view.defaultHorizonDays, ...view.horizonChoices];
 
   return (
-    <Shell>
+    <Shell strategy={strategy}>
       <div className="flex items-center gap-2 mt-2 flex-wrap">
         <span className="text-xs text-gray-500">Horizon</span>
         {choices.map((days) => (

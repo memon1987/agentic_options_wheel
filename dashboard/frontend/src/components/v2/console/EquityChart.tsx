@@ -23,6 +23,7 @@ import type { SweepResultRow } from '../../../types/v2';
 import { fmtCurrency, fmtDateShort } from '../../../utils/format';
 import { pctOrDash, renderCell } from '../sims/resultCells';
 import type { EquityOverlayResult } from './series';
+import StrategyBanner from './StrategyBanner';
 
 export interface EquityChartProps {
   overlay: EquityOverlayResult;
@@ -33,6 +34,7 @@ export interface EquityChartProps {
   baseAbsence: string | null;
   artifactAbsence: string | null;
   capitalBase: number | null;
+  strategy?: string;
 }
 
 export default function EquityChart({
@@ -42,6 +44,7 @@ export default function EquityChart({
   baseAbsence,
   artifactAbsence,
   capitalBase,
+  strategy = 'wheel',
 }: EquityChartProps) {
   const measured = renderCell(row).kind === 'return';
 
@@ -59,6 +62,7 @@ export default function EquityChart({
   return (
     <section data-testid="equity-chart" className="rounded-lg border border-gray-700 bg-gray-800 p-5">
       <h3 className="text-base font-semibold text-white">Equity vs base vs buy &amp; hold</h3>
+      <StrategyBanner strategy={strategy} />
       <p className="text-xs text-gray-500 mt-1 mb-3">
         {measured ? (
           <span data-testid="equity-header-numbers">
@@ -95,7 +99,9 @@ export default function EquityChart({
       )}
       {!overlay.hasBase && !isBase && (
         <p data-testid="equity-no-base" className="text-xs text-gray-500 mb-2">
-          Base overlay omitted — {baseAbsence ?? 'the base cell&rsquo;s artifact is not loaded.'}
+          {/* A JSX ENTITY inside a JS string literal is not an entity — this
+              printed "the base cell&rsquo;s artifact" on screen. */}
+          Base overlay omitted — {baseAbsence ?? 'the base cell\u2019s artifact is not loaded.'}
         </p>
       )}
 

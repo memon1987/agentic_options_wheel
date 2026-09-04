@@ -13,9 +13,12 @@ import { normaliseSweepDetail } from '../sims/normaliseReport';
 import { indexRows, lookupCell } from '../sims/resultCells';
 import { normaliseArtifact } from './normaliseArtifact';
 import {
+  describeFilter,
+  EXPORT_SCOPE_CSV_COLUMNS,
   EXPORT_SERIALISATION_NOTE,
   exportJson,
   filterLedger,
+  isFiltered,
   LEDGER_CSV_COLUMNS,
   ledgerCsv,
   PROVENANCE_CSV_COLUMNS,
@@ -81,7 +84,11 @@ describe('ledgerCsv', () => {
     const csv = ledgerCsv(artifact.ledger, context);
     const rows = parseCsv(csv);
     expect(rows).toHaveLength(73); // 72 events + header
-    expect(rows[0]).toEqual([...LEDGER_CSV_COLUMNS, ...PROVENANCE_CSV_COLUMNS]);
+    expect(rows[0]).toEqual([
+      ...LEDGER_CSV_COLUMNS,
+      ...PROVENANCE_CSV_COLUMNS,
+      ...EXPORT_SCOPE_CSV_COLUMNS,
+    ]);
     // No `#` lines, ever: Excel renders them as a broken first row and pandas
     // needs a `comment='#'` nobody passes.
     expect(csv.split('\r\n').some((line) => line.startsWith('#'))).toBe(false);
@@ -91,7 +98,7 @@ describe('ledgerCsv', () => {
     const rows = parseCsv(ledgerCsv(artifact.ledger, context));
     const start = LEDGER_CSV_COLUMNS.length;
     for (const line of rows.slice(1)) {
-      expect(line.slice(start)).toEqual([
+      expect(line.slice(start, start + PROVENANCE_CSV_COLUMNS.length)).toEqual([
         '13cc2729d1c74211',
         'base',
         'GOOGL',
@@ -113,12 +120,52 @@ describe('ledgerCsv', () => {
     const rows = parseCsv(ledgerCsv([nasty], context));
     const detail = rows[1][LEDGER_CSV_COLUMNS.indexOf('detail')];
     expect(JSON.parse(detail)).toEqual(nasty.detail);
-    expect(rows[1]).toHaveLength(LEDGER_CSV_COLUMNS.length + PROVENANCE_CSV_COLUMNS.length);
+    expect(rows[1]).toHaveLength(
+      LEDGER_CSV_COLUMNS.length + PROVENANCE_CSV_COLUMNS.length + EXPORT_SCOPE_CSV_COLUMNS.length,
+    );
   });
 
   it('exports exactly the rows it was handed — the table’s current view', () => {
     const filtered = filterLedger(artifact.ledger, { kinds: ['buy_to_close'] });
     expect(parseCsv(ledgerCsv(filtered, context))).toHaveLength(7);
+  });
+});
+
+describe('ledgerCsv — a filtered file says so (R7)', () => {
+  it('carries rows_exported / rows_total / filter on every row', () => {
+    const filtered = filterLedger(artifact.ledger, { kinds: ['buy_to_close'] });
+    const rows = parseCsv(
+      ledgerCsv(filtered, context, { rowsTotal: artifact.ledger.length, filter: { kinds: ['buy_to_close'] } }),
+    );
+    const start = LEDGER_CSV_COLUMNS.length + PROVENANCE_CSV_COLUMNS.length;
+    expect(rows).toHaveLength(7);
+    for (const line of rows.slice(1)) {
+      expect(line.slice(start)).toEqual(['6', '72', 'kinds=buy_to_close']);
+    }
+  });
+
+  it('marks an UNfiltered file as the whole ledger', () => {
+    const rows = parseCsv(
+      ledgerCsv(artifact.ledger, context, { rowsTotal: artifact.ledger.length, filter: {} }),
+    );
+    const start = LEDGER_CSV_COLUMNS.length + PROVENANCE_CSV_COLUMNS.length;
+    expect(rows[1].slice(start)).toEqual(['72', '72', '']);
+    expect(isFiltered({ rowsTotal: 72, filter: {} }, 72)).toBe(false);
+    expect(isFiltered({ rowsTotal: 72, filter: { text: 'x' } }, 72)).toBe(true);
+    expect(isFiltered({ rowsTotal: 72, filter: {} }, 6)).toBe(true);
+  });
+
+  it('names the filter in words, kinds sorted and text trimmed', () => {
+    expect(describeFilter({ kinds: ['sell_put_open', 'buy_to_close'], text: '  GOOGL ' })).toBe(
+      'kinds=buy_to_close|sell_put_open;text=GOOGL',
+    );
+    expect(describeFilter({})).toBe('');
+  });
+
+  it('prints “engine default” rather than a blank fill haircut', () => {
+    const rows = parseCsv(ledgerCsv([artifact.ledger[0]], { ...context, fillHaircut: null }));
+    const at = LEDGER_CSV_COLUMNS.length + PROVENANCE_CSV_COLUMNS.indexOf('fill_haircut');
+    expect(rows[1][at]).toBe('engine default');
   });
 });
 

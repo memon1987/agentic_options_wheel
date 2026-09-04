@@ -248,6 +248,14 @@ export interface DeploymentReading {
   /** Days holding shares this module could not value. Non-zero ⇒ `ratio` null. */
   unresolvedShareDays: number;
   /**
+   * Did a sidecar with bars reach this reading at all?
+   *
+   * `basis: 'at cost'` has two causes and the caption must not conflate them:
+   * no sidecar for the run, or a sidecar that prices a DIFFERENT underlying
+   * from the one held (review round 1, LOW).
+   */
+  hadSidecar: boolean;
+  /**
    * Why those days could not be valued, for the tile (review round 1, F9).
    * `null` when there are none. An absent ratio with no reason beside it reads
    * as "not computed yet".
@@ -351,6 +359,7 @@ export function deploymentSeries(
     reading: {
       ratio: valuable && capitalBase ? (reservedSum + sharesValueSum) / days / capitalBase : null,
       basis: days === 0 ? 'none' : !hasCloses || valuedAtCost > 0 ? 'at cost' : 'closes',
+      hadSidecar: hasCloses,
       days,
       reservedMeanDollars: days > 0 ? reservedSum / days : 0,
       sharesValueMeanDollars: valuable ? sharesValueSum / days : null,

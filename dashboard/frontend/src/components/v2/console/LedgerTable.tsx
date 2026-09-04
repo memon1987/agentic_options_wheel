@@ -16,9 +16,12 @@ import { useMemo, useState } from 'react';
 import type { SimArtifact, SimLedgerEvent } from '../../../types/v2';
 import { KNOWN_LEDGER_KINDS } from '../../../types/v2';
 import { fmtCurrency, fmtCurrencyDetail, fmtDateShort, parseOcc } from '../../../utils/format';
+import StrategyBanner from './StrategyBanner';
 import {
+  describeFilter,
   exportJson,
   filterLedger,
+  isFiltered,
   ledgerCsv,
   sortLedger,
   type ExportContext,
@@ -71,9 +74,16 @@ export interface LedgerTableProps {
   artifact: SimArtifact | null;
   absence: string | null;
   context: ExportContext;
+  /** The cell's state, for the empty-ledger message (review R9). */
+  stateLabel?: string | null;
 }
 
-export default function LedgerTable({ artifact, absence, context }: LedgerTableProps) {
+export default function LedgerTable({
+  artifact,
+  absence,
+  context,
+  stateLabel = null,
+}: LedgerTableProps) {
   const [sortKey, setSortKey] = useState<LedgerSortKey>('date');
   const [direction, setDirection] = useState<SortDirection>('asc');
   const [kinds, setKinds] = useState<string[]>([]);
@@ -93,6 +103,10 @@ export default function LedgerTable({ artifact, absence, context }: LedgerTableP
     () => sortLedger(filterLedger(ledger, { kinds, text }), sortKey, direction),
     [ledger, kinds, text, sortKey, direction],
   );
+  // R7: a filtered export is a different file from a full one and must not be
+  // mistakable for it — in the name and in three trailing columns.
+  const scope = { rowsTotal: ledger.length, filter: { kinds, text } };
+  const filtered = isFiltered(scope, rows.length);
 
   if (!artifact) {
     return (
@@ -100,6 +114,23 @@ export default function LedgerTable({ artifact, absence, context }: LedgerTableP
         <h3 className="text-base font-semibold text-white">Trade ledger</h3>
         <p data-testid="ledger-absent" className="text-sm text-gray-400 mt-2">
           {absence ?? 'No ledger was stored for this cell.'}
+        </p>
+      </section>
+    );
+  }
+
+  if (ledger.length === 0) {
+    return (
+      <section
+        data-testid="ledger-table"
+        className="rounded-lg border border-gray-700 bg-gray-800 p-5"
+      >
+        <StrategyBanner strategy={context.strategy} />
+        <h3 className="text-base font-semibold text-white">Trade ledger</h3>
+        <p data-testid="ledger-no-events" className="text-sm text-gray-400 mt-2">
+          No option event in this window — the engine opened nothing
+          {stateLabel ? `, and this cell is ${stateLabel}` : ''}. That is a stored result, not a
+          missing artifact: the rejection panel below says what bound every decision day.
         </p>
       </section>
     );
@@ -118,6 +149,7 @@ export default function LedgerTable({ artifact, absence, context }: LedgerTableP
 
   return (
     <section data-testid="ledger-table" className="rounded-lg border border-gray-700 bg-gray-800 p-5">
+      <StrategyBanner strategy={context.strategy} />
       <div className="flex items-baseline justify-between flex-wrap gap-2">
         <h3 className="text-base font-semibold text-white">Trade ledger</h3>
         <div className="flex gap-2">
@@ -127,8 +159,9 @@ export default function LedgerTable({ artifact, absence, context }: LedgerTableP
             className="text-xs px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-200"
             onClick={() =>
               save(
-                `ledger-${context.runId}-${context.scenario}-${context.symbol}-${context.split}.csv`,
-                ledgerCsv(rows, context),
+                `ledger-${context.runId}-${context.scenario}-${context.symbol}-${context.split}` +
+                  `${filtered ? '-filtered' : ''}.csv`,
+                ledgerCsv(rows, context, scope),
                 'text/csv;charset=utf-8',
               )
             }
@@ -154,6 +187,15 @@ export default function LedgerTable({ artifact, absence, context }: LedgerTableP
       <p className="text-xs text-gray-500 mt-1">
         {rows.length} of {ledger.length} events. Both exports carry this run, arm, symbol, split,
         engine identity and fill basis on every row — a ledger cannot circulate unlabelled.
+        {filtered && (
+          <span data-testid="ledger-filtered-note">
+            {' '}
+            This view is FILTERED ({describeFilter(scope.filter) || 'no matching events'}); the
+            CSV says so in its name and in its <span className="font-mono">rows_exported</span> /
+            <span className="font-mono">rows_total</span> / <span className="font-mono">filter</span>{' '}
+            columns.
+          </span>
+        )}
       </p>
 
       <div className="flex flex-wrap gap-1 mt-3 items-center">

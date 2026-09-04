@@ -16,7 +16,7 @@ import { useMemo, useState } from 'react';
 import type { SimBars, SweepReport, SweepRow } from '../../../types/v2';
 import { useArtifact } from '../../../hooks/useArtifact';
 import { useBars } from '../../../hooks/useBars';
-import { indexRows, lookupCell } from '../sims/resultCells';
+import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
 import { computeDigest } from './artifactDigest';
 import { artifactStrategy } from './normaliseArtifact';
 import { equityOverlay } from './series';
@@ -178,6 +178,10 @@ export default function Console({
     [artifactState.runId, artifactState.data, sweep, scenario, symbol, split, fill, report, strategy, row],
   );
 
+  // The cell's state in the partition's own words — for the panels that must
+  // say WHY a stored artifact has nothing in it (review round 1, R9).
+  const stateLabel = renderCell(row).kind === 'return' ? null : renderCell(row).text;
+
   const symbolTabClass = (active: boolean) =>
     `px-2 py-1 rounded text-xs border ${
       active
@@ -274,6 +278,7 @@ export default function Console({
           symbol={symbol}
           bars={barsState.data}
           barsAbsence={barsState.absent ?? barsState.error}
+          barsLoading={barsState.loading}
           artifact={artifactState.data}
           artifactAbsence={artifactState.absent ?? artifactState.error}
           window={window ? { start: window.start, end: window.end } : null}
@@ -288,15 +293,22 @@ export default function Console({
         baseAbsence={baseState.absent ?? baseState.error}
         artifactAbsence={digestAbsence}
         capitalBase={digest?.capitalBase ?? null}
+        strategy={strategy}
       />
 
-      <PremiumCharts digest={digest} absence={digestAbsence} />
+      <PremiumCharts
+        digest={digest}
+        absence={digestAbsence}
+        strategy={strategy}
+        stateLabel={stateLabel}
+      />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <DrawdownChart
           series={digest?.drawdownSeries ?? []}
           row={row}
           absence={digestAbsence}
+          strategy={strategy}
         />
         <DeploymentChart
           series={digest?.deploymentSeries ?? []}
@@ -304,24 +316,41 @@ export default function Console({
           capitalBase={digest?.capitalBase ?? null}
           suppressionReason={digest?.suppressionReason ?? null}
           absence={digestAbsence}
+          strategy={strategy}
         />
       </div>
 
-      <ForecastPanel report={report} scenario={scenario} symbol={symbol} />
+      {/* Keyed on the cell so the horizon selector resets when the operator
+          moves to another run, arm or symbol (review round 1, LOW). A 365-day
+          horizon chosen on one cell silently carrying over to the next is a
+          number read against the wrong window. */}
+      <ForecastPanel
+        key={`${sweep.run_id}:${scenario}:${symbol}`}
+        report={report}
+        scenario={scenario}
+        symbol={symbol}
+      />
 
       <LedgerTable
         artifact={artifactState.data}
         absence={digestAbsence}
         context={exportContext}
+        stateLabel={stateLabel}
       />
 
-      <SimCycleTable artifact={artifactState.data} absence={digestAbsence} />
+      <SimCycleTable
+        artifact={artifactState.data}
+        absence={digestAbsence}
+        row={row}
+        strategy={strategy}
+      />
 
       <RejectionPanel
         artifact={artifactState.data}
         absence={digestAbsence}
         earningsSymbolsWithoutData={report.earnings_symbols_without_data ?? []}
         caveat={report.rejection_tally_caveat}
+        strategy={strategy}
       />
 
       <ProvenanceFooter

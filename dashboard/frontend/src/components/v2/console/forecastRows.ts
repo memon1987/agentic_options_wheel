@@ -45,6 +45,15 @@ export interface ForecastRange {
   nSummed: number | null;
   /** Symbols left out of THIS basis' sum, named. Portfolio rows only. */
   excluded: Array<{ symbol: string; reason: string }>;
+  /**
+   * Why this basis has no rate, when it has none (review round 1, R6).
+   *
+   * `null` when a rate was served. A suppressed basis is not a server fault and
+   * must not read as one: the covered-call case is a symbol with a premium rate
+   * and no total-P&L rate because no capital base was stamped, and the server
+   * says so in `excluded_by_basis`.
+   */
+  suppression: string | null;
 }
 
 export interface ForecastView {
@@ -86,8 +95,12 @@ function rangeFrom(
   served: SimForecastBasis | null | undefined,
   horizon: number,
   excluded: Array<{ symbol: string; reason: string }>,
+  suppression: string | null = null,
 ): ForecastRange {
   return {
+    suppression: served?.low_per_day === null || served?.low_per_day === undefined
+      ? (suppression ?? 'no rate served for this basis')
+      : null,
     basis,
     label: BASIS_LABEL[basis],
     low: scale(served?.low_per_day, horizon),
@@ -167,7 +180,16 @@ export function forecastRows(
         fill: symbolForecast.fill ?? null,
         days: symbolForecast.days,
         ranges: BASIS_ORDER.map((basis) =>
-          rangeFrom(basis, symbolForecast[basis], horizonDays, []),
+          rangeFrom(
+            basis,
+            symbolForecast[basis],
+            horizonDays,
+            [],
+            byBasis[basis]?.[symbol] ??
+              (symbolForecast.capital_base === null && basis === 'total_pnl'
+                ? 'suppressed: no stamped capital base on this cell, so total P&L has no denominator'
+                : null),
+          ),
         ),
       }
     : null;

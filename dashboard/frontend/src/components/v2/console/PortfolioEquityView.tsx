@@ -36,6 +36,7 @@ import { fmtDateShort } from '../../../utils/format';
 import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
 import { parseArtifact } from './normaliseArtifact';
 import { portfolioIndex, type PortfolioCell } from './series';
+import StrategyBanner from './StrategyBanner';
 
 export const PORTFOLIO_CONCURRENCY = 4;
 
@@ -132,13 +133,33 @@ export default function PortfolioEquityView({
     [index, report.symbols, scenario, split],
   );
 
+  /**
+   * The symbols BASE measured in this window (review round 1, R2).
+   *
+   * The overlay used to be built over the ARM's measured set, which quietly
+   * averaged base cells base never measured: an `insufficient` base cell is a
+   * flat line at its own starting cash, so it pulls the base index toward 100
+   * and the arm reads as beating a benchmark that was never computed. The two
+   * indices must be over the SAME constituency or there is no overlay.
+   */
+  const baseSymbols = useMemo(
+    () => (isBase ? [] : measuredFor('base')),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [index, report.symbols, split, isBase],
+  );
+
   const cells = useMemo(() => {
     const wanted: CellRef[] = armSymbols.map((symbol) => ({ scenario, symbol, split }));
     if (withBase && !isBase) {
-      for (const symbol of armSymbols) wanted.push({ scenario: 'base', symbol, split });
+      // Only base cells base MEASURED are fetched: an unmeasured one cannot
+      // enter the index, so requesting it is a round trip for a 404 or for an
+      // artifact nothing may read.
+      for (const symbol of armSymbols) {
+        if (baseSymbols.includes(symbol)) wanted.push({ scenario: 'base', symbol, split });
+      }
     }
     return wanted;
-  }, [armSymbols, scenario, split, withBase, isBase]);
+  }, [armSymbols, baseSymbols, scenario, split, withBase, isBase]);
 
   const loaded = useArtifactSet(sweep, cells);
 
@@ -149,17 +170,26 @@ export default function PortfolioEquityView({
   }
   const arm = portfolioIndex(armCells, armSymbols);
 
+  // The overlay's target constituency: the arm's index members that base ALSO
+  // measured. Anything the arm measured and base did not is named below rather
+  // than averaged in at its starting cash.
+  const overlayTarget = arm.included.filter((symbol) => baseSymbols.includes(symbol));
+  const missingFromBase = arm.included.filter((symbol) => !baseSymbols.includes(symbol));
+
   const baseCells: Record<string, PortfolioCell> = {};
-  for (const symbol of arm.included) {
+  for (const symbol of overlayTarget) {
     const entry = loaded[cellKey({ scenario: 'base', symbol, split })];
     if (entry) baseCells[symbol] = { ...entry, specStrategy };
   }
-  const baseIndex = withBase && !isBase ? portfolioIndex(baseCells, arm.included) : null;
-  // The overlay is drawn ONLY over the same symbols as the arm's own index.
-  // Two lines built from different constituencies are not comparable, and a
-  // chart is the last place that difference would be noticed.
+  const baseIndex = withBase && !isBase ? portfolioIndex(baseCells, overlayTarget) : null;
+  // Drawn ONLY when base measured every symbol in the arm's index and every one
+  // of those artifacts is in hand. Two lines over different constituencies are
+  // not comparable, and a chart is the last place that difference is noticed.
   const baseComparable =
-    !!baseIndex && baseIndex.included.length === arm.included.length && arm.included.length > 0;
+    !!baseIndex &&
+    missingFromBase.length === 0 &&
+    baseIndex.included.length === arm.included.length &&
+    arm.included.length > 0;
 
   const rows = useMemo(() => {
     const baseBy = new Map((baseComparable ? baseIndex!.rows : []).map((r) => [r.date, r.index]));
@@ -197,9 +227,12 @@ export default function PortfolioEquityView({
         )}
       </div>
 
+      <StrategyBanner strategy={specStrategy} />
+
       <p data-testid="portfolio-caption" className="text-xs text-gray-500 mt-1 mb-3">
         Equal-weight index of {arm.included.length} independent single-symbol replays, each on its
-        own capital — not a portfolio simulation. Base 100 at the window start.{' '}
+        own capital — not a portfolio simulation. 100 = capital base: the mean of each measured
+        symbol&rsquo;s equity ÷ its own capital base, never rebased to its first day.{' '}
         <span data-testid="portfolio-loaded">
           {arm.loaded} of {arm.total} loaded
         </span>
@@ -280,8 +313,22 @@ export default function PortfolioEquityView({
       )}
       {withBase && !isBase && !baseComparable && (
         <p data-testid="portfolio-base-omitted" className="text-xs text-amber-400 mt-1">
-          Base overlay omitted: base does not measure the same symbol set in this window, and two
-          indices over different constituencies are not comparable.
+          Base overlay omitted:{' '}
+          {missingFromBase.length > 0 ? (
+            <>
+              base did not measure {missingFromBase.join(', ')} in this window (
+              {missingFromBase
+                .map(
+                  (symbol) =>
+                    `${symbol}: ${renderCell(lookupCell(index, 'base', symbol, split)).text}`,
+                )
+                .join(', ')}
+              ). Averaging an unmeasured base cell in would put its flat starting-cash line into
+              the benchmark and make this arm look like it beat one.
+            </>
+          ) : (
+            <>base&rsquo;s artifacts for these symbols are not all loaded yet.</>
+          )}
         </p>
       )}
     </section>

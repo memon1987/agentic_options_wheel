@@ -22,6 +22,7 @@ import {
 } from 'recharts';
 import { fmtCurrency, fmtDateShort, fmtPercent } from '../../../utils/format';
 import type { DeploymentPoint, DeploymentReading } from './series';
+import StrategyBanner from './StrategyBanner';
 
 export interface DeploymentChartProps {
   series: DeploymentPoint[];
@@ -29,6 +30,7 @@ export interface DeploymentChartProps {
   capitalBase: number | null;
   suppressionReason: string | null;
   absence: string | null;
+  strategy?: string;
 }
 
 export default function DeploymentChart({
@@ -37,6 +39,7 @@ export default function DeploymentChart({
   capitalBase,
   suppressionReason,
   absence,
+  strategy = 'wheel',
 }: DeploymentChartProps) {
   if (series.length === 0) {
     return (
@@ -72,12 +75,15 @@ export default function DeploymentChart({
       className="rounded-lg border border-gray-700 bg-gray-800 p-5"
     >
       <h3 className="text-base font-semibold text-white">Collateral and deployment</h3>
+      <StrategyBanner strategy={strategy} />
       <p className="text-xs text-gray-500 mt-1 mb-3">
         Reserved put collateral and share value, stacked, against a capital base of{' '}
         {fmtCurrency(capitalBase)}. From the artifact&rsquo;s daily state —{' '}
         {reading?.basis === 'closes'
           ? 'shares priced at this window’s closes'
-          : 'shares priced AT COST (no bars sidecar for this run)'}
+          : reading?.hadSidecar
+            ? 'shares priced AT COST on the days a holding this window’s sidecar does not price'
+            : 'shares priced AT COST (no bars sidecar was stored for this run)'}
         . Display only: never coloured, never compared.
       </p>
       {reading?.unresolvedReason && (

@@ -18,14 +18,21 @@ import type { SweepResultRow } from '../../../types/v2';
 import { fmtDateShort, fmtPercent } from '../../../utils/format';
 import { pctOrDash, renderCell } from '../sims/resultCells';
 import type { DrawdownPoint } from './series';
+import StrategyBanner from './StrategyBanner';
 
 export interface DrawdownChartProps {
   series: DrawdownPoint[];
   row: SweepResultRow | null;
   absence: string | null;
+  strategy?: string;
 }
 
-export default function DrawdownChart({ series, row, absence }: DrawdownChartProps) {
+export default function DrawdownChart({
+  series,
+  row,
+  absence,
+  strategy = 'wheel',
+}: DrawdownChartProps) {
   const measured = renderCell(row).kind === 'return';
 
   if (series.length === 0) {
@@ -48,6 +55,7 @@ export default function DrawdownChart({ series, row, absence }: DrawdownChartPro
       className="rounded-lg border border-gray-700 bg-gray-800 p-5"
     >
       <h3 className="text-base font-semibold text-white">Drawdown</h3>
+      <StrategyBanner strategy={strategy} />
       <p className="text-xs text-gray-500 mt-1 mb-3">
         {measured ? (
           <span data-testid="drawdown-header">

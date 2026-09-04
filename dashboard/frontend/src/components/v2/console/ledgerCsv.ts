@@ -54,6 +54,16 @@ export const LEDGER_CSV_COLUMNS = [
   'detail',
 ] as const;
 
+/**
+ * What the file is a view OF (review round 1, R7).
+ *
+ * The export writes exactly the rows on screen, which means a filtered export
+ * and a full one are the same shape and the same nine provenance values. Two
+ * files on a desk, one of them three-quarters of a ledger, and nothing on
+ * either says which — so the scope travels in the file as well as in its name.
+ */
+export const EXPORT_SCOPE_CSV_COLUMNS = ['rows_exported', 'rows_total', 'filter'] as const;
+
 export const PROVENANCE_CSV_COLUMNS = [
   'run_id',
   'scenario',
@@ -86,6 +96,26 @@ export function csvField(value: unknown): string {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+/** How much of the ledger this file is, and what narrowed it. */
+export interface ExportScope {
+  /** Events in the cell's whole ledger, before any filter. */
+  rowsTotal: number;
+  /** The filter in force, or `{}` for none. */
+  filter?: LedgerFilter;
+}
+
+/** `kinds=a|b;text=foo`, or empty when the file is the whole ledger. */
+export function describeFilter(filter: LedgerFilter | undefined): string {
+  const parts: string[] = [];
+  if (filter?.kinds && filter.kinds.length) parts.push(`kinds=${[...filter.kinds].sort().join('|')}`);
+  if (filter?.text && filter.text.trim()) parts.push(`text=${filter.text.trim()}`);
+  return parts.join(';');
+}
+
+/** Is this export a subset? Decides the filename marker and the `filter` cell. */
+export const isFiltered = (scope: ExportScope | undefined, rows: number): boolean =>
+  !!scope && (describeFilter(scope.filter) !== '' || rows !== scope.rowsTotal);
+
 /** The provenance cells, in `PROVENANCE_CSV_COLUMNS` order. */
 function provenanceCells(context: ExportContext): unknown[] {
   return [
@@ -95,7 +125,9 @@ function provenanceCells(context: ExportContext): unknown[] {
     context.split,
     context.engineIdentity,
     context.fillBasis,
-    context.fillHaircut,
+    // A blank cell reads as "unknown"; the engine's own default is a FACT about
+    // the replay, and `forecast.fill.is_engine_default` is how PR-1 says so.
+    context.fillHaircut === null ? 'engine default' : context.fillHaircut,
     context.inSampleOnly,
     context.strategy,
   ];
@@ -109,9 +141,22 @@ function provenanceCells(context: ExportContext): unknown[] {
  * file about what they were looking at. The header block is the columns and
  * nothing else: no `#` lines, ever.
  */
-export function ledgerCsv(rows: SimLedgerEvent[], context: ExportContext): string {
-  const header = [...LEDGER_CSV_COLUMNS, ...PROVENANCE_CSV_COLUMNS].join(',');
+export function ledgerCsv(
+  rows: SimLedgerEvent[],
+  context: ExportContext,
+  scope: ExportScope = { rowsTotal: rows.length },
+): string {
+  const header = [
+    ...LEDGER_CSV_COLUMNS,
+    ...PROVENANCE_CSV_COLUMNS,
+    ...EXPORT_SCOPE_CSV_COLUMNS,
+  ].join(',');
   const provenance = provenanceCells(context).map(csvField);
+  const scopeCells = [
+    csvField(rows.length),
+    csvField(scope.rowsTotal),
+    csvField(describeFilter(scope.filter)),
+  ];
   const lines = rows.map((event) =>
     [
       csvField(event.date),
@@ -125,6 +170,7 @@ export function ledgerCsv(rows: SimLedgerEvent[], context: ExportContext): strin
       csvField(event.fees),
       csvField(event.detail),
       ...provenance,
+      ...scopeCells,
     ].join(','),
   );
   return [header, ...lines].join('\r\n');

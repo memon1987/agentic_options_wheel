@@ -39,13 +39,17 @@ export const UNKNOWN_MARKER_KIND = '__unknown__';
  * file knew it) renders with a neutral marker and its raw kind in the tooltip.
  */
 export const MARKER_SPECS: MarkerSpec[] = [
-  { kind: 'sell_put_open', key: 'mk_sell_put_open', label: 'Put sold', glyph: '▽', shape: 'triangle', color: '#60a5fa' },
-  { kind: 'sell_call_open', key: 'mk_sell_call_open', label: 'Call sold', glyph: '△', shape: 'star', color: '#a78bfa' },
+  // Glyph and shape AGREE (review round 1, LOW): the legend's ▽ used to sit
+  // beside a filled recharts `triangle` and its △ beside a `star`, so the key
+  // described marks that were not on the chart. Colour plus label is what
+  // distinguishes two kinds that share a shape.
+  { kind: 'sell_put_open', key: 'mk_sell_put_open', label: 'Put sold', glyph: '▲', shape: 'triangle', color: '#60a5fa' },
+  { kind: 'sell_call_open', key: 'mk_sell_call_open', label: 'Call sold', glyph: '★', shape: 'star', color: '#a78bfa' },
   { kind: 'put_assignment', key: 'mk_put_assignment', label: 'Put assigned', glyph: '◆', shape: 'diamond', color: '#f59e0b' },
-  { kind: 'call_assignment', key: 'mk_call_assignment', label: 'Called away', glyph: '◇', shape: 'diamond', color: '#34d399' },
-  { kind: 'buy_to_close', key: 'mk_buy_to_close', label: 'Bought to close', glyph: '✕', shape: 'cross', color: '#f87171' },
-  { kind: 'expire_worthless', key: 'mk_expire_worthless', label: 'Expired worthless', glyph: '○', shape: 'circle', color: '#9ca3af' },
-  { kind: 'dividend', key: 'mk_dividend', label: 'Dividend', glyph: '·', shape: 'wye', color: '#22d3ee' },
+  { kind: 'call_assignment', key: 'mk_call_assignment', label: 'Called away', glyph: '■', shape: 'square', color: '#34d399' },
+  { kind: 'buy_to_close', key: 'mk_buy_to_close', label: 'Bought to close', glyph: '✚', shape: 'cross', color: '#f87171' },
+  { kind: 'expire_worthless', key: 'mk_expire_worthless', label: 'Expired worthless', glyph: '●', shape: 'circle', color: '#9ca3af' },
+  { kind: 'dividend', key: 'mk_dividend', label: 'Dividend', glyph: 'Y', shape: 'wye', color: '#22d3ee' },
   { kind: 'synthetic_lot_open', key: 'mk_synthetic_lot_open', label: 'Synthetic lot opened', glyph: '■', shape: 'square', color: '#e879f9' },
   { kind: UNKNOWN_MARKER_KIND, key: 'mk_unknown', label: 'Other event', glyph: '●', shape: 'circle', color: '#d1d5db' },
 ];
@@ -95,6 +99,15 @@ export interface ChartRowsResult {
   droppedEvents: SimLedgerEvent[];
   /** Events (and rolls) actually placed on a row. */
   placedEvents: number;
+  /**
+   * Events hidden UNDER another marker of the same kind on the same session
+   * (review round 1, LOW).
+   *
+   * One row key holds one y value, so two puts sold on one day draw one
+   * triangle while the legend counts two events. The count is reported so the
+   * chart can say the marks are sessions-with-an-event, not events.
+   */
+  collapsedEvents: number;
 }
 
 /**
@@ -156,6 +169,7 @@ export function chartRows(
   const droppedEvents: SimLedgerEvent[] = [];
   let offSessionEvents = 0;
   let placedEvents = 0;
+  let collapsedEvents = 0;
 
   for (const event of ledger) {
     const index = sessionIndexFor(sessions, event.date);
@@ -171,6 +185,7 @@ export function chartRows(
     }
     row.events.push({ event, offSession });
     const spec = markerSpecFor(SPEC_BY_KIND.has(event.kind) ? event.kind : UNKNOWN_MARKER_KIND);
+    if (row[spec.key] !== undefined) collapsedEvents += 1;
     // The marker's y IS the session's close. Never the strike, never the fill
     // price: a marker drawn at its own price would sit off the line it is
     // meant to annotate, and the tooltip carries the trade's price anyway.
@@ -198,5 +213,13 @@ export function chartRows(
     count: counts.get(s.kind) as number,
   }));
 
-  return { rows, markers, rollLines, offSessionEvents, droppedEvents, placedEvents };
+  return {
+    rows,
+    markers,
+    rollLines,
+    offSessionEvents,
+    droppedEvents,
+    placedEvents,
+    collapsedEvents,
+  };
 }

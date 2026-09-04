@@ -12,6 +12,7 @@
 // being checkable against the report it came from.
 
 import type { SimArtifact } from '../../../types/v2';
+import StrategyBanner from './StrategyBanner';
 
 export interface RejectionPanelProps {
   artifact: SimArtifact | null;
@@ -20,6 +21,7 @@ export interface RejectionPanelProps {
   earningsSymbolsWithoutData: string[];
   /** `report.rejection_tally_caveat`, rendered verbatim. */
   caveat: string | null;
+  strategy?: string;
 }
 
 export default function RejectionPanel({
@@ -27,6 +29,7 @@ export default function RejectionPanel({
   absence,
   earningsSymbolsWithoutData,
   caveat,
+  strategy = 'wheel',
 }: RejectionPanelProps) {
   if (!artifact) {
     return (
@@ -45,6 +48,7 @@ export default function RejectionPanel({
   const rejections = artifact.rejections;
   const top = rejections.length ? Math.max(...rejections.map((r) => r.days)) : 0;
   const counters = artifact.counters;
+  const reasonDays = rejections.reduce((sum, r) => sum + r.days, 0);
   const coverage = artifact.earnings_coverage;
   const unpriced = counters.unpriced_ex_div_calls ?? 0;
 
@@ -54,12 +58,37 @@ export default function RejectionPanel({
       className="rounded-lg border border-gray-700 bg-gray-800 p-5"
     >
       <h3 className="text-base font-semibold text-white">Rejections and binding constraint</h3>
+      <StrategyBanner strategy={strategy} />
+      {/* R4: this caption used to say "the rest were rejected for the reasons
+          below", which asserts a partition the tally does not have. Two facts
+          break it. `candidate_days` is the stage-7 counter — the chain offered a
+          qualifying contract — and says nothing about what selection and sizing
+          did afterwards. And reasons are tallied per (day, reason) across EVERY
+          stage, so one day can appear under several and the column sums past
+          `decision_days`: 252 reason-days against 189 decision days on the
+          captured cell, and the live `position_20pct` cell has 170 candidate
+          days under a 170-day "position sizing" bar. */}
       <p className="text-xs text-gray-500 mt-1 mb-3">
         <span data-testid="rejection-days">
           {counters.candidate_days ?? '—'} candidate days of {counters.decision_days ?? '—'}{' '}
           decision days
         </span>{' '}
-        — the rest were rejected for the reasons below, in the engine&rsquo;s own ranked order.
+        — a candidate day is one where the chain offered a qualifying contract, BEFORE selection and
+        sizing had their say. The reasons below are in the engine&rsquo;s own ranked order and are
+        tallied per stage: one day can be counted under several of them, and a day that produced a
+        trade can still appear, so they are not a partition of the days above
+        {reasonDays > 0 && (
+          <span data-testid="rejection-sum">
+            {' '}
+            — they sum to {reasonDays} reason-days over {counters.decision_days ?? '—'} decision
+            days
+          </span>
+        )}
+        .
+      </p>
+      <p data-testid="rejection-in-position" className="text-xs text-gray-500 mb-3">
+        &ldquo;Already holds this underlying&rdquo; is the wheel being IN POSITION — the strategy
+        working, not an opportunity blocked. Those are the days the grid counts as time in position.
       </p>
 
       {rejections.length === 0 ? (
@@ -119,6 +148,10 @@ export default function RejectionPanel({
         )}
       </div>
 
+      <p data-testid="rejection-binding-note" className="mt-3 text-[11px] text-gray-500">
+        The binding constraint above is stamped on THIS cell&rsquo;s artifact. The run report
+        carries no such column — the caveat below is about the report, not about this panel.
+      </p>
       {caveat && (
         <p
           data-testid="rejection-caveat"

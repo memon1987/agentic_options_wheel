@@ -22,13 +22,22 @@ import {
 import MonthlyPremiumBars from '../MonthlyPremiumBars';
 import { fmtCurrency, fmtDateShort } from '../../../utils/format';
 import type { ArtifactDigest } from './artifactDigest';
+import StrategyBanner from './StrategyBanner';
 
 export interface PremiumChartsProps {
   digest: ArtifactDigest | null;
   absence: string | null;
+  strategy?: string;
+  /** The cell's state, for the empty-ledger message (review R9). */
+  stateLabel?: string | null;
 }
 
-export default function PremiumCharts({ digest, absence }: PremiumChartsProps) {
+export default function PremiumCharts({
+  digest,
+  absence,
+  strategy = 'wheel',
+  stateLabel = null,
+}: PremiumChartsProps) {
   if (!digest) {
     return (
       <section
@@ -43,13 +52,37 @@ export default function PremiumCharts({ digest, absence }: PremiumChartsProps) {
     );
   }
 
+  // R9: an artifact with 189 decision days and ZERO ledger events is a real
+  // stored object (the live `position_20pct` cell is one). Its chart is an empty
+  // AreaChart with axes and no line — a rendering that says "loading" or "broken"
+  // rather than "this arm never traded in this window", which is the finding.
+  if (digest.netOptionCashSeries.length === 0) {
+    return (
+      <section
+        data-testid="premium-charts"
+        className="rounded-lg border border-gray-700 bg-gray-800 p-5"
+      >
+        <h3 className="text-base font-semibold text-white">Premium: cumulative and monthly</h3>
+        <StrategyBanner strategy={strategy} />
+        <p data-testid="premium-no-events" className="text-sm text-gray-400 mt-2">
+          No option event in this window — the engine opened nothing, so there is no cash flow to
+          chart{stateLabel ? ` (this cell is ${stateLabel})` : ''}. The rejection panel below says
+          what bound it.
+        </p>
+      </section>
+    );
+  }
+
   return (
     <section data-testid="premium-charts" className="space-y-4">
       <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
         <h3 className="text-base font-semibold text-white">Cumulative net option cash</h3>
+        <StrategyBanner strategy={strategy} />
         <p className="text-xs text-gray-500 mt-1 mb-3">
-          Premiums received minus buy-to-close costs, running total by the date the cash moved.
-          From the ledger — display only, never ranked or compared.
+          Premiums received minus buy-to-close costs, running total by the date the cash moved —
+          NET of fees, because the ledger&rsquo;s <span className="font-mono">cash_delta</span> is.
+          (The monthly tooltip below shows gross premium and buybacks separately; those two differ
+          from the net bar by the fees.) From the ledger — display only, never ranked or compared.
         </p>
         <div className="h-56">
           <ResponsiveContainer width="100%" height="100%">

@@ -99,23 +99,53 @@ describe('PortfolioEquityView', () => {
     );
   });
 
-  it('fetches N artifacts, and 2N only once the base overlay is asked for', async () => {
-    show('position_20pct', {
-      ...multi,
-      rows: multi.rows.map((r) =>
-        r.scenario === 'position_20pct' ? { ...r, measured: true, insufficient: false } : r,
-      ),
-    });
+  /** Every arm cell measured; base measures all but DUD. */
+  const armMeasured: SweepReport = {
+    ...multi,
+    rows: multi.rows.map((r) =>
+      r.scenario === 'position_20pct' ? { ...r, measured: true, insufficient: false } : r,
+    ),
+  };
+
+  it('fetches N artifacts, and only the base cells base MEASURED (R2)', async () => {
+    show('position_20pct', armMeasured);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
     expect(
       fetchMock.mock.calls.every((call) => String(call[0]).includes('/position_20pct/')),
     ).toBe(true);
 
     fireEvent.click(screen.getByTestId('portfolio-base-toggle'));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(8));
-    expect(
-      fetchMock.mock.calls.filter((call) => String(call[0]).includes('/base/')),
-    ).toHaveLength(4);
+    // THREE, not four: base's DUD cell is `insufficient`, so it can never enter
+    // the overlay and requesting it is a round trip for nothing.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(7));
+    const baseCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes('/base/'));
+    expect(baseCalls).toHaveLength(3);
+    expect(baseCalls.some((call) => String(call[0]).includes('/DUD/'))).toBe(false);
+  });
+
+  it('OMITS the base overlay when base did not measure a member, and names it', async () => {
+    // The mutation this kills: build the base index over the ARM's measured set.
+    // Base's DUD cell is a flat line at its starting cash, so averaging it in
+    // drags the base index toward 100 and the arm reads as beating a benchmark
+    // that was never computed for that symbol.
+    show('position_20pct', armMeasured);
+    fireEvent.click(screen.getByTestId('portfolio-base-toggle'));
+    await waitFor(() => expect(screen.getByTestId('portfolio-base-omitted')).toBeInTheDocument());
+    const omitted = screen.getByTestId('portfolio-base-omitted').textContent!;
+    expect(omitted).toMatch(/base did not measure DUD/);
+    expect(omitted).toMatch(/DUD: insuf/);
+    expect(omitted).toMatch(/flat starting-cash line/);
+  });
+
+  it('DRAWS the overlay when base measures every member', async () => {
+    const bothMeasured: SweepReport = {
+      ...armMeasured,
+      symbols: ['GOOGL', 'AAA', 'BBB'],
+    };
+    show('position_20pct', bothMeasured);
+    fireEvent.click(screen.getByTestId('portfolio-base-toggle'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(6));
+    await waitFor(() => expect(screen.queryByTestId('portfolio-base-omitted')).toBeNull());
   });
 
   it('says there is no index when nothing in the arm was measured', async () => {
