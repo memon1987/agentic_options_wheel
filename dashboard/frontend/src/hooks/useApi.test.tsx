@@ -12,7 +12,9 @@ import { useApi } from './useApi';
 import {
   SESSION_EXPIRED_MESSAGE,
   RELOAD_HINT,
+  markSessionRefreshed,
   resetSessionExpiredSignal,
+  resetSessionGeneration,
   sessionExpiredSnapshot,
 } from './iapSession';
 
@@ -59,6 +61,7 @@ const advance = async (ms: number) => {
 beforeEach(() => {
   vi.useFakeTimers();
   resetSessionExpiredSignal();
+  resetSessionGeneration();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -67,6 +70,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   resetSessionExpiredSignal();
+  resetSessionGeneration();
 });
 
 describe('useApi — the IAP header goes on every read', () => {
@@ -198,6 +202,52 @@ describe('useApi — an ordinary failure still retries', () => {
     await advance(10_000);
     // 3 attempts on mount, then at least one more interval tick's worth.
     expect(fetchMock.mock.calls.length).toBeGreaterThan(3);
+  });
+
+  it('resumes after a session refresh — the PR-6 way back', async () => {
+    // FC-096 Phase E PR-6. Phase D's expiry is one-way by design: the interval
+    // is torn down and only a reload builds it again. With the refresh popup
+    // there is now a tab in which the session came back and this hook is still
+    // mounted, still expired, still silent. That is the state under test.
+    fetchMock.mockResolvedValue(iapUnauthorized());
+    const { result } = renderHook(() =>
+      useApi<{ paper_trading: boolean }>('/api/live/account', { refreshInterval: 1_000 }),
+    );
+    await settle();
+    expect(result.current.sessionExpired).toBe(true);
+    await advance(10_000);
+    // Ten interval ticks, no requests: the Phase D behaviour, unchanged.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockResolvedValue(json(200, { paper_trading: true }));
+    await act(async () => {
+      markSessionRefreshed();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    // Refetched at once, rather than after a whole interval of blank screen.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.sessionExpired).toBe(false);
+    expect(result.current.data).toEqual({ paper_trading: true });
+
+    // And the interval is armed again — the half a "clear the flag" fix would
+    // miss, leaving one fresh read and then silence for the rest of the tab.
+    await advance(1_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('leaves a hook that never expired alone on a generation bump', async () => {
+    fetchMock.mockResolvedValue(json(200, { paper_trading: true }));
+    renderHook(() => useApi('/api/live/account'));
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      markSessionRefreshed();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // A bump is tab-wide; the resume is not. Every mounted hook re-reading on
+    // someone else's sign-in would be a thundering herd for no gain.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('recovers to data on a good response', async () => {

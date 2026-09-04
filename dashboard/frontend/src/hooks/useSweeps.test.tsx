@@ -23,7 +23,9 @@ import {
 } from './useSweeps';
 import {
   RELOAD_HINT,
+  markSessionRefreshed,
   resetSessionExpiredSignal,
+  resetSessionGeneration,
   sessionExpiredSnapshot,
 } from './iapSession';
 import type { SweepRow, SweepSpec } from '../types/v2';
@@ -147,6 +149,7 @@ const advance = async (ms: number) => {
 
 beforeEach(() => {
   resetSessionExpiredSignal();
+  resetSessionGeneration();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -157,6 +160,7 @@ afterEach(() => {
   // Module state outlives a render; one expired test would poison every later
   // one (and the `LayoutV2` banner assertions with them).
   resetSessionExpiredSignal();
+  resetSessionGeneration();
 });
 
 describe('submitSweep — one request, never a retry', () => {
@@ -401,6 +405,34 @@ describe('the IAP session expiring is its own state (FC-096 Phase D)', () => {
     await advance(SWEEP_POLL_MS * 5);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.current.sessionExpired).toBe(true);
+  });
+
+  it('RESUMES when the session comes back (FC-096 Phase E PR-6)', async () => {
+    // The other half of "stops polling": Phase D had no way back short of a
+    // reload, which destroys the selected run and the scroll position. A
+    // refresh bumps the tab-wide generation and this hook picks up where it
+    // stopped — same url, same rendered data, polling again.
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(iapUnauthorized());
+    const { result } = renderHook(() => useSweepList());
+    await settle();
+    await advance(SWEEP_POLL_MS * 3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.current.sessionExpired).toBe(true);
+
+    fetchMock.mockResolvedValue(jsonResponse(200, [row({ status: 'running' })]));
+    await act(async () => {
+      markSessionRefreshed();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.sessionExpired).toBe(false);
+    expect(result.current.data).toHaveLength(1);
+
+    // And the interval polls again — a resume that fetched once and then went
+    // quiet would look identical on screen for fifteen seconds and then stop.
+    await advance(SWEEP_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('an ordinary 500 is NOT a session expiry and keeps polling', async () => {

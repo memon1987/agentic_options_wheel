@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
 import { SESSION_EXPIRED_MESSAGE, useSessionExpiredSignal } from '../../hooks/iapSession';
+import { useSessionRefresh } from '../../hooks/iapRefresh';
 
 interface AccountData {
   paper_trading?: boolean;
@@ -38,6 +39,29 @@ export default function LayoutV2() {
   //     could trail the page's own failures by up to 45 seconds.
   const signalled = useSessionExpiredSignal();
   const sessionExpired = accountSessionExpired || signalled;
+
+  // FC-096 Phase E PR-6: recover in place instead of reloading. "Reload" stays
+  // as the fallback — it is the only remedy that survives a blocked popup, and
+  // it is the one an operator already knows works.
+  //
+  // The copy carries one load-bearing distinction: WHILE running, this page is
+  // watching and recovers on its own; once an attempt has ENDED — `timeout`
+  // especially — nothing is watching any more and the operator has to click
+  // again. Round-1 review: the old `timeout` copy said "finish signing in
+  // there" beside a stopped poller, which reads as "and it will pick up",
+  // and it will not.
+  const { running, outcome, start } = useSessionRefresh();
+  const refreshNote = running
+    ? 'Opening Google sign-in. Finish signing in there — for the next five minutes this page picks up on its own, no reload needed. After that it stops watching and you click Refresh session again.'
+    : outcome === 'blocked'
+      ? 'Your browser blocked the sign-in popup. Allow popups for this site and try again, or use Reload.'
+      : outcome === 'denied'
+        ? 'Signed in, but the account you signed in with is not allowed on this dashboard — switch accounts in the sign-in window, then click Refresh session again. That window has been left open for you.'
+        : outcome === 'closed'
+          ? 'The sign-in window closed and the session had not come back a minute later, so this page stopped checking. Click Refresh session to try again, or use Reload.'
+          : outcome === 'timeout'
+            ? 'Five minutes passed and the session has not come back, so this page has stopped checking. The sign-in window is still open — finish signing in there, then click Refresh session again (it re-uses the open window where the browser allows). Leaving that window open is not wasted: Google’s page keeps refreshing the session for as long as it is open.'
+            : null;
 
   return (
     <div className="min-h-screen bg-gray-900">
@@ -129,17 +153,48 @@ export default function LayoutV2() {
               <div>
                 <p className="text-sm font-medium text-yellow-300">{SESSION_EXPIRED_MESSAGE}</p>
                 <p className="text-xs text-yellow-200/80 mt-1">
-                  Nothing on this page is refreshing any more. Reloading signs you back in through
-                  Google and returns you here.
+                  Nothing on this page is refreshing any more. Refreshing the session signs you back
+                  in through Google in a popup and keeps everything on this page; reloading also
+                  works and starts over.
                 </p>
+                {refreshNote && (
+                  <p data-testid="session-refresh-note" className="text-xs text-yellow-200/80 mt-1">
+                    {refreshNote}
+                  </p>
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => window.location.reload()}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
-              >
-                Reload
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="session-refresh-button"
+                  onClick={start}
+                  // `aria-disabled`, NOT `disabled`. A `disabled` button is
+                  // pulled out of the tab order the instant it is pressed, so
+                  // the focus the operator just placed on it is thrown to the
+                  // document and a screen reader announces nothing at all —
+                  // on the one control whose whole job is a slow, invisible
+                  // background task. It stays focusable and announces itself
+                  // busy instead; the second click is refused by the hook's
+                  // own re-entrancy guard (`runningRef`), which is where that
+                  // rule belongs and where a test pins it.
+                  aria-disabled={running}
+                  aria-busy={running}
+                  className={`px-3 py-1.5 rounded text-xs font-medium text-white ${
+                    running
+                      ? 'bg-blue-900 text-blue-300 cursor-default'
+                      : 'bg-blue-600 hover:bg-blue-500'
+                  }`}
+                >
+                  {running ? 'Signing in…' : 'Refresh session'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
+                >
+                  Reload
+                </button>
+              </div>
             </section>
           )}
           <Outlet />
