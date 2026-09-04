@@ -236,6 +236,11 @@ describe('startSessionRefresh — outcomes', () => {
     expect(outcome).toBe('refreshed');
     expect(doFetch).toHaveBeenCalledTimes(2);
     expect(sessionGenerationSnapshot()).toBe(1);
+    // IN THE SAME TICK, and this is the assertion that says so: two sleeps, two
+    // probes. Opening the grace window and then `continue`-ing — probing only on
+    // the NEXT tick — reaches the same outcome two seconds late and would pass
+    // every line above; here it is three sleeps.
+    expect(sleeps).toBe(2);
   });
 
   it('open returns null ⇒ blocked, with no probe at all', async () => {

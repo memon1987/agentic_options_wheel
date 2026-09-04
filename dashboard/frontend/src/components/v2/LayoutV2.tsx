@@ -60,7 +60,7 @@ export default function LayoutV2() {
         : outcome === 'closed'
           ? 'The sign-in window closed and the session had not come back a minute later, so this page stopped checking. Click Refresh session to try again, or use Reload.'
           : outcome === 'timeout'
-            ? 'Five minutes passed and the session has not come back, so this page has stopped checking. The sign-in window is still open — finish signing in there, then click Refresh session again (it re-uses the open window where the browser allows). Leaving that window open is not wasted: Google\u2019s page keeps refreshing the session for as long as it is open.'
+            ? 'Five minutes passed and the session has not come back, so this page has stopped checking. The sign-in window is still open — finish signing in there, then click Refresh session again (it re-uses the open window where the browser allows). Leaving that window open is not wasted: Google’s page keeps refreshing the session for as long as it is open.'
             : null;
 
   return (
