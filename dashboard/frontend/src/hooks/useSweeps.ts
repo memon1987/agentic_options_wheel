@@ -32,6 +32,7 @@ import {
   isSessionExpired,
   markSessionExpired,
   unauthorizedError,
+  useSessionGeneration,
 } from './iapSession';
 
 export const SWEEP_POLL_MS = 15_000;
@@ -343,6 +344,16 @@ function usePolledGet<T>(
   // different reasons — a new url, or a manual refetch — and only the first may
   // throw away what is on screen.
   const loadedUrlRef = useRef<string | null | undefined>(undefined);
+  // FC-096 Phase E PR-6. The interval below does not tear itself down on an
+  // expiry — it keeps ticking and returns early on every tick — so resuming is
+  // not a matter of rebuilding a timer but of getting one more request out.
+  // Depending the whole effect on the generation does exactly that: a bump
+  // re-runs it, which fires `load()` immediately (the `loadedUrlRef` guard
+  // keeps the same url on the keep-what-is-on-screen branch, so nothing
+  // blanks), and a successful read clears `sessionExpired`, after which the
+  // ticks stop returning early. A bump on a hook that never expired costs one
+  // extra read, once per sign-in — the price of not tracking per-hook state.
+  const generation = useSessionGeneration();
 
   const refetch = useCallback(() => setTick((t) => t + 1), []);
 
@@ -432,7 +443,7 @@ function usePolledGet<T>(
       controller.abort();
       clearInterval(interval);
     };
-  }, [url, tick]);
+  }, [url, tick, generation]);
 
   return { ...state, refetch };
 }

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
 import { SESSION_EXPIRED_MESSAGE, useSessionExpiredSignal } from '../../hooks/iapSession';
+import { useSessionRefresh } from '../../hooks/iapRefresh';
 
 interface AccountData {
   paper_trading?: boolean;
@@ -38,6 +39,20 @@ export default function LayoutV2() {
   //     could trail the page's own failures by up to 45 seconds.
   const signalled = useSessionExpiredSignal();
   const sessionExpired = accountSessionExpired || signalled;
+
+  // FC-096 Phase E PR-6: recover in place instead of reloading. "Reload" stays
+  // as the fallback — it is the only remedy that survives a blocked popup, and
+  // it is the one an operator already knows works.
+  const { running, outcome, start } = useSessionRefresh();
+  const refreshNote = running
+    ? 'Opening Google sign-in. Finish signing in in the popup window — this page picks up on its own, no reload needed.'
+    : outcome === 'blocked'
+      ? 'Your browser blocked the sign-in popup. Allow popups for this site and try again, or use Reload.'
+      : outcome === 'closed'
+        ? 'The sign-in window closed before the session came back. Try again, or use Reload.'
+        : outcome === 'timeout'
+          ? 'Five minutes passed and the session has not come back. The sign-in window is still open — finish signing in there, or use Reload.'
+          : null;
 
   return (
     <div className="min-h-screen bg-gray-900">
@@ -129,17 +144,34 @@ export default function LayoutV2() {
               <div>
                 <p className="text-sm font-medium text-yellow-300">{SESSION_EXPIRED_MESSAGE}</p>
                 <p className="text-xs text-yellow-200/80 mt-1">
-                  Nothing on this page is refreshing any more. Reloading signs you back in through
-                  Google and returns you here.
+                  Nothing on this page is refreshing any more. Refreshing the session signs you back
+                  in through Google in a popup and keeps everything on this page; reloading also
+                  works and starts over.
                 </p>
+                {refreshNote && (
+                  <p data-testid="session-refresh-note" className="text-xs text-yellow-200/80 mt-1">
+                    {refreshNote}
+                  </p>
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => window.location.reload()}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
-              >
-                Reload
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="session-refresh-button"
+                  onClick={start}
+                  disabled={running}
+                  className="px-3 py-1.5 rounded text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:bg-blue-900 disabled:text-blue-300 text-white"
+                >
+                  {running ? 'Signing in…' : 'Refresh session'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="px-3 py-1.5 rounded text-xs font-medium bg-yellow-700 hover:bg-yellow-600 text-white"
+                >
+                  Reload
+                </button>
+              </div>
             </section>
           )}
           <Outlet />

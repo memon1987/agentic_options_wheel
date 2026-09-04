@@ -220,3 +220,79 @@ export function resetSessionExpiredSignal(): void {
   expired = false;
   listeners.forEach((notify) => notify());
 }
+
+// --------------------------------------------------------------------------- //
+// The tab-wide GENERATION (FC-096 Phase E PR-6)
+// --------------------------------------------------------------------------- //
+//
+// `markSessionExpired` is one-way: once a hook has seen a 401 the whole tab
+// stops polling and the banner says "reload". PR-6 makes the session
+// recoverable in place (Google's `DO_SESSION_REFRESH` popup), and a recovery
+// has to reach the hooks that already gave up — none of which is listening for
+// "un-expired", because until now that state did not exist.
+//
+// A COUNTER rather than a boolean, deliberately: a hook resumes on a CHANGE,
+// and a change is a thing you can compare against what you last saw. A boolean
+// flipping false→true→false would leave a hook that mounted mid-refresh unable
+// to tell "already resumed" from "never expired", and a second expiry→refresh
+// cycle in one tab would produce the same value twice.
+//
+// NAMING, on the record: §IAP of `docs/plans/fc-096-e.md` spells the success
+// outcome `'restored'` / `markSessionRestored()`. The PR-6 build brief spells
+// it `'refreshed'` / `markSessionRefreshed()`, and the brief won — one word,
+// used consistently, matching Google's own `DO_SESSION_REFRESH`. Recorded so
+// the plan/code divergence is a decision rather than a drift.
+
+let generation = 0;
+const generationListeners = new Set<() => void>();
+
+/**
+ * The IAP session came back. Clears the expiry signal and bumps the counter.
+ *
+ * Called by `startSessionRefresh` (`iapRefresh.ts`) on the first non-401 probe,
+ * and by nothing else — an expiry is cleared by EVIDENCE (a request that got
+ * through), never by optimism.
+ */
+export function markSessionRefreshed(): void {
+  expired = false;
+  generation += 1;
+  // Both sets: the banner has to come down (expiry listeners) AND the hooks
+  // that stopped polling have to re-arm (generation listeners).
+  listeners.forEach((notify) => notify());
+  generationListeners.forEach((notify) => notify());
+}
+
+export function sessionGenerationSnapshot(): number {
+  return generation;
+}
+
+export function subscribeSessionGeneration(notify: () => void): () => void {
+  generationListeners.add(notify);
+  return () => {
+    generationListeners.delete(notify);
+  };
+}
+
+/**
+ * Subscribe a hook to the tab-wide refresh counter.
+ *
+ * Starts at 0 and only ever increases. A hook that stopped polling on an expiry
+ * resumes when this value differs from the one it last saw — see `useApi` and
+ * `usePolledGet`.
+ */
+export function useSessionGeneration(): number {
+  return useSyncExternalStore(
+    subscribeSessionGeneration,
+    sessionGenerationSnapshot,
+    sessionGenerationSnapshot,
+  );
+}
+
+/**
+ * Reset the generation. Tests ONLY, for the same reason as
+ * `resetSessionExpiredSignal`: module state outlives a `render()`.
+ */
+export function resetSessionGeneration(): void {
+  generation = 0;
+  generationListeners.forEach((notify) => notify());
+}

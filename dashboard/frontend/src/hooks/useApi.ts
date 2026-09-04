@@ -6,6 +6,7 @@ import {
   isSessionExpired,
   markSessionExpired,
   unauthorizedError,
+  useSessionGeneration,
 } from './iapSession';
 
 export { SESSION_EXPIRED_MESSAGE } from './iapSession';
@@ -172,6 +173,35 @@ export function useApi<T>(url: string | null, options: UseApiOptions = {}): UseA
       mountedRef.current = false;
     };
   }, [fetchData, immediate, url]);
+
+  // FC-096 Phase E PR-6: the way back from an expiry.
+  //
+  // The interval effect below tears the timer down when `sessionExpired` flips
+  // true and never builds it again — correct in Phase D, where the only remedy
+  // was a reload that destroyed this hook anyway. With the refresh popup there
+  // is now a live tab in which the session came back and the hook is still
+  // mounted, still expired, still not polling.
+  //
+  // The ref guard is what keeps this from firing on MOUNT: a hook mounted after
+  // a refresh sees a non-zero generation on its first render and must not read
+  // that as a change. Only hooks that actually stopped are restarted — one that
+  // never expired is left exactly as it was, with no extra request.
+  const generation = useSessionGeneration();
+  const lastGenerationRef = useRef(generation);
+  const sessionExpiredRef = useRef(sessionExpired);
+  sessionExpiredRef.current = sessionExpired;
+
+  useEffect(() => {
+    if (lastGenerationRef.current === generation) return;
+    lastGenerationRef.current = generation;
+    if (!sessionExpiredRef.current) return;
+    // Clear first, then refetch. Clearing re-arms the interval effect below;
+    // the refetch is what puts data back on screen without waiting a whole
+    // refresh interval for it. If the session is somehow gone again, this
+    // fetch's own 401 sets the flag straight back.
+    setSessionExpired(false);
+    if (url) fetchData();
+  }, [generation, fetchData, url]);
 
   useEffect(() => {
     // `sessionExpired` is BOTH a guard and a dep, and that is the whole of the
