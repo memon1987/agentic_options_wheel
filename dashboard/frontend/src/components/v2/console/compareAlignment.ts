@@ -356,6 +356,10 @@ export const DELTA_REFUSAL_SPLIT =
   'No A−B number: the two cells are different splits. A fit Δ and a holdout Δ answer different ' +
   'questions about different windows.';
 
+export const DELTA_REFUSAL_NOT_DONE =
+  'No A−B number: at least one side’s run is not `done`, so it has no cells to compare. A run ' +
+  'that failed will never have them; one that is still running does not have them YET.';
+
 export const DELTA_REFUSAL_SAME_CELL =
   'No A−B number: A and B are the SAME cell. The difference of a served Δ with itself is 0 by ' +
   'construction, and printing “0.0%” would read as a finding about two configs rather than as ' +
@@ -648,6 +652,39 @@ export function alignCells(
         'verbatim, and it applies to everything below it.'
       : 'Neither run is in-sample only.',
   });
+
+  // --- a side that is not `done` is not comparable AT ALL (review round 1, R1)
+  //
+  // A `failed`, `running` or `submitted` run has no cells. Some rows would
+  // still answer off the run ROW — `base_config_hash` and `engine_identity` are
+  // recorded before a single cell exists — and printing "aligned" beside a run
+  // that produced nothing invites the reading that the pair checks out. Every
+  // row becomes UNCHECKED, and the reason is the run's own status.
+  const notDone = [a, b].filter((side) => side.status !== null && side.status !== 'done');
+  if (notDone.length > 0) {
+    const named = notDone
+      .map((side) => `${side.ref.runId} is ${side.status}`)
+      .join('; ');
+    return {
+      rows: rows.map((row) => ({
+        ...row,
+        outcome: 'unknown' as AlignmentOutcome,
+        detail:
+          `Not checked: ${named}. A run that is not \`done\` has no cells, so nothing about ` +
+          'this pair has been compared — including the rows that could be answered off the run ' +
+          'row alone.',
+      })),
+      refusal,
+      withheldReasons: [],
+      tilesWithheld: false,
+      curvesBase100: false,
+      allowsDelta: false,
+      deltaRefusal: refusal ?? DELTA_REFUSAL_NOT_DONE,
+      overridesDiff: diff,
+      inSample,
+      windowUnion,
+    };
+  }
 
   // --- the A−B rule ------------------------------------------------------------ //
   const tilesWithheld = withheldReasons.length > 0;

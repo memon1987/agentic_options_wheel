@@ -315,3 +315,145 @@ describe('absence states', () => {
     expect(screen.getByTestId('strip-A')).toBeTruthy();
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Review round 1
+// --------------------------------------------------------------------------- //
+
+describe('R3 — withholding reaches the paired renderers', () => {
+  beforeEach(() => {
+    show(sideFor(shaped13cc, BASE), sideFor(shaped13cc, { ...BASE, split: 'holdout' }));
+  });
+
+  it('prints no drawdown header number on either side', () => {
+    expect(screen.queryAllByTestId('drawdown-header')).toHaveLength(0);
+    expect(screen.queryAllByTestId('drawdown-withheld')).toHaveLength(2);
+  });
+
+  it('prints no deployment reading and no dollar means', () => {
+    expect(screen.queryAllByTestId('deployment-mean')).toHaveLength(0);
+    expect(screen.queryAllByTestId('deployment-withheld')).toHaveLength(2);
+  });
+
+  it('prints no cumulative premium total and no monthly bars', () => {
+    expect(screen.queryAllByTestId('premium-total')).toHaveLength(0);
+    expect(screen.queryAllByTestId('premium-withheld')).toHaveLength(2);
+    expect(screen.queryAllByTestId('monthly-premium-bars')).toHaveLength(0);
+  });
+
+  it('still draws the curves — the panels are present, only the numbers are gone', () => {
+    expect(screen.queryAllByTestId('drawdown-chart')).toHaveLength(2);
+    expect(screen.queryAllByTestId('deployment-chart')).toHaveLength(2);
+  });
+});
+
+describe('R3 — an ALIGNED pair keeps every one of those numbers', () => {
+  it('so the withheld assertions above mean something', () => {
+    show(sideFor(shaped13cc, BASE), sideFor(shaped13cc, A));
+    expect(screen.queryAllByTestId('drawdown-header').length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId('deployment-mean').length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId('premium-total').length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId('drawdown-withheld')).toHaveLength(0);
+  });
+});
+
+describe('R2 — a base-config mismatch is a different STRATEGY', () => {
+  // TWO runs, so both base columns render and the mismatch is the real shape:
+  // one recorded base per run, disagreeing on a key neither arm overrides.
+  const withBase = (payload: unknown, hash: string, putDelta: number) =>
+    sideFor(payload, BASE, {
+      sweep: { ...detailOf(payload).sweep, base_config_hash: hash },
+      baseEffective: { 'strategy.put_delta_range': [putDelta, putDelta + 0.1] },
+    });
+
+  beforeEach(() => {
+    show(
+      withBase(shaped13cc, '4c6e74c428681de7', 0.15),
+      withBase(shapedA48d, 'ffffffffffffffff', 0.3),
+    );
+  });
+
+  it('does not call the base row aligned, and withholds the tiles', () => {
+    expect(screen.getByTestId('alignment-base_config').getAttribute('data-outcome')).toBe(
+      'withheld',
+    );
+    expect(screen.getAllByTestId('tiles-withheld').length).toBe(2);
+    expect(screen.queryAllByTestId('tile-annualized')).toHaveLength(0);
+  });
+
+  it('lists the base-only key both arms leave alone, marked as base-only', () => {
+    const row = screen.getByTestId('overrides-row-strategy.put_delta_range');
+    expect(row.getAttribute('data-origin')).toBe('base');
+    expect(row.getAttribute('data-same')).toBe('false');
+    expect(row.textContent).toContain('0.15');
+    expect(row.textContent).toContain('0.3');
+    expect(screen.getByTestId('overrides-base-keys').textContent).toContain('NEITHER arm');
+  });
+});
+
+describe('R2a — same overrides, different effective config', () => {
+  it('is NOT aligned, whatever `scenario_hash` says', () => {
+    const a = sideFor(shaped13cc, BASE);
+    const b = sideFor(shapedA48d, BASE, {
+      report: {
+        // Same overrides hash, DIFFERENT effective config hash: the pre-fix row
+        // read only the first and called this pair aligned.
+        scenario_hashes: { base: '34f837365f81cd76', position_20pct: '552c55c7166a3e7b' },
+        scenario_config_hashes: { base: 'deadbeefdeadbeef', position_20pct: '9881345d1e116d17' },
+      },
+    });
+    show(a, b);
+    expect(screen.getByTestId('alignment-arm_identity').getAttribute('data-outcome')).toBe('noted');
+    expect(screen.getByTestId('alignment-arm_identity').parentElement?.textContent).toContain(
+      'DIFFERENT effective config',
+    );
+  });
+});
+
+describe('R1 — a non-`done` side says what the run IS', () => {
+  it('names a failed run and its error, and leaves the matrix unchecked', () => {
+    const failed = sideFor(shaped13cc, BASE, {
+      report: null,
+      sweep: { ...detailOf(shaped13cc).sweep, status: 'failed', error: 'chain fetch blew up' },
+      status: 'failed',
+    });
+    show(sideFor(shaped13cc, BASE), failed);
+    const absent = screen.getByTestId('strip-B-absent');
+    expect(absent.getAttribute('data-run-status')).toBe('failed');
+    expect(absent.textContent).toContain('FAILED');
+    expect(absent.textContent).toContain('chain fetch blew up');
+    expect(absent.textContent).not.toContain('Loading this run');
+    // Every row that needs B's report is UNCHECKED, never aligned.
+    for (const id of ['window', 'arm_identity', 'base_config']) {
+      expect([id, screen.getByTestId(`alignment-${id}`).getAttribute('data-outcome')]).toEqual([
+        id,
+        'unknown',
+      ]);
+    }
+  });
+
+  it('says a running run is still running, not that it is loading', () => {
+    const running = sideFor(shaped13cc, BASE, {
+      report: null,
+      sweep: { ...detailOf(shaped13cc).sweep, status: 'running' },
+      status: 'running',
+    });
+    show(sideFor(shaped13cc, BASE), running);
+    expect(screen.getByTestId('strip-B-absent').textContent).toContain('running');
+    expect(screen.getByTestId('strip-B-absent').textContent).toContain('keeps polling');
+  });
+
+  it('shows the "answered by run X" notice on a followed side', () => {
+    show(sideFor(shaped13cc, BASE), sideFor(shaped13cc, A, { dedupFrom: 'cafebabecafebabe' }));
+    expect(screen.getByTestId('provenance-B-dedup').textContent).toContain('cafebabecafebabe');
+    expect(screen.getByTestId('provenance-B-dedup').textContent).toContain('deduplicated');
+  });
+});
+
+describe('R8 — a cell against itself is never "A−B 0.0%"', () => {
+  it('refuses, and says the difference is a tautology', () => {
+    show(sideFor(shaped13cc, BASE), sideFor(shaped13cc, BASE));
+    expect(screen.queryByTestId('ab-delta')).toBeNull();
+    expect(screen.getByTestId('ab-refused').textContent).toContain('SAME cell');
+  });
+});

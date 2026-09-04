@@ -161,12 +161,54 @@ describe('nonOverlap — what only one side covers', () => {
     expect(nonOverlap(null, { start: '2025-01-01', end: '2025-06-01' })).toEqual([]);
   });
 
-  it('names both edges and which side owns them', () => {
+  it('names both edges and which side owns them, SNAPPED to rows (R4)', () => {
+    // Rows are SESSIONS. The window bounds below are not among them, and an
+    // unsnapped ReferenceArea on a category axis silently draws nothing.
+    const rows = ['2025-01-02', '2025-01-31', '2025-02-03', '2025-05-30', '2025-06-02', '2025-07-01'];
+    expect(
+      nonOverlap(
+        { start: '2025-01-01', end: '2025-06-01' },
+        { start: '2025-02-01', end: '2025-07-01' },
+        rows,
+      ),
+    ).toEqual([
+      { start: '2025-01-02', end: '2025-01-31', side: 'a' },
+      { start: '2025-06-02', end: '2025-07-01', side: 'b' },
+    ]);
+  });
+
+  it('snaps the committed fixture’s Labor-Day window start to its first session', () => {
+    // The mutation this kills: passing the WINDOW bounds through unsnapped. The
+    // fit window starts 2025-09-01 (Labor Day) and the first bar is 2025-09-02,
+    // so the shade rendered nowhere and nobody could see that it had not.
+    const rows = realBars.bars.map((b) => b.date);
+    expect(rows[0]).toBe('2025-09-02');
+    const [shade] = nonOverlap(
+      { start: '2025-09-01', end: '2026-06-02' },
+      { start: '2025-10-01', end: '2026-06-02' },
+      rows,
+    );
+    expect(shade.side).toBe('a');
+    expect(rows).toContain(shade.start);
+    expect(rows).toContain(shade.end);
+    expect(shade.start).toBe('2025-09-02');
+    expect(shade.end < '2025-10-01').toBe(true);
+  });
+
+  it('drops a stretch that contains no session at all', () => {
+    // A weekend-only gap is a claim about a period the chart does not draw.
+    expect(
+      nonOverlap(
+        { start: '2025-01-04', end: '2025-06-01' },
+        { start: '2025-01-06', end: '2025-06-01' },
+        ['2025-01-06', '2025-01-07'],
+      ),
+    ).toEqual([]);
+  });
+
+  it('returns nothing when no rows are supplied — never an unsnapped bound', () => {
     expect(
       nonOverlap({ start: '2025-01-01', end: '2025-06-01' }, { start: '2025-02-01', end: '2025-07-01' }),
-    ).toEqual([
-      { start: '2025-01-01', end: '2025-02-01', side: 'a' },
-      { start: '2025-06-01', end: '2025-07-01', side: 'b' },
-    ]);
+    ).toEqual([]);
   });
 });

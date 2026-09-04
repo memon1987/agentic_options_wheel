@@ -288,3 +288,201 @@ describe('the entry points', () => {
     );
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Review round 1
+// --------------------------------------------------------------------------- //
+
+describe('R7 — one detail fetch per DISTINCT run', () => {
+  const detailCalls = (runId: string) =>
+    fetchMock.mock.calls.filter((c) => c[0] === `/api/v2/sweeps/${runId}`).length;
+
+  it('a same-run pair polls that run ONCE, not twice', async () => {
+    show(`/sims/compare?a=${ref(RUN, 'position_20pct')}&b=${ref(RUN, 'base')}`);
+    await waitFor(() => expect(screen.getByTestId('alignment-matrix')).toBeTruthy());
+    expect(detailCalls(RUN)).toBe(1);
+  });
+
+  it('a cross-run pair fetches each run exactly once', async () => {
+    show(`/sims/compare?a=${ref(RUN)}&b=${ref(RUN_B)}`);
+    await waitFor(() => expect(screen.getByTestId('alignment-matrix')).toBeTruthy());
+    expect(detailCalls(RUN)).toBe(1);
+    expect(detailCalls(RUN_B)).toBe(1);
+  });
+});
+
+describe('R1 — a deduplicated slot follows its pointer', () => {
+  const DEDUP = 'deadbeefdeadbeef';
+
+  beforeEach(() => {
+    const dedupPayload = {
+      ...shaped13cc,
+      run_id: DEDUP,
+      status: 'deduplicated',
+      run: {
+        ...shaped13cc.run,
+        run_id: DEDUP,
+        status: 'deduplicated',
+        deduplicated_to: RUN,
+      },
+    };
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v2/sweeps/allowlist')) {
+        return Promise.resolve(ok({ allowed: [], rejected: [], presets: [], caps: {} }));
+      }
+      if (/\/artifacts\/|\/bars\//.test(url)) {
+        return Promise.resolve(notFound('No detail artifact for this cell in this run.'));
+      }
+      if (url === `/api/v2/sweeps/${DEDUP}`) return Promise.resolve(ok(dedupPayload));
+      if (url === `/api/v2/sweeps/${RUN}`) return Promise.resolve(ok(shaped13cc));
+      if (url === `/api/v2/sweeps/${RUN_B}`) return Promise.resolve(ok(shapedA48d));
+      if (url.startsWith('/api/v2/sweeps/')) return Promise.resolve(notFound('no such run'));
+      if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow(RUN), listRow(RUN_B)]));
+      return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
+    });
+  });
+
+  it('REPLACES the slot with the run that holds the evidence, and says so', async () => {
+    show(`/sims/compare?a=${ref(RUN)}&b=${ref(DEDUP)}`);
+    // `b` now points at the target, not at the deduplicated run.
+    await waitFor(() => expect(seen.search).not.toContain(DEDUP));
+    expect(seen.search).toContain(encodeURIComponent(ref(RUN, 'base')));
+    expect(navLog.filter((n) => n.type === 'PUSH')).toHaveLength(0);
+    expect(navLog[navLog.length - 1].type).toBe('REPLACE');
+    await waitFor(() =>
+      expect(screen.getByTestId('picker-B-dedup').textContent).toContain(DEDUP),
+    );
+  });
+
+  it('does not follow a row that points at ITSELF — that is corrupt, not resolvable', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v2/sweeps/allowlist')) {
+        return Promise.resolve(ok({ allowed: [], rejected: [], presets: [], caps: {} }));
+      }
+      if (/\/artifacts\/|\/bars\//.test(url)) return Promise.resolve(notFound('absent'));
+      if (url === `/api/v2/sweeps/${RUN}`) return Promise.resolve(ok(shaped13cc));
+      if (url === `/api/v2/sweeps/${DEDUP}`) {
+        return Promise.resolve(
+          ok({
+            ...shaped13cc,
+            run_id: DEDUP,
+            status: 'deduplicated',
+            run: { ...shaped13cc.run, run_id: DEDUP, status: 'deduplicated', deduplicated_to: DEDUP },
+          }),
+        );
+      }
+      if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow(RUN)]));
+      return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
+    });
+    show(`/sims/compare?a=${ref(RUN)}&b=${ref(DEDUP)}`);
+    await waitFor(() =>
+      expect(screen.getByTestId('strip-B-absent').getAttribute('data-run-status')).toBe(
+        'deduplicated',
+      ),
+    );
+    expect(seen.search).toContain(DEDUP);
+    expect(screen.getByTestId('strip-B-absent').textContent).toContain('nothing to open');
+  });
+});
+
+describe('R1 — a non-`done` run is labelled, never "loading"', () => {
+  it('labels the run picker options by status', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v2/sweeps/allowlist')) {
+        return Promise.resolve(ok({ allowed: [], rejected: [], presets: [], caps: {} }));
+      }
+      if (/\/artifacts\/|\/bars\//.test(url)) return Promise.resolve(notFound('absent'));
+      if (url === `/api/v2/sweeps/${RUN}`) return Promise.resolve(ok(shaped13cc));
+      if (url === '/api/v2/sweeps') {
+        return Promise.resolve(
+          ok([listRow(RUN), { ...listRow(RUN_B), status: 'running' }]),
+        );
+      }
+      return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
+    });
+    show(`/sims/compare?a=${ref(RUN)}`);
+    const select = (await screen.findByTestId('picker-A-run')) as HTMLSelectElement;
+    await waitFor(() => expect(select.options.length).toBe(2));
+    const labels = [...select.options].map((o) => o.textContent);
+    expect(labels).toContain(`${RUN_B} — running`);
+    expect(labels).toContain(RUN);
+  });
+
+  it('renders a failed run’s status rather than a loading sentence', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v2/sweeps/allowlist')) {
+        return Promise.resolve(ok({ allowed: [], rejected: [], presets: [], caps: {} }));
+      }
+      if (/\/artifacts\/|\/bars\//.test(url)) return Promise.resolve(notFound('absent'));
+      if (url === `/api/v2/sweeps/${RUN}`) return Promise.resolve(ok(shaped13cc));
+      if (url === `/api/v2/sweeps/${RUN_B}`) {
+        return Promise.resolve(
+          ok({
+            ...shapedA48d,
+            status: 'failed',
+            run: { ...shapedA48d.run, status: 'failed', error: 'chain fetch blew up' },
+          }),
+        );
+      }
+      if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow(RUN), listRow(RUN_B)]));
+      return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
+    });
+    show(`/sims/compare?a=${ref(RUN)}&b=${ref(RUN_B)}`);
+    await waitFor(() =>
+      expect(screen.getByTestId('strip-B-absent').getAttribute('data-run-status')).toBe('failed'),
+    );
+    expect(screen.getByTestId('strip-B-absent').textContent).toContain('chain fetch blew up');
+    expect(screen.getByTestId('strip-B-absent').textContent).not.toContain('Loading this run');
+    expect(screen.getByTestId('alignment-window').getAttribute('data-outcome')).toBe('unknown');
+  });
+});
+
+describe('R6 — a PENDING sidecar is not an absent one', () => {
+  it('says the price history is loading, never "stored no price series"', async () => {
+    let releaseBars: (() => void) | null = null;
+    const barsGate = new Promise<void>((resolve) => {
+      releaseBars = resolve;
+    });
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v2/sweeps/allowlist')) {
+        return Promise.resolve(ok({ allowed: [], rejected: [], presets: [], caps: {} }));
+      }
+      if (/\/bars\//.test(url)) {
+        return barsGate.then(() => notFound('This run stored no price series.'));
+      }
+      if (/\/artifacts\//.test(url)) return Promise.resolve(notFound('absent'));
+      if (url === `/api/v2/sweeps/${RUN}`) return Promise.resolve(ok(shaped13cc));
+      if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow(RUN)]));
+      return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
+    });
+    show(`/sims/compare?a=${ref(RUN, 'position_20pct')}&b=${ref(RUN, 'base')}`);
+    await waitFor(() => expect(screen.getAllByTestId('price-chart-absent').length).toBe(2));
+    // Still in flight: the panels say LOADING, never "stored no price series".
+    for (const panel of screen.getAllByTestId('price-chart-absent')) {
+      expect(panel.textContent).toContain('Loading price history');
+      expect(panel.textContent).not.toContain('stored no price series');
+    }
+    await act(async () => {
+      releaseBars?.();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getAllByTestId('price-chart-absent')[0].textContent).toContain(
+        'stored no price series',
+      ),
+    );
+  });
+});
+
+describe('R8 / LOW — swap is a no-op on a pair with itself', () => {
+  it('offers no swap when A and B are the same cell', async () => {
+    show(`/sims/compare?a=${ref(RUN)}&b=${ref(RUN)}`);
+    await waitFor(() => expect(screen.getByTestId('alignment-matrix')).toBeTruthy());
+    const before = navLog.length;
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('compare-swap'));
+    });
+    expect(navLog.length).toBe(before);
+    expect(screen.getByTestId('ab-refused').textContent).toContain('SAME cell');
+  });
+});
