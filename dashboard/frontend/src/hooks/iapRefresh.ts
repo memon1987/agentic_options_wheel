@@ -23,9 +23,20 @@
 //   2. An IFRAME does not work. IAP's sign-in page sets
 //      `X-Frame-Options`/CSP frame-ancestors, so the frame renders nothing and
 //      the poll runs to timeout. A popup is not a stylistic choice here.
+//   3. `win.closed` is ADVISORY, never a stop signal. Google's sign-in page
+//      sets `Cross-Origin-Opener-Policy: same-origin-allow-popups`, which
+//      severs the opener relationship: once the popup navigates there the
+//      browsing-context group swaps and this `WindowProxy.closed` reports
+//      TRUE while the window is visibly open, with the operator typing a
+//      password into it. On the path that matters — signed out of Google, a
+//      real sign-in page rendered — the FIRST 2 s tick would therefore have
+//      ended the attempt as `'closed'`. So observing it opens a bounded grace
+//      window (`IAP_REFRESH_CLOSED_GRACE_MS`) during which polling continues,
+//      and `'closed'` is returned only if the session is still gone at its
+//      end.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { IAP_XHR_HEADERS, markSessionRefreshed } from './iapSession';
+import { IAP_XHR_HEADERS, isIapGenerated, markSessionRefreshed } from './iapSession';
 
 // --------------------------------------------------------------------------- //
 // Constants
@@ -35,13 +46,32 @@ import { IAP_XHR_HEADERS, markSessionRefreshed } from './iapSession';
 export const IAP_SESSION_REFRESH_URL = '/?gcp-iap-mode=DO_SESSION_REFRESH';
 
 /**
- * A NAMED target, so a second click reuses the popup instead of spawning a
- * second one. The operator who clicks twice gets one window, and the window
- * left open by a `timeout` is the one the next attempt re-navigates.
+ * A NAMED target. Where the browser still resolves the name, a second click
+ * re-navigates the one popup instead of spawning a second sign-in beside it.
+ *
+ * WHERE, precisely: only until the popup navigates cross-origin. Google's
+ * sign-in sets `Cross-Origin-Opener-Policy: same-origin-allow-popups`, and a
+ * name in one browsing-context group is not resolvable from another — so once
+ * the operator is on Google's page, a fresh `open` with this name opens a NEW
+ * window rather than re-using the old one. The name is worth having for the
+ * clicks that land before that (double-clicks, and a `blocked`/`timeout`
+ * retry the operator makes without touching the popup); it is not a guarantee,
+ * and no copy may promise one.
  */
 export const IAP_REFRESH_WINDOW_NAME = 'iap-session-refresh';
 
-/** Small, and deliberately not `noopener`: `win.closed` is how `'closed'` is detected. */
+/**
+ * Small, and deliberately WITHOUT `noopener`.
+ *
+ * The trade-off, stated: `noopener` is the safe default because it denies the
+ * opened page a handle on this one. It is omitted here because without an
+ * opener there is no `WindowProxy` at all — no `closed` to read, no `close()`
+ * to call — and the handler would have nothing but the five-minute deadline.
+ * The exposure it buys back is acceptable and bounded: the popup's content is
+ * Google's own sign-in and IAP's own refresh handler, on Google infrastructure
+ * that already owns this session outright. Pointing it at anything else would
+ * make the omission indefensible, which is why the URL is a constant.
+ */
 export const IAP_REFRESH_WINDOW_FEATURES = 'width=560,height=680,menubar=no,toolbar=no';
 
 /**
@@ -59,19 +89,41 @@ export const IAP_REFRESH_POLL_MS = 2_000;
 export const IAP_REFRESH_TIMEOUT_MS = 5 * 60_000;
 
 /**
+ * How long a popup reported `closed` keeps being polled anyway.
+ *
+ * Two populations share this window and both are served by it: the operator
+ * who really did close the popup (they wait a minute for a banner that stays
+ * up — cheap), and the operator whose popup only LOOKS closed because it
+ * navigated to Google (header note 3 — they get the whole minute of sign-in
+ * time they actually need, and 401s are the cheapest request the service
+ * serves). Bounded rather than open-ended so a genuine give-up still ends the
+ * attempt long before the five-minute deadline would.
+ */
+export const IAP_REFRESH_CLOSED_GRACE_MS = 60_000;
+
+/**
  * How the attempt ended.
  *
- *   * `refreshed` — a probe came back non-401. The session is good, the
- *     tab-wide generation is bumped, the stopped hooks resume.
+ *   * `refreshed` — a probe got THROUGH IAP: non-401, and not a response IAP
+ *     wrote itself. The session is good, the tab-wide generation is bumped,
+ *     the stopped hooks resume.
  *   * `blocked`   — `window.open` returned null: the browser blocked the popup.
  *     The banner falls back to the reload copy, which always works.
- *   * `closed`    — the popup went away before the session came back (the
- *     operator closed it), or the caller abandoned the attempt. Polling stops;
- *     nothing is claimed about the session.
- *   * `timeout`   — five minutes of 401s. The popup is LEFT OPEN, because the
- *     operator may be mid-sign-in and closing it would destroy that.
+ *   * `denied`    — IAP answered, and its answer was "not this account": an
+ *     IAP-GENERATED 403. The operator signed in successfully, at Google, as
+ *     somebody the IAP policy does not list — the ordinary outcome of the
+ *     multi-account chooser. The popup is LEFT OPEN on purpose: it is the only
+ *     affordance for switching accounts, and closing it would leave the
+ *     operator with a banner and no way out but Reload.
+ *   * `closed`    — the popup was reported closed and the session was STILL
+ *     gone one grace window later (see `IAP_REFRESH_CLOSED_GRACE_MS`; `closed`
+ *     alone proves nothing — header note 3), or the caller abandoned the
+ *     attempt. Polling stops; nothing is claimed about the session.
+ *   * `timeout`   — five minutes without getting through. The popup is LEFT
+ *     OPEN, because the operator may be mid-sign-in and closing it would
+ *     destroy that.
  */
-export type SessionRefreshOutcome = 'refreshed' | 'blocked' | 'closed' | 'timeout';
+export type SessionRefreshOutcome = 'refreshed' | 'blocked' | 'denied' | 'closed' | 'timeout';
 
 /** The slice of `Window` this module touches. Keeps the test double honest. */
 export interface RefreshWindowHandle {
@@ -95,20 +147,41 @@ export interface SessionRefreshDeps {
 // The probe
 // --------------------------------------------------------------------------- //
 
+/** What one probe established. */
+type ProbeVerdict =
+  /** IAP passed the request to the backend. Whatever came back, we are in. */
+  | 'through'
+  /** IAP answered it ITSELF with a 403: signed in, but not an allowed account. */
+  | 'denied'
+  /** Still shut out, or nothing was learned. Keep polling. */
+  | 'not-yet';
+
 /**
  * Has IAP started letting requests through again?
  *
- * NON-401 is the test, not 200. A 500 from the backend still proves IAP passed
- * the request to it, which is exactly the question being asked; treating only
- * 200 as success would leave the operator staring at a sign-out banner because
- * an unrelated endpoint was unwell.
+ * The test is `status !== 401` AND `!isIapGenerated(response)`. "Any non-401"
+ * was the round-1 rule and it was wrong in both directions that matter:
+ *
+ *   * an IAP-generated **403** (the multi-account chooser landed on an account
+ *     the IAP policy does not list) would have been read as success — the
+ *     popup closed, the banner taken down, every hook resumed straight into
+ *     403 HTML, and the retry loops running for ever behind a page that looks
+ *     signed in. It is reported as `'denied'` instead, with the popup intact.
+ *   * an IAP-generated **5xx** would have done the same, minus the 403's
+ *     diagnosis. It is `'not-yet'`: transient, keep polling.
+ *
+ * A BACKEND non-401 still counts as through, 5xx included — the question asked
+ * here is "did IAP pass the request on", not "is the backend well", and the
+ * app's own errors are the hooks' business to surface. The
+ * `x-goog-iap-generated-response` header is what tells the two apart, and it
+ * is readable because `/api/health` is same-origin.
  *
  * `credentials: 'include'` is a SAME-ORIGIN NO-OP — `/api/health` is on this
  * origin and cookies go anyway. It is here for parity with Google's published
  * sample, so a reader comparing the two finds them the same. It is not
  * load-bearing and no test asserts that it does anything.
  */
-async function probeSession(doFetch: typeof globalThis.fetch): Promise<boolean> {
+async function probeSession(doFetch: typeof globalThis.fetch): Promise<ProbeVerdict> {
   try {
     const response = await doFetch(IAP_REFRESH_PROBE_URL, {
       credentials: 'include',
@@ -117,11 +190,13 @@ async function probeSession(doFetch: typeof globalThis.fetch): Promise<boolean> 
       // session is still gone.
       cache: 'no-store',
     });
-    return response.status !== 401;
+    if (response.status === 401) return 'not-yet';
+    if (isIapGenerated(response)) return response.status === 403 ? 'denied' : 'not-yet';
+    return 'through';
   } catch {
     // A network blip mid-refresh is not evidence of anything. Keep polling
     // until the deadline rather than reporting a false `refreshed`.
-    return false;
+    return 'not-yet';
   }
 }
 
@@ -157,28 +232,55 @@ export async function startSessionRefresh(
 
   const deadline = now() + IAP_REFRESH_TIMEOUT_MS;
 
-  while (now() < deadline) {
+  // Null until `win.closed` has been observed; then the instant at which a
+  // still-shut-out session is finally reported as `'closed'`.
+  let graceUntil: number | null = null;
+
+  for (;;) {
+    // `abandoned()` is the caller saying stop — a real stop signal, unlike
+    // `win.closed`. No grace window: nobody is waiting for the answer.
+    if (abandoned()) return 'closed';
+
+    if (graceUntil === null) {
+      if (now() >= deadline) return 'timeout';
+    } else if (now() >= graceUntil) {
+      // A whole grace window of 401s after the window was reported closed.
+      // Now it means what it says.
+      return 'closed';
+    }
+
     await sleep(IAP_REFRESH_POLL_MS);
+    if (abandoned()) return 'closed';
 
-    // Checked BEFORE the probe: a closed popup means the operator gave up, and
-    // one more request against a session that is still gone helps nobody.
-    if (win.closed || abandoned()) return 'closed';
+    // ADVISORY (header note 3). Observing `closed` starts the grace window and
+    // NOTHING else — in particular it does not skip the probe below, which is
+    // the one immediate probe owed to the operator who finished signing in and
+    // then closed the popup within a single tick. Ending the attempt here, as
+    // round 1 did, reported `'closed'` to somebody who was already signed in.
+    if (graceUntil === null && win.closed) graceUntil = now() + IAP_REFRESH_CLOSED_GRACE_MS;
 
-    if (await probeSession(doFetch)) {
+    const verdict = await probeSession(doFetch);
+
+    // Signed in as the wrong account. The popup STAYS: it is the switch-account
+    // affordance, and the session is not refreshed, so nothing is marked.
+    if (verdict === 'denied') return 'denied';
+
+    if (verdict === 'through') {
       // Order matters only in that the window is closed before anything can
       // re-render — the popup has done its job and an orphan window is litter.
       try {
         win.close();
       } catch {
-        // A popup that navigated cross-origin can refuse `close()`. Not fatal:
-        // the session is back, which is the thing that was asked for.
+        // Best-effort, and frequently a NO-OP rather than a throw: after the
+        // popup has navigated cross-origin this `WindowProxy` is severed
+        // (header note 3) and `close()` on it does nothing at all. Either way
+        // the session is back, which is the thing that was asked for; an
+        // orphan popup is litter, not a failure.
       }
       markSessionRefreshed();
       return 'refreshed';
     }
   }
-
-  return 'timeout';
 }
 
 // --------------------------------------------------------------------------- //
@@ -186,7 +288,13 @@ export async function startSessionRefresh(
 // --------------------------------------------------------------------------- //
 
 export interface SessionRefreshState {
-  /** An attempt is in flight. The button is disabled while this is true. */
+  /**
+   * An attempt is in flight. The button marks itself `aria-disabled` /
+   * `aria-busy` while this is true — not `disabled`, which would blow focus
+   * off the button the operator just pressed and leave a screen reader with
+   * nothing to announce. Re-entrancy is `start`'s own business (`runningRef`),
+   * not the DOM's.
+   */
   running: boolean;
   /** How the last attempt ended, or null if none has finished this mount. */
   outcome: SessionRefreshOutcome | null;
