@@ -137,7 +137,15 @@ describe('PortfolioEquityView', () => {
     // that was never computed for that symbol.
     show('position_20pct', armMeasured);
     fireEvent.click(screen.getByTestId('portfolio-base-toggle'));
-    await waitFor(() => expect(screen.getByTestId('portfolio-base-omitted')).toBeInTheDocument());
+    // Wait for the SETTLED state before asserting. The notice is also true for
+    // a moment while the base artifacts are in flight, and an assertion that
+    // accepts the transient one passes even when the settled state is wrong —
+    // which is how the first version of this test let three mutations through.
+    await waitFor(() =>
+      expect(screen.getByTestId('portfolio-loaded').textContent).toBe('4 of 4 loaded'),
+    );
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBe(7));
+    expect(screen.getByTestId('portfolio-base-omitted')).toBeInTheDocument();
     const omitted = screen.getByTestId('portfolio-base-omitted').textContent!;
     expect(omitted).toMatch(/base did not measure DUD/);
     expect(omitted).toMatch(/DUD: insuf/);
