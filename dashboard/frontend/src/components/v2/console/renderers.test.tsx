@@ -176,6 +176,29 @@ describe('PriceChart — the fallback is gated on the sidecar settling (R5)', ()
     vi.unstubAllGlobals();
   });
 
+  it('issues none when the sidecar was never asked for at all', async () => {
+    // Not loading, no data, no absence: `useStoredObject`'s idle state, which
+    // is what a cell with no split or symbol yet looks like. Nothing has said
+    // there is no sidecar, so there is nothing to fall back FROM.
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <PriceChart
+        symbol="GOOGL"
+        bars={null}
+        barsAbsence={null}
+        barsLoading={false}
+        artifact={artifact}
+        artifactAbsence={null}
+        window={WINDOW}
+        strategy="wheel"
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('price-chart-absent')).toBeInTheDocument());
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
   it('issues exactly ONE once the sidecar has settled absent', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

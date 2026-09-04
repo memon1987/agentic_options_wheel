@@ -511,6 +511,26 @@ export interface PortfolioIndexResult {
 }
 
 /**
+ * Which symbols a base OVERLAY may be built over, and which are in the way.
+ *
+ * Extracted so the rule is stated once and testable on its own (review round 1,
+ * R2): an overlay may only average base cells BASE MEASURED. An `insufficient`
+ * base cell is a flat line at its own starting cash, so including it drags the
+ * base index toward 100 and the arm reads as beating a benchmark that was never
+ * computed for that symbol.
+ */
+export function overlayConstituency(
+  armIncluded: string[],
+  baseMeasured: string[],
+): { target: string[]; missing: string[] } {
+  const measured = new Set(baseMeasured);
+  return {
+    target: armIncluded.filter((symbol) => measured.has(symbol)),
+    missing: armIncluded.filter((symbol) => !measured.has(symbol)),
+  };
+}
+
+/**
  * An equal-weight index of `equity / capital_base`, base 100, over the MEASURED
  * symbols only.
  *

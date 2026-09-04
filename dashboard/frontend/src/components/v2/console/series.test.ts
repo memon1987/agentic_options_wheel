@@ -18,6 +18,7 @@ import { indexRows, lookupCell } from '../sims/resultCells';
 import { normaliseArtifact, normaliseBars } from './normaliseArtifact';
 import {
   deploymentSeries,
+  overlayConstituency,
   drawdownSeries,
   equityOverlay,
   monthlyFromLedger,
@@ -249,5 +250,28 @@ describe('portfolioIndex', () => {
     );
     expect(result.rows).toHaveLength(2);
     expect(result.droppedDates).toBe(1);
+  });
+});
+
+describe('overlayConstituency (R2)', () => {
+  it('keeps only the symbols BASE measured, and names the rest', () => {
+    // The mutation this states the contract against: passing the ARM's index
+    // members as the overlay's measured set. Base's `insuf` cell is a flat line
+    // at its starting cash; averaged in, it pulls the base index toward 100.
+    expect(overlayConstituency(['AAA', 'BBB', 'DUD'], ['AAA', 'BBB'])).toEqual({
+      target: ['AAA', 'BBB'],
+      missing: ['DUD'],
+    });
+  });
+
+  it('is empty on both sides when the arm has no index yet', () => {
+    expect(overlayConstituency([], ['AAA'])).toEqual({ target: [], missing: [] });
+  });
+
+  it('ignores symbols base measured that the arm did not', () => {
+    expect(overlayConstituency(['AAA'], ['AAA', 'ZZZ'])).toEqual({
+      target: ['AAA'],
+      missing: [],
+    });
   });
 });

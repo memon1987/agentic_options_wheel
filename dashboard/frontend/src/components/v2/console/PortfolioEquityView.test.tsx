@@ -72,9 +72,16 @@ describe('PortfolioEquityView', () => {
     await waitFor(() =>
       expect(screen.getByTestId('portfolio-loaded').textContent).toBe('3 of 3 loaded'),
     );
-    expect(screen.getByTestId('portfolio-caption').textContent).toMatch(
+    const caption = screen.getByTestId('portfolio-caption').textContent!;
+    expect(caption).toMatch(
       /independent single-symbol replays, each on its own capital — not a portfolio simulation/,
     );
+    // R10: the index is `mean(equity / capital_base) × 100` and is NEVER
+    // rebased to its first day — day one of the captured cell is 99.999, not
+    // 100, and a caption promising a rebase makes that look like a bug.
+    expect(caption).toMatch(/100 = capital base/);
+    expect(caption).toMatch(/never rebased to its first day/);
+    expect(caption).not.toMatch(/Base 100 at the window start/);
   });
 
   it('prints NO aggregate number anywhere', async () => {

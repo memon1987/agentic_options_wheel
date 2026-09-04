@@ -35,7 +35,7 @@ import { artifactUrl, type CellRef } from '../../../hooks/useArtifact';
 import { fmtDateShort } from '../../../utils/format';
 import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
 import { parseArtifact } from './normaliseArtifact';
-import { portfolioIndex, type PortfolioCell } from './series';
+import { overlayConstituency, portfolioIndex, type PortfolioCell } from './series';
 import StrategyBanner from './StrategyBanner';
 
 export const PORTFOLIO_CONCURRENCY = 4;
@@ -173,8 +173,10 @@ export default function PortfolioEquityView({
   // The overlay's target constituency: the arm's index members that base ALSO
   // measured. Anything the arm measured and base did not is named below rather
   // than averaged in at its starting cash.
-  const overlayTarget = arm.included.filter((symbol) => baseSymbols.includes(symbol));
-  const missingFromBase = arm.included.filter((symbol) => !baseSymbols.includes(symbol));
+  const { target: overlayTarget, missing: missingFromBase } = overlayConstituency(
+    arm.included,
+    baseSymbols,
+  );
 
   const baseCells: Record<string, PortfolioCell> = {};
   for (const symbol of overlayTarget) {
