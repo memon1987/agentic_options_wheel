@@ -503,6 +503,9 @@ function ResultsRegion({
             symbol={selection.symbol}
             split={selection.split}
             dedupFrom={dedupFrom}
+            // A symbol TAB is a cell selection like any other: it pushes, so
+            // Back walks the operator's own history through it.
+            onSelectSymbol={(symbol) => onSelectCell({ ...selection, symbol })}
           />
         </section>
       )}
