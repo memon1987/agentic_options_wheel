@@ -1085,6 +1085,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-096 Phase E PR-4 #124 review; FC-060 D7 (one parser).
 
+### FC-105: identity re-check after an IAP session refresh — `GET /api/whoami`
+
+**Scope:** shared
+**Status:** Filed 2026-09-04 (raised by both FC-096 Phase E PR-6 reviews; deferred out of PR-6 because it needs a backend route)
+**Size estimate:** S
+
+**Problem:** the Phase E session-refresh handler proves only that IAP admitted *a* request after the popup sign-in — not that it is the same user. A multi-account operator can sign into a different Google account in the popup; the page then resumes polling and rendering under identity B with state built for identity A (the tweak bar's 403-learned "not an operator" assumptions, a half-filled submit). Bounded today because the SPA caches no identity or role state and every write is verified per request (`services/auth.py`), but the moment the SPA caches "am I an operator" this becomes a privilege-confusion bug.
+
+**Proposal:** `GET /api/whoami` backed by `authenticate_only` (returns the verified email, or 401 with the same sanitized event); the SPA reads it on load, uses it as the refresh probe target (an IAP-generated 403 is non-JSON, so `jsonDetail` separates the cases cleanly), and reloads the page when the email changes after a refresh. Pin in the plan: the SPA never caches identity or role.
+
+**Links:** FC-096 Phase E PR-6 #126 reviews; `docs/plans/fc-096-e.md` §Amendments (PR-6 review round).
+
 
 ## Completed
 
