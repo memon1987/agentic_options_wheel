@@ -643,6 +643,15 @@ export interface SweepCaps {
   max_starting_cash?: number;
   max_spec_bytes?: number;
   running_lock_hours?: number;
+  /**
+   * The arm-name rules the runner enforces, served by the live allowlist
+   * (`max_scenario_name_chars: 40`, `scenario_name_pattern:
+   * "^[A-Za-z0-9][A-Za-z0-9_.\\-]*\\Z"`). PR-4's tweak bar BUILDS a name rather
+   * than taking one, so these two are the contract it has to satisfy — a name
+   * the pattern refuses is a 422 for a name the operator never typed.
+   */
+  max_scenario_name_chars?: number;
+  scenario_name_pattern?: string;
 }
 
 export interface SweepPreset {

@@ -41,7 +41,12 @@ export interface TweakControl {
   description: string;
   /** `base_config_json.effective[key]`, or `undefined` when the run has none. */
   baseValue: unknown;
-  /** The run recorded no value for this key: prefill is empty and says so. */
+  /**
+   * The run has NO base value for this key — absent, or recorded as `null`
+   * (`universe.max_spread_pct` is `null` on the live run). Prefill is empty and
+   * the control says so, and a value typed into it is a change from nothing
+   * rather than a change from a number the operator never saw.
+   */
   baseMissing: boolean;
 }
 
@@ -55,18 +60,22 @@ export interface FieldValue {
 export type FieldMap = Record<string, FieldValue>;
 
 /**
- * Read a DOTTED key out of the run's `effective` config.
+ * Read an allowlist key out of the run's `effective` config.
  *
- * `effective` is nested (`{strategy: {min_put_premium: 0.5}}`), and the
- * allowlist keys are dotted paths into it. A flat `effective[key]` lookup — the
- * obvious reading of "prefilled from `base_config_json.effective[key]`" — finds
- * nothing and would silently prefill every control as "not recorded".
+ * **`effective` is FLAT and its keys are the dotted allowlist keys themselves**
+ * — verified against the live payload of run `13cc2729d1c74211`, whose
+ * `base_config_json.effective` is `{"strategy.min_put_premium": 0.5, ...}` (the
+ * NESTED sections live beside it, as `base_config_json.strategy` and friends).
+ * The flat lookup is therefore the primary one; the nested walk is kept as a
+ * fallback so a payload that ever moves to `{strategy: {min_put_premium}}` does
+ * not silently prefill every control as "not recorded".
  */
 export function readDotted(
   effective: Record<string, unknown> | null | undefined,
   key: string,
 ): unknown {
   if (!effective) return undefined;
+  if (Object.prototype.hasOwnProperty.call(effective, key)) return effective[key];
   let node: unknown = effective;
   for (const part of key.split('.')) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) return undefined;
@@ -96,7 +105,7 @@ export function buildControls(
       type: raw as TweakType,
       description: entry.description ?? '',
       baseValue,
-      baseMissing: baseValue === undefined,
+      baseMissing: baseValue === undefined || baseValue === null,
     });
   }
   return controls;
@@ -256,18 +265,33 @@ const valueToken = (value: unknown): string => {
 };
 
 /**
+ * One `key_value` token, with the KEY trimmed if the pair is over the cap.
+ *
+ * The whole dotted key is used, not its leaf: `earnings.enabled` and
+ * `rolling.enabled` share a leaf, and two arms both named `enabled_false` are
+ * two different questions wearing one name — exactly what the compare view's
+ * "same name, different arm" warning exists to catch, produced here on purpose.
+ *
+ * And when the pair is too long it is the KEY that gives way, never the value.
+ * Truncating the value would collapse `..._threshold_0.25` and
+ * `..._threshold_0.30` onto one name, so two submits would look like a re-run
+ * of one arm and the second would 409 or read as a dedup of the first.
+ */
+function keyValueToken(key: string, value: unknown): string {
+  const valueTok = valueToken(value);
+  const budget = Math.max(4, MAX_NAME_CHARS - valueTok.length - 1);
+  return `${key.replace(/\./g, '_').slice(0, budget)}_${valueTok}`;
+}
+
+/**
  * The arm's name, built FROM the change so the grid column says what it is.
  *
- * `strategy.min_put_premium = 0.6` becomes `min_put_premium_0.6`, and a band
- * becomes `put_delta_range_0.15-0.25`. The leaf is used rather than the dotted
- * key because a dot in a name reads as a config path in a column header, and
- * because the 40-character cap is tight.
+ * `strategy.min_put_premium = 0.6` becomes `strategy_min_put_premium_0.6`, and
+ * a band becomes `strategy_put_delta_range_0.15-0.25`.
  */
 export function armNameFor(changed: string[], overrides: Record<string, unknown>): string | null {
   if (changed.length === 0) return null;
-  const raw = changed
-    .map((key) => `${key.split('.').pop() ?? key}_${valueToken(overrides[key])}`)
-    .join('_');
+  const raw = changed.map((key) => keyValueToken(key, overrides[key])).join('_');
   let name = raw.replace(NAME_SAFE, '_').slice(0, MAX_NAME_CHARS);
   // The pattern demands an alphanumeric FIRST character, and a leading `-`
   // (from a negative value) or `_` would be refused by the runner with a
