@@ -152,6 +152,43 @@ describe('PortfolioEquityView', () => {
     expect(omitted).toMatch(/flat starting-cash line/);
   });
 
+  it('OMITS the overlay when a base artifact 404s, and names that symbol (guard 3)', async () => {
+    // The confirmation pass proved this guard is load-bearing, not redundant:
+    // base MEASURES every symbol here, so `missingFromBase` is empty and the
+    // fetch set is complete — only the index-length check stands between a
+    // 2-symbol base line and a 3-symbol arm line on the same axes. §D-5 makes a
+    // base cell 404 a normal, permanent answer.
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        String(url).includes('/base/BBB/')
+          ? ({
+              ok: false,
+              status: 404,
+              statusText: 'Not Found',
+              text: async () =>
+                JSON.stringify({ detail: 'No detail artifact for this cell in this run.' }),
+            } as unknown as Response)
+          : ({
+              ok: true,
+              status: 200,
+              statusText: '',
+              text: async () => JSON.stringify(artifact13cc),
+            } as unknown as Response),
+      ),
+    );
+    show('position_20pct', { ...armMeasured, symbols: ['GOOGL', 'AAA', 'BBB'] });
+    fireEvent.click(screen.getByTestId('portfolio-base-toggle'));
+    await waitFor(() =>
+      expect(screen.getByTestId('portfolio-loaded').textContent).toBe('3 of 3 loaded'),
+    );
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBe(6));
+    expect(screen.getByTestId('portfolio-base-omitted')).toBeInTheDocument();
+    const omitted = screen.getByTestId('portfolio-base-omitted').textContent!;
+    expect(omitted).toMatch(/base’s cell for BBB could not be read/);
+    expect(omitted).toMatch(/BBB: No detail artifact for this cell in this run\./);
+    expect(omitted).not.toMatch(/not all loaded yet/);
+  });
+
   it('DRAWS the overlay when base measures every member', async () => {
     const bothMeasured: SweepReport = {
       ...armMeasured,

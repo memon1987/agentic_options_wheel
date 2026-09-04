@@ -328,6 +328,18 @@ export default function PortfolioEquityView({
               ). Averaging an unmeasured base cell in would put its flat starting-cash line into
               the benchmark and make this arm look like it beat one.
             </>
+          ) : baseIndex && baseIndex.excluded.length > 0 ? (
+            <>
+              {/* A base cell that 404s is PERMANENT (§D-5), not "not loaded
+                  yet": the confirmer showed guard 3 is what stops a 2-symbol
+                  base line being drawn against a 3-symbol arm, and the notice
+                  beside it has to say which symbol and why. */}
+              base&rsquo;s cell for{' '}
+              {baseIndex.excluded.map((entry) => entry.symbol).join(', ')} could not be read —{' '}
+              {baseIndex.excluded.map((entry) => `${entry.symbol}: ${entry.reason}`).join('; ')}. An
+              index over fewer symbols than the arm&rsquo;s is not the same benchmark, so it is not
+              drawn.
+            </>
           ) : (
             <>base&rsquo;s artifacts for these symbols are not all loaded yet.</>
           )}

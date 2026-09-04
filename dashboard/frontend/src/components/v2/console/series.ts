@@ -493,7 +493,15 @@ export interface PortfolioCell {
 }
 
 export interface PortfolioIndexResult {
-  /** `date -> index`, base 100 at the first common date. No aggregate number. */
+  /**
+   * `date -> index`, where index is `mean(equity / capital_base) x 100` over the
+   * included symbols on that date.
+   *
+   * 100 is the CAPITAL BASE, not the first common date: nothing here is rebased
+   * to day one, so a cell that had already moved by its first decision day does
+   * not start at exactly 100 (the captured fixture opens at 99.999). Never an
+   * aggregate number.
+   */
   rows: Array<{ date: string; index: number }>;
   included: string[];
   /** Every symbol left out, with the reason IN WORDS. Never a silent drop. */
@@ -531,8 +539,9 @@ export function overlayConstituency(
 }
 
 /**
- * An equal-weight index of `equity / capital_base`, base 100, over the MEASURED
- * symbols only.
+ * An equal-weight index of `equity / capital_base` x 100 over the MEASURED
+ * symbols only — 100 means "at its capital base", and no series is rebased to
+ * its own first day.
  *
  * Measured only, because an `insufficient` cell is a flat line at its starting
  * cash — a symbol that never traded would pull the index toward 100 and read as
