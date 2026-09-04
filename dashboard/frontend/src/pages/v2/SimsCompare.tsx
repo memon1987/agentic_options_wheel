@@ -15,33 +15,46 @@
 // `:runId` in any case — but the order is written down rather than relied on.
 
 import { useEffect, useMemo } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import { useArtifact } from '../../hooks/useArtifact';
 import { useBars } from '../../hooks/useBars';
 import { computeDigest } from '../../components/v2/console/artifactDigest';
 import { artifactStrategy } from '../../components/v2/console/normaliseArtifact';
 import { parseBaseEffective, specStrategy, BASE_SCENARIO } from '../../components/v2/console/Console';
-import CompareView, { type CompareSideData } from '../../components/v2/console/CompareView';
+import CompareView, {
+  sideStatusNote,
+  type CompareSideData,
+} from '../../components/v2/console/CompareView';
 import BiasFooter from '../../components/v2/sims/BiasFooter';
 import {
   formatCellRef,
   parseCellRef,
+  sameRef,
   type CompareRef,
 } from '../../components/v2/console/compareAlignment';
 import { indexRows, lookupCell } from '../../components/v2/sims/resultCells';
 import { cellExists, defaultCell } from './Simulations';
-import type { SimBars, SweepRow } from '../../types/v2';
+import type { SimBars, SweepDetail, SweepRow } from '../../types/v2';
 
 /**
  * One side's data, assembled from the hooks.
  *
- * Every hook is called unconditionally with a possibly-`null` argument, because
- * hooks may not be called conditionally and because "no second cell" is a
- * normal state of this page rather than an error.
+ * The run DETAIL is handed in rather than fetched here (review round 1, R7).
+ * Two sides of one run used to mount two `useSweepDetail`s on the same URL,
+ * which is two polls of one row for as long as the page is open; the page now
+ * fetches the SET of distinct runs and passes each side its own.
+ *
+ * Every remaining hook is called unconditionally with a possibly-`null`
+ * argument, because hooks may not be called conditionally and because "no
+ * second cell" is a normal state of this page rather than an error.
  */
-function useSide(ref: CompareRef | null): CompareSideData | null {
-  const { data: detail, error } = useSweepDetail(ref?.runId ?? null);
+function useSide(
+  ref: CompareRef | null,
+  detail: SweepDetail | null,
+  error: string | null,
+  dedupFrom: string | null,
+): CompareSideData | null {
   // The Decision 4 invariant (PR-2 amendments): the report on screen belongs to
   // the URL's run. `usePolledGet` clears the previous run's data inside an
   // effect, so one committed render carries the NEW ref with the OLD detail.
@@ -106,6 +119,7 @@ function useSide(ref: CompareRef | null): CompareSideData | null {
     baseAbsence: baseState.absent ?? baseState.error,
     bars: barsState.data,
     barsAbsence: barsState.absent ?? barsState.error,
+    barsLoading: barsState.loading,
     digest,
     digestAbsence,
     artifactRunId: artifactState.runId,
@@ -113,6 +127,8 @@ function useSide(ref: CompareRef | null): CompareSideData | null {
     strategy: artifactStrategy(specStrategyValue, artifactState.data),
     loading: !matched && !error,
     error: matched ? null : error,
+    status: sweep?.status ?? null,
+    dedupFrom,
   };
 }
 
@@ -145,18 +161,26 @@ function SidePicker({
   onClear?: () => void;
 }) {
   const report = side?.report ?? null;
+  // Each option is LABELLED with its status (review round 1, R1), so an
+  // operator never picks a `failed` or `running` run and then reads its empty
+  // side as "nothing to compare". `done` is left unlabelled — it is the norm.
   const runOptions = useMemo(() => {
-    const ids = runs.map((r) => r.run_id);
+    const opts = runs.map((r) => ({
+      value: r.run_id,
+      label: r.status === 'done' ? r.run_id : `${r.run_id} — ${r.status}`,
+    }));
     // A deep-linked run that is not in the recent list is still selected: the
     // list is the last N runs, not the set of runs that exist.
-    if (cellRef && !ids.includes(cellRef.runId)) return [cellRef.runId, ...ids];
-    return ids;
+    if (cellRef && !opts.some((o) => o.value === cellRef.runId)) {
+      return [{ value: cellRef.runId, label: cellRef.runId }, ...opts];
+    }
+    return opts;
   }, [runs, cellRef]);
 
   const select = (
     labelText: string,
     value: string,
-    options: string[],
+    options: Array<{ value: string; label: string }>,
     onPick: (v: string) => void,
     testId: string,
   ) => (
@@ -173,8 +197,8 @@ function SidePicker({
       >
         {options.length === 0 && <option value={value}>{value || '—'}</option>}
         {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
+          <option key={o.value} value={o.value}>
+            {o.label}
           </option>
         ))}
       </select>
@@ -240,30 +264,35 @@ function SidePicker({
         {select(
           'Arm',
           cellRef.scenario,
-          report?.scenarios ?? [],
+          (report?.scenarios ?? []).map((v) => ({ value: v, label: v })),
           (scenario) => onChange({ ...cellRef, scenario }),
           `picker-${tag}-arm`,
         )}
         {select(
           'Symbol',
           cellRef.symbol,
-          report?.symbols ?? [],
+          (report?.symbols ?? []).map((v) => ({ value: v, label: v })),
           (symbol) => onChange({ ...cellRef, symbol }),
           `picker-${tag}-symbol`,
         )}
         {select(
           'Split',
           cellRef.split,
-          report?.windows.map((w) => w.split) ?? [],
+          (report?.windows ?? []).map((w) => ({ value: w.split, label: w.split })),
           (split) => onChange({ ...cellRef, split }),
           `picker-${tag}-split`,
         )}
       </div>
       {!report && (
         <p className="text-xs text-gray-500" data-testid={`picker-${tag}-loading`}>
-          {side?.error
-            ? `This run could not be read: ${side.error}. Its state is unknown, not empty.`
-            : 'Loading this run — the arm, symbol and split options come from its own report.'}
+          {sideStatusNote(side)}
+        </p>
+      )}
+      {side?.dedupFrom && (
+        <p className="text-xs text-gray-400" data-testid={`picker-${tag}-dedup`}>
+          Run <span className="font-mono">{side.dedupFrom}</span> was deduplicated — nothing was
+          replayed under its own id — so this side was opened on run{' '}
+          <span className="font-mono">{side.ref.runId}</span>, which holds the answer.
         </p>
       )}
     </div>
@@ -273,6 +302,7 @@ function SidePicker({
 export default function SimsCompare() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const rawA = params.get('a');
   const rawB = params.get('b');
 
@@ -282,8 +312,21 @@ export default function SimsCompare() {
   const refB = useMemo(() => parseCellRef(rawB), [rawB]);
 
   const { data: runs } = useSweepList();
-  const sideA = useSide(refA);
-  const sideB = useSide(refB);
+
+  // R7: ONE detail fetch per DISTINCT run. Two sides of one run share a poll —
+  // `useSweepDetail(null)` is inert, so the second hook simply does not fetch.
+  const sameRun = !!refA && !!refB && refA.runId === refB.runId;
+  const detailA = useSweepDetail(refA?.runId ?? null);
+  const detailB = useSweepDetail(sameRun ? null : (refB?.runId ?? null));
+  const forB = sameRun ? detailA : detailB;
+
+  // Which run each slot was auto-followed FROM, off the history entry's own
+  // state (the PR-2 dedup pattern). Absent on a typed or bookmarked URL, which
+  // is exactly the notice's scope.
+  const followed = (location.state ?? null) as { dedupA?: string; dedupB?: string } | null;
+
+  const sideA = useSide(refA, detailA.data, detailA.error, followed?.dedupA ?? null);
+  const sideB = useSide(refB, forB.data, forB.error, followed?.dedupB ?? null);
 
   // A malformed `a` is not repairable — which of the four fields was dropped is
   // not knowable — so the page hands the operator back to `/sims` rather than
@@ -297,58 +340,117 @@ export default function SimsCompare() {
   // down: `a` is still readable and worth showing.
   useEffect(() => {
     if (rawB !== null && refB === null) {
-      const next = new URLSearchParams(params);
-      next.delete('b');
-      setParams(next, { replace: true });
+      // FUNCTIONAL updater (review round 1, LOW): two automatic corrections can
+      // land in one commit, and each reading `params` from the closure would
+      // write a copy of the OTHER's stale value back — the second silently
+      // undoing the first.
+      setParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete('b');
+          return next;
+        },
+        { replace: true },
+      );
     }
-  }, [rawB, refB, params, setParams]);
+  }, [rawB, refB, setParams]);
+
+  /**
+   * Follow a `deduplicated` run to the run that holds the evidence (R1).
+   *
+   * The PR-2 amendment, applied to both slots: a deduplicated run stored
+   * NOTHING under its own id — that is what dedup means — so comparing against
+   * it would compare against an empty side for ever. The same cell under
+   * `deduplicated_to` REPLACES the slot, and the run it was reached from
+   * travels in the history entry's state so the destination can say so.
+   *
+   * A row pointing at ITSELF is corrupt rather than resolvable and is not
+   * followed; `ResultsRegion` on `/sims` says so in its own words, and here the
+   * side simply renders its status.
+   */
+  const followDedup = (key: 'a' | 'b', ref: CompareRef | null, side: CompareSideData | null) => {
+    if (!ref || !side?.sweep) return;
+    if (side.sweep.status !== 'deduplicated') return;
+    const target = side.sweep.deduplicated_to ?? null;
+    if (!target || target === ref.runId) return;
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set(key, formatCellRef({ ...ref, runId: target }));
+        return next;
+      },
+      {
+        replace: true,
+        state: { ...(followed ?? {}), [key === 'a' ? 'dedupA' : 'dedupB']: ref.runId },
+      },
+    );
+  };
 
   /**
    * Repair a cell this run does not have — a deep link from another sweep, or
    * the arm/symbol/split carried across a RUN change in the picker.
    *
    * Automatic, so it REPLACES (decision 4). Gated on the report belonging to
-   * the URL's run, which `useSide` has already enforced.
+   * the URL's run, which `useSide` has already enforced — and on the run being
+   * `done`, because a `running` run has no report to repair against and a
+   * `failed` one never will.
    */
   const repair = (key: 'a' | 'b', ref: CompareRef | null, side: CompareSideData | null) => {
     if (!ref || !side?.report) return;
     if (cellExists(side.report, ref)) return;
     const fallback = defaultCell(side.report);
     if (!fallback) return;
-    const next = new URLSearchParams(params);
-    next.set(key, formatCellRef({ runId: ref.runId, ...fallback }));
-    setParams(next, { replace: true });
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set(key, formatCellRef({ runId: ref.runId, ...fallback }));
+        return next;
+      },
+      { replace: true },
+    );
   };
+
+  const statusA = sideA?.sweep?.status ?? null;
+  const statusB = sideB?.sweep?.status ?? null;
   useEffect(() => {
+    followDedup('a', refA, sideA);
     repair('a', refA, sideA);
-    // The repair reads `params` and writes it; depending on the side objects
-    // (new on every render) would loop. The refs and the reports are what
-    // actually decide whether a repair is needed.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refA, sideA?.report]);
+    // The two corrections read the ref and the loaded run and nothing else;
+    // depending on the side OBJECT (new on every render) would loop. `statusA`
+    // is in the list so the dedup follow fires the moment the row resolves.
+  }, [refA, sideA?.report, statusA]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
+    followDedup('b', refB, sideB);
     repair('b', refB, sideB);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refB, sideB?.report]);
+  }, [refB, sideB?.report, statusB]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** A user's pick. PUSHES, so Back walks their own comparisons. */
   const setSide = (key: 'a' | 'b', ref: CompareRef) => {
-    const next = new URLSearchParams(params);
-    next.set(key, formatCellRef(ref));
-    setParams(next);
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set(key, formatCellRef(ref));
+      return next;
+    });
   };
   const clearSide = (key: 'a' | 'b') => {
-    const next = new URLSearchParams(params);
-    next.delete(key);
-    setParams(next);
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete(key);
+      return next;
+    });
   };
 
   const swap = () => {
-    if (!refA || !refB) return;
-    const next = new URLSearchParams(params);
-    next.set('a', formatCellRef(refB));
-    next.set('b', formatCellRef(refA));
-    setParams(next);
+    // A no-op when the two slots hold the same cell (review round 1, LOW):
+    // swapping a pair with itself pushes a history entry that changes nothing
+    // and that Back then has to walk back through.
+    if (!refA || !refB || sameRef(refA, refB)) return;
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('a', formatCellRef(refB));
+      next.set('b', formatCellRef(refA));
+      return next;
+    });
   };
 
   return (
@@ -430,9 +532,15 @@ export default function SimsCompare() {
   );
 }
 
-/** Do the two runs record the same known-bias titles? A difference is a finding. */
+/**
+ * Do the two runs record the same known biases? A difference is a finding.
+ *
+ * TITLE AND BODY (review round 1, LOW). Comparing titles alone would call two
+ * runs identical when one of them reworded what a caveat actually says, which
+ * is the case where showing only A's footer does the most damage.
+ */
 function sameBiasTitles(a: CompareSideData, b: CompareSideData): boolean {
-  const ta = (a.report?.known_biases ?? []).map((x) => x.title).join('|');
-  const tb = (b.report?.known_biases ?? []).map((x) => x.title).join('|');
-  return ta === tb;
+  const flatten = (side: CompareSideData) =>
+    (side.report?.known_biases ?? []).map((x) => `${x.title}\u0000${x.detail}`).join('\u0001');
+  return flatten(a) === flatten(b);
 }

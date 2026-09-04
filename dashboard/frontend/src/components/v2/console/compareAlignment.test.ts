@@ -14,7 +14,7 @@ import shaped13cc from '../../../test/fixtures/sweep_shaped_13cc.json';
 import shapedA48d from '../../../test/fixtures/sweep_shaped_a48d.json';
 import { normaliseSweepDetail } from '../sims/normaliseReport';
 import { indexRows, lookupCell } from '../sims/resultCells';
-import type { SweepReport, SweepRow } from '../../../types/v2';
+import type { SimArtifact, SweepReport, SweepRow } from '../../../types/v2';
 import {
   alignCells,
   capitalBaseOf,
@@ -39,7 +39,13 @@ const RUN_13CC = '13cc2729d1c74211';
 const side = (
   payload: unknown,
   ref: Omit<CompareRef, 'runId'> & { runId?: string },
-  over: { sweep?: Partial<SweepRow>; report?: Partial<SweepReport>; capitalBase?: number | null } = {},
+  over: {
+    sweep?: Partial<SweepRow>;
+    report?: Partial<SweepReport>;
+    capitalBase?: number | null;
+    artifact?: SimArtifact | null;
+    status?: string | null;
+  } = {},
 ): CompareSide => {
   const { sweep, report } = detail(payload);
   const merged = { ...report, ...(over.report ?? {}) };
@@ -50,6 +56,8 @@ const side = (
     report: merged,
     row: lookupCell(indexRows(merged.rows), full.scenario, full.symbol, full.split) ?? null,
     stampedCapitalBase: over.capitalBase === undefined ? 100000 : over.capitalBase,
+    artifact: over.artifact ?? null,
+    status: over.status ?? 'done',
   };
 };
 
@@ -150,6 +158,7 @@ describe('same run, arm vs base — the default comparison', () => {
     expect(alignment.overridesDiff).toEqual([
       {
         key: 'risk.max_position_size',
+        origin: 'override',
         a: '0.2',
         b: '(base)',
         baseA: '—',
@@ -173,14 +182,15 @@ describe('same run, arm vs arm — where A−B actually exists', () => {
   // rule, not the number: two served Δs, same run, same split, same base.
   const a = side(shaped13cc, { scenario: 'position_20pct', symbol: 'GOOGL', split: 'fit' });
   const armRow = { ...a.row!, delta_vs_base_annualized: -0.04 };
-  const withDelta = (delta: number): CompareSide => ({
+  const withDelta = (delta: number, scenario = 'position_20pct'): CompareSide => ({
     ...a,
+    ref: { ...a.ref, scenario },
     row: { ...armRow, delta_vs_base_annualized: delta },
   });
 
   it('subtracts the two SERVED Δs and nothing else', () => {
     const x = withDelta(-0.04);
-    const y = withDelta(0.01);
+    const y = withDelta(0.01, 'another_arm');
     const alignment = alignCells(x, y);
     expect(alignment.allowsDelta).toBe(true);
     expect(differenceOfDeltas(alignment, x, y)).toBeCloseTo(-0.05, 12);
@@ -189,8 +199,7 @@ describe('same run, arm vs arm — where A−B actually exists', () => {
   it('never shows A−B when the matrix withheld the tiles', () => {
     const x = withDelta(-0.04);
     const y: CompareSide = {
-      ...withDelta(0.01),
-      ref: { ...x.ref, split: 'fit' },
+      ...withDelta(0.01, 'another_arm'),
       report: { ...x.report!, starting_cash: 250000 },
       stampedCapitalBase: 250000,
     };
@@ -251,28 +260,61 @@ describe('the withheld rows, one synthetic field each', () => {
     expect(alignment.withheldReasons.join(' ')).toContain('DIFFERENT STRATEGY');
   });
 
-  it('a base-config mismatch is NOTED and kills A−B, but withholds nothing', () => {
+  it('a base-config mismatch WITHHOLDS the tiles and kills A−B (review R2c)', () => {
     const a = base();
-    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+    // Distinct arms, so the SAME-CELL refusal (R8) does not answer first.
+    const b = side(shaped13cc, { scenario: 'position_20pct', symbol: 'GOOGL', split: 'fit' }, {
       sweep: { base_config_hash: 'ffffffffffffffff' },
     });
     const alignment = alignCells(a, b);
-    expect(outcome(alignment, 'base_config')).toBe('noted');
-    expect(alignment.tilesWithheld).toBe(false);
+    expect(outcome(alignment, 'base_config')).toBe('withheld');
+    // The mutation this kills: leaving it a `noted` row, which showed two
+    // strategies' returns beside each other as if only the arms differed.
+    expect(alignment.tilesWithheld).toBe(true);
+    expect(alignment.withheldReasons.join(' ')).toContain('different strategy');
     expect(alignment.allowsDelta).toBe(false);
     expect(alignment.deltaRefusal).toContain('different base configs');
   });
 
-  it('a differing fill haircut is noted on the varying side', () => {
+  it('an UNKNOWN base hash is not a DIFFERENT one, and says so', () => {
     const a = base();
+    const b = side(shaped13cc, { scenario: 'position_20pct', symbol: 'GOOGL', split: 'fit' }, {
+      sweep: { base_config_hash: null },
+    });
+    const alignment = alignCells(a, b);
+    expect(outcome(alignment, 'base_config')).toBe('unknown');
+    expect(alignment.tilesWithheld).toBe(false);
+    expect(alignment.deltaRefusal).toContain('UNKNOWN');
+    expect(alignment.deltaRefusal).not.toContain('recorded different base configs');
+  });
+
+  it('a differing fill is noted, and each side names its SOURCE (review R5)', () => {
+    const a = base();
+    // A's fill is SERVED by the forecast; B's run serves none, so B falls
+    // through to what its spec DECLARED. Same number would still be two
+    // different claims, and the row prints both sources.
     const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
-      report: { scenario_fill_haircuts: { base: 0.5 } },
+      report: { forecast: null, scenario_fill_haircuts: { base: 0.5 } },
     });
     const alignment = alignCells(a, b);
     expect(outcome(alignment, 'fill_haircut')).toBe('noted');
     const row = alignment.rows.find((r) => r.id === 'fill_haircut')!;
-    expect(row.a).toBe('engine default');
-    expect(row.b).toBe('0.5');
+    expect(row.a).toContain('served by the forecast');
+    expect(row.b).toContain('declared on the spec');
+    expect(row.b).toContain('0.5');
+  });
+
+  it('reads the fill off the cell ARTIFACT first, and names that source', () => {
+    const stamped = {
+      provenance: { fill: { basis: 'bid', fill_haircut: 0.9 } },
+    } as unknown as SimArtifact;
+    const a = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: stamped,
+    });
+    const b = base();
+    const row = alignCells(a, b).rows.find((r) => r.id === 'fill_haircut')!;
+    expect(row.a).toContain('stamped on the cell artifact');
+    expect(row.a).toContain('bid');
   });
 
   it('an in-sample side is noted, and it is enough that ONE side is', () => {
@@ -300,7 +342,15 @@ describe('same NAME is not same OVERRIDES', () => {
       'SAME NAME, DIFFERENT ARM',
     );
     expect(alignment.overridesDiff).toEqual([
-      { key: 'risk.max_position_size', a: '0.2', b: '0.35', baseA: '—', baseB: '—', same: false },
+      {
+        key: 'risk.max_position_size',
+        origin: 'override',
+        a: '0.2',
+        b: '0.35',
+        baseA: '—',
+        baseB: '—',
+        same: false,
+      },
     ]);
   });
 
@@ -319,6 +369,8 @@ describe('an unloaded side is UNCHECKED, never aligned', () => {
     report: null,
     row: null,
     stampedCapitalBase: null,
+    artifact: null,
+    status: null,
   };
   const alignment = alignCells(loaded, empty);
 
@@ -358,7 +410,15 @@ describe('overridesDiff — the union of both arms’ keys, with each run’s ba
     const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' });
     const diff = overridesDiff(a, b, { 'risk.max_position_size': 0.1 }, { 'risk.max_position_size': 0.1 });
     expect(diff).toEqual([
-      { key: 'risk.max_position_size', a: '0.2', b: '(base)', baseA: '0.1', baseB: '0.1', same: false },
+      {
+        key: 'risk.max_position_size',
+        origin: 'override',
+        a: '0.2',
+        b: '(base)',
+        baseA: '0.1',
+        baseB: '0.1',
+        same: false,
+      },
     ]);
   });
 

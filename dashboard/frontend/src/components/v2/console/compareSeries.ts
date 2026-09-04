@@ -159,20 +159,45 @@ export function compareEquity(
 }
 
 /**
- * The stretches of the union window that only ONE side covers.
+ * The stretches of the union window that only ONE side covers, SNAPPED to rows.
  *
- * Returned as at most two closed ranges so the renderer can shade them. Both
- * `null` windows, or identical ones, give `[]` — there is nothing to shade.
+ * Review round 1, R4: recharts positions a `ReferenceArea` on a category axis
+ * by looking its `x1`/`x2` up among the rows, and silently draws nothing when
+ * the value is not one of them. Window bounds are CALENDAR dates and rows are
+ * SESSIONS — the committed fixture's fit window starts 2025-09-01, which is
+ * Labor Day, and its first row is 2025-09-02 — so an unsnapped shade never
+ * rendered at all. Every bound returned here is a date that exists in `dates`.
+ *
+ * Both `null` windows, identical ones, or a stretch containing no session at
+ * all give `[]`: there is nothing to shade, and a shade that covers no row
+ * would be a claim about a period the chart does not draw.
  */
 export function nonOverlap(
   wa: { start: string; end: string } | null,
   wb: { start: string; end: string } | null,
+  dates: string[] = [],
 ): Array<{ start: string; end: string; side: 'a' | 'b' }> {
   if (!wa || !wb) return [];
+  const rows = [...dates].sort();
+
+  /** First row in `[from, toExclusive)`, and the last — or `null` if none. */
+  const snapLeading = (from: string, toExclusive: string) => {
+    const inside = rows.filter((d) => d >= from && d < toExclusive);
+    return inside.length ? { start: inside[0], end: inside[inside.length - 1] } : null;
+  };
+  /** First row in `(fromExclusive, to]`, and the last — or `null` if none. */
+  const snapTrailing = (fromExclusive: string, to: string) => {
+    const inside = rows.filter((d) => d > fromExclusive && d <= to);
+    return inside.length ? { start: inside[0], end: inside[inside.length - 1] } : null;
+  };
+
   const out: Array<{ start: string; end: string; side: 'a' | 'b' }> = [];
-  if (wa.start < wb.start) out.push({ start: wa.start, end: wb.start, side: 'a' });
-  if (wb.start < wa.start) out.push({ start: wb.start, end: wa.start, side: 'b' });
-  if (wa.end > wb.end) out.push({ start: wb.end, end: wa.end, side: 'a' });
-  if (wb.end > wa.end) out.push({ start: wa.end, end: wb.end, side: 'b' });
+  const push = (range: { start: string; end: string } | null, side: 'a' | 'b') => {
+    if (range) out.push({ ...range, side });
+  };
+  if (wa.start < wb.start) push(snapLeading(wa.start, wb.start), 'a');
+  if (wb.start < wa.start) push(snapLeading(wb.start, wa.start), 'b');
+  if (wa.end > wb.end) push(snapTrailing(wb.end, wa.end), 'a');
+  if (wb.end > wa.end) push(snapTrailing(wa.end, wb.end), 'b');
   return out;
 }

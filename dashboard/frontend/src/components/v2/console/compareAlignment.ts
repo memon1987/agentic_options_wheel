@@ -20,7 +20,7 @@
 // The matrix never *hides* a difference. A row that aligns says so, so an
 // operator can tell "checked and equal" from "not checked".
 
-import type { SweepReport, SweepResultRow, SweepRow } from '../../../types/v2';
+import type { SimArtifact, SweepReport, SweepResultRow, SweepRow } from '../../../types/v2';
 
 /** One side of the comparison, exactly as the URL spells it. */
 export interface CompareRef {
@@ -81,6 +81,15 @@ export interface CompareSide {
    * `starting_cash` is the fallback and is labelled as such.
    */
   stampedCapitalBase: number | null;
+  /**
+   * The cell's stored artifact, when it loaded. The matrix reads two things off
+   * it and nothing else: `provenance.fill` (the EFFECTIVE fill this cell was
+   * replayed under — review round 1, R5) and, through `stampedCapitalBase`, the
+   * denominator its ratios used.
+   */
+  artifact: SimArtifact | null;
+  /** The run's status, so a non-`done` side is never compared as if it were. */
+  status: string | null;
 }
 
 export type AlignmentOutcome = 'aligned' | 'noted' | 'withheld' | 'refused' | 'unknown';
@@ -110,6 +119,12 @@ export interface AlignmentRow {
 
 export interface OverridesDiffRow {
   key: string;
+  /**
+   * `override` — an arm sets this key. `base` — neither arm does, but the two
+   * runs' RECORDED base configs disagree on it, which is a difference between
+   * the two cells all the same (review round 1, R2b).
+   */
+  origin: 'override' | 'base';
   a: string;
   b: string;
   /** `a`'s run's recorded base effective value for this key. */
@@ -157,7 +172,10 @@ const show = (value: unknown): string => {
 
 const windowOf = (side: CompareSide): { start: string; end: string } | null => {
   const w = side.report?.windows?.find((x) => x.split === side.ref.split);
-  return w ? { start: w.start, end: w.end } : null;
+  // A window row with a missing bound is UNKNOWN, never two empty strings that
+  // compare equal — that would print "aligned" off two absent dates.
+  if (!w || !w.start || !w.end) return null;
+  return { start: w.start, end: w.end };
 };
 
 const windowText = (side: CompareSide): string => {
@@ -227,22 +245,97 @@ export function overridesDiff(
 ): OverridesDiffRow[] {
   const overridesA = a.report?.scenario_overrides?.[a.ref.scenario] ?? {};
   const overridesB = b.report?.scenario_overrides?.[b.ref.scenario] ?? {};
-  const keys = [...new Set([...Object.keys(overridesA), ...Object.keys(overridesB)])].sort();
+  const overrideKeys = new Set([...Object.keys(overridesA), ...Object.keys(overridesB)]);
+
+  // Review round 1, R2b: two runs can record DIFFERENT bases, and a key neither
+  // arm overrides is still a difference between the two cells when the bases
+  // disagree on it. Both maps are already loaded, so the diff can say which
+  // keys those are instead of leaving `base_config_hash` as an opaque note.
+  // Self-limiting: identical (or absent) bases add nothing.
+  const baseOnlyKeys = new Set<string>();
+  for (const key of new Set([
+    ...Object.keys(baseEffectiveA ?? {}),
+    ...Object.keys(baseEffectiveB ?? {}),
+  ])) {
+    if (overrideKeys.has(key)) continue;
+    if (baseEffectiveA === null || baseEffectiveB === null) continue;
+    if (show(baseEffectiveA[key]) !== show(baseEffectiveB[key])) baseOnlyKeys.add(key);
+  }
+
+  const keys = [...overrideKeys, ...baseOnlyKeys].sort();
   return keys.map((key) => {
     const hasA = Object.prototype.hasOwnProperty.call(overridesA, key);
     const hasB = Object.prototype.hasOwnProperty.call(overridesB, key);
     const showA = hasA ? show(overridesA[key]) : '(base)';
     const showB = hasB ? show(overridesB[key]) : '(base)';
+    const baseA = baseEffectiveValue(a.report, baseEffectiveA, key);
+    const baseB = baseEffectiveValue(b.report, baseEffectiveB, key);
     return {
       key,
+      origin: overrideKeys.has(key) ? ('override' as const) : ('base' as const),
       a: showA,
       b: showB,
-      baseA: baseEffectiveValue(a.report, baseEffectiveA, key),
-      baseB: baseEffectiveValue(b.report, baseEffectiveB, key),
-      same: showA === showB,
+      baseA,
+      baseB,
+      // "Same" means the two cells resolve this key the same way — an
+      // un-overridden key whose BASES differ is not the same value, and the
+      // amber row is exactly the point of listing it.
+      same: showA === showB && (hasA || hasB || baseA === baseB),
     };
   });
 }
+
+// --------------------------------------------------------------------------- //
+// The effective fill (review round 1, R5)
+// --------------------------------------------------------------------------- //
+
+export interface EffectiveFill {
+  basis: string | null;
+  haircut: number | null;
+  /** Where the reading came from — `declared` is not `measured`. */
+  source: string;
+}
+
+const finite = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null;
+
+/**
+ * The fill this cell was ACTUALLY replayed under, in the PR-2 source order.
+ *
+ * The cell artifact's own `provenance.fill` first, then the forecast's (which
+ * omits excluded arms and in-sample runs), then the spec's DECLARED haircut —
+ * and the source is returned beside the number, because "declared" and
+ * "stamped on the replay" are different claims and the matrix must not compare
+ * one side's declaration with the other side's measurement without saying so.
+ * A null declared haircut is `engine default`, never `—`.
+ */
+export function effectiveFill(side: CompareSide): EffectiveFill {
+  const stamped = side.artifact?.provenance.fill ?? null;
+  if (stamped) {
+    return {
+      basis: stamped.basis ?? null,
+      haircut: finite(stamped.fill_haircut),
+      source: 'stamped on the cell artifact',
+    };
+  }
+  const served =
+    side.report?.forecast?.by_scenario?.[side.ref.scenario]?.symbols?.[side.ref.symbol]?.fill ??
+    null;
+  if (served) {
+    return {
+      basis: served.basis ?? null,
+      haircut: finite(served.fill_haircut),
+      source: served.is_engine_default === true ? 'served by the forecast (engine default)' : 'served by the forecast',
+    };
+  }
+  const declared = side.report?.scenario_fill_haircuts?.[side.ref.scenario];
+  if (declared === undefined) return { basis: null, haircut: null, source: 'not known' };
+  if (declared === null) return { basis: null, haircut: null, source: 'declared: engine default' };
+  return { basis: null, haircut: declared, source: 'declared on the spec' };
+}
+
+const fillText = (fill: EffectiveFill): string =>
+  `${fill.basis ?? '—'} · haircut ${fill.haircut === null ? 'engine default' : fill.haircut} · ${fill.source}`;
 
 // --------------------------------------------------------------------------- //
 // The matrix
@@ -262,6 +355,16 @@ export const DELTA_REFUSAL_CROSS_RUN =
 export const DELTA_REFUSAL_SPLIT =
   'No A−B number: the two cells are different splits. A fit Δ and a holdout Δ answer different ' +
   'questions about different windows.';
+
+export const DELTA_REFUSAL_SAME_CELL =
+  'No A−B number: A and B are the SAME cell. The difference of a served Δ with itself is 0 by ' +
+  'construction, and printing “0.0%” would read as a finding about two configs rather than as ' +
+  'the tautology it is.';
+
+export const DELTA_REFUSAL_BASE_UNKNOWN =
+  'No A−B number: at least one run records no `base_config_hash`, so whether the two Δs are ' +
+  'against the same base is UNKNOWN — not equal, and not different. Runs written before the ' +
+  'hash was stored are in this state.';
 
 export const DELTA_REFUSAL_BASE_HASH =
   'No A−B number: the two runs recorded different base configs (`base_config_hash`), so each ' +
@@ -318,9 +421,13 @@ export function alignCells(
     b: b.ref.split,
     detail: splitAligned
       ? 'Same window role.'
-      : 'In-sample vs holdout — not comparable. The fit window is the one the config was chosen ' +
-        'on and the holdout is the one it was not; a difference between them is a statement about ' +
-        'the windows, not about the arms. Curves are drawn, numbers are withheld.',
+      : [a.ref.split, b.ref.split].includes('all')
+        ? `A whole-run window (\`all\`) against a \`${a.ref.split === 'all' ? b.ref.split : a.ref.split}\` ` +
+          'window — one contains the other, so a difference between them is arithmetic about ' +
+          'overlapping periods rather than a comparison. Curves are drawn, numbers are withheld.'
+        : 'In-sample vs holdout — not comparable. The fit window is the one the config was chosen ' +
+          'on and the holdout is the one it was not; a difference between them is a statement ' +
+          'about the windows, not about the arms. Curves are drawn, numbers are withheld.',
   });
 
   // --- window -------------------------------------------------------------- //
@@ -360,15 +467,32 @@ export function alignCells(
   // --- arm identity: same NAME is not same OVERRIDES ----------------------- //
   const hashA = a.report?.scenario_hashes?.[a.ref.scenario] ?? null;
   const hashB = b.report?.scenario_hashes?.[b.ref.scenario] ?? null;
+  // Review round 1, R2a: `scenario_hash` is the OVERRIDES' hash, so two arms
+  // that set the same overrides against DIFFERENT bases hash the same and would
+  // have read "aligned" while running different configs. `config_hash` is the
+  // hash of the effective config the cell actually replayed, which is the
+  // question this row is asking.
+  const configA = a.report?.scenario_config_hashes?.[a.ref.scenario] ?? null;
+  const configB = b.report?.scenario_config_hashes?.[b.ref.scenario] ?? null;
   const diff = overridesDiff(a, b, baseEffectiveA, baseEffectiveB);
   let armOutcome: AlignmentOutcome = 'unknown';
   let armDetail =
     'Not yet known — `scenario_hash` has not been read for at least one side. UNCHECKED, not equal.';
-  if (known(hashA, hashB)) {
+  if (known(configA, configB) && configA !== configB) {
+    armOutcome = 'noted';
+    armDetail =
+      `Same overrides (\`scenario_hash\` ${hashA === hashB ? 'equal' : 'differs too'}) but a ` +
+      'DIFFERENT effective config (`config_hash`): the two cells replayed different configs. ' +
+      'The diff below lists every key that differs, base keys included.';
+  } else if (known(hashA, hashB)) {
     if (hashA === hashB) {
-      armOutcome = 'aligned';
+      armOutcome = known(configA, configB) ? 'aligned' : 'noted';
       armDetail =
-        'Same `scenario_hash`: the two arms carry the same overrides, whatever they are named.';
+        known(configA, configB)
+          ? 'Same `scenario_hash` AND same `config_hash`: the two arms carry the same overrides ' +
+            'over the same effective config, whatever they are named.'
+          : 'Same `scenario_hash`, but at least one side records no `config_hash`, so whether ' +
+            'the EFFECTIVE configs match is unchecked — same overrides is not same config.';
     } else {
       armOutcome = 'noted';
       armDetail =
@@ -391,8 +515,8 @@ export function alignCells(
     id: 'arm_identity',
     label: 'Arm identity',
     outcome: armOutcome,
-    a: `${a.ref.scenario}${hashA ? ` (${hashA})` : ''}`,
-    b: `${b.ref.scenario}${hashB ? ` (${hashB})` : ''}`,
+    a: `${a.ref.scenario}${hashA ? ` (${hashA}` : ''}${configA ? ` / cfg ${configA})` : hashA ? ')' : ''}`,
+    b: `${b.ref.scenario}${hashB ? ` (${hashB}` : ''}${configB ? ` / cfg ${configB})` : hashB ? ')' : ''}`,
     detail: armDetail,
   });
 
@@ -432,7 +556,8 @@ export function alignCells(
   const baseHashB = b.sweep?.base_config_hash ?? null;
   let baseOutcome: AlignmentOutcome = 'unknown';
   let baseDetail =
-    'Not yet known — `base_config_hash` has not been read for at least one run. UNCHECKED.';
+    'Not yet known — `base_config_hash` has not been read for at least one run. UNCHECKED: not ' +
+    'equal, and not different.';
   if (known(baseHashA, baseHashB)) {
     if (baseHashA === baseHashB) {
       baseOutcome = 'aligned';
@@ -440,14 +565,20 @@ export function alignCells(
         'Both runs recorded the same base config, so each side’s Δ is against the same base. ' +
         'This is the run’s RECORDED base, not the sim service’s current one.';
     } else {
-      baseOutcome = 'noted';
+      // Review round 1, R2c: this was a note, and a note is too weak. A base
+      // that moved a risk or strategy key is a DIFFERENT STRATEGY on the other
+      // side, not the same one rescaled — the same argument the capital-base
+      // row makes. The diff below names the keys; the numbers are withheld.
+      baseOutcome = 'withheld';
       baseDetail =
-        'The two runs recorded DIFFERENT base configs. Each side’s Δ vs base is therefore ' +
-        'against a different base, and no A−B number is shown. The service’s base moves when ' +
-        'its config is redeployed; this hash is how that shows up.';
+        'The two runs recorded DIFFERENT base configs. Every key neither arm overrides was still ' +
+        'resolved differently on the two sides — a moved `put_delta_range` or `max_position_size` ' +
+        'is a different strategy, not a rescaled one — so the numbers are withheld and the diff ' +
+        'below lists the keys. Each side’s Δ is also against a different base, so there is no ' +
+        'A−B. The service’s base moves when its config is redeployed; this hash is how that shows.';
     }
   }
-  rows.push({
+  withhold({
     id: 'base_config',
     label: 'Base config',
     outcome: baseOutcome,
@@ -484,21 +615,24 @@ export function alignCells(
   });
 
   // --- fill haircut ---------------------------------------------------------- //
-  const fillA = a.report?.scenario_fill_haircuts?.[a.ref.scenario] ?? null;
-  const fillB = b.report?.scenario_fill_haircuts?.[b.ref.scenario] ?? null;
-  const fillAligned = fillA === fillB;
+  const fillA = effectiveFill(a);
+  const fillB = effectiveFill(b);
+  const fillAligned = fillA.basis === fillB.basis && fillA.haircut === fillB.haircut;
   rows.push({
     id: 'fill_haircut',
-    label: 'Fill haircut',
+    label: 'Fill',
     outcome: fillAligned ? 'aligned' : 'noted',
-    a: fillA === null ? 'engine default' : String(fillA),
-    b: fillB === null ? 'engine default' : String(fillB),
+    a: fillText(fillA),
+    b: fillText(fillB),
     detail: fillAligned
-      ? 'Same fill assumption on both sides. `engine default` means the spec declared no ' +
-        'haircut and the engine applied its own.'
-      : 'DIFFERENT fill assumptions. Part of the difference between these two cells is the ' +
-        'assumed fill price rather than the config, and the varying side carries an amber fill ' +
-        'label wherever its numbers appear. `engine default` means the spec declared none.',
+      ? 'Same effective fill on both sides, read in the PR-2 source order: the cell artifact’s ' +
+        'own stamp, then the forecast’s, then the spec’s declared haircut. The source is printed ' +
+        'beside each reading — a DECLARED haircut is not a measured one, and the two must not be ' +
+        'compared as if they were. `engine default` means the spec declared none.'
+      : 'DIFFERENT effective fills. Part of the difference between these two cells is the assumed ' +
+        'fill price rather than the config, and the varying side carries an amber fill label ' +
+        'wherever its numbers appear. Check the source on each side before reading the gap as a ' +
+        'real one: a stamped fill against a declared one may be the same fill, differently known.',
   });
 
   // --- in-sample -------------------------------------------------------------- //
@@ -521,8 +655,14 @@ export function alignCells(
   const deltaB = b.row?.delta_vs_base_annualized ?? null;
   let deltaRefusal: string | null = null;
   if (refusal) deltaRefusal = refusal;
+  // Review round 1, R8: A−B of a cell with ITSELF is 0 by construction. It used
+  // to print as "A−B 0.0%", which reads as a finding about two configs.
+  else if (sameRef(a.ref, b.ref)) deltaRefusal = DELTA_REFUSAL_SAME_CELL;
   else if (a.ref.runId !== b.ref.runId) deltaRefusal = DELTA_REFUSAL_CROSS_RUN;
   else if (a.ref.split !== b.ref.split) deltaRefusal = DELTA_REFUSAL_SPLIT;
+  // `unknown` and `withheld` are different answers and get different words: a
+  // run with no recorded hash is not a run with a DIFFERENT base.
+  else if (baseOutcome === 'unknown') deltaRefusal = DELTA_REFUSAL_BASE_UNKNOWN;
   else if (baseOutcome !== 'aligned') deltaRefusal = DELTA_REFUSAL_BASE_HASH;
   else if (tilesWithheld) deltaRefusal = DELTA_REFUSAL_WITHHELD;
   else if (deltaA === null || deltaB === null) deltaRefusal = DELTA_REFUSAL_NULL;
@@ -546,9 +686,15 @@ export function alignCells(
  *
  * "Difference of two served Δs" is the whole definition. Both inputs are the
  * server's `delta_vs_base_annualized`, so this subtracts two quantities the
- * engine computed against the same base over the same symbol and split. It is
- * never a difference of two annualised returns, which would be a Δ this page
- * derived — the FC-060 rule the console does not cross.
+ * engine computed against the same base over the same symbol and split.
+ *
+ * Worth being straight about (review round 1, LOW): because the gate requires
+ * one run, one split and one aligned base, the base term cancels and this
+ * number IS `annualized_return(a) − annualized_return(b)`. The point of routing
+ * it through the served Δs is not that it computes something different — it is
+ * that every input is the ENGINE's, so the page cannot produce a difference
+ * where the server refused to produce a Δ (an unmeasured cell, a base cell, a
+ * mismatched base). That is the FC-060 rule the console does not cross.
  */
 export function differenceOfDeltas(alignment: Alignment, a: CompareSide, b: CompareSide): number | null {
   if (!alignment.allowsDelta) return null;

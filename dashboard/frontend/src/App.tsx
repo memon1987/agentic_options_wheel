@@ -25,8 +25,9 @@ export default function App() {
                 order on the page matches the order in the ranking. React
                 Router 6 ranks a static segment above a dynamic one whatever
                 the source order, so `compare` is never read as a run id — the
-                position here is documentation, and `SimsRouting`'s test is the
-                enforcement. */}
+                position here is documentation. The enforcement is the
+                `App`-level precedence test in `SimsCompare.test.tsx`, which
+                mounts THIS component rather than re-declaring the routes. */}
             <Route path="/sims/compare"        element={<SimsCompareV2 />} />
             {/* FC-096 Phase E (decision 4): the URL is the state. A deep link
                 addresses a run, or one cell of it; `main.py:72` serves

@@ -56,6 +56,7 @@ const sideFor = (
     baseAbsence: null,
     bars,
     barsAbsence: null,
+    barsLoading: false,
     digest,
     digestAbsence: null,
     artifactRunId: sweep.run_id,
@@ -63,6 +64,8 @@ const sideFor = (
     strategy: 'wheel',
     loading: false,
     error: null,
+    status: 'done',
+    dedupFrom: null,
     ...(rest as Partial<CompareSideData>),
   };
 };

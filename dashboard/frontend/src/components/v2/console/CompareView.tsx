@@ -54,6 +54,13 @@ export interface CompareSideData {
   baseAbsence: string | null;
   bars: SimBars | null;
   barsAbsence: string | null;
+  /**
+   * Is the SIDECAR fetch still in flight? Review round 1, R6: this used to be
+   * wired to the detail's loading flag, so a pending sidecar rendered the
+   * absence sentence — "no price series was stored" — about an object that was
+   * still on the wire, and `PriceChart`'s BigQuery fallback fired against it.
+   */
+  barsLoading: boolean;
   digest: ArtifactDigest | null;
   digestAbsence: string | null;
   artifactRunId: string | null;
@@ -62,6 +69,45 @@ export interface CompareSideData {
   /** The run's detail is still loading, or could not be read. */
   loading: boolean;
   error: string | null;
+  /** The run's own status. `null` until its row loads. */
+  status: string | null;
+  /** Set when this side's ref was auto-followed FROM a deduplicated run. */
+  dedupFrom: string | null;
+}
+
+/**
+ * Why a side has no report, in the run's OWN words (review round 1, R1).
+ *
+ * "Loading this run…" was printed for every state that was not `done`, so a
+ * `failed` run — which will never have a report — and a `running` one — which
+ * will, in six to eight minutes — read identically, and both read as a slow
+ * network. A run's status is a fact about the run; absence of a report is a
+ * consequence of it, and the two are said in that order.
+ */
+export function sideStatusNote(side: CompareSideData | null): string {
+  if (!side) return 'No cell chosen.';
+  if (side.error) return `This run could not be read: ${side.error}. Its state is UNKNOWN, not empty.`;
+  const status = side.status;
+  if (status === null) {
+    return 'Loading this run — the arm, symbol and split options come from its own report.';
+  }
+  if (status === 'done') return 'This run is done but carries no report rows — a gap in the store.';
+  if (status === 'failed') {
+    return (
+      `This run FAILED and produced no report, so there is nothing on this side to compare. ` +
+      (side.sweep?.error ? `The engine said: ${side.sweep.error}` : 'It recorded no error text.')
+    );
+  }
+  if (status === 'deduplicated') {
+    return (
+      'This run was deduplicated and stored nothing under its own id. Its pointer to the run ' +
+      'that answered it is missing or points at itself, so there is nothing to open.'
+    );
+  }
+  return (
+    `This run is ${status} — it has not finished, so it has no report yet and nothing on this ` +
+    'side can be compared. The page keeps polling it.'
+  );
 }
 
 const OUTCOME_STYLE: Record<string, string> = {
@@ -86,6 +132,8 @@ const toSide = (d: CompareSideData): CompareSide => ({
   report: d.report,
   row: d.row,
   stampedCapitalBase: d.artifact?.provenance.capital_base ?? null,
+  artifact: d.artifact,
+  status: d.status,
 });
 
 const cellPathOf = (ref: CompareRef): string =>
@@ -158,18 +206,31 @@ export function OverridesDiff({
   b: CompareRef;
 }) {
   const oneRun = a.runId === b.runId;
+  const baseRows = alignment.overridesDiff.filter((r) => r.origin === 'base').length;
   return (
-    <Panel title="Overrides — what each arm actually sets">
+    <Panel title="Config — what each side actually resolved">
       <p className="text-xs text-gray-500">
-        The union of both arms&rsquo; override keys, so a key one arm sets and the other leaves at
-        base is visible as exactly that. The base column{oneRun ? '' : 's'} show
+        The union of both arms&rsquo; override keys — so a key one arm sets and the other leaves at
+        base is visible as exactly that — plus every key on which the two runs&rsquo; recorded base
+        configs disagree. The base column{oneRun ? '' : 's'} show
         {oneRun ? 's' : ''} each run&rsquo;s <strong>recorded</strong>{' '}
         <span className="font-mono">base_config_json.effective</span> — what that run replayed
         against, not the sim service&rsquo;s current config, which may have moved since.
       </p>
+      {baseRows > 0 && (
+        <p className="text-xs text-amber-300" data-testid="overrides-base-keys">
+          {baseRows} of these {baseRows === 1 ? 'is a key' : 'are keys'} NEITHER arm overrides — the
+          two runs&rsquo; recorded base configs simply disagree on{' '}
+          {baseRows === 1 ? 'it' : 'them'}. That is a difference between these two cells, and it is
+          why the base-config row withholds the numbers.
+        </p>
+      )}
       {alignment.overridesDiff.length === 0 ? (
         <p data-testid="overrides-diff-empty" className="text-sm text-gray-400">
-          Neither arm records an override: both are the run&rsquo;s base arm.
+          {oneRun
+            ? 'Neither arm records an override: both are this run’s base arm.'
+            : 'Neither arm records an override, and the two runs’ recorded base configs agree on ' +
+              'every key they both carry. Nothing in the config differs between these two cells.'}
         </p>
       ) : (
         <table className="w-full text-sm" data-testid="overrides-diff">
@@ -194,9 +255,17 @@ export function OverridesDiff({
                 key={row.key}
                 data-testid={`overrides-row-${row.key}`}
                 data-same={row.same ? 'true' : 'false'}
+                data-origin={row.origin}
                 className={`border-t border-gray-700/60 ${row.same ? '' : 'bg-amber-950/20'}`}
               >
-                <td className="py-1 pr-3 font-mono text-xs text-blue-300 break-all">{row.key}</td>
+                <td className="py-1 pr-3 font-mono text-xs text-blue-300 break-all">
+                  {row.key}
+                  {row.origin === 'base' && (
+                    <span className="ml-2 font-sans text-[10px] uppercase tracking-wide text-amber-400/80">
+                      base only
+                    </span>
+                  )}
+                </td>
                 <td className="py-1 pr-3 font-mono text-xs text-gray-200">{row.a}</td>
                 <td className="py-1 pr-3 font-mono text-xs text-gray-200">{row.b}</td>
                 <td className="py-1 pr-3 font-mono text-xs text-gray-500">{row.baseA}</td>
@@ -271,20 +340,30 @@ export function CompareEquityChart({
   );
   const wa = a.report?.windows.find((w) => w.split === a.ref.split) ?? null;
   const wb = b.report?.windows.find((w) => w.split === b.ref.split) ?? null;
-  const shades = nonOverlap(wa, wb);
+  // Snapped to the rows the chart actually draws (review round 1, R4).
+  const shades = nonOverlap(wa, wb, series.rows.map((r) => r.date));
   const fmt = (n: number) => (series.base100 ? n.toFixed(1) : fmtCurrency(n, { compact: true }));
 
   if (series.rows.length === 0) {
     return (
       <Panel title="Equity — both sides, each anchored to its own base">
         <p data-testid="compare-equity-absent" className="text-sm text-gray-400">
-          {a.artifactAbsence ??
-            b.artifactAbsence ??
-            'No daily state was stored for either cell, so there is no curve to draw.'}
+          Neither cell stored daily state. A: {a.artifactAbsence ?? 'nothing loaded yet'}. B:{' '}
+          {b.artifactAbsence ?? 'nothing loaded yet'}.
         </p>
       </Panel>
     );
   }
+
+  // One side has rows and the other does not: name WHICH, in that side's own
+  // endpoint words (review round 1, LOW). A single merged sentence left the
+  // operator reading a one-sided chart as a comparison.
+  const oneSided =
+    series.hasA !== series.hasB
+      ? series.hasA
+        ? `Only A is drawn. B: ${b.artifactAbsence ?? 'its artifact has not loaded.'}`
+        : `Only B is drawn. A: ${a.artifactAbsence ?? 'its artifact has not loaded.'}`
+      : null;
 
   return (
     <Panel title="Equity — both sides, each anchored to its own base">
@@ -299,6 +378,11 @@ export function CompareEquityChart({
       <p className="text-xs text-gray-500" data-testid="compare-benchmark-note">
         {series.benchmarkNote}
       </p>
+      {oneSided && (
+        <p className="text-sm text-amber-300" data-testid="compare-equity-one-sided">
+          {oneSided} Nothing on this chart is a comparison while one side is missing.
+        </p>
+      )}
       {shades.length > 0 && (
         <p className="text-xs text-amber-300" data-testid="compare-nonoverlap">
           Shaded: the stretches only one side&rsquo;s window covers. Nothing inside them is a
@@ -378,8 +462,12 @@ export interface CompareViewProps {
 function SideProvenance({ side, tag }: { side: CompareSideData; tag: 'A' | 'B' }) {
   if (!side.sweep || !side.report) {
     return (
-      <p data-testid={`provenance-${tag}-absent`} className="text-sm text-gray-400">
-        {tag}: {side.error ?? 'this run has not loaded, so its provenance cannot be shown.'}
+      <p
+        data-testid={`provenance-${tag}-absent`}
+        data-run-status={side.status ?? 'unknown'}
+        className="text-sm text-gray-400"
+      >
+        {tag} · <span className="font-mono">{side.ref.runId}</span>: {sideStatusNote(side)}
       </p>
     );
   }
@@ -388,6 +476,13 @@ function SideProvenance({ side, tag }: { side: CompareSideData; tag: 'A' | 'B' }
       <p className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">
         {tag} · {side.ref.runId} · {label(side.ref)}
       </p>
+      {side.dedupFrom && (
+        <p data-testid={`provenance-${tag}-dedup`} className="text-xs text-gray-400 mb-1">
+          Reached from run <span className="font-mono">{side.dedupFrom}</span>, which was
+          deduplicated — nothing was replayed under its id, and the evidence below answers its spec
+          as well as this run&rsquo;s.
+        </p>
+      )}
       <ProvenanceFooter
         sweep={side.sweep}
         report={side.report}
@@ -438,8 +533,12 @@ export default function CompareView({ a, b }: CompareViewProps) {
         />
       </div>
     ) : (
-      <p data-testid={`strip-${tag}-absent`} className="text-sm text-gray-400">
-        {tag}: {side.error ?? 'loading this run…'}
+      <p
+        data-testid={`strip-${tag}-absent`}
+        data-run-status={side.status ?? 'unknown'}
+        className="text-sm text-gray-400"
+      >
+        {tag} · <span className="font-mono">{side.ref.runId}</span>: {sideStatusNote(side)}
       </p>
     );
 
@@ -494,7 +593,7 @@ export default function CompareView({ a, b }: CompareViewProps) {
               symbol={a.ref.symbol}
               bars={a.bars}
               barsAbsence={a.barsAbsence}
-              barsLoading={a.loading}
+              barsLoading={a.barsLoading}
               artifact={a.artifact}
               artifactAbsence={a.artifactAbsence}
               window={a.report?.windows.find((w) => w.split === a.ref.split) ?? null}
@@ -504,7 +603,7 @@ export default function CompareView({ a, b }: CompareViewProps) {
               symbol={b.ref.symbol}
               bars={b.bars}
               barsAbsence={b.barsAbsence}
-              barsLoading={b.loading}
+              barsLoading={b.barsLoading}
               artifact={b.artifact}
               artifactAbsence={b.artifactAbsence}
               window={b.report?.windows.find((w) => w.split === b.ref.split) ?? null}
@@ -515,15 +614,29 @@ export default function CompareView({ a, b }: CompareViewProps) {
               row={a.row}
               absence={a.digestAbsence}
               strategy={a.strategy}
+              numbersWithheld={alignment.tilesWithheld}
             />
             <DrawdownChart
               series={b.digest?.drawdownSeries ?? []}
               row={b.row}
               absence={b.digestAbsence}
               strategy={b.strategy}
+              numbersWithheld={alignment.tilesWithheld}
             />
-            <PremiumCharts digest={a.digest} absence={a.digestAbsence} strategy={a.strategy} stateLabel={null} />
-            <PremiumCharts digest={b.digest} absence={b.digestAbsence} strategy={b.strategy} stateLabel={null} />
+            <PremiumCharts
+              digest={a.digest}
+              absence={a.digestAbsence}
+              strategy={a.strategy}
+              stateLabel={null}
+              numbersWithheld={alignment.tilesWithheld}
+            />
+            <PremiumCharts
+              digest={b.digest}
+              absence={b.digestAbsence}
+              strategy={b.strategy}
+              stateLabel={null}
+              numbersWithheld={alignment.tilesWithheld}
+            />
             <DeploymentChart
               series={a.digest?.deploymentSeries ?? []}
               reading={a.digest?.deployment ?? null}
@@ -531,6 +644,7 @@ export default function CompareView({ a, b }: CompareViewProps) {
               suppressionReason={a.digest?.suppressionReason ?? null}
               absence={a.digestAbsence}
               strategy={a.strategy}
+              numbersWithheld={alignment.tilesWithheld}
             />
             <DeploymentChart
               series={b.digest?.deploymentSeries ?? []}
@@ -539,6 +653,7 @@ export default function CompareView({ a, b }: CompareViewProps) {
               suppressionReason={b.digest?.suppressionReason ?? null}
               absence={b.digestAbsence}
               strategy={b.strategy}
+              numbersWithheld={alignment.tilesWithheld}
             />
           </div>
           <p className="text-xs text-gray-500" data-testid="paired-charts-note">
