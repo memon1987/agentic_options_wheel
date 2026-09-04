@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
 import {
+  IAP_REFRESH_CLOSED_GRACE_MS,
   IAP_REFRESH_POLL_MS,
   IAP_REFRESH_PROBE_URL,
   IAP_REFRESH_TIMEOUT_MS,
@@ -38,7 +39,32 @@ const respond = (status: number): Response =>
     json: async () => ({}),
   }) as unknown as Response;
 
-/** A popup double. `closed` is the browser's own signal and the `'closed'` outcome. */
+/**
+ * A response IAP wrote ITSELF rather than proxying — its own 401 sign-in page,
+ * its own 403 for an account the policy does not list, its own 5xx. The
+ * `x-goog-iap-generated-response` header is the ONLY thing that says so; the
+ * status alone cannot, because the backend serves 403s and 5xx too.
+ */
+const iapRespond = (status: number): Response =>
+  ({
+    ok: false,
+    status,
+    statusText: '',
+    type: 'basic',
+    headers: new Headers({ 'x-goog-iap-generated-response': 'true' }),
+    text: async () => '<html>IAP</html>',
+    json: async () => ({}),
+  }) as unknown as Response;
+
+/**
+ * A popup double.
+ *
+ * `closed` is NOT a stop signal (see the module header): a real popup that has
+ * navigated to Google's sign-in reports `closed === true` through a severed
+ * `WindowProxy` while the window is on screen and being typed into. These tests
+ * flip it exactly as the browser would — early, and while the session is still
+ * gone — and assert the handler keeps going.
+ */
 function fakeWindow() {
   const win = {
     closed: false,
@@ -143,39 +169,73 @@ describe('startSessionRefresh — outcomes', () => {
     expect(sessionGenerationSnapshot()).toBe(before + 1);
   });
 
-  it('treats any NON-401 as through-the-door — a 500 is IAP passing the request on', async () => {
+  it('a BACKEND 500 — no IAP header — is through-the-door: refreshed', async () => {
     const win = fakeWindow();
     const outcome = await startSessionRefresh({
       open: () => win,
       fetch: vi.fn(async () => respond(500)),
       ...instant(),
     });
-    // The question is "does IAP let a request through", not "is the backend
-    // well". Requiring 200 would leave the operator behind a sign-out banner
-    // because some unrelated dependency was down.
+    // The question this loop asks is "does IAP let a request through", not "is
+    // the backend well". Requiring 200 would leave the operator behind a
+    // sign-out banner because some unrelated dependency was down; the app's own
+    // errors are the hooks' business to surface, not this one's.
     expect(outcome).toBe('refreshed');
   });
 
-  it('win.closed ⇒ closed: polling stops and nothing is claimed', async () => {
+  it('an IAP-generated 403 ⇒ denied, with the popup LEFT OPEN', async () => {
+    markSessionExpired();
     const win = fakeWindow();
-    const doFetch = vi.fn(async () => respond(401));
+    const doFetch = vi.fn(async () => iapRespond(403));
+    const outcome = await startSessionRefresh({ open: () => win, fetch: doFetch, ...instant() });
+
+    // The multi-account chooser landed on an account the IAP policy does not
+    // list. Round 1 read this as success: popup closed, banner down, every hook
+    // resumed into 403 HTML and retried for ever behind a page that looked
+    // signed in.
+    expect(outcome).toBe('denied');
+    // The popup is the ONLY switch-account affordance there is. Closing it
+    // leaves the operator with a banner and no way out but Reload.
+    expect(win.close).not.toHaveBeenCalled();
+    expect(sessionExpiredSnapshot()).toBe(true);
+    expect(sessionGenerationSnapshot()).toBe(0);
+  });
+
+  it('an IAP-generated 5xx is not through the door either — it keeps polling', async () => {
+    const win = fakeWindow();
+    const doFetch = vi
+      .fn()
+      .mockResolvedValueOnce(iapRespond(502))
+      .mockResolvedValueOnce(respond(200));
+    const outcome = await startSessionRefresh({ open: () => win, fetch: doFetch, ...instant() });
+    expect(outcome).toBe('refreshed');
+    expect(doFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('win.closed does NOT stop the attempt: the probe in that same tick still runs', async () => {
+    const win = fakeWindow();
+    const doFetch = vi
+      .fn()
+      .mockResolvedValueOnce(respond(401))
+      .mockResolvedValueOnce(respond(200));
     let sleeps = 0;
     const outcome = await startSessionRefresh({
       open: () => win,
       fetch: doFetch,
       now: () => 0,
+      // The operator finishes signing in and closes the popup inside one 2 s
+      // tick — or, far more often, the popup merely LOOKS closed because it
+      // navigated to Google. Either way the session is back.
       sleep: async () => {
         sleeps += 1;
-        // The operator closes the popup during the third wait.
-        if (sleeps === 3) win.closed = true;
+        if (sleeps === 2) win.closed = true;
       },
     });
-    expect(outcome).toBe('closed');
-    // Two probes ran; the third cycle saw the closed window and stopped BEFORE
-    // probing again. A `closed` that kept polling would be four requests a
-    // minute for five minutes against a session that is still gone.
+    // Round 1 returned `'closed'` here, telling somebody who was already
+    // signed in that the window closed before the session came back.
+    expect(outcome).toBe('refreshed');
     expect(doFetch).toHaveBeenCalledTimes(2);
-    expect(sessionGenerationSnapshot()).toBe(0);
+    expect(sessionGenerationSnapshot()).toBe(1);
   });
 
   it('open returns null ⇒ blocked, with no probe at all', async () => {
@@ -271,6 +331,38 @@ describe('startSessionRefresh — cadence and deadline', () => {
     expect(outcomes).toEqual(['timeout']);
     // Left open ON PURPOSE: five minutes in, the likeliest explanation is a
     // sign-in still in progress, and closing it would throw that away.
+    expect(win.close).not.toHaveBeenCalled();
+    expect(sessionGenerationSnapshot()).toBe(0);
+  });
+
+  it('closed + 401 for the whole grace window ⇒ closed, at its END and not before', async () => {
+    vi.useFakeTimers();
+    expect(IAP_REFRESH_CLOSED_GRACE_MS).toBe(60_000);
+    const win = fakeWindow();
+    const doFetch = vi.fn(async () => respond(401));
+    const outcomes: string[] = [];
+    void startSessionRefresh({ open: () => win, fetch: doFetch }).then((o) => outcomes.push(o));
+
+    await vi.advanceTimersByTimeAsync(IAP_REFRESH_POLL_MS);
+    expect(doFetch).toHaveBeenCalledTimes(1);
+
+    // The browser now says the popup is gone. It may be; it may equally be
+    // Google's sign-in page behind a severed WindowProxy.
+    win.closed = true;
+    await vi.advanceTimersByTimeAsync(IAP_REFRESH_POLL_MS);
+    const atGraceStart = doFetch.mock.calls.length;
+    expect(outcomes).toEqual([]);
+
+    // Still 401, still polling, a whole minute of sign-in time later. A grace
+    // window of zero — the mutation — resolves `'closed'` right here.
+    await vi.advanceTimersByTimeAsync(IAP_REFRESH_CLOSED_GRACE_MS - IAP_REFRESH_POLL_MS);
+    expect(outcomes).toEqual([]);
+    expect(doFetch.mock.calls.length).toBeGreaterThan(atGraceStart + 20);
+
+    await vi.advanceTimersByTimeAsync(IAP_REFRESH_POLL_MS * 2);
+    expect(outcomes).toEqual(['closed']);
+    // Nothing is claimed about the session, and the window the operator may
+    // still be looking at is not touched.
     expect(win.close).not.toHaveBeenCalled();
     expect(sessionGenerationSnapshot()).toBe(0);
   });
