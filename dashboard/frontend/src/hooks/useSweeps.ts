@@ -470,3 +470,319 @@ export function useSweepDetail(runId: string | null) {
 export function useSweepAllowlist() {
   return usePolledGet<SweepAllowlist>('/api/v2/sweeps/allowlist', () => false);
 }
+
+// --------------------------------------------------------------------------- //
+// The sim proxy and the pin (FC-096 Phase E PR-4)
+// --------------------------------------------------------------------------- //
+//
+// `POST /api/v2/sims/run` is a PROXY (`routers/v2.py:948`): it hands back the
+// sim service's own status and body untouched, so everything below reads the
+// service's contract (`deploy/sim_service.py`), not the dashboard's:
+//
+//   200 {run_id, deduplicated: true}  an identical spec already completed
+//   202 {run_id, status, ...}         accepted; poll GET /api/v2/sweeps/{id}
+//   409                               busy | coverage | budget | other
+//   422                               the spec was refused, with the reason
+//   502                               token/network — includes the cold tail
+//
+// The proxy waits 150 s, which is longer than this module's 20 s read timeout,
+// so the sim submit gets its own: aborting at 20 s on a request the service is
+// still working on produces exactly the failure the proxy's own comment names —
+// the operator resubmits and the second attempt 409s against the first.
+
+export const SIM_REQUEST_TIMEOUT_MS = 160_000;
+
+/**
+ * The sentence the 502 branch adds to the server's own words.
+ *
+ * The proxy's network-failure 502 already explains the cold tail; its
+ * token-mint 502 does not, and both arrive here. Rendering the detail verbatim
+ * AND this sentence means the operator is never left with "502" and no next
+ * move, and never has the server's IAM diagnostic paraphrased away.
+ */
+export const SIM_COLD_START_NOTE =
+  'The sim service is scale-to-zero with a measured cold-start tail of up to ~4 minutes, ' +
+  'which is longer than the proxy’s 150 s timeout — so a FIRST submit after an idle period ' +
+  'can land here having woken the instance anyway. Retrying is the right move: the instance ' +
+  'this attempt woke is warm now. Whether this attempt RAN is not knowable from here — ' +
+  'Cloud Run queues the request, so the service can still accept it after the proxy gave up. ' +
+  'If the first attempt landed, Retry answers 409 and links that run.';
+
+/** The four shapes a `/simulate` 409 takes. */
+export type SimConflictKind = 'busy' | 'coverage' | 'budget' | 'generic';
+
+export interface SimConflict {
+  kind: SimConflictKind;
+  /** The service's own words, always. */
+  detail: string;
+  /** The blocking run, when the body names one. `null` is a real answer here:
+   *  the instance-lock 409 sends `run_id: null` when the current run is gone. */
+  runId: string | null;
+  /** Coverage only: how many symbol-days the lake is missing. */
+  missingSymbolDays: number | null;
+  /** Coverage only: `{SYMBOL: [ISO dates]}` as the service listed them. */
+  missing: Record<string, string[]> | null;
+}
+
+const asRecord = (body: unknown): Record<string, unknown> | null =>
+  body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>)
+    : null;
+
+/**
+ * Which 409 this is, by KEY PRESENCE — the deploy smoke's rule
+ * (`cloudbuild.yaml:1264-1272`), which is the only rule that works.
+ *
+ * The bodies carry no `kind` discriminator, so the fields are the
+ * discriminator: the busy 409s carry `run_id` (`sim_service.py:1081,1097`), the
+ * coverage 409 carries `missing_symbol_days` (`:586`), and the two budget 409s
+ * carry `max_cells` (`:551`) or `total_seconds` (`:560`). Presence, never
+ * VALUE: the instance-lock 409 sets `run_id` to `null` when `_CURRENT` has
+ * already been cleared, and a truthiness test would file that as "generic" and
+ * tell the operator nothing about the replay that is blocking them.
+ */
+export function classifySimConflict(body: unknown): SimConflict {
+  const record = asRecord(body);
+  const detail = detailOf(body, 'The sim service refused this spec (409).');
+  const base: SimConflict = {
+    kind: 'generic',
+    detail,
+    runId: null,
+    missingSymbolDays: null,
+    missing: null,
+  };
+  if (!record) return base;
+  if ('run_id' in record) {
+    const raw = record.run_id;
+    return { ...base, kind: 'busy', runId: typeof raw === 'string' && raw ? raw : null };
+  }
+  if ('missing_symbol_days' in record) {
+    const days = record.missing_symbol_days;
+    const missing = asRecord(record.missing);
+    const listed: Record<string, string[]> = {};
+    if (missing) {
+      for (const [symbol, value] of Object.entries(missing)) {
+        if (Array.isArray(value)) {
+          listed[symbol] = value.filter((d): d is string => typeof d === 'string');
+        }
+      }
+    }
+    return {
+      ...base,
+      kind: 'coverage',
+      missingSymbolDays: typeof days === 'number' ? days : null,
+      missing: Object.keys(listed).length > 0 ? listed : null,
+    };
+  }
+  if ('max_cells' in record || 'total_seconds' in record) {
+    return { ...base, kind: 'budget' };
+  }
+  return base;
+}
+
+/** What came back from the ONE POST to `/api/v2/sims/run`. */
+export type SimSubmitOutcome =
+  /** 202 — accepted and running on the service's worker thread. Poll the run. */
+  | { kind: 'accepted'; runId: string; cellCount: number | null }
+  /** 200 — an identical spec had already completed. NOTHING was replayed. */
+  | { kind: 'deduplicated'; runId: string }
+  | { kind: 'session_expired'; detail: string }
+  | { kind: 'unauthenticated'; detail: string }
+  /** 403 — a verified identity that is not an operator. Shown, not hidden. */
+  | { kind: 'unauthorized'; detail: string }
+  | { kind: 'conflict'; conflict: SimConflict }
+  /** 422 — the spec was refused; `detail` is the service's reason, verbatim. */
+  | { kind: 'invalid'; detail: string }
+  /** 502 — token or network, including the cold-start tail. Retryable. */
+  | { kind: 'unreachable'; detail: string }
+  /** 503 — `SIM_SERVICE_URL` unset on this revision, or the service refused. */
+  | { kind: 'disabled'; detail: string }
+  | { kind: 'error'; status: number | null; detail: string };
+
+/**
+ * POST the spec to the sim proxy. EXACTLY ONE request, no retry, ever.
+ *
+ * Same contract as `submitSweep` and for a sharper reason: this endpoint takes
+ * a process-wide lock on the sim service, so an automatic second attempt would
+ * 409 against the first and report the operator's own submit as a conflict.
+ */
+export async function submitSim(spec: SweepSpec): Promise<SimSubmitOutcome> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SIM_REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch('/api/v2/sims/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...IAP_XHR_HEADERS },
+      body: JSON.stringify(spec),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const e = err as Error;
+    return {
+      kind: 'error',
+      status: null,
+      detail:
+        e.name === 'AbortError'
+          ? `The submit did not answer within ${SIM_REQUEST_TIMEOUT_MS / 1000}s. It was NOT ` +
+            'retried, and whether it ran is not knowable from here — the request may still be ' +
+            'queued. If it landed, a Retry answers 409 and links that run; the runs list shows it too.'
+          : e.message || 'The submit could not be sent.',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // Body first, verdict second — IAP's 401 is HTML, the backend's is JSON with
+  // a diagnostic that names its own repair (`submitSweep`, review round 1 F3).
+  if (response.status === 401) {
+    const err = unauthorizedError(response, await response.text().catch(() => ''));
+    if (isSessionExpired(err)) {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    return { kind: 'unauthenticated', detail: err.message };
+  }
+
+  const body = await readBody(response);
+
+  if (response.ok) {
+    if (typeof body === 'string') {
+      // A 2xx whose body will not parse is the sign-in page, not the API.
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    const record = asRecord(body) ?? {};
+    const runId = typeof record.run_id === 'string' ? record.run_id : null;
+    if (!runId) {
+      return {
+        kind: 'error',
+        status: response.status,
+        detail: 'The sim service answered without a run_id, so there is nothing to open.',
+      };
+    }
+    // 200 and 202 are DIFFERENT ANSWERS and the status is what separates them.
+    // A 200 replayed nothing: it is the prior run's id, and treating it as an
+    // acceptance would poll a finished run and call a stored answer new work.
+    if (response.status === 200) return { kind: 'deduplicated', runId };
+    if (response.status === 202) {
+      const cells = record.cell_count;
+      return { kind: 'accepted', runId, cellCount: typeof cells === 'number' ? cells : null };
+    }
+    return {
+      kind: 'error',
+      status: response.status,
+      detail: `The sim service answered ${response.status}, which is neither a dedup hit (200) nor an acceptance (202).`,
+    };
+  }
+
+  const detail = detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim());
+  switch (response.status) {
+    case 403:
+      return { kind: 'unauthorized', detail };
+    case 409:
+      return { kind: 'conflict', conflict: classifySimConflict(body) };
+    case 422:
+      return { kind: 'invalid', detail };
+    case 502:
+      return { kind: 'unreachable', detail };
+    case 503:
+      return { kind: 'disabled', detail };
+    default:
+      return { kind: 'error', status: response.status, detail };
+  }
+}
+
+/** What came back from the ONE POST to `/api/v2/sims/pins`. */
+export type PinOutcome =
+  /** 201 — pinned. `detail` carries the rolling-window echo the route returns. */
+  | { kind: 'created'; pinId: string; windowDays: number | null; holdoutDays: number | null }
+  /** 409 — already pinned, or the active cap. The body NAMES which; verbatim. */
+  | { kind: 'conflict'; detail: string }
+  | { kind: 'invalid'; detail: string }
+  | { kind: 'session_expired'; detail: string }
+  | { kind: 'unauthenticated'; detail: string }
+  | { kind: 'unauthorized'; detail: string }
+  | { kind: 'error'; status: number | null; detail: string };
+
+/**
+ * Pin a spec into the weekly battery. `{spec, note}`, one request, no retry.
+ *
+ * `DELETE` is deliberately NOT offered here (plan §PR-4): un-pinning is a
+ * decision about the battery's standing cost, not a step in reading one cell.
+ */
+export async function pinSpec(spec: SweepSpec, note: string): Promise<PinOutcome> {
+  // A blank note is sent as NO note. The route takes `{spec, note}` with `note`
+  // optional, and filling it with the derived arm name would put a string the
+  // operator never wrote into the pin list as if it were their annotation.
+  const trimmed = note.trim();
+  const pinBody: Record<string, unknown> = trimmed ? { spec, note: trimmed } : { spec };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch('/api/v2/sims/pins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...IAP_XHR_HEADERS },
+      body: JSON.stringify(pinBody),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const e = err as Error;
+    return {
+      kind: 'error',
+      status: null,
+      detail:
+        e.name === 'AbortError'
+          ? 'The pin did not answer in time. It was NOT retried — check GET /api/v2/sims/pins.'
+          : e.message || 'The pin could not be sent.',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 401) {
+    const err = unauthorizedError(response, await response.text().catch(() => ''));
+    if (isSessionExpired(err)) {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    return { kind: 'unauthenticated', detail: err.message };
+  }
+
+  const body = await readBody(response);
+
+  if (response.ok) {
+    if (typeof body === 'string') {
+      markSessionExpired();
+      return { kind: 'session_expired', detail: SESSION_EXPIRED_MESSAGE };
+    }
+    const record = asRecord(body) ?? {};
+    const pinId = typeof record.pin_id === 'string' ? record.pin_id : null;
+    if (!pinId) {
+      return {
+        kind: 'error',
+        status: response.status,
+        detail: 'The pin was accepted but came back without a pin_id.',
+      };
+    }
+    return {
+      kind: 'created',
+      pinId,
+      windowDays: typeof record.window_days === 'number' ? record.window_days : null,
+      holdoutDays: typeof record.holdout_days === 'number' ? record.holdout_days : null,
+    };
+  }
+
+  const detail = detailOf(body, `HTTP ${response.status} ${response.statusText}`.trim());
+  switch (response.status) {
+    case 403:
+      return { kind: 'unauthorized', detail };
+    case 409:
+      return { kind: 'conflict', detail };
+    case 422:
+      return { kind: 'invalid', detail };
+    default:
+      return { kind: 'error', status: response.status, detail };
+  }
+}

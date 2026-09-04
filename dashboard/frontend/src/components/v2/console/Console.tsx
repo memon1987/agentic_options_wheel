@@ -13,7 +13,7 @@
 // base" number is served per cell by PR-1 rather than derived from two objects.
 
 import { useMemo, useState } from 'react';
-import type { SimBars, SweepReport, SweepRow } from '../../../types/v2';
+import type { SimBars, SweepAllowlist, SweepReport, SweepRow, SweepSpec } from '../../../types/v2';
 import { useArtifact } from '../../../hooks/useArtifact';
 import { useBars } from '../../../hooks/useBars';
 import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
@@ -22,6 +22,8 @@ import { artifactStrategy } from './normaliseArtifact';
 import { equityOverlay } from './series';
 import VerdictStrip from './VerdictStrip';
 import ProvenanceFooter from './ProvenanceFooter';
+import TweakBar from './TweakBar';
+import type { SimRefusal } from './TweakBar';
 import PriceChart from './PriceChart';
 import PortfolioEquityView from './PortfolioEquityView';
 import EquityChart from './EquityChart';
@@ -85,6 +87,28 @@ export interface ConsoleProps {
    * the address bar knows nothing about. The tabs are inert without it.
    */
   onSelectSymbol?: (symbol: string) => void;
+  /** Open any cell of THIS run — the tweak bar's already-asked-arm link. */
+  onSelectCell?: (cell: { scenario: string; symbol: string; split: string }) => void;
+  /**
+   * PR-4. The allowlist types the tweak bar's controls; `null` while it loads
+   * and an error string when it could not be read. Both are passed down rather
+   * than fetched here: `Simulations` already holds one `useSweepAllowlist`, and
+   * a second call would be a second poll of a payload that is static per deploy.
+   */
+  allowlist?: SweepAllowlist | null;
+  allowlistError?: string | null;
+  /**
+   * The tweak submit, OWNED BY THE PAGE (review round 1, R5) — a request that
+   * outlives this subtree cannot have its state in it. Absent ⇒ the bar is not
+   * rendered at all, which keeps `Console` usable from a screen with no router.
+   */
+  onTweakSubmit?: (spec: SweepSpec, armName: string) => void;
+  /** The page's in-flight flag and refusal, both keyed to THIS run. */
+  tweakSubmitting?: boolean;
+  /** The run whose submit is in flight — named on every OTHER run's bar. */
+  tweakSubmittingFrom?: string | null;
+  tweakOutcome?: SimRefusal | null;
+  onClearTweakOutcome?: () => void;
 }
 
 export default function Console({
@@ -95,6 +119,14 @@ export default function Console({
   split,
   dedupFrom = null,
   onSelectSymbol,
+  onSelectCell,
+  allowlist = null,
+  allowlistError = null,
+  onTweakSubmit,
+  tweakSubmitting = false,
+  tweakSubmittingFrom = null,
+  tweakOutcome = null,
+  onClearTweakOutcome,
 }: ConsoleProps) {
   const cell = useMemo(() => ({ scenario, symbol, split }), [scenario, symbol, split]);
   const artifactState = useArtifact(sweep, cell);
@@ -352,6 +384,30 @@ export default function Console({
         caveat={report.rejection_tally_caveat}
         strategy={strategy}
       />
+
+      {onTweakSubmit && (
+        <TweakBar
+          // Keyed on the RUN: the controls are prefilled from this run's
+          // effective config, so carrying a half-typed field across a run
+          // switch would show one run's number under another run's key.
+          key={sweep.run_id}
+          sweep={sweep}
+          allowlist={allowlist}
+          allowlistError={allowlistError}
+          baseEffective={baseEffective}
+          scenario={scenario}
+          symbol={symbol}
+          split={split}
+          submitting={tweakSubmitting}
+          submittingFrom={tweakSubmittingFrom}
+          outcome={tweakOutcome}
+          onSubmit={onTweakSubmit}
+          onClearOutcome={onClearTweakOutcome ?? (() => undefined)}
+          // The already-asked arm is a cell of THIS run, so opening it is a
+          // cell selection like any other and travels through the URL.
+          onOpenCell={(cell) => onSelectCell?.(cell)}
+        />
+      )}
 
       <ProvenanceFooter
         sweep={sweep}

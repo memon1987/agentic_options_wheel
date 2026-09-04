@@ -1,0 +1,285 @@
+{
+    "allowed": [
+        {
+            "key": "earnings.blackout_days",
+            "description": "put-leg symbol-level blackout window, days"
+        },
+        {
+            "key": "earnings.enabled",
+            "description": "earnings gate on/off"
+        },
+        {
+            "key": "risk.max_position_size",
+            "description": "per-position fraction of portfolio value \u2014 DOWNWARD ONLY until FC-079 (the sizer never sizes above 1 contract, so raising it is inert)"
+        },
+        {
+            "key": "rolling.enabled",
+            "description": "daily credit-only roller on/off"
+        },
+        {
+            "key": "rolling.imminence_extrinsic_threshold",
+            "description": "extrinsic $/share below which pricing goes mid-based"
+        },
+        {
+            "key": "rolling.itm_trigger_ratio",
+            "description": "stock/strike ratio that makes a call roll-eligible"
+        },
+        {
+            "key": "rolling.max_extension_days",
+            "description": "replacement expiry <= old expiry + N"
+        },
+        {
+            "key": "rolling.max_replacement_delta",
+            "description": "upper delta rail on a replacement call"
+        },
+        {
+            "key": "rolling.min_net_credit_per_contract",
+            "description": "minimum net credit, $/contract"
+        },
+        {
+            "key": "strategy.call_delta_range",
+            "description": "call delta band [lo, hi]"
+        },
+        {
+            "key": "strategy.call_target_dte",
+            "description": "call DTE target, days (1-21 \u2014 bounded by the stored chain lake's reach)"
+        },
+        {
+            "key": "strategy.max_stock_price",
+            "description": "stage-1 price ceiling"
+        },
+        {
+            "key": "strategy.min_avg_volume",
+            "description": "stage-1 average-volume floor"
+        },
+        {
+            "key": "strategy.min_call_premium",
+            "description": "call premium floor, $/share"
+        },
+        {
+            "key": "strategy.min_put_premium",
+            "description": "put premium floor, $/share"
+        },
+        {
+            "key": "strategy.min_stock_price",
+            "description": "stage-1 price floor"
+        },
+        {
+            "key": "strategy.put_delta_range",
+            "description": "put delta band [lo, hi]"
+        },
+        {
+            "key": "strategy.put_target_dte",
+            "description": "put DTE target, days (1-21 \u2014 bounded by the stored chain lake's reach)"
+        },
+        {
+            "key": "universe.excluded_symbols",
+            "description": "symbols the call leg must never write"
+        },
+        {
+            "key": "universe.max_spread_pct",
+            "description": "inventory validator: max bid/ask as fraction of mid"
+        }
+    ],
+    "rejected": [
+        {
+            "key": "bigquery_dataset",
+            "reason": "a sweep never writes to BigQuery (FC-060 Layer 3 owns persistence), so this key changes nothing here."
+        },
+        {
+            "key": "risk.call_stop_loss_percent",
+            "reason": "stop losses are evaluated on /monitor, which the replay's day loop does not run; both switches are off in production anyway (FC-010). An arm that toggled this would be indistinguishable from the base."
+        },
+        {
+            "key": "risk.put_stop_loss_percent",
+            "reason": "stop losses are evaluated on /monitor, which the replay's day loop does not run; both switches are off in production anyway (FC-010). An arm that toggled this would be indistinguishable from the base."
+        },
+        {
+            "key": "risk.stop_loss_multiplier",
+            "reason": "stop losses are evaluated on /monitor, which the replay's day loop does not run; both switches are off in production anyway (FC-010). An arm that toggled this would be indistinguishable from the base."
+        },
+        {
+            "key": "risk.use_call_stop_loss",
+            "reason": "stop losses are evaluated on /monitor, which the replay's day loop does not run; both switches are off in production anyway (FC-010). An arm that toggled this would be indistinguishable from the base."
+        },
+        {
+            "key": "risk.use_put_stop_loss",
+            "reason": "stop losses are evaluated on /monitor, which the replay's day loop does not run; both switches are off in production anyway (FC-010). An arm that toggled this would be indistinguishable from the base."
+        },
+        {
+            "key": "rolling.fallback_strike_attempts",
+            "reason": "unreachable in a replay. The knob decides how many FURTHER strikes the roller tries after the first two rungs, and rung 1 always fills here: `BacktestAlpacaClient.place_option_order` fills immediately at the broker's haircut price rather than resting a limit that can go unfilled. Instrumented over 37 rolls x 7 arms, rung >= 3 was reached 0 times, so every arm returns the base row. It is live in production, where a real limit can miss; it is inert here."
+        },
+        {
+            "key": "stocks.symbols",
+            "reason": "the universe is run SCOPE, not a scenario: pass --symbols. A candidate symbol is a cold materialisation, which belongs to Layer 3's onboarding story."
+        },
+        {
+            "key": "strategy.call_limit_spread_fraction",
+            "reason": "same as put_limit_spread_fraction: the replay records the limit price and fills at `mid - fill_haircut x half-spread` regardless (`BacktestAlpacaClient.place_option_order`). Use `Scenario(fill_haircut=...)` to vary the fill."
+        },
+        {
+            "key": "strategy.opportunity_max_age_minutes",
+            "reason": "the replay hands opportunities from scan to execute in memory; there is no GCS blob and no age to test (see simulator.py's module docstring)."
+        },
+        {
+            "key": "strategy.put_limit_spread_fraction",
+            "reason": "the replay does not honour limit prices. `BacktestAlpacaClient.place_option_order` records `limit_price` and fills at the broker's `mid - fill_haircut x half-spread` instead \u2014 at one decision point per day there is no intraday path along which to decide whether a limit would have been touched. Measured: a `put_limit_spread_fraction: 0.0` arm returned results byte-identical to base on all six effective-universe symbols over a year. Vary the FILL ASSUMPTION instead, with `Scenario(fill_haircut=...)`."
+        },
+        {
+            "key": "strategy_id",
+            "reason": "the strategy profile is chosen by --config, not by an override. A sweep that switched profiles mid-run would compare two engines."
+        },
+        {
+            "key": "universe.min_open_interest",
+            "reason": "the engine has no open-interest data: `BacktestAlpacaClient.get_options_chain` hardcodes `open_interest: 0` (the vendor's historical chains carry no OI). Any floor >= 1 therefore rejects EVERY call, deterministically, and the arm reads as 'this threshold kills the call leg' when the truth is 'the engine cannot see the number'. `universe.max_spread_pct` is allowed because its input is a documented model with a measured error, not an absent field."
+        }
+    ],
+    "described": [
+        "earnings.blackout_days \u2014 put-leg symbol-level blackout window, days",
+        "earnings.enabled \u2014 earnings gate on/off",
+        "risk.max_position_size \u2014 per-position fraction of portfolio value \u2014 DOWNWARD ONLY until FC-079 (the sizer never sizes above 1 contract, so raising it is inert)",
+        "rolling.enabled \u2014 daily credit-only roller on/off",
+        "rolling.imminence_extrinsic_threshold \u2014 extrinsic $/share below which pricing goes mid-based",
+        "rolling.itm_trigger_ratio \u2014 stock/strike ratio that makes a call roll-eligible",
+        "rolling.max_extension_days \u2014 replacement expiry <= old expiry + N",
+        "rolling.max_replacement_delta \u2014 upper delta rail on a replacement call",
+        "rolling.min_net_credit_per_contract \u2014 minimum net credit, $/contract",
+        "strategy.call_delta_range \u2014 call delta band [lo, hi]",
+        "strategy.call_target_dte \u2014 call DTE target, days (1-21 \u2014 bounded by the stored chain lake's reach)",
+        "strategy.max_stock_price \u2014 stage-1 price ceiling",
+        "strategy.min_avg_volume \u2014 stage-1 average-volume floor",
+        "strategy.min_call_premium \u2014 call premium floor, $/share",
+        "strategy.min_put_premium \u2014 put premium floor, $/share",
+        "strategy.min_stock_price \u2014 stage-1 price floor",
+        "strategy.put_delta_range \u2014 put delta band [lo, hi]",
+        "strategy.put_target_dte \u2014 put DTE target, days (1-21 \u2014 bounded by the stored chain lake's reach)",
+        "universe.excluded_symbols \u2014 symbols the call leg must never write",
+        "universe.max_spread_pct \u2014 inventory validator: max bid/ask as fraction of mid"
+    ],
+    "presets": [
+        {
+            "name": "tighter_calls",
+            "label": "Tighter call delta band",
+            "overrides": {
+                "strategy.call_delta_range": [
+                    0.1,
+                    0.2
+                ]
+            }
+        },
+        {
+            "name": "wider_calls",
+            "label": "Wider call delta band",
+            "overrides": {
+                "strategy.call_delta_range": [
+                    0.2,
+                    0.35
+                ]
+            }
+        },
+        {
+            "name": "tighter_puts",
+            "label": "Tighter put delta band",
+            "overrides": {
+                "strategy.put_delta_range": [
+                    0.08,
+                    0.15
+                ]
+            }
+        },
+        {
+            "name": "put_floor_025",
+            "label": "Put premium floor $0.25",
+            "overrides": {
+                "strategy.min_put_premium": 0.25
+            }
+        },
+        {
+            "name": "call_floor_015",
+            "label": "Call premium floor $0.15",
+            "overrides": {
+                "strategy.min_call_premium": 0.15
+            }
+        },
+        {
+            "name": "ceiling_1000",
+            "label": "Price ceiling $1000 (FC-055)",
+            "overrides": {
+                "strategy.max_stock_price": 1000
+            }
+        },
+        {
+            "name": "position_20pct",
+            "label": "Position size 20%",
+            "overrides": {
+                "risk.max_position_size": 0.2
+            }
+        },
+        {
+            "name": "earnings_off",
+            "label": "Earnings gate off",
+            "overrides": {
+                "earnings.enabled": false
+            }
+        },
+        {
+            "name": "roller_off",
+            "label": "Roller off",
+            "overrides": {
+                "rolling.enabled": false
+            }
+        },
+        {
+            "name": "at_the_bid",
+            "label": "Fill at the bid (worst case)",
+            "overrides": {},
+            "fill_haircut": 1.0
+        }
+    ],
+    "caps": {
+        "max_symbols": 12,
+        "max_scenarios": 20,
+        "max_cells": 240,
+        "max_window_days": 730,
+        "min_holdout_days": 60,
+        "min_starting_cash": 10000.0,
+        "max_starting_cash": 1000000.0,
+        "max_spec_bytes": 24576,
+        "max_scenario_name_chars": 40,
+        "scenario_name_pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*\\Z",
+        "symbol_pattern": "^[A-Z][A-Z.]{0,5}\\Z",
+        "job_task_timeout_seconds": 10800,
+        "stale_grace_minutes": 10
+    },
+    "value_types": {
+        "strategy.put_delta_range": "band",
+        "strategy.call_delta_range": "band",
+        "strategy.min_put_premium": "number",
+        "strategy.min_call_premium": "number",
+        "strategy.put_target_dte": "int",
+        "strategy.call_target_dte": "int",
+        "strategy.min_stock_price": "number",
+        "strategy.max_stock_price": "number",
+        "strategy.min_avg_volume": "number",
+        "risk.max_position_size": "number",
+        "universe.excluded_symbols": "symbols",
+        "universe.max_spread_pct": "number",
+        "earnings.enabled": "bool",
+        "earnings.blackout_days": "int",
+        "rolling.enabled": "bool",
+        "rolling.itm_trigger_ratio": "number",
+        "rolling.max_extension_days": "int",
+        "rolling.max_replacement_delta": "number",
+        "rolling.min_net_credit_per_contract": "number",
+        "rolling.imminence_extrinsic_threshold": "number"
+    },
+    "defaults": {
+        "starting_cash": 100000.0,
+        "run_sensitivity": false
+    },
+    "base_scenario_name": "base",
+    "engine_version": "fc-069-scanner-rewire",
+    "engine_identity": "129711f15fe0488a",
+    "min_days_in_position": 0.25
+}

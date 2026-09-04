@@ -19,16 +19,24 @@
 // when a run resolves — replace, so Back never has to fight an auto-select to
 // leave the page.
 
-import { useEffect, useMemo } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../../hooks/useApi';
-import type { LiveStrategyConfig, SweepDetail, SweepReport } from '../../types/v2';
-import { useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
+import type {
+  LiveStrategyConfig,
+  SweepAllowlist,
+  SweepDetail,
+  SweepReport,
+  SweepSpec,
+} from '../../types/v2';
+import { isTerminalSweepStatus } from '../../types/v2';
+import { submitSim, useSweepAllowlist, useSweepDetail, useSweepList } from '../../hooks/useSweeps';
 import SubmitSweep from '../../components/v2/sims/SubmitSweep';
 import RunsList from '../../components/v2/sims/RunsList';
 import SweepResults from '../../components/v2/sims/SweepResults';
 import BiasFooter from '../../components/v2/sims/BiasFooter';
 import Console from '../../components/v2/console/Console';
+import type { SimRefusal } from '../../components/v2/console/TweakBar';
 
 /** Where the console opens when nobody has chosen a cell. */
 export interface CellSelection {
@@ -92,6 +100,78 @@ export const cellPath = (runId: string, cell: CellSelection): string =>
   `/sims/${encodeURIComponent(runId)}/${encodeURIComponent(cell.scenario)}/` +
   `${encodeURIComponent(cell.symbol)}/${encodeURIComponent(cell.split)}`;
 
+
+/** What a submit answered, kept on the PAGE so it survives the bar (R5). */
+export interface TweakNotice {
+  kind: 'accepted' | 'deduplicated';
+  /** The run that holds the answer. */
+  runId: string;
+  /** The run the submit was made from. */
+  sourceRunId: string;
+  armName: string;
+  cellCount: number | null;
+  /** False when the operator had navigated away before the answer arrived. */
+  navigated: boolean;
+}
+
+interface TweakState {
+  /** The run the in-flight submit was made from. */
+  from: string | null;
+  submitting: boolean;
+  outcome: SimRefusal | null;
+}
+
+/**
+ * The submit's answer, rendered ABOVE every results shell (review round 1, R3).
+ *
+ * It used to live inside the `done` branch, so a 202 — whose destination is by
+ * definition NOT done — showed the generic Job shell ("6-8 minutes") with no
+ * acknowledgement that anything had been submitted; and when the run finished,
+ * the notice appeared saying "this page polls it until it finishes" about a run
+ * that had already finished, and stayed there.
+ *
+ * So it renders first, and the polling clause is a function of the run's LIVE
+ * status rather than of what was true at submit time.
+ */
+export function TweakNoticeBanner({
+  notice,
+  status,
+}: {
+  notice: TweakNotice;
+  /** The destination run's status, or `null` while it has not loaded. */
+  status: string | null;
+}) {
+  const terminal = status !== null && isTerminalSweepStatus(status);
+  const cells = notice.cellCount === null ? '' : ` (${notice.cellCount} cells)`;
+  const body =
+    notice.kind === 'deduplicated'
+      ? `Answered from stored run ${notice.runId} — an identical spec had already completed on ` +
+        'this engine and commit, so NOTHING was replayed.'
+      : `Run ${notice.runId} accepted — replaying arm “${notice.armName}”${cells}.` +
+        (terminal ? ' It has finished.' : ' This page polls it until it finishes.');
+  return (
+    <p
+      data-testid="tweak-notice"
+      data-notice-kind={notice.kind}
+      role="status"
+      aria-live="polite"
+      className="rounded border border-blue-800/60 bg-blue-950/30 px-3 py-2 text-sm text-blue-200"
+    >
+      {body}
+      {!notice.navigated && (
+        <>
+          {' '}
+          You had moved to another run while this was in flight, so nothing was opened for you.{' '}
+          <Link className="underline" to={`/sims/${encodeURIComponent(notice.runId)}`}>
+            Open run {notice.runId}
+          </Link>
+          .
+        </>
+      )}
+    </p>
+  );
+}
+
 export default function Simulations() {
   const { runId, scenario, symbol, split } = useParams<{
     runId?: string;
@@ -145,6 +225,72 @@ export default function Simulations() {
     if (selectedRunId) navigate(cellPath(selectedRunId, cell));
   };
 
+  /**
+   * PR-4 (review round 1, R3 + R5). The submit lives HERE, not in the bar.
+   *
+   * A sim submit waits up to 150 s. The bar is keyed on the run, so selecting
+   * another run mid-flight unmounts it — and the first version's `setState` in
+   * the promise's tail then lost the refusal entirely, or fired a navigation
+   * that yanked the operator off whatever they had moved on to read. So the
+   * page owns the request, its in-flight flag, its refusal and its notice, and
+   * every one of them is keyed to the run the submit was made FROM.
+   */
+  const [tweak, setTweak] = useState<TweakState>({ from: null, submitting: false, outcome: null });
+  const [notice, setNotice] = useState<TweakNotice | null>(null);
+
+  /**
+   * Clear the outcome — but only the one belonging to the run on screen.
+   *
+   * The confirmation pass caught this: unconditional, typing in run B's bar
+   * dropped run A's pending refusal before the operator ever returned to A,
+   * which is the exact loss R5 exists to prevent. An outcome is cleared by the
+   * operator editing the spec THAT OUTCOME BELONGS TO, and by nothing else.
+   */
+  const clearTweakOutcome = () => {
+    setTweak((prev) =>
+      prev.outcome && prev.from === latestRunId.current ? { ...prev, outcome: null } : prev,
+    );
+  };
+
+  const onTweakSubmit = (spec: SweepSpec, armName: string) => {
+    const from = selectedRunId;
+    const cell = { symbol: symbol ?? '', split: split ?? '' };
+    // Unreachable from the UI — `tweak.submitting` is passed PAGE-WIDE, so the
+    // bar on every run is disabled while any submit is in flight and says
+    // which run holds it. Kept as the last word rather than the only one: a
+    // silent `return` here is what the confirmation pass found, and it left the
+    // operator clicking a live button that did nothing.
+    if (!from || tweak.submitting) return;
+    setTweak({ from, submitting: true, outcome: null });
+    setNotice(null);
+    void submitSim(spec).then((result) => {
+      setTweak({ from, submitting: false, outcome: null });
+      if (result.kind !== 'accepted' && result.kind !== 'deduplicated') {
+        // A refusal is shown on the run it was made from, whatever is on
+        // screen now — never dropped because the operator moved on.
+        setTweak({ from, submitting: false, outcome: result });
+        return;
+      }
+      // `latestRunId` rather than `selectedRunId`: this closure was made before
+      // the wait, and the operator may have navigated during it.
+      const stillHere = latestRunId.current === from;
+      setNotice({
+        kind: result.kind,
+        runId: result.runId,
+        sourceRunId: from,
+        armName,
+        cellCount: result.kind === 'accepted' ? result.cellCount : null,
+        navigated: stillHere,
+      });
+      // R5: a late 2xx never navigates. The operator is reading something else
+      // by now, and moving them is the same defect as losing the refusal.
+      if (stillHere) {
+        navigate(cellPath(result.runId, { scenario: armName, ...cell }));
+      }
+      refetchList();
+    });
+  };
+
   // Land on the newest run so the page is not empty on arrival — REPLACING, so
   // Back from here leaves /sims rather than bouncing off an auto-select.
   // Depends on `list`, not the derived `sweeps`: `?? []` is a fresh identity on
@@ -168,6 +314,11 @@ export default function Simulations() {
   //
   // So everything downstream is gated on the IDENTITY, not on presence. A
   // mismatch renders the loading state, which is what it actually is.
+  // Read INSIDE the submit's promise tail, which was closed over before the
+  // wait: `selectedRunId` there is the run at submit time, not the run now.
+  const latestRunId = useRef<string | null>(selectedRunId);
+  latestRunId.current = selectedRunId;
+
   const detailMatchesUrl = !!detail && detail.sweep.run_id === selectedRunId;
   const matchedDetail = detailMatchesUrl ? detail : null;
   const report = matchedDetail?.results ?? null;
@@ -256,6 +407,21 @@ export default function Simulations() {
           selection={selection}
           onSelectCell={selectCell}
           dedupFrom={dedupFrom}
+          allowlist={allowlist}
+          allowlistError={allowlistError}
+          onTweakSubmit={onTweakSubmit}
+          // PAGE-WIDE, not per-run: one sim runs at a time, so a flight from
+          // another run disables this bar too — with that run named.
+          tweakSubmitting={tweak.submitting}
+          tweakSubmittingFrom={tweak.from}
+          tweakOutcome={tweak.from === selectedRunId ? tweak.outcome : null}
+          onClearTweakOutcome={clearTweakOutcome}
+          // The answer belongs on the run that HOLDS it. When the operator had
+          // moved on before it arrived, nothing was opened for them — so it
+          // shows on WHATEVER they are looking at, with a link, rather than
+          // waiting on a screen they may never go back to. Either way it is
+          // replaced by the next submit.
+          notice={notice && (!notice.navigated || notice.runId === selectedRunId) ? notice : null}
         />
       )}
     </div>
@@ -358,6 +524,14 @@ function ResultsRegion({
   selection,
   onSelectCell,
   dedupFrom,
+  allowlist,
+  allowlistError,
+  onTweakSubmit,
+  tweakSubmitting,
+  tweakSubmittingFrom,
+  tweakOutcome,
+  onClearTweakOutcome,
+  notice,
 }: {
   detail: SweepDetail | null;
   detailError: string | null;
@@ -366,23 +540,63 @@ function ResultsRegion({
   onSelectCell: (cell: CellSelection) => void;
   /** The deduplicated run this screen was auto-opened from, if any. */
   dedupFrom: string | null;
+  /** PR-4: the tweak bar's control types, and where a submit lands. */
+  allowlist: SweepAllowlist | null;
+  allowlistError: string | null;
+  onTweakSubmit: (spec: SweepSpec, armName: string) => void;
+  tweakSubmitting: boolean;
+  /** The run whose submit is in flight, when one is. */
+  tweakSubmittingFrom: string | null;
+  tweakOutcome: SimRefusal | null;
+  onClearTweakOutcome: () => void;
+  /** What the submit that brought us here said, or `null`. */
+  notice: TweakNotice | null;
 }) {
+  // R3: the submit's answer precedes every shell below it. A 202 lands on a
+  // run that is by definition not `done`, so a notice rendered only in the
+  // `done` branch is a notice the operator never sees at the moment it matters.
+  const banner = notice ? (
+    <TweakNoticeBanner notice={notice} status={detail?.sweep.status ?? null} />
+  ) : null;
+  const framed = (body: React.ReactNode) => (
+    <div className="space-y-6">
+      {banner}
+      {body}
+    </div>
+  );
+
   if (detailError && !detail) {
-    return (
-      <section className="rounded-lg border border-yellow-700/60 bg-gray-800 p-5">
+    // A run submitted seconds ago is not "unreadable": the row reaches
+    // BigQuery on a short streaming lag, and the red banner reads as a failure
+    // of a run that is in fact fine (review round 1, LOW).
+    const awaiting = !!notice && notice.runId !== null && notice.navigated;
+    return framed(
+      <section
+        className={`rounded-lg border bg-gray-800 p-5 ${
+          awaiting ? 'border-gray-700' : 'border-yellow-700/60'
+        }`}
+      >
         <h2 className="text-base font-semibold text-white">Results</h2>
-        <p className="text-sm text-yellow-400 mt-2">
-          ⚠ This run could not be read: {detailError}. Its state is <strong>unknown</strong>, not empty.
-        </p>
-      </section>
+        {awaiting ? (
+          <p data-testid="results-streaming-lag" className="text-sm text-gray-400 mt-2">
+            This run is not visible yet — its row reaches the store on a short streaming lag after
+            the service accepts it. This page keeps polling. ({detailError})
+          </p>
+        ) : (
+          <p className="text-sm text-yellow-400 mt-2">
+            ⚠ This run could not be read: {detailError}. Its state is <strong>unknown</strong>, not
+            empty.
+          </p>
+        )}
+      </section>,
     );
   }
   if (!detail) {
-    return (
+    return framed(
       <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
         <h2 className="text-base font-semibold text-white">Results</h2>
         <p className="text-sm text-gray-400 mt-2">Loading…</p>
-      </section>
+      </section>,
     );
   }
 
@@ -390,16 +604,19 @@ function ResultsRegion({
   const id = <span className="font-mono">{sweep.run_id}</span>;
 
   const shell = (body: React.ReactNode, tone: 'neutral' | 'bad' = 'neutral') => (
-    <section
+    <div className="space-y-6">
+      {banner}
+      <section
       data-testid="results-status"
       data-run-status={sweep.status}
       className={`rounded-lg border bg-gray-800 p-5 ${
         tone === 'bad' ? 'border-red-800/60' : 'border-gray-700'
       }`}
     >
-      <h2 className="text-base font-semibold text-white">Results</h2>
-      {body}
-    </section>
+        <h2 className="text-base font-semibold text-white">Results</h2>
+        {body}
+      </section>
+    </div>
   );
 
   if (sweep.status === 'submitted' || sweep.status === 'running') {
@@ -491,6 +708,7 @@ function ResultsRegion({
           ⚠ Could not refresh this run ({detailError}) — showing the last good read.
         </p>
       )}
+      {banner}
       <SweepResults sweep={sweep} report={results} raw={raw} />
       {selection && cellExists(results, selection) && (
         <section className="rounded-lg border border-gray-700 bg-gray-800 p-5 space-y-4">
@@ -506,6 +724,14 @@ function ResultsRegion({
             // A symbol TAB is a cell selection like any other: it pushes, so
             // Back walks the operator's own history through it.
             onSelectSymbol={(symbol) => onSelectCell({ ...selection, symbol })}
+            allowlist={allowlist}
+            allowlistError={allowlistError}
+            onTweakSubmit={onTweakSubmit}
+            tweakSubmitting={tweakSubmitting}
+            tweakSubmittingFrom={tweakSubmittingFrom}
+            tweakOutcome={tweakOutcome}
+            onClearTweakOutcome={onClearTweakOutcome}
+            onSelectCell={onSelectCell}
           />
         </section>
       )}
