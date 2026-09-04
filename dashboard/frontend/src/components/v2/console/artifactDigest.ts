@@ -34,86 +34,43 @@
 // exist on the 20 objects already stored, and monthly buckets are a chart, not
 // a fact the engine should own.
 
-import type {
-  MonthlyCashflow,
-  SimArtifact,
-  SimBars,
-  SimCycle,
-  SimLedgerEvent,
-} from '../../../types/v2';
-import { parseOcc } from '../../../utils/format';
-import { artifactStrategy, isWheelStrategy } from './normaliseArtifact';
+import type { MonthlyCashflow, SimArtifact, SimBars } from '../../../types/v2';
+import { artifactStrategy } from './normaliseArtifact';
+import {
+  CAPITAL_BASE_SUPPRESSED,
+  deploymentSeries,
+  drawdownSeries,
+  FEE_BEARING_KINDS,
+  inSet,
+  maxDrawdownOf,
+  monthlyFromLedger,
+  OPEN_KINDS,
+  resolveCapitalBase,
+  type CapitalBaseSource,
+  type DeploymentPoint,
+  type DeploymentReading,
+  type DrawdownPoint,
+} from './series';
 
 // --------------------------------------------------------------------------- //
-// The event sets, named once
+// Re-exports.
+//
+// PR-3 moved the series builders and the capital-base resolver into `series.ts`
+// so the CHARTS and these TILES read one definition rather than two. The names
+// stay exported from here because this is where §D-4 describes them and where
+// the callers already import them from; the bodies live next to the chart seams
+// they also feed.
 // --------------------------------------------------------------------------- //
 
-/** Cash RECEIVED for writing an option, before the fee deduction. */
-export const OPEN_KINDS = ['sell_put_open', 'sell_call_open'] as const;
-
-/**
- * The events that carry a fee.
- *
- * The fee RATE on the tile is `Σ fees ÷ Σ contracts` over THIS set, not over
- * the whole ledger: `expire_worthless` carries contracts and no fee, so mixing
- * the all-events fee sum with an open-events contract count prints $0.047 on
- * the captured fixture (1.68 ÷ 36) for an engine whose constant is $0.04. Same
- * set on top and bottom, or the label lies.
- */
-export const FEE_BEARING_KINDS = ['sell_put_open', 'sell_call_open', 'buy_to_close'] as const;
-
-/**
- * The option-lifecycle events whose cash movements are the option leg.
- *
- * Assignments and dividends are deliberately OUT: an assignment's `cash_delta`
- * is the share purchase or sale, which belongs to the stock leg. On the
- * captured fixture this set's cash sums to $4,453.49 — the row's `option_pnl`
- * exactly — which is the cheap check that the boundary is drawn where the
- * engine draws it.
- */
-export const OPTION_CASH_KINDS = [
-  'sell_put_open',
-  'sell_call_open',
-  'buy_to_close',
-  'expire_worthless',
-] as const;
-
-const inSet = (kinds: readonly string[], kind: string): boolean => kinds.includes(kind);
-
-// --------------------------------------------------------------------------- //
-// Shapes
-// --------------------------------------------------------------------------- //
-
-export type CapitalBaseSource = 'stamped' | 'starting_cash';
-
-export interface DeploymentReading {
-  /**
-   * Dollar-weighted mean over ALL decision days of
-   * `(reserved_collateral + share value) / capital_base`.
-   *
-   * All days, not deployed days: "how much of the account was working" is a
-   * question about the window, and averaging only the days with a position
-   * answers a different one (on the captured fixture the reserved-only readings
-   * are $14,328 all-days against $29,758 deployed-days — a 2× difference that
-   * an unstated definition would hide).
-   */
-  ratio: number | null;
-  /** `closes` = share value from the sidecar; `at cost` = the fallback. */
-  basis: 'closes' | 'at cost' | 'none';
-  days: number;
-  /** The reserved-collateral component alone, in dollars. Pinned by test. */
-  reservedMeanDollars: number;
-  /** The share-value component alone, in dollars; `null` when unvaluable. */
-  sharesValueMeanDollars: number | null;
-  /** Days holding shares this module could not value. Non-zero ⇒ `ratio` null. */
-  unresolvedShareDays: number;
-  /**
-   * Why those days could not be valued, for the tile (review round 1, F9).
-   * `null` when there are none. An absent ratio with no reason beside it reads
-   * as "not computed yet".
-   */
-  unresolvedReason: string | null;
-}
+export {
+  CAPITAL_BASE_SUPPRESSED,
+  FEE_BEARING_KINDS,
+  maxDrawdownOf,
+  OPEN_KINDS,
+  OPTION_CASH_KINDS,
+  resolveCapitalBase,
+} from './series';
+export type { CapitalBaseSource, DeploymentReading } from './series';
 
 export interface DigestReconcile {
   optionPnl: number;
@@ -163,13 +120,8 @@ export interface ArtifactDigest {
   netOptionCash: number;
   netOptionCashSeries: Array<{ date: string; value: number }>;
   monthly: MonthlyCashflow[];
-  drawdownSeries: Array<{ date: string; equity: number; drawdown: number }>;
-  deploymentSeries: Array<{
-    date: string;
-    reserved: number;
-    sharesValue: number | null;
-    ratio: number | null;
-  }>;
+  drawdownSeries: DrawdownPoint[];
+  deploymentSeries: DeploymentPoint[];
   deployment: DeploymentReading;
 
   /** FOR THE TEST ONLY. Never rendered — the strip shows the ROW's numbers. */
@@ -182,53 +134,8 @@ export interface DigestOptions {
 }
 
 // --------------------------------------------------------------------------- //
-// Capital base
-// --------------------------------------------------------------------------- //
-
-export const CAPITAL_BASE_SUPPRESSED =
-  'Capital base not stamped on this artifact, so every ratio on this cell would need a ' +
-  'denominator this console had to guess. They are hidden rather than approximated: a ' +
-  "covered-call cell divided by the wheel's starting cash prints a plausible, wrong " +
-  'percentage under a correct-looking label.';
-
-/**
- * THE denominator, resolved in the order §D-4 fixes.
- *
- * `provenance.capital_base` (PR-1's stamp) whenever present. Otherwise
- * `starting_cash` — but ONLY on a wheel artifact, where the two are the same
- * number by construction. On any other strategy the answer is "there isn't
- * one", which is a renderable state and a wrong denominator is not.
- */
-export function resolveCapitalBase(
-  artifact: SimArtifact,
-  strategy: string,
-): { base: number | null; source: CapitalBaseSource | null } {
-  const stamped = artifact.provenance.capital_base;
-  if (typeof stamped === 'number' && Number.isFinite(stamped) && stamped > 0) {
-    return { base: stamped, source: 'stamped' };
-  }
-  const starting = artifact.provenance.starting_cash;
-  if (isWheelStrategy(strategy) && typeof starting === 'number' && Number.isFinite(starting) && starting > 0) {
-    return { base: starting, source: 'starting_cash' };
-  }
-  return { base: null, source: null };
-}
-
-// --------------------------------------------------------------------------- //
 // Pieces
 // --------------------------------------------------------------------------- //
-
-/** Put or call, from the OCC symbol where there is one, else from the kind. */
-function optionSide(event: SimLedgerEvent): 'put' | 'call' | null {
-  const parsed = parseOcc(event.symbol);
-  if (parsed.optionType === 'P') return 'put';
-  if (parsed.optionType === 'C') return 'call';
-  if (event.kind === 'sell_put_open' || event.kind === 'put_assignment') return 'put';
-  if (event.kind === 'sell_call_open' || event.kind === 'call_assignment') return 'call';
-  return null;
-}
-
-const monthOf = (date: string): string => date.slice(0, 7);
 
 /**
  * The engine's `days`: `(end - start).days` over the first and last DECISION
@@ -245,39 +152,6 @@ export function calendarSpan(artifact: SimArtifact): number | null {
   const b = Date.parse(`${last}T00:00:00Z`);
   if (Number.isNaN(a) || Number.isNaN(b)) return null;
   return Math.round((b - a) / 86_400_000);
-}
-
-/** `fitness._max_drawdown`, including its collapse of sub-basis-point noise. */
-export function maxDrawdownOf(equity: number[]): number {
-  let peak = -Infinity;
-  let worst = 0;
-  for (const value of equity) {
-    if (value > peak) peak = value;
-    if (peak > 0) {
-      const dd = (value - peak) / peak;
-      if (dd < worst) worst = dd;
-    }
-  }
-  return worst > -1e-9 ? 0 : worst;
-}
-
-/**
- * The cost basis to value shares at on `date` when there is no sidecar.
- *
- * The cycle with the LATEST start that still contains the day. An open cycle's
- * `end` is null, which extends it to the last decision day — the same reading
- * the engine's own cycle materialisation uses.
- */
-function costBasisOn(cycles: SimCycle[], underlying: string, date: string): number | null {
-  let best: SimCycle | null = null;
-  for (const cycle of cycles) {
-    if (cycle.underlying !== underlying) continue;
-    if (cycle.cost_basis === null) continue;
-    if (cycle.start > date) continue;
-    if (cycle.end !== null && cycle.end < date) continue;
-    if (!best || cycle.start > best.start) best = cycle;
-  }
-  return best ? best.cost_basis : null;
 }
 
 // --------------------------------------------------------------------------- //
@@ -308,118 +182,16 @@ export function computeDigest(
   const feeRatePerContract = feeContracts > 0 ? feeBearingFees / feeContracts : null;
 
   // --- option cash, cumulative and by month ------------------------------ //
-  const byDate = new Map<string, number>();
-  const byMonth = new Map<string, MonthlyCashflow>();
-  for (const event of artifact.ledger) {
-    if (!inSet(OPTION_CASH_KINDS, event.kind)) continue;
-    byDate.set(event.date, (byDate.get(event.date) ?? 0) + event.cash_delta);
-
-    const month = monthOf(event.date);
-    const row = byMonth.get(month) ?? {
-      month,
-      net_option_cashflow: 0,
-      put_net_cashflow: 0,
-      call_net_cashflow: 0,
-      gross_premium: 0,
-      buyback_cost: 0,
-      event_count: 0,
-    };
-    row.net_option_cashflow += event.cash_delta;
-    const side = optionSide(event);
-    if (side === 'put') row.put_net_cashflow += event.cash_delta;
-    else if (side === 'call') row.call_net_cashflow += event.cash_delta;
-    if (inSet(OPEN_KINDS, event.kind)) row.gross_premium += event.cash_delta + event.fees;
-    if (event.kind === 'buy_to_close') row.buyback_cost += -event.cash_delta;
-    row.event_count += 1;
-    byMonth.set(month, row);
-  }
-  const netOptionCashSeries: Array<{ date: string; value: number }> = [];
-  let running = 0;
-  for (const date of [...byDate.keys()].sort()) {
-    running += byDate.get(date) as number;
-    netOptionCashSeries.push({ date, value: running });
-  }
-  const monthly = [...byMonth.values()].sort((a, b) => a.month.localeCompare(b.month));
+  //
+  // One builder, shared with `PremiumCharts` (§PR-3). The tile's number and the
+  // chart's last point cannot disagree because there is only one of them.
+  const optionCash = monthlyFromLedger(artifact.ledger);
 
   // --- drawdown ---------------------------------------------------------- //
-  const drawdownSeries: Array<{ date: string; equity: number; drawdown: number }> = [];
-  let peak = -Infinity;
-  for (const day of artifact.daily) {
-    if (day.equity > peak) peak = day.equity;
-    drawdownSeries.push({
-      date: day.date,
-      equity: day.equity,
-      drawdown: peak > 0 ? (day.equity - peak) / peak : 0,
-    });
-  }
+  const drawdown = drawdownSeries(artifact.daily);
 
   // --- deployment -------------------------------------------------------- //
-  //
-  // The sidecar is ONE symbol's bars (review round 1, F9). It was being applied
-  // to every underlying in `shares_held`: on a cell holding shares of anything
-  // but the sidecar's symbol, the deployment ratio was that symbol's share count
-  // priced at a DIFFERENT company's close — a plausible number under a
-  // correct-looking label, which is the exact failure §D-4 suppresses ratios to
-  // avoid. Today `shares_held` carries one underlying per cell, so this was
-  // latent; a portfolio-level artifact would have made it wrong on arrival.
-  const closes = new Map<string, number>();
-  for (const bar of sidecar?.bars ?? []) closes.set(bar.date, bar.close);
-  const sidecarSymbol = sidecar?.provenance.symbol ?? null;
-  const hasCloses = closes.size > 0;
-
-  const deploymentSeries: ArtifactDigest['deploymentSeries'] = [];
-  let reservedSum = 0;
-  let sharesValueSum = 0;
-  let unresolvedShareDays = 0;
-  let valuedAtCost = 0;
-  const unvaluable = new Set<string>();
-  for (const day of artifact.daily) {
-    reservedSum += day.reserved_collateral;
-    let sharesValue: number | null = 0;
-    for (const [underlying, shares] of Object.entries(day.shares_held)) {
-      if (shares === 0) continue;
-      // The sidecar's close ONLY for the sidecar's own symbol. Anything else
-      // falls back to the lot's cost basis, which is a stated approximation
-      // ("at cost") rather than another company's price.
-      const close =
-        hasCloses && underlying === sidecarSymbol ? (closes.get(day.date) ?? null) : null;
-      const price = close ?? costBasisOn(artifact.cycles, underlying, day.date);
-      if (price === null) {
-        sharesValue = null;
-        unvaluable.add(underlying);
-        break;
-      }
-      if (close === null) valuedAtCost += 1;
-      sharesValue += shares * price;
-    }
-    if (sharesValue === null) unresolvedShareDays += 1;
-    else sharesValueSum += sharesValue;
-    deploymentSeries.push({
-      date: day.date,
-      reserved: day.reserved_collateral,
-      sharesValue,
-      ratio:
-        capitalBase && sharesValue !== null
-          ? (day.reserved_collateral + sharesValue) / capitalBase
-          : null,
-    });
-  }
-  const days = artifact.daily.length;
-  const valuable = days > 0 && unresolvedShareDays === 0;
-  const deployment: DeploymentReading = {
-    ratio: valuable && capitalBase ? (reservedSum + sharesValueSum) / days / capitalBase : null,
-    basis: days === 0 ? 'none' : !hasCloses || valuedAtCost > 0 ? 'at cost' : 'closes',
-    days,
-    reservedMeanDollars: days > 0 ? reservedSum / days : 0,
-    sharesValueMeanDollars: valuable ? sharesValueSum / days : null,
-    unresolvedShareDays,
-    unresolvedReason: unresolvedShareDays
-      ? `${unresolvedShareDays} day${unresolvedShareDays === 1 ? '' : 's'} held ` +
-        `${[...unvaluable].sort().join(', ')} at a price this console could not establish — ` +
-        'no bar in the sidecar for that symbol and no cycle cost basis covering the day. ' +
-        'The ratio is withheld rather than computed over a partial position.'
-      : null,
-  };
+  const deployed = deploymentSeries(artifact.daily, sidecar, artifact.cycles, capitalBase);
 
   // --- reconcile (test-only; see the header) ------------------------------ //
   const finalEquity = artifact.daily.length
@@ -462,14 +234,12 @@ export function computeDigest(
     fees,
     feeContracts,
     feeRatePerContract,
-    netOptionCash: netOptionCashSeries.length
-      ? netOptionCashSeries[netOptionCashSeries.length - 1].value
-      : 0,
-    netOptionCashSeries,
-    monthly,
-    drawdownSeries,
-    deploymentSeries,
-    deployment,
+    netOptionCash: optionCash.total,
+    netOptionCashSeries: optionCash.cumulative,
+    monthly: optionCash.monthly,
+    drawdownSeries: drawdown,
+    deploymentSeries: deployed.series,
+    deployment: deployed.reading,
     reconcile,
   };
 }

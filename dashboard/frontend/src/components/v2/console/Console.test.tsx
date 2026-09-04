@@ -18,7 +18,7 @@
 // of the four are about the seam between the report, the hooks and the strip.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import shaped13cc from '../../../test/fixtures/sweep_shaped_13cc.json';
 import artifact13cc from '../../../test/fixtures/artifact_13cc_base_googl_fit.json';
 import bars13cc from '../../../test/fixtures/bars_13cc_googl_fit.json';
@@ -215,7 +215,11 @@ describe('the cell-state partition, beyond `insuf`', () => {
 });
 
 describe('the shell’s composition', () => {
-  it('renders the strip, the six PR-3 placeholders and the footer, in order', async () => {
+  it('renders every panel in the order the plan fixes', async () => {
+    // The order is an ARGUMENT, not a layout preference: the in-sample banner
+    // precedes everything it qualifies, the strip's engine numbers precede any
+    // picture of them, and the provenance footer closes the page under the
+    // evidence it describes.
     serveObjects();
     show();
     await screen.findByTestId('verdict-strip');
@@ -224,14 +228,27 @@ describe('the shell’s composition', () => {
     ).map((el) => el.getAttribute('data-testid'));
     const ordered = [
       'verdict-strip',
-      'placeholder-price',
-      'placeholder-equity',
-      'placeholder-premium',
-      'placeholder-forecast',
-      'placeholder-ledger',
-      'placeholder-rejections',
+      'symbol-tabs',
+      'price-chart',
+      'equity-chart',
+      'premium-charts',
+      'drawdown-chart',
+      'deployment-chart',
+      'forecast-panel',
+      'ledger-table',
+      'cycle-table',
+      'rejection-panel',
       'provenance-footer',
     ];
     expect(ids.filter((id) => ordered.includes(id!))).toEqual(ordered);
+  });
+
+  it('swaps the price chart for the portfolio index on the Portfolio tab', async () => {
+    serveObjects();
+    show();
+    await screen.findByTestId('price-chart');
+    fireEvent.click(screen.getByTestId('portfolio-tab'));
+    expect(screen.getByTestId('portfolio-equity-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('price-chart')).not.toBeInTheDocument();
   });
 });

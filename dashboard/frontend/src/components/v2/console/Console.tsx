@@ -12,31 +12,34 @@
 // fetch the base cell's artifact — that is PR-3's overlay, and the strip's "vs
 // base" number is served per cell by PR-1 rather than derived from two objects.
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { SimBars, SweepReport, SweepRow } from '../../../types/v2';
 import { useArtifact } from '../../../hooks/useArtifact';
 import { useBars } from '../../../hooks/useBars';
-import { indexRows, lookupCell } from '../sims/resultCells';
+import { indexRows, lookupCell, renderCell } from '../sims/resultCells';
 import { computeDigest } from './artifactDigest';
 import { artifactStrategy } from './normaliseArtifact';
+import { equityOverlay } from './series';
 import VerdictStrip from './VerdictStrip';
 import ProvenanceFooter from './ProvenanceFooter';
+import PriceChart from './PriceChart';
+import PortfolioEquityView from './PortfolioEquityView';
+import EquityChart from './EquityChart';
+import PremiumCharts from './PremiumCharts';
+import DrawdownChart from './DrawdownChart';
+import DeploymentChart from './DeploymentChart';
+import ForecastPanel from './ForecastPanel';
+import LedgerTable from './LedgerTable';
+import SimCycleTable from './SimCycleTable';
+import RejectionPanel from './RejectionPanel';
+import type { ExportContext } from './ledgerCsv';
 import { IN_SAMPLE_FALLBACK } from '../sims/SweepResults';
 
-/** A panel PR-3 will fill. Named so its absence is legible, not a gap. */
-function Placeholder({ title, testId }: { title: string; testId: string }) {
-  return (
-    <section
-      data-testid={testId}
-      className="rounded-lg border border-dashed border-gray-700 bg-gray-900/40 p-4"
-    >
-      <h3 className="text-sm font-semibold text-gray-400">{title}</h3>
-      <p className="text-xs text-gray-600 mt-1">
-        Rendered in FC-096 Phase E PR-3. The evidence for it is already loaded.
-      </p>
-    </section>
-  );
-}
+/** The name the runner reserves for the implicit base arm. */
+export const BASE_SCENARIO = 'base';
+
+/** The portfolio tab's sentinel — never a symbol, because symbols are tickers. */
+export const PORTFOLIO_TAB = '__portfolio__';
 
 /** `base_config_json` is a JSON STRING on the row; a bad one is not fatal. */
 function parseBaseEffective(raw: string | null | undefined): Record<string, unknown> | null {
@@ -76,6 +79,12 @@ export interface ConsoleProps {
    * a run that stored nothing, and this is how the destination says so.
    */
   dedupFrom?: string | null;
+  /**
+   * Selecting a symbol TAB is selecting a cell, so it goes through the URL like
+   * every other user selection (decision 4) rather than into local state that
+   * the address bar knows nothing about. The tabs are inert without it.
+   */
+  onSelectSymbol?: (symbol: string) => void;
 }
 
 export default function Console({
@@ -85,10 +94,20 @@ export default function Console({
   symbol,
   split,
   dedupFrom = null,
+  onSelectSymbol,
 }: ConsoleProps) {
   const cell = useMemo(() => ({ scenario, symbol, split }), [scenario, symbol, split]);
   const artifactState = useArtifact(sweep, cell);
   const barsState = useBars(sweep, symbol, split);
+  // The BASE cell's artifact, for the equity overlay only. Not fetched when the
+  // selected cell IS base: the overlay would be the same curve twice.
+  const isBase = scenario === BASE_SCENARIO;
+  const baseCell = useMemo(
+    () => (isBase ? null : { scenario: BASE_SCENARIO, symbol, split }),
+    [isBase, symbol, split],
+  );
+  const baseState = useArtifact(sweep, baseCell);
+  const [tab, setTab] = useState<string | null>(null);
 
   // Both are JSON STRINGS on the row and both are parsed exactly once per row,
   // not once per render and not three times per render (review round 1, F9).
@@ -116,6 +135,64 @@ export default function Console({
     artifactState.error ??
     (artifactState.sessionExpired ? 'Session expired — reload to sign in again.' : null) ??
     (artifactState.loading ? 'Loading this cell’s artifact…' : null);
+
+  const overlay = useMemo(
+    () => equityOverlay(artifactState.data, baseState.data, barsState.data),
+    [artifactState.data, baseState.data, barsState.data],
+  );
+
+  const window = useMemo(
+    () => report.windows.find((w) => w.split === split) ?? null,
+    [report.windows, split],
+  );
+
+  /**
+   * The fill label's source order (PR-2 amendments, F4): the CELL's own stamp
+   * first, then the forecast's — which omits excluded arms and in-sample runs —
+   * then the spec's declared haircut. A basis is never invented.
+   */
+  const fill = useMemo(() => {
+    const stamped = artifactState.data?.provenance.fill ?? null;
+    if (stamped) return stamped;
+    const served = report.forecast?.by_scenario?.[scenario]?.symbols?.[symbol]?.fill ?? null;
+    if (served) return served;
+    const declared = report.scenario_fill_haircuts?.[scenario];
+    return declared === undefined ? null : { basis: null, fill_haircut: declared };
+  }, [artifactState.data, report.forecast, report.scenario_fill_haircuts, scenario, symbol]);
+
+  const exportContext: ExportContext = useMemo(
+    () => ({
+      runId: artifactState.runId ?? sweep.run_id,
+      scenario,
+      symbol,
+      split,
+      engineIdentity: artifactState.data?.provenance.engine_identity ?? sweep.engine_identity ?? null,
+      fillBasis: fill?.basis ?? null,
+      fillHaircut: fill?.fill_haircut ?? null,
+      inSampleOnly: !!report.in_sample_only,
+      inSampleBanner: report.in_sample_banner ?? null,
+      strategy,
+      knownBiases: report.known_biases,
+      row,
+    }),
+    [artifactState.runId, artifactState.data, sweep, scenario, symbol, split, fill, report, strategy, row],
+  );
+
+  // The cell's state in the partition's own words — for the panels that must
+  // say WHY a stored artifact has nothing in it (review round 1, R9).
+  const stateLabel = renderCell(row).kind === 'return' ? null : renderCell(row).text;
+
+  const symbolTabClass = (active: boolean) =>
+    `px-2 py-1 rounded text-xs border ${
+      active
+        ? 'bg-blue-950/60 border-blue-700 text-blue-200'
+        : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200'
+    }`;
+  // The symbol tabs mirror the URL, always — only the portfolio tab is local
+  // state. Otherwise a symbol picked in the cell selector above would leave the
+  // tab strip highlighting the previous one, and the two would disagree about
+  // what is on screen.
+  const activeTab = tab === PORTFOLIO_TAB ? PORTFOLIO_TAB : symbol;
 
   return (
     <section data-testid="sim-console" className="space-y-4">
@@ -161,12 +238,120 @@ export default function Console({
         artifact={artifactState.data}
       />
 
-      <Placeholder testId="placeholder-price" title="Price + event markers (component 2)" />
-      <Placeholder testId="placeholder-equity" title="Equity vs base vs buy & hold (component 3)" />
-      <Placeholder testId="placeholder-premium" title="Premium: cumulative and monthly (component 3)" />
-      <Placeholder testId="placeholder-forecast" title="Forecast range (component 7)" />
-      <Placeholder testId="placeholder-ledger" title="Ledger + cycle tables (components 4 and 5)" />
-      <Placeholder testId="placeholder-rejections" title="Rejections and binding constraint (component 6)" />
+      {/* Symbol tabs, in the run's DECLARATION order, plus the portfolio view.
+          Choosing a symbol is choosing a cell, so it travels through the URL;
+          the portfolio tab is a view of the same cell selection and is local. */}
+      <div data-testid="symbol-tabs" className="flex flex-wrap gap-1 items-center">
+        {report.symbols.map((s) => (
+          <button
+            key={s}
+            type="button"
+            className={symbolTabClass(activeTab === s)}
+            onClick={() => {
+              setTab(null);
+              if (s !== symbol) onSelectSymbol?.(s);
+            }}
+          >
+            {s}
+          </button>
+        ))}
+        <button
+          type="button"
+          data-testid="portfolio-tab"
+          className={symbolTabClass(activeTab === PORTFOLIO_TAB)}
+          onClick={() => setTab(PORTFOLIO_TAB)}
+        >
+          Portfolio
+        </button>
+      </div>
+
+      {activeTab === PORTFOLIO_TAB ? (
+        <PortfolioEquityView
+          sweep={sweep}
+          report={report}
+          scenario={scenario}
+          split={split}
+          specStrategy={specStrategyValue}
+        />
+      ) : (
+        <PriceChart
+          symbol={symbol}
+          bars={barsState.data}
+          barsAbsence={barsState.absent ?? barsState.error}
+          barsLoading={barsState.loading}
+          artifact={artifactState.data}
+          artifactAbsence={artifactState.absent ?? artifactState.error}
+          window={window ? { start: window.start, end: window.end } : null}
+          strategy={strategy}
+        />
+      )}
+
+      <EquityChart
+        overlay={overlay}
+        row={row}
+        isBase={isBase}
+        baseAbsence={baseState.absent ?? baseState.error}
+        artifactAbsence={digestAbsence}
+        capitalBase={digest?.capitalBase ?? null}
+        strategy={strategy}
+      />
+
+      <PremiumCharts
+        digest={digest}
+        absence={digestAbsence}
+        strategy={strategy}
+        stateLabel={stateLabel}
+      />
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <DrawdownChart
+          series={digest?.drawdownSeries ?? []}
+          row={row}
+          absence={digestAbsence}
+          strategy={strategy}
+        />
+        <DeploymentChart
+          series={digest?.deploymentSeries ?? []}
+          reading={digest?.deployment ?? null}
+          capitalBase={digest?.capitalBase ?? null}
+          suppressionReason={digest?.suppressionReason ?? null}
+          absence={digestAbsence}
+          strategy={strategy}
+        />
+      </div>
+
+      {/* Keyed on the cell so the horizon selector resets when the operator
+          moves to another run, arm or symbol (review round 1, LOW). A 365-day
+          horizon chosen on one cell silently carrying over to the next is a
+          number read against the wrong window. */}
+      <ForecastPanel
+        key={`${sweep.run_id}:${scenario}:${symbol}`}
+        report={report}
+        scenario={scenario}
+        symbol={symbol}
+      />
+
+      <LedgerTable
+        artifact={artifactState.data}
+        absence={digestAbsence}
+        context={exportContext}
+        stateLabel={stateLabel}
+      />
+
+      <SimCycleTable
+        artifact={artifactState.data}
+        absence={digestAbsence}
+        row={row}
+        strategy={strategy}
+      />
+
+      <RejectionPanel
+        artifact={artifactState.data}
+        absence={digestAbsence}
+        earningsSymbolsWithoutData={report.earnings_symbols_without_data ?? []}
+        caveat={report.rejection_tally_caveat}
+        strategy={strategy}
+      />
 
       <ProvenanceFooter
         sweep={sweep}
