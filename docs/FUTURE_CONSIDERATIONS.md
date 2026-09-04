@@ -1073,6 +1073,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §D-4; PR-2 #122 review), FC-060 guardrails, `docs/BACKTEST_ENGINE.md`.
 
+### FC-104: two symbol regexes — the dashboard refuses symbols the engine accepts
+
+**Scope:** shared
+**Status:** Filed 2026-09-04 (found by the FC-096 Phase E PR-4 sim-contract review)
+**Size estimate:** S
+
+**Problem:** `dashboard/backend/services/sweeps.py` `SYMBOL_RE` is `^[A-Z][A-Z.]{0,5}` while `src/backtesting/scenarios/identity.py`'s symbol rule allows digits and `-` up to 16 chars. A sweep submitted from the sim service or the CLI with e.g. `BRK-B` persists and renders, but the dashboard's `validateSpec` (and therefore the Phase E tweak bar, which carries the run's symbols verbatim) refuses to re-submit or pin it. Two parsers for one identity — the D7 failure one layer up.
+
+**Proposal:** one symbol rule, imported (not restated) by the dashboard from `scenario_identity` (already copied into the image), with a byte-equality test like the other copied constants; the SPA's `specValidation.ts` mirrors it with a fixture test against the served allowlist caps.
+
+**Links:** FC-096 Phase E PR-4 #124 review; FC-060 D7 (one parser).
+
 
 ## Completed
 
