@@ -384,6 +384,31 @@ describe('R1 — a deduplicated slot follows its pointer', () => {
     expect(seen.search).toContain(DEDUP);
     expect(screen.getByTestId('strip-B-absent').textContent).toContain('nothing to open');
   });
+
+  // The confirmation pass's finding. `setSearchParams(fn)` is NOT a queued
+  // reducer: React Router 6 evaluates the updater against THIS render's params
+  // and navigates immediately (`react-router-dom` 6.30.2,
+  // `dist/index.js:1038-1042`). Two corrections committed together therefore
+  // used to compute from the same stale params, and the second navigation won
+  // — leaving the loser's slot on the deduplicated run for ever, since its
+  // effect had no dependency left to change.
+  //
+  // The SAME-RUN pair is where that is reachable from a typed or bookmarked
+  // URL: one deduplicated run fills both slots, so both sides resolve in one
+  // commit off the single shared detail poll (R7).
+  it('follows BOTH slots when one deduplicated run fills the pair', async () => {
+    show(`/sims/compare?a=${ref(DEDUP, 'position_20pct')}&b=${ref(DEDUP, 'base')}`);
+    await waitFor(() => expect(seen.search).not.toContain(DEDUP));
+    expect(seen.search).toContain(encodeURIComponent(ref(RUN, 'position_20pct')));
+    expect(seen.search).toContain(encodeURIComponent(ref(RUN, 'base')));
+    // Automatic, so it never pushes; and it settles in one or two commits.
+    expect(navLog.filter((n) => n.type === 'PUSH')).toHaveLength(0);
+    expect(navLog.filter((n) => n.type === 'REPLACE').length).toBeLessThanOrEqual(2);
+    // BOTH sides say where they were opened from — the state of the one
+    // navigation carries both pointers.
+    await waitFor(() => expect(screen.getByTestId('picker-A-dedup').textContent).toContain(DEDUP));
+    expect(screen.getByTestId('picker-B-dedup').textContent).toContain(DEDUP);
+  });
 });
 
 describe('R1 — a non-`done` run is labelled, never "loading"', () => {

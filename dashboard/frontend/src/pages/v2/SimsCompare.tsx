@@ -299,6 +299,50 @@ function SidePicker({
   );
 }
 
+/**
+ * The one automatic correction a slot needs right now, or `null`.
+ *
+ * PURE and per-slot, so the caller can decide both slots and write them in a
+ * single navigation. Two rules, in priority order:
+ *
+ *  1. FOLLOW a `deduplicated` run to the run that holds the evidence (R1, the
+ *     PR-2 amendment). A deduplicated run stored NOTHING under its own id —
+ *     that is what dedup means — so comparing against it would compare against
+ *     an empty side for ever. The run it was reached from travels back to the
+ *     caller so the destination can say where the slot came from.
+ *
+ *     A row pointing at ITSELF is corrupt rather than resolvable and is not
+ *     followed; `ResultsRegion` on `/sims` says so in its own words, and here
+ *     the side simply renders its status. Such a row still falls through to
+ *     rule 2, exactly as the two separate effects did.
+ *
+ *  2. REPAIR a cell this run does not have — a deep link from another sweep, or
+ *     the arm/symbol/split carried across a RUN change in the picker. Gated on
+ *     the report belonging to the URL's run, which `useSide` has already
+ *     enforced — and, through that, on the run being `done`: a `running` run
+ *     has no report to repair against and a `failed` one never will.
+ *
+ * A follow SUPERSEDES a repair rather than racing it: the slot is about to move
+ * to another run, and the cell is re-checked against THAT run's report on the
+ * next commit.
+ */
+function correctionFor(
+  ref: CompareRef | null,
+  side: CompareSideData | null,
+): { value: string; dedupFrom?: string } | null {
+  if (!ref || !side) return null;
+  if (side.sweep?.status === 'deduplicated') {
+    const target = side.sweep.deduplicated_to ?? null;
+    if (target && target !== ref.runId) {
+      return { value: formatCellRef({ ...ref, runId: target }), dedupFrom: ref.runId };
+    }
+  }
+  if (!side.report) return null;
+  if (cellExists(side.report, ref)) return null;
+  const fallback = defaultCell(side.report);
+  if (!fallback) return null;
+  return { value: formatCellRef({ runId: ref.runId, ...fallback }) };
+}
 export default function SimsCompare() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
@@ -355,74 +399,56 @@ export default function SimsCompare() {
     }
   }, [rawB, refB, setParams]);
 
-  /**
-   * Follow a `deduplicated` run to the run that holds the evidence (R1).
-   *
-   * The PR-2 amendment, applied to both slots: a deduplicated run stored
-   * NOTHING under its own id — that is what dedup means — so comparing against
-   * it would compare against an empty side for ever. The same cell under
-   * `deduplicated_to` REPLACES the slot, and the run it was reached from
-   * travels in the history entry's state so the destination can say so.
-   *
-   * A row pointing at ITSELF is corrupt rather than resolvable and is not
-   * followed; `ResultsRegion` on `/sims` says so in its own words, and here the
-   * side simply renders its status.
-   */
-  const followDedup = (key: 'a' | 'b', ref: CompareRef | null, side: CompareSideData | null) => {
-    if (!ref || !side?.sweep) return;
-    if (side.sweep.status !== 'deduplicated') return;
-    const target = side.sweep.deduplicated_to ?? null;
-    if (!target || target === ref.runId) return;
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.set(key, formatCellRef({ ...ref, runId: target }));
-        return next;
-      },
-      {
-        replace: true,
-        state: { ...(followed ?? {}), [key === 'a' ? 'dedupA' : 'dedupB']: ref.runId },
-      },
-    );
-  };
-
-  /**
-   * Repair a cell this run does not have — a deep link from another sweep, or
-   * the arm/symbol/split carried across a RUN change in the picker.
-   *
-   * Automatic, so it REPLACES (decision 4). Gated on the report belonging to
-   * the URL's run, which `useSide` has already enforced — and on the run being
-   * `done`, because a `running` run has no report to repair against and a
-   * `failed` one never will.
-   */
-  const repair = (key: 'a' | 'b', ref: CompareRef | null, side: CompareSideData | null) => {
-    if (!ref || !side?.report) return;
-    if (cellExists(side.report, ref)) return;
-    const fallback = defaultCell(side.report);
-    if (!fallback) return;
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.set(key, formatCellRef({ runId: ref.runId, ...fallback }));
-        return next;
-      },
-      { replace: true },
-    );
-  };
-
   const statusA = sideA?.sweep?.status ?? null;
   const statusB = sideB?.sweep?.status ?? null;
+
+  /**
+   * BOTH slots' automatic corrections, decided together and written in ONE
+   * navigation (confirmation pass).
+   *
+   * The round-1 note that called `setParams`'s functional form sufficient was
+   * WRONG, and this is the correction of it. `setSearchParams(fn)` is not a
+   * queued reducer: React Router 6 evaluates `fn` against the params of the
+   * render it was called from and navigates immediately
+   * (`react-router-dom` 6.30.2, `dist/index.js:1038-1042`). Two corrections
+   * committed together therefore both read the SAME stale params, and the
+   * second navigation overwrites the first.
+   *
+   * Reachable from a typed or bookmarked URL: a SAME-RUN pair on a
+   * `deduplicated` run. `forB` is `detailA` there (R7's shared poll), so both
+   * sides resolve in one commit; the follow for `b` used to land on top of the
+   * follow for `a`, and `a` then had no dependency left to change, so it sat on
+   * the deduplicated run printing "its pointer … is missing or points at
+   * itself" — a false statement about a row whose pointer was fine.
+   *
+   * One effect over both sides, one `setParams`, one history entry. The state
+   * carries BOTH `dedupFrom` pointers and preserves any already on the entry,
+   * so a follow that is later followed by a repair does not silently drop the
+   * notice explaining where the slot came from.
+   */
   useEffect(() => {
-    followDedup('a', refA, sideA);
-    repair('a', refA, sideA);
-    // The two corrections read the ref and the loaded run and nothing else;
-    // depending on the side OBJECT (new on every render) would loop. `statusA`
-    // is in the list so the dedup follow fires the moment the row resolves.
-  }, [refA, sideA?.report, statusA]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    followDedup('b', refB, sideB);
-    repair('b', refB, sideB);
-  }, [refB, sideB?.report, statusB]); // eslint-disable-line react-hooks/exhaustive-deps
+    const corrA = correctionFor(refA, sideA);
+    const corrB = correctionFor(refB, sideB);
+    if (!corrA && !corrB) return;
+    const state = {
+      ...(followed ?? {}),
+      ...(corrA?.dedupFrom ? { dedupA: corrA.dedupFrom } : {}),
+      ...(corrB?.dedupFrom ? { dedupB: corrB.dedupFrom } : {}),
+    };
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (corrA) next.set('a', corrA.value);
+        if (corrB) next.set('b', corrB.value);
+        return next;
+      },
+      // Automatic, so it REPLACES (decision 4).
+      { replace: true, state: Object.keys(state).length > 0 ? state : undefined },
+    );
+    // The corrections read the refs and the loaded runs and nothing else;
+    // depending on the side OBJECTS (new on every render) would loop. The
+    // statuses are in the list so a follow fires the moment its row resolves.
+  }, [refA, refB, sideA?.report, sideB?.report, statusA, statusB]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** A user's pick. PUSHES, so Back walks their own comparisons. */
   const setSide = (key: 'a' | 'b', ref: CompareRef) => {
