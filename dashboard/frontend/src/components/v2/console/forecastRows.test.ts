@@ -67,6 +67,43 @@ describe('forecastRows — the served run', () => {
     expect(portfolio.nSymbols).toBe(1);
   });
 
+  it('takes n_summed even when it DIFFERS from n_included', () => {
+    // On the captured run the two coincide (1 and 1), so the fixture alone
+    // cannot tell a correct label from `n_included`. This is the case PR-1's
+    // §Execution note is about: a basis drops a symbol the arm still counts as
+    // included — a covered-call row with no stamped capital base has a premium
+    // rate and no total-P&L one — so the sums are over different sets and only
+    // `n_summed` describes the number standing next to it.
+    const portfolio = forecast.by_scenario.base.portfolio;
+    const skewed = {
+      ...forecast,
+      by_scenario: {
+        base: {
+          ...forecast.by_scenario.base,
+          portfolio: {
+            ...portfolio,
+            included: ['GOOGL', 'MSFT'],
+            n_included: 2,
+            n_symbols: 3,
+            excluded_by_basis: {
+              net_option_pnl: {},
+              total_pnl: { MSFT: 'no stamped capital base' },
+            },
+            net_option_pnl: { ...portfolio.net_option_pnl!, n_summed: 2 },
+            total_pnl: { ...portfolio.total_pnl!, n_summed: 1 },
+          },
+        },
+      },
+    };
+    const view = forecastRows(skewed, 'base', 'GOOGL', 90);
+    const [premium, total] = view.portfolio!.ranges;
+    expect(premium.nSummed).toBe(2);
+    expect(total.nSummed).toBe(1);
+    expect(total.nSummed).not.toBe(skewed.by_scenario.base.portfolio.n_included);
+    expect(total.excluded).toEqual([{ symbol: 'MSFT', reason: 'no stamped capital base' }]);
+    expect(premium.excluded).toEqual([]);
+  });
+
   it('carries the fill stamp, including the engine-default flag', () => {
     const view = forecastRows(forecast, 'base', 'GOOGL', 90);
     expect(view.symbol!.fill).toEqual({ basis: 'mid', fill_haircut: 0.25, is_engine_default: true });
