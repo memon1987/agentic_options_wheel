@@ -397,3 +397,139 @@ describe('the pin button', () => {
     expect(screen.getByTestId('pin-rolling-note').textContent).toContain('re-anchored');
   });
 });
+
+describe('a non-base cell says whose values these are (review R2a)', () => {
+  it('captions the arm, and names the overrides it is NOT carrying', () => {
+    // The bar prefills from the run's BASE whatever cell is on screen. Read as
+    // the selected arm's config it is simply wrong, and the arm's own
+    // overrides are not carried into the tweak.
+    setup({ scenario: 'position_20pct' });
+    const caption = screen.getByTestId('tweak-non-base-caption');
+    expect(caption.textContent).toContain('base');
+    expect(caption.textContent).toContain('position_20pct');
+    expect(caption.textContent).toContain('risk.max_position_size');
+    expect(caption.textContent).toContain('not carried');
+  });
+
+  it('says nothing on the base cell, where the prefill IS the cell', () => {
+    setup({ scenario: 'base' });
+    expect(screen.queryByTestId('tweak-non-base-caption')).toBeNull();
+  });
+
+  it('refuses a tweak that reproduces an existing arm, and links its cell', () => {
+    const onOpenCell = vi.fn();
+    setup({ onOpenCell });
+    typeInto('risk.max_position_size', '0.2');
+    expect(screen.getByTestId('tweak-blocking').textContent).toContain('would NOT deduplicate');
+    expect(submit()).toBeDisabled();
+    fireEvent.click(screen.getByTestId('tweak-open-existing-arm'));
+    expect(onOpenCell).toHaveBeenCalledWith({
+      scenario: 'position_20pct',
+      symbol: 'GOOGL',
+      split: 'holdout',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('the DOWNWARD ONLY warning (review R7)', () => {
+  it('warns above base without blocking the submit', () => {
+    setup();
+    typeInto('risk.max_position_size', '0.5');
+    expect(screen.getByTestId('tweak-warnings').textContent).toContain('DOWNWARD ONLY');
+    expect(submit()).not.toBeDisabled();
+  });
+
+  it('says nothing when the value is lowered', () => {
+    setup();
+    typeInto('risk.max_position_size', '0.25');
+    expect(screen.queryByTestId('tweak-warnings')).toBeNull();
+  });
+});
+
+describe('the outcome belongs to the spec that produced it (review R8)', () => {
+  it('clears the moment a control changes', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(422, { detail: 'refused for a reason' }));
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    fireEvent.click(submit());
+    await waitFor(() => expect(screen.getByTestId('tweak-outcome')).toBeTruthy());
+    typeInto('strategy.min_put_premium', '0.7');
+    expect(screen.queryByTestId('tweak-outcome')).toBeNull();
+  });
+
+  it('shows the rolling-window warning on EVERY confirm, not just the first', async () => {
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    fireEvent.click(screen.getByTestId('pin-open'));
+    fetchMock.mockResolvedValue(jsonResponse(409, { detail: 'pin pin_1234 already asks this' }));
+    fireEvent.click(screen.getByTestId('pin-confirm'));
+    await waitFor(() => expect(screen.getByTestId('pin-detail')).toBeTruthy());
+    // The refusal did not close the panel, so the standing-cost warning has to
+    // still be there when the operator confirms again.
+    expect(screen.getByTestId('pin-rolling-note')).toBeTruthy();
+  });
+});
+
+describe('the small things a reviewer checks (review LOW)', () => {
+  it('keeps the submit button rendered and ENABLED for a viewer’s 403', async () => {
+    // Decision 11: no `whoami`, so the control is never hidden — and it must
+    // stay usable, because the operator who can submit shares this screen.
+    fetchMock.mockResolvedValue(jsonResponse(403, { detail: 'not in OPERATORS' }));
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    fireEvent.click(submit());
+    await waitFor(() => expect(screen.getByTestId('tweak-outcome')).toBeTruthy());
+    expect(submit()).toBeVisible();
+    expect(submit()).not.toBeDisabled();
+  });
+
+  it('does not POST twice when the button is clicked during the flight', async () => {
+    let release: (r: Response) => void = () => undefined;
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        release = resolve;
+      }),
+    );
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    fireEvent.click(submit());
+    await waitFor(() => expect(submit()).toBeDisabled());
+    fireEvent.click(submit());
+    fireEvent.submit(screen.getByTestId('tweak-form'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    release(jsonResponse(202, { run_id: 'x', cell_count: 4 }));
+    await waitFor(() => expect(screen.getByTestId('harness-accepted')).toBeTruthy());
+  });
+
+  it('submits on Enter, because the controls are in a real form', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(202, { run_id: 'new456', cell_count: 4 }));
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    fireEvent.submit(screen.getByTestId('tweak-form'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  });
+
+  it('says a LOADED allowlist types nothing, rather than "Loading" for ever', () => {
+    setup({ allowlist: { ...allowlist, value_types: {} } });
+    expect(screen.getByTestId('tweak-no-typed-keys').textContent).toContain('types no editable keys');
+    expect(screen.queryByText('Loading the allowlist…')).toBeNull();
+  });
+
+  it('blames the RUN’s spec, not the operator, for a carried-field cap breach', () => {
+    // Every field `validateSpec` checks here is carried from the run unedited,
+    // so "fix your input" names an input this bar does not have.
+    setup({ allowlist: { ...allowlist, caps: { ...allowlist.caps, max_window_days: 30 } } });
+    typeInto('strategy.min_put_premium', '0.65');
+    expect(screen.getByTestId('tweak-blocking').textContent).toContain(
+      "This run's own spec no longer satisfies the current caps",
+    );
+  });
+
+  it('scopes the cell-count hint to the SIM service, not to the pin', () => {
+    setup();
+    typeInto('strategy.min_put_premium', '0.65');
+    expect(screen.getByTestId('tweak-form').textContent).toContain('SIM SERVICE caps');
+    expect(screen.getByTestId('tweak-form').textContent).toContain('A pin has its own standing cap');
+  });
+});

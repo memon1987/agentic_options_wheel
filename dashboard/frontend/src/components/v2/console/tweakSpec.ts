@@ -271,6 +271,8 @@ export function diffToBase(controls: TweakControl[], fields: FieldMap): TweakDif
 const NAME_SAFE = /[^A-Za-z0-9_.-]/g;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const MAX_NAME_CHARS = 40;
+/** The shortest key remnant that still names the knob being varied. */
+const MIN_KEY_CHARS = 8;
 /**
  * `__` is the ARTIFACT NAME SEPARATOR, and `validate_scenario_name` refuses a
  * name that carries one (`identity.py:110-117`: object names are
@@ -317,8 +319,11 @@ const valueToken = (value: unknown): string => {
  */
 function keyValueToken(key: string, value: unknown): string | null {
   const valueTok = valueToken(value).replace(NAME_SAFE, '_');
-  // One key character and the joining `_` are the minimum a pair needs.
-  if (valueTok.length > MAX_NAME_CHARS - 2) return null;
+  // A name is a COLUMN HEADER. One surviving key character would satisfy the
+  // pattern and tell the reader nothing — `s_0.12345678901234568-0.2345678`
+  // is a legal name and an unreadable one — so a value that leaves less than
+  // this is refused, with a sentence, rather than named badly.
+  if (valueTok.length > MAX_NAME_CHARS - MIN_KEY_CHARS - 1) return null;
   const budget = MAX_NAME_CHARS - valueTok.length - 1;
   const keyTok = key
     .replace(/\./g, '_')

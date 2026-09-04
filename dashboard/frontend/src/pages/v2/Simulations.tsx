@@ -398,17 +398,12 @@ export default function Simulations() {
           tweakSubmitting={tweak.submitting && tweak.from === selectedRunId}
           tweakOutcome={tweak.from === selectedRunId ? tweak.outcome : null}
           onClearTweakOutcome={clearTweakOutcome}
-          // The answer belongs on the run that HOLDS it; when the operator had
-          // moved away it is shown on the run they submitted FROM instead, with
-          // a link, because that is the screen they are looking at.
-          notice={
-            notice &&
-            (notice.navigated
-              ? notice.runId === selectedRunId
-              : notice.sourceRunId === selectedRunId)
-              ? notice
-              : null
-          }
+          // The answer belongs on the run that HOLDS it. When the operator had
+          // moved on before it arrived, nothing was opened for them — so it
+          // shows on WHATEVER they are looking at, with a link, rather than
+          // waiting on a screen they may never go back to. Either way it is
+          // replaced by the next submit.
+          notice={notice && (!notice.navigated || notice.runId === selectedRunId) ? notice : null}
         />
       )}
     </div>

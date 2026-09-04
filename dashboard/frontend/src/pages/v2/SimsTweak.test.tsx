@@ -17,6 +17,8 @@ import { resetSessionExpiredSignal } from '../../hooks/iapSession';
 
 const RUN = '13cc2729d1c74211';
 const ARM = 'strategy_min_put_premium_0.65';
+/** A second run, so the operator can switch away mid-flight (R5). */
+const OTHER_RUN = 'aaaa1111bbbb2222';
 
 const ok = (body: unknown) =>
   ({
@@ -77,7 +79,7 @@ const listRow = {
 };
 
 let fetchMock: ReturnType<typeof vi.fn>;
-let simAnswer: Response;
+let simAnswer: Response | Promise<Response>;
 let detailByRun: Record<string, unknown>;
 let navLog: Array<{ pathname: string; type: string }>;
 
@@ -118,9 +120,13 @@ beforeEach(() => {
     }
     if (url.startsWith('/api/v2/sweeps/')) {
       const id = url.slice('/api/v2/sweeps/'.length);
-      return Promise.resolve(ok(detailByRun[id] ?? shapedFor(id)));
+      const custom = detailByRun[id];
+      if (custom === 'MISSING') return Promise.resolve(notFound(`no sweep ${id}`));
+      return Promise.resolve(ok(custom ?? shapedFor(id)));
     }
-    if (url === '/api/v2/sweeps') return Promise.resolve(ok([listRow]));
+    if (url === '/api/v2/sweeps') {
+      return Promise.resolve(ok([listRow, { ...listRow, run_id: OTHER_RUN }]));
+    }
     return Promise.resolve(ok({ stock_symbols: ['GOOGL'] }));
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -206,5 +212,84 @@ describe('a refusal never navigates', () => {
     await waitFor(() => expect(screen.getByTestId('tweak-outcome')).toBeTruthy());
     expect(navLog.some((n) => n.pathname.startsWith('/sims/new456'))).toBe(false);
     expect(screen.queryByTestId('tweak-notice')).toBeNull();
+  });
+});
+
+describe('the notice sits ABOVE the shells (review R3)', () => {
+  it('acknowledges a 202 on the RUNNING shell, where the generic Job copy is', async () => {
+    // It used to render only inside the `done` branch, so the destination of a
+    // 202 — which is by definition not done — showed "6-8 minutes" and no sign
+    // that anything had been submitted.
+    detailByRun.new456 = runningRun('new456');
+    await tweakAndSubmit();
+    const notice = await screen.findByTestId('tweak-notice');
+    expect(notice.dataset.noticeKind).toBe('accepted');
+    expect(notice.textContent).toContain('new456');
+    expect(notice.textContent).toContain('polls it until it finishes');
+    const shell = screen.getByTestId('results-status');
+    expect(shell.dataset.runStatus).toBe('running');
+    // ABOVE, asserted rather than left to whoever edits the JSX next.
+    expect(notice.compareDocumentPosition(shell) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('drops the polling claim once the destination is terminal', async () => {
+    // The same notice on a finished run used to go on saying "this page polls
+    // it until it finishes" about a run that had already finished.
+    detailByRun.new456 = shapedFor('new456');
+    await tweakAndSubmit();
+    // The destination's detail arrives a tick after the notice does; the
+    // clause is a function of the LIVE status, so it settles on "finished".
+    await waitFor(() =>
+      expect(screen.getByTestId('tweak-notice').textContent).toContain('It has finished.'),
+    );
+    expect(screen.getByTestId('tweak-notice').textContent).not.toContain(
+      'polls it until it finishes',
+    );
+  });
+
+  it('reads a first-15s 404 as streaming lag, not as an unreadable run', async () => {
+    detailByRun.new456 = 'MISSING';
+    await tweakAndSubmit();
+    const lag = await screen.findByTestId('results-streaming-lag');
+    expect(lag.textContent).toContain('not visible yet');
+    expect(screen.queryByText(/state is/)).toBeNull();
+  });
+});
+
+describe('an in-flight submit outlives the bar (review R5)', () => {
+  it('surfaces a LATE refusal on the run it was submitted from', async () => {
+    // The bar is keyed on the run, so a run switch during the ≤150 s wait
+    // unmounts it. The refusal must still land — on the source run's screen,
+    // which is where the operator asked the question.
+    let release: (r: Response) => void = () => undefined;
+    simAnswer = new Promise<Response>((r) => (release = r));
+    await tweakAndSubmit();
+    await waitFor(() => expect(screen.getByTestId('tweak-submit')).toBeDisabled());
+    release(posted(422, { detail: 'the service refused this spec' }));
+    const outcome = await screen.findByTestId('tweak-outcome');
+    expect(outcome.dataset.outcome).toBe('invalid');
+    expect(screen.getByTestId('tweak-detail').textContent).toBe('the service refused this spec');
+  });
+
+  it('does NOT navigate on a late 2xx once the operator has moved on', async () => {
+    // Yanking them off what they moved to read is the same defect as losing
+    // the refusal. The answer is offered as a link instead.
+    detailByRun.new456 = runningRun('new456');
+    let release: (r: Response) => void = () => undefined;
+    simAnswer = new Promise<Response>((r) => (release = r));
+    await tweakAndSubmit();
+    await waitFor(() => expect(screen.getByTestId('tweak-submit')).toBeDisabled());
+
+    // The operator selects another run while the submit is in flight.
+    fireEvent.click(screen.getByText(OTHER_RUN));
+    await waitFor(() => expect(navLog.some((n) => n.pathname.includes(OTHER_RUN))).toBe(true));
+    const before = navLog.length;
+
+    release(posted(202, { run_id: 'new456', cell_count: 4 }));
+    const notice = await screen.findByTestId('tweak-notice');
+    expect(notice.textContent).toContain('You had moved to another run');
+    expect(screen.getByRole('link', { name: /Open run new456/ })).toBeTruthy();
+    expect(navLog.length).toBe(before);
+    expect(navLog.some((n) => n.pathname.startsWith('/sims/new456'))).toBe(false);
   });
 });

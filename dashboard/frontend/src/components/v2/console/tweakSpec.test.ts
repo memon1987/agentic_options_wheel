@@ -21,12 +21,16 @@ import {
   buildTweak,
   coerceField,
   diffToBase,
+  downwardOnlyWarnings,
   editableControls,
   initialFields,
+  isValidArmName,
   listOnlyControls,
+  parseRunArms,
   parseRunSpec,
   prefill,
   readDotted,
+  sameOverrides,
   tweakSpec,
 } from './tweakSpec';
 import { validateSpec } from '../sims/specValidation';
@@ -380,5 +384,158 @@ describe('buildTweak — one field, one arm', () => {
     });
     expect(verdict.valid).toBe(true);
     expect(verdict.cellCount).toBe(4);
+  });
+});
+
+describe('the arm name satisfies the runner’s FULL contract (review R1)', () => {
+  const contract = (name: string) => {
+    const pattern = new RegExp(allowlist.caps.scenario_name_pattern!.replace('\\Z', '$'));
+    return {
+      pattern: pattern.test(name),
+      length: name.length <= (allowlist.caps.max_scenario_name_chars ?? 40),
+      noSeparator: !name.includes('__'),
+    };
+  };
+
+  it('never emits `__`, which the artifact-name parse refuses', () => {
+    // `validate_scenario_name` (identity.py:110-117) rejects `__` outright: it
+    // is the field separator in `<run>/<scenario>__<symbol>__<split>.json.gz`.
+    // Each of these three trims the key to a boundary that USED to leave a
+    // trailing `_` right before the joining one.
+    const cases: Array<[string, unknown]> = [
+      ['rolling.imminence_extrinsic_threshold', 0.123456789],
+      ['rolling.min_net_credit_per_contract', 0.3333333333],
+      ['strategy.put_delta_range', [0.1234567, 0.23456789]],
+    ];
+    for (const [key, value] of cases) {
+      const name = armNameFor([key], { [key]: value })!;
+      expect(name).not.toBeNull();
+      expect(contract(name)).toEqual({ pattern: true, length: true, noSeparator: true });
+      expect(isValidArmName(name)).toBe(true);
+    }
+  });
+
+  it('keeps the whole value in the name — it is the key that gives way', () => {
+    const key = 'rolling.imminence_extrinsic_threshold';
+    const a = armNameFor([key], { [key]: 0.123456789 })!;
+    const b = armNameFor([key], { [key]: 0.123456788 })!;
+    expect(a.endsWith('_0.123456789')).toBe(true);
+    expect(a).not.toBe(b);
+  });
+
+  it('refuses (null) rather than truncating a value that cannot fit', () => {
+    const key = 'strategy.put_delta_range';
+    // Long enough that no useful part of the key survives — the name would be
+    // legal and unreadable, so it is refused instead.
+    const value = [0.12345678901234568, 0.2345678901234567];
+    expect(armNameFor([key], { [key]: value })).toBeNull();
+  });
+
+  it('agrees with `isValidArmName` on the rules it enforces', () => {
+    expect(isValidArmName('a__b')).toBe(false);
+    expect(isValidArmName('_leading')).toBe(false);
+    expect(isValidArmName('x'.repeat(41))).toBe(false);
+    expect(isValidArmName('ok_0.5-0.6')).toBe(true);
+  });
+});
+
+describe('the run’s other arms (review R2b)', () => {
+  const fields = initialFields(controls);
+  const arms = parseRunArms(sweep.spec_json);
+
+  it('reads the run’s declared arms off spec_json', () => {
+    expect(arms).toEqual([
+      { name: 'position_20pct', overrides: { 'risk.max_position_size': 0.2 } },
+    ]);
+    expect(parseRunArms(null)).toEqual([]);
+    expect(parseRunArms('{ not json')).toEqual([]);
+  });
+
+  it('refuses a tweak that reproduces an arm this run already has', () => {
+    // Re-running it would NOT dedup: the arm name is part of the engine
+    // identity and this bar derives a different one, so the service would
+    // replay in full an answer already on screen.
+    const out = buildTweak({
+      controls,
+      fields: { ...fields, 'risk.max_position_size': { value: '0.2' } },
+      basis: parseRunSpec(sweep.spec_json),
+      arms,
+    });
+    expect(out.spec).toBeNull();
+    expect(out.existingArm?.name).toBe('position_20pct');
+    expect(out.errors.join(' ')).toContain('would NOT deduplicate');
+  });
+
+  it('folds numerically — `0.20` is the same arm as `0.2`', () => {
+    expect(sameOverrides({ a: 0.2 }, { a: 0.2 })).toBe(true);
+    expect(sameOverrides({ a: [0.1, 0.2] }, { a: [0.1, 0.2] })).toBe(true);
+    expect(sameOverrides({ a: 0.2 }, { a: 0.3 })).toBe(false);
+    expect(sameOverrides({ a: 0.2 }, { a: 0.2, b: 1 })).toBe(false);
+    const out = buildTweak({
+      controls,
+      fields: { ...initialFields(controls), 'risk.max_position_size': { value: '0.20' } },
+      basis: parseRunSpec(sweep.spec_json),
+      arms,
+    });
+    expect(out.existingArm?.name).toBe('position_20pct');
+  });
+
+  it('allows a DIFFERENT value for the same key', () => {
+    const out = buildTweak({
+      controls,
+      fields: { ...fields, 'risk.max_position_size': { value: '0.25' } },
+      basis: parseRunSpec(sweep.spec_json),
+      arms,
+    });
+    expect(out.existingArm).toBeNull();
+    expect(out.spec).not.toBeNull();
+  });
+});
+
+describe('DOWNWARD ONLY keys warn without blocking (review R7)', () => {
+  const fields = initialFields(controls);
+
+  it('warns when the value is raised above base, and still submits', () => {
+    // The served description says `risk.max_position_size` is DOWNWARD ONLY
+    // until FC-079 — the sizer never sizes above one contract, so an arm that
+    // raises it comes back numerically identical to base.
+    expect(control('risk.max_position_size').description).toContain('DOWNWARD ONLY');
+    expect(control('risk.max_position_size').baseValue).toBe(0.35);
+    const out = buildTweak({
+      controls,
+      fields: { ...fields, 'risk.max_position_size': { value: '0.5' } },
+      basis: parseRunSpec(sweep.spec_json),
+    });
+    expect(out.warnings.join(' ')).toContain('DOWNWARD ONLY');
+    expect(out.warnings.join(' ')).toContain('identical to base');
+    expect(out.spec).not.toBeNull();
+    expect(out.errors).toEqual([]);
+  });
+
+  it('says nothing when the value is lowered', () => {
+    const out = buildTweak({
+      controls,
+      fields: { ...fields, 'risk.max_position_size': { value: '0.25' } },
+      basis: parseRunSpec(sweep.spec_json),
+    });
+    expect(out.warnings).toEqual([]);
+  });
+
+  it('reads the rule off the served prose, not a hardcoded key', () => {
+    expect(downwardOnlyWarnings(controls, { ...fields, 'strategy.min_put_premium': { value: '9' } })).toEqual(
+      [],
+    );
+  });
+});
+
+describe('a decimal is a decimal (review LOW)', () => {
+  it('refuses hex, binary and separators that `Number()` would accept', () => {
+    const premium = control('strategy.min_put_premium');
+    expect(coerceField(premium, { value: '0x10' }).ok).toBe(false);
+    expect(coerceField(premium, { value: '0b11' }).ok).toBe(false);
+    expect(coerceField(premium, { value: '1_000' }).ok).toBe(false);
+    expect(coerceField(premium, { value: 'Infinity' }).ok).toBe(false);
+    expect(coerceField(premium, { value: '1e-2' })).toEqual({ ok: true, value: 0.01 });
+    expect(coerceField(premium, { value: '.5' })).toEqual({ ok: true, value: 0.5 });
   });
 });
