@@ -28,6 +28,12 @@ const TWEAK_TYPES: TweakType[] = ['band', 'number', 'int', 'bool', 'symbols'];
  * HINT: the service validates, and its refusal is what the operator reads.
  */
 export const DTE_MIN = 1;
+/**
+ * The engine's `MAX_SWEEPABLE_DTE`. Declared ONCE here and interpolated into
+ * the refusal text below, so the bound and the sentence explaining it can never
+ * disagree — and the allowlist's own `described` ("1-21 — bounded by the stored
+ * chain lake's reach") is the server-side statement of the same rule.
+ */
 export const DTE_MAX = 21;
 
 /** Keys the DTE bound applies to — matched on the leaf, not the whole path. */
@@ -150,9 +156,16 @@ export function isBlank(control: TweakControl, field: FieldValue | undefined): b
 
 export type Coerced = { ok: true; value: unknown } | { ok: false; error: string };
 
+/**
+ * Decimal only. `Number()` alone accepts `0x10`, `0b11`, `1_000` and `Infinity`
+ * — a config value typed as `0x10` would silently become 16, which is not what
+ * anyone meant by a premium floor.
+ */
+const DECIMAL_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
 const finite = (raw: string): number | null => {
   const trimmed = raw.trim();
-  if (!trimmed) return null;
+  if (!DECIMAL_RE.test(trimmed)) return null;
   const n = Number(trimmed);
   return Number.isFinite(n) ? n : null;
 };
@@ -256,7 +269,26 @@ export function diffToBase(controls: TweakControl[], fields: FieldMap): TweakDif
 
 /** `caps.scenario_name_pattern` admits `[A-Za-z0-9]` then `[A-Za-z0-9_.-]*`. */
 const NAME_SAFE = /[^A-Za-z0-9_.-]/g;
+const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const MAX_NAME_CHARS = 40;
+/**
+ * `__` is the ARTIFACT NAME SEPARATOR, and `validate_scenario_name` refuses a
+ * name that carries one (`identity.py:110-117`: object names are
+ * `<run_id>/<scenario>__<symbol>__<split>.json.gz` and are parsed back with
+ * `rsplit('__', 2)`). A single underscore is fine; two are a 422 on a name the
+ * operator never typed, which is the worst kind of refusal to read.
+ */
+const ARTIFACT_NAME_SEPARATOR = '__';
+
+/** The FULL contract `validate_scenario_name` applies, in one predicate. */
+export function isValidArmName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name.length <= MAX_NAME_CHARS &&
+    NAME_PATTERN.test(name) &&
+    !name.includes(ARTIFACT_NAME_SEPARATOR)
+  );
+}
 
 const valueToken = (value: unknown): string => {
   if (Array.isArray(value)) return value.map(valueToken).join('-');
@@ -272,15 +304,29 @@ const valueToken = (value: unknown): string => {
  * two different questions wearing one name — exactly what the compare view's
  * "same name, different arm" warning exists to catch, produced here on purpose.
  *
- * And when the pair is too long it is the KEY that gives way, never the value.
- * Truncating the value would collapse `..._threshold_0.25` and
- * `..._threshold_0.30` onto one name, so two submits would look like a re-run
- * of one arm and the second would 409 or read as a dedup of the first.
+ * Two rules the review round found the first version breaking:
+ *
+ *  * **The value is never trimmed.** Truncating it would collapse
+ *    `..._threshold_0.25` and `..._threshold_0.30` onto one name, so a second
+ *    submit would look like a re-run of the first. `null` (refuse) is the
+ *    answer when the value alone will not fit, not a shortened value.
+ *  * **The trimmed key may not end in a separator.** `0.123456789` leaves a
+ *    28-character budget, which cuts `rolling_imminence_extrinsic_threshold`
+ *    to `rolling_imminence_extrinsic_` — and the joining `_` then makes the
+ *    `__` the runner refuses.
  */
-function keyValueToken(key: string, value: unknown): string {
-  const valueTok = valueToken(value);
-  const budget = Math.max(4, MAX_NAME_CHARS - valueTok.length - 1);
-  return `${key.replace(/\./g, '_').slice(0, budget)}_${valueTok}`;
+function keyValueToken(key: string, value: unknown): string | null {
+  const valueTok = valueToken(value).replace(NAME_SAFE, '_');
+  // One key character and the joining `_` are the minimum a pair needs.
+  if (valueTok.length > MAX_NAME_CHARS - 2) return null;
+  const budget = MAX_NAME_CHARS - valueTok.length - 1;
+  const keyTok = key
+    .replace(/\./g, '_')
+    .replace(NAME_SAFE, '_')
+    .slice(0, budget)
+    // Trailing separators go BEFORE the join, which is what keeps `__` out.
+    .replace(/[_.-]+$/, '');
+  return keyTok ? `${keyTok}_${valueTok}` : null;
 }
 
 /**
@@ -288,18 +334,29 @@ function keyValueToken(key: string, value: unknown): string {
  *
  * `strategy.min_put_premium = 0.6` becomes `strategy_min_put_premium_0.6`, and
  * a band becomes `strategy_put_delta_range_0.15-0.25`.
+ *
+ * `null` means "no name this runner would accept" — the caller reports it as a
+ * blocking error rather than posting a name that comes back 422.
  */
 export function armNameFor(changed: string[], overrides: Record<string, unknown>): string | null {
   if (changed.length === 0) return null;
-  const raw = changed.map((key) => keyValueToken(key, overrides[key])).join('_');
-  let name = raw.replace(NAME_SAFE, '_').slice(0, MAX_NAME_CHARS);
-  // The pattern demands an alphanumeric FIRST character, and a leading `-`
-  // (from a negative value) or `_` would be refused by the runner with a
-  // message about a name the operator never typed.
-  name = name.replace(/^[^A-Za-z0-9]+/, '');
-  if (!name) name = 'tweak';
+  const tokens = changed.map((key) => keyValueToken(key, overrides[key]));
+  if (tokens.some((t) => t === null)) return null;
+  let name = (tokens as string[])
+    .join('_')
+    .replace(NAME_SAFE, '_')
+    // Collapse any run of underscores the sanitiser or the join produced: a
+    // single `__` anywhere is a refusal, wherever it came from.
+    .replace(/_{2,}/g, '_')
+    // The pattern demands an alphanumeric FIRST character, and a leading `-`
+    // (from a negative value) or `_` would be refused by the runner with a
+    // message about a name the operator never typed.
+    .replace(/^[^A-Za-z0-9]+/, '');
   // `base` is reserved and runs implicitly; an arm that claimed it is a 422.
-  return name === 'base' ? 'tweak_base' : name;
+  if (name === 'base') name = 'tweak_base';
+  // The contract, asserted rather than assumed: anything that still fails it
+  // is refused here, where the operator can see why, not by the service.
+  return isValidArmName(name) ? name : null;
 }
 
 /** The subset of a run's stored spec a tweak carries forward verbatim. */
@@ -365,6 +422,10 @@ export interface TweakBuild {
   overrides: Record<string, unknown>;
   /** Every reason this cannot be submitted, in the order they were found. */
   errors: string[];
+  /** Non-blocking notes — the submit is still allowed (review round 1, R7). */
+  warnings: string[];
+  /** The arm of THIS run that already asks this question, if any (R2). */
+  existingArm: RunArm | null;
 }
 
 /**
@@ -378,9 +439,12 @@ export function buildTweak(args: {
   controls: TweakControl[];
   fields: FieldMap;
   basis: RunSpecBasis | null;
+  /** The run's own declared arms, for the already-asked check (R2). */
+  arms?: RunArm[];
 }): TweakBuild {
   const { changed, overrides, errors } = diffToBase(args.controls, args.fields);
   const all = [...errors];
+  const warnings = downwardOnlyWarnings(args.controls, args.fields);
   if (changed.length === 0 && errors.length === 0) {
     all.push('Nothing is changed yet — edit one field to build an arm.');
   }
@@ -394,8 +458,26 @@ export function buildTweak(args: {
     all.push('This run did not store a readable spec, so there is no window to replay against.');
   }
   const armName = changed.length === 1 ? armNameFor(changed, overrides) : null;
+  // A `null` name with exactly one change is not "nothing to do": it is a value
+  // this runner cannot name, and saying so here is the difference between a
+  // sentence the operator can act on and a 422 about a name they never typed.
+  if (changed.length === 1 && armName === null && errors.length === 0) {
+    all.push(
+      `${changed[0]}: that value is too long to name an arm with (names are capped at ` +
+        `${MAX_NAME_CHARS} characters and carry the value). Round it and try again.`,
+    );
+  }
+  const existingArm = changed.length > 0 ? existingArmFor(overrides, args.arms ?? []) : null;
+  if (existingArm) {
+    all.push(
+      `This run's arm \u201C${existingArm.name}\u201D already carries exactly these overrides. ` +
+        'Re-running it would NOT deduplicate \u2014 the arm name is part of the engine identity ' +
+        'and this bar derives a different one \u2014 so it would replay, in full, an answer ' +
+        'already on screen.',
+    );
+  }
   if (all.length > 0 || !armName || !args.basis) {
-    return { spec: null, armName, changed, overrides, errors: all };
+    return { spec: null, armName, changed, overrides, errors: all, warnings, existingArm };
   }
   return {
     spec: tweakSpec(args.basis, { name: armName, overrides }),
@@ -403,5 +485,96 @@ export function buildTweak(args: {
     changed,
     overrides,
     errors: [],
+    warnings,
+    existingArm: null,
   };
+}
+
+// --------------------------------------------------------------------------- //
+// The run's OTHER arms (review round 1, R2)
+// --------------------------------------------------------------------------- //
+
+/** One arm as the run's own `spec_json` declared it. */
+export interface RunArm {
+  name: string;
+  overrides: Record<string, unknown>;
+}
+
+/** Every declared arm of the run, `base` excluded (it is implicit). */
+export function parseRunArms(specJson: string | null | undefined): RunArm[] {
+  if (!specJson) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(specJson);
+  } catch {
+    return [];
+  }
+  const scenarios = (parsed as { scenarios?: unknown } | null)?.scenarios;
+  if (!Array.isArray(scenarios)) return [];
+  const arms: RunArm[] = [];
+  for (const entry of scenarios) {
+    if (!entry || typeof entry !== 'object') continue;
+    const arm = entry as { name?: unknown; overrides?: unknown };
+    if (typeof arm.name !== 'string' || !arm.name) continue;
+    const overrides =
+      arm.overrides && typeof arm.overrides === 'object' && !Array.isArray(arm.overrides)
+        ? (arm.overrides as Record<string, unknown>)
+        : {};
+    arms.push({ name: arm.name, overrides });
+  }
+  return arms;
+}
+
+/** Numeric-folded deep equality over two override maps. */
+export function sameOverrides(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every(
+    (key) => Object.prototype.hasOwnProperty.call(b, key) && sameValue(a[key], b[key]),
+  );
+}
+
+/**
+ * The arm of THIS run that already asks this question, if there is one.
+ *
+ * Submitting it again would not deduplicate: the arm NAME is part of the
+ * engine identity, and this bar derives a different name from the same
+ * overrides — so the service would replay, in full, an answer already on
+ * screen. Refused with a pointer to the cell instead.
+ */
+export function existingArmFor(
+  overrides: Record<string, unknown>,
+  arms: RunArm[],
+): RunArm | null {
+  return arms.find((arm) => sameOverrides(arm.overrides, overrides)) ?? null;
+}
+
+/**
+ * A key the served description marks DOWNWARD ONLY, raised above its base.
+ *
+ * `risk.max_position_size` is the live instance: the sizer never sizes above
+ * one contract (FC-079), so an arm that raises it replays to a grid cell
+ * numerically identical to base. A WARNING and not a block — the allowlist
+ * allows the key, the service will run it, and the operator may want the
+ * negative result on the record. The rule is read off the server's own prose
+ * rather than hardcoded to a key, so a second downward-only knob inherits it.
+ */
+export function downwardOnlyWarnings(controls: TweakControl[], fields: FieldMap): string[] {
+  const warnings: string[] = [];
+  for (const control of editableControls(controls)) {
+    if (!/DOWNWARD ONLY/i.test(control.description)) continue;
+    if (control.baseMissing || typeof control.baseValue !== 'number') continue;
+    const field = fields[control.key];
+    if (isBlank(control, field)) continue;
+    const coerced = coerceField(control, field);
+    if (!coerced.ok || typeof coerced.value !== 'number') continue;
+    if (coerced.value > control.baseValue) {
+      warnings.push(
+        `${control.key} is ${coerced.value}, above this run's base of ${control.baseValue} — the ` +
+          'served description says DOWNWARD ONLY, so raising it is inert and this arm will come ' +
+          'back numerically identical to base. It will still run.',
+      );
+    }
+  }
+  return warnings;
 }

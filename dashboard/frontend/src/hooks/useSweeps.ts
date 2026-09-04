@@ -504,7 +504,9 @@ export const SIM_COLD_START_NOTE =
   'The sim service is scale-to-zero with a measured cold-start tail of up to ~4 minutes, ' +
   'which is longer than the proxy’s 150 s timeout — so a FIRST submit after an idle period ' +
   'can land here having woken the instance anyway. Retrying is the right move: the instance ' +
-  'this attempt woke is warm now. Nothing was run.';
+  'this attempt woke is warm now. Whether this attempt RAN is not knowable from here — ' +
+  'Cloud Run queues the request, so the service can still accept it after the proxy gave up. ' +
+  'If the first attempt landed, Retry answers 409 and links that run.';
 
 /** The four shapes a `/simulate` 409 takes. */
 export type SimConflictKind = 'busy' | 'coverage' | 'budget' | 'generic';
@@ -623,7 +625,8 @@ export async function submitSim(spec: SweepSpec): Promise<SimSubmitOutcome> {
       detail:
         e.name === 'AbortError'
           ? `The submit did not answer within ${SIM_REQUEST_TIMEOUT_MS / 1000}s. It was NOT ` +
-            'retried — the run may still have started. Check the runs list before submitting again.'
+            'retried, and whether it ran is not knowable from here — the request may still be ' +
+            'queued. If it landed, a Retry answers 409 and links that run; the runs list shows it too.'
           : e.message || 'The submit could not be sent.',
     };
   } finally {
@@ -709,6 +712,11 @@ export type PinOutcome =
  * decision about the battery's standing cost, not a step in reading one cell.
  */
 export async function pinSpec(spec: SweepSpec, note: string): Promise<PinOutcome> {
+  // A blank note is sent as NO note. The route takes `{spec, note}` with `note`
+  // optional, and filling it with the derived arm name would put a string the
+  // operator never wrote into the pin list as if it were their annotation.
+  const trimmed = note.trim();
+  const pinBody: Record<string, unknown> = trimmed ? { spec, note: trimmed } : { spec };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
@@ -716,7 +724,7 @@ export async function pinSpec(spec: SweepSpec, note: string): Promise<PinOutcome
     response = await fetch('/api/v2/sims/pins', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...IAP_XHR_HEADERS },
-      body: JSON.stringify({ spec, note }),
+      body: JSON.stringify(pinBody),
       signal: controller.signal,
     });
   } catch (err) {
