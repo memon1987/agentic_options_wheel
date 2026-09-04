@@ -30,6 +30,13 @@ export interface PremiumChartsProps {
   strategy?: string;
   /** The cell's state, for the empty-ledger message (review R9). */
   stateLabel?: string | null;
+  /**
+   * PR-5 (review round 1, R3): the alignment matrix withheld this pair's
+   * numbers, so every DOLLAR and RATE this panel would print is suppressed.
+   * The curve's shape still belongs to this cell and is still drawn; what goes
+   * is the figure a reader would set beside the panel next to it.
+   */
+  numbersWithheld?: boolean;
 }
 
 export default function PremiumCharts({
@@ -37,6 +44,7 @@ export default function PremiumCharts({
   absence,
   strategy = 'wheel',
   stateLabel = null,
+  numbersWithheld = false,
 }: PremiumChartsProps) {
   if (!digest) {
     return (
@@ -123,13 +131,20 @@ export default function PremiumCharts({
             </AreaChart>
           </ResponsiveContainer>
         </div>
-        <p data-testid="premium-total" className="text-xs text-gray-500 mt-2">
-          Ends at {fmtCurrency(digest.netOptionCash)} over{' '}
-          {digest.netOptionCashSeries.length} cash-moving days.
-        </p>
+        {numbersWithheld ? (
+          <p data-testid="premium-withheld" className="text-xs text-gray-500 mt-2">
+            The cumulative total and the monthly bars are withheld: they are dollars, and the
+            alignment matrix says these two cells&rsquo; dollars are not comparable.
+          </p>
+        ) : (
+          <p data-testid="premium-total" className="text-xs text-gray-500 mt-2">
+            Ends at {fmtCurrency(digest.netOptionCash)} over{' '}
+            {digest.netOptionCashSeries.length} cash-moving days.
+          </p>
+        )}
       </div>
 
-      <MonthlyPremiumBars data={digest.monthly} />
+      {!numbersWithheld && <MonthlyPremiumBars data={digest.monthly} />}
     </section>
   );
 }

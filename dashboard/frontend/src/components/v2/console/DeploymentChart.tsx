@@ -31,6 +31,13 @@ export interface DeploymentChartProps {
   suppressionReason: string | null;
   absence: string | null;
   strategy?: string;
+  /**
+   * PR-5 (review round 1, R3): the alignment matrix withheld this pair's
+   * numbers, so every DOLLAR and RATE this panel would print is suppressed.
+   * The curve's shape still belongs to this cell and is still drawn; what goes
+   * is the figure a reader would set beside the panel next to it.
+   */
+  numbersWithheld?: boolean;
 }
 
 export default function DeploymentChart({
@@ -40,6 +47,7 @@ export default function DeploymentChart({
   suppressionReason,
   absence,
   strategy = 'wheel',
+  numbersWithheld = false,
 }: DeploymentChartProps) {
   if (series.length === 0) {
     return (
@@ -136,7 +144,13 @@ export default function DeploymentChart({
           </AreaChart>
         </ResponsiveContainer>
       </div>
-      {reading && (
+      {numbersWithheld && (
+        <p data-testid="deployment-withheld" className="text-xs text-gray-500 mt-2">
+          The dollar-weighted mean is withheld: the alignment matrix says these two cells are not
+          comparable on rates, and a share of capital is a rate.
+        </p>
+      )}
+      {reading && !numbersWithheld && (
         <p data-testid="deployment-mean" className="text-xs text-gray-500 mt-2">
           Dollar-weighted mean over all {reading.days} decision days:{' '}
           {reading.ratio === null ? '—' : fmtPercent(reading.ratio, 1)} of capital

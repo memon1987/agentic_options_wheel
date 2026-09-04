@@ -25,6 +25,13 @@ export interface DrawdownChartProps {
   row: SweepResultRow | null;
   absence: string | null;
   strategy?: string;
+  /**
+   * PR-5 (review round 1, R3): the alignment matrix withheld this pair's
+   * numbers, so every DOLLAR and RATE this panel would print is suppressed.
+   * The curve's shape still belongs to this cell and is still drawn; what goes
+   * is the figure a reader would set beside the panel next to it.
+   */
+  numbersWithheld?: boolean;
 }
 
 export default function DrawdownChart({
@@ -32,6 +39,7 @@ export default function DrawdownChart({
   row,
   absence,
   strategy = 'wheel',
+  numbersWithheld = false,
 }: DrawdownChartProps) {
   const measured = renderCell(row).kind === 'return';
 
@@ -57,7 +65,12 @@ export default function DrawdownChart({
       <h3 className="text-base font-semibold text-white">Drawdown</h3>
       <StrategyBanner strategy={strategy} />
       <p className="text-xs text-gray-500 mt-1 mb-3">
-        {measured ? (
+        {numbersWithheld ? (
+          <span data-testid="drawdown-withheld">
+            Max drawdown withheld — the alignment matrix says these two cells are not comparable
+            on returns or rates. The shape below is still this cell&rsquo;s own.
+          </span>
+        ) : measured ? (
           <span data-testid="drawdown-header">
             Max drawdown {pctOrDash(row?.max_drawdown)} — the engine&rsquo;s number, from the grid
             cell.

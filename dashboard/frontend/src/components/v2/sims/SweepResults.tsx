@@ -26,8 +26,10 @@
 // console, so the caveats stay the last word on the screen instead of ending up
 // in the middle of the evidence they qualify.
 
+import { Link } from 'react-router-dom';
 import type { SweepReport, SweepRow } from '../../../types/v2';
 import { fmtNumber, cls } from '../../../utils/format';
+import { comparePath } from '../console/compareAlignment';
 import {
   indexRows,
   lookupCell,
@@ -198,16 +200,43 @@ export default function SweepResults({ sweep, report, raw }: Props) {
                         </td>
                         {report.symbols.map((sym) => {
                           const cell = renderCell(lookupCell(index, scenario, sym, split));
+                          // PR-5 entry point: any grid cell opens the compare
+                          // view with itself as A and this run's base arm at
+                          // the same split as B. On the base row there is no
+                          // default partner, so the link carries A alone and
+                          // the compare page's B picker stays empty — the page
+                          // never chooses one.
+                          const href = comparePath(
+                            { runId: sweep.run_id, scenario, symbol: sym, split },
+                            isBase
+                              ? null
+                              : { runId: sweep.run_id, scenario: 'base', symbol: sym, split },
+                          );
                           return (
                             <td key={sym} className="px-3 py-2 text-right">
-                              <span
-                                data-testid={`cell-${scenario}-${sym}-${split}`}
-                                data-cell-kind={cell.kind}
-                                title={cell.title}
-                                className={cls('inline-block px-2 py-0.5 rounded text-xs', cell.className)}
+                              {/* A link that looks like one (review round 1,
+                                  LOW): the cell was a bare span with no hover,
+                                  no underline and no focus ring, so nothing on
+                                  screen said the grid had become clickable.
+                                  ONE title, on the link, because two nested
+                                  ones race in the tooltip. */}
+                              <Link
+                                to={href}
+                                data-testid={`compare-cell-${scenario}-${sym}-${split}`}
+                                title={`${cell.title} — open the compare view with this cell${isBase ? '' : ' against base'}.`}
+                                className="inline-block rounded hover:ring-1 hover:ring-blue-500/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
                               >
-                                {cell.text}
-                              </span>
+                                <span
+                                  data-testid={`cell-${scenario}-${sym}-${split}`}
+                                  data-cell-kind={cell.kind}
+                                  className={cls(
+                                    'inline-block px-2 py-0.5 rounded text-xs underline decoration-dotted decoration-gray-500 underline-offset-2',
+                                    cell.className,
+                                  )}
+                                >
+                                  {cell.text}
+                                </span>
+                              </Link>
                             </td>
                           );
                         })}

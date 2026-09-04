@@ -13,6 +13,8 @@
 // base" number is served per cell by PR-1 rather than derived from two objects.
 
 import { useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { comparePath } from './compareAlignment';
 import type { SimBars, SweepAllowlist, SweepReport, SweepRow, SweepSpec } from '../../../types/v2';
 import { useArtifact } from '../../../hooks/useArtifact';
 import { useBars } from '../../../hooks/useBars';
@@ -44,7 +46,7 @@ export const BASE_SCENARIO = 'base';
 export const PORTFOLIO_TAB = '__portfolio__';
 
 /** `base_config_json` is a JSON STRING on the row; a bad one is not fatal. */
-function parseBaseEffective(raw: string | null | undefined): Record<string, unknown> | null {
+export function parseBaseEffective(raw: string | null | undefined): Record<string, unknown> | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -59,7 +61,7 @@ function parseBaseEffective(raw: string | null | undefined): Record<string, unkn
 }
 
 /** `spec.strategy` off the run's own spec, when it carries one (Phase C). */
-function specStrategy(sweep: SweepRow): string | null {
+export function specStrategy(sweep: SweepRow): string | null {
   if (!sweep.spec_json) return null;
   try {
     const spec = JSON.parse(sweep.spec_json) as Record<string, unknown>;
@@ -258,6 +260,25 @@ export default function Console({
           <span className="font-mono">{dedupFrom ? sweep.run_id : artifactState.runId}</span>.
         </p>
       )}
+
+      {/* PR-5 entry point. `a` is the cell on screen; `b` is pre-filled with
+          THIS run's base arm at the same split, which is the comparison the
+          console is already anchored to. On the base cell itself there is no
+          default partner — comparing base with base is not a question — so the
+          link carries `a` alone and the compare page's `b` picker stays empty.
+          The page never chooses a partner on its own. */}
+      <p className="text-xs">
+        <Link
+          data-testid="compare-link"
+          className="underline text-blue-300"
+          to={comparePath(
+            { runId: sweep.run_id, scenario, symbol, split },
+            isBase ? null : { runId: sweep.run_id, scenario: BASE_SCENARIO, symbol, split },
+          )}
+        >
+          Compare this cell{isBase ? '…' : ' with base'}
+        </Link>
+      </p>
 
       <VerdictStrip
         row={row}

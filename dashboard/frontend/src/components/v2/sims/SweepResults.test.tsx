@@ -10,6 +10,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
+// PR-5 made every grid cell a compare <Link>, so the grid needs a router.
+import { MemoryRouter } from 'react-router-dom';
 import SweepResults from './SweepResults';
 import BiasFooter from './BiasFooter';
 import { normaliseReport } from './normaliseReport';
@@ -61,10 +63,10 @@ const unknownReport = () => normaliseReport(shapedUnknown, sweep())!;
 // the footer is genuinely last on the real page.
 const show = (report: SweepReport, row: SweepRow = sweep(), raw?: unknown) =>
   render(
-    <>
+    <MemoryRouter>
       <SweepResults sweep={row} report={report} raw={raw} />
       <BiasFooter report={report} />
-    </>,
+    </MemoryRouter>,
   );
 
 const cell = (scenario: string, symbol: string, split: string) =>
@@ -111,7 +113,11 @@ describe('SweepResults — the five cell renderings', () => {
     const c = cell('call_floor_0_50', 'AAPL', 'fit');
     expect(c).toHaveAttribute('data-cell-kind', 'err');
     expect(c.textContent).toBe('err');
-    expect(c.getAttribute('title')).toMatch(/UnadjustedCorporateAction/);
+    // PR-5 wrapped every cell in a compare <Link> and moved the hover text onto
+    // it — ONE title, because two nested ones race in the tooltip. The engine's
+    // error is still the first thing it says.
+    expect(c.closest('a')?.getAttribute('title')).toMatch(/UnadjustedCorporateAction/);
+    expect(c.getAttribute('title')).toBeNull();
   });
 
   it('renders an UNCLASSIFIED cell as `unknown` — not as a green return', () => {

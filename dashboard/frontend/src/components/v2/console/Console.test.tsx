@@ -19,6 +19,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+// PR-5 put a "Compare this cell" <Link> in the console's header, so the tree now
+// needs a router ancestor. `MemoryRouter` rather than a stub: a fake Link would
+// stop testing the href the entry point actually produces.
+import { MemoryRouter } from 'react-router-dom';
 import shaped13cc from '../../../test/fixtures/sweep_shaped_13cc.json';
 import artifact13cc from '../../../test/fixtures/artifact_13cc_base_googl_fit.json';
 import bars13cc from '../../../test/fixtures/bars_13cc_googl_fit.json';
@@ -65,13 +69,15 @@ const serveNothing = () =>
 
 const show = (over: Partial<SweepReport> = {}, scenario = 'base', split = 'fit') =>
   render(
-    <Console
-      sweep={sweep}
-      report={{ ...report, ...over }}
-      scenario={scenario}
-      symbol="GOOGL"
-      split={split}
-    />,
+    <MemoryRouter>
+      <Console
+        sweep={sweep}
+        report={{ ...report, ...over }}
+        scenario={scenario}
+        symbol="GOOGL"
+        split={split}
+      />
+    </MemoryRouter>,
   );
 
 /**
