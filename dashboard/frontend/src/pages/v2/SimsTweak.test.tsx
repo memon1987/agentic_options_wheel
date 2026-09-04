@@ -222,14 +222,21 @@ describe('the notice sits ABOVE the shells (review R3)', () => {
     // that anything had been submitted.
     detailByRun.new456 = runningRun('new456');
     await tweakAndSubmit();
-    const notice = await screen.findByTestId('tweak-notice');
+    // Wait for the SHELL first: both nodes have to be read from one settled
+    // render, or `compareDocumentPosition` is asked about a detached node it
+    // left behind — which answers DISCONNECTED and passes a naive bitmask test.
+    await waitFor(() =>
+      expect(screen.getByTestId('results-status').dataset.runStatus).toBe('running'),
+    );
+    const shell = screen.getByTestId('results-status');
+    const notice = screen.getByTestId('tweak-notice');
     expect(notice.dataset.noticeKind).toBe('accepted');
     expect(notice.textContent).toContain('new456');
     expect(notice.textContent).toContain('polls it until it finishes');
-    const shell = screen.getByTestId('results-status');
-    expect(shell.dataset.runStatus).toBe('running');
     // ABOVE, asserted rather than left to whoever edits the JSX next.
-    expect(notice.compareDocumentPosition(shell) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const where = notice.compareDocumentPosition(shell);
+    expect(where & Node.DOCUMENT_POSITION_DISCONNECTED).toBe(0);
+    expect(where & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('drops the polling claim once the destination is terminal', async () => {
@@ -253,6 +260,11 @@ describe('the notice sits ABOVE the shells (review R3)', () => {
     const lag = await screen.findByTestId('results-streaming-lag');
     expect(lag.textContent).toContain('not visible yet');
     expect(screen.queryByText(/state is/)).toBeNull();
+    // And the acknowledgement is there too — this is the FIRST screen after a
+    // submit, and the one most likely to read as a failure without it.
+    const notice = screen.getByTestId('tweak-notice');
+    expect(notice.textContent).toContain('new456');
+    expect(notice.compareDocumentPosition(lag) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 
