@@ -8,6 +8,7 @@
 // The allowlist and the run row are the REAL captured payloads.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useState } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import allowlistFixture from '../../../test/fixtures/sweep_allowlist.json';
@@ -15,7 +16,9 @@ import shaped13cc from '../../../test/fixtures/sweep_shaped_13cc.json';
 import type { SweepAllowlist } from '../../../types/v2';
 import { normaliseSweepDetail } from '../sims/normaliseReport';
 import { resetSessionExpiredSignal } from '../../../hooks/iapSession';
+import { submitSim } from '../../../hooks/useSweeps';
 import TweakBar, { TWEAK_BASE_ANCHOR } from './TweakBar';
+import type { SimRefusal } from './TweakBar';
 
 const allowlist = allowlistFixture as unknown as SweepAllowlist;
 const sweep = normaliseSweepDetail(shaped13cc)!.sweep;
@@ -23,22 +26,54 @@ const baseEffective = JSON.parse(sweep.base_config_json!).effective as Record<st
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
-const setup = (props: Partial<React.ComponentProps<typeof TweakBar>> = {}) => {
-  const onSubmitted = vi.fn();
-  render(
+/**
+ * The bar is a CONTROLLED component now (review round 1, R5): the page owns the
+ * request, the in-flight flag and the outcome. `Harness` is the page's half,
+ * small enough to keep the wiring under test rather than mocked away.
+ */
+function Harness(props: Partial<React.ComponentProps<typeof TweakBar>> & {
+  onSubmitSpy?: ReturnType<typeof vi.fn>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [outcome, setOutcome] = useState<SimRefusal | null>(null);
+  const [accepted, setAccepted] = useState<string | null>(null);
+  return (
     <MemoryRouter>
       <TweakBar
         sweep={sweep}
         allowlist={allowlist}
         allowlistError={null}
         baseEffective={baseEffective}
+        scenario="base"
         symbol="GOOGL"
         split="holdout"
-        onSubmitted={onSubmitted}
+        submitting={submitting}
+        outcome={outcome}
+        onSubmit={(spec, armName) => {
+          props.onSubmitSpy?.(spec, armName);
+          setSubmitting(true);
+          setOutcome(null);
+          void submitSim(spec).then((result) => {
+            setSubmitting(false);
+            if (result.kind === 'accepted' || result.kind === 'deduplicated') {
+              setAccepted(`${result.kind}:${result.runId}:${armName}`);
+              return;
+            }
+            setOutcome(result);
+          });
+        }}
+        onClearOutcome={() => setOutcome(null)}
+        onOpenCell={props.onOpenCell ?? (() => undefined)}
         {...props}
       />
-    </MemoryRouter>,
+      {accepted && <span data-testid="harness-accepted">{accepted}</span>}
+    </MemoryRouter>
   );
+}
+
+const setup = (props: Partial<React.ComponentProps<typeof TweakBar>> = {}) => {
+  const onSubmitted = vi.fn();
+  render(<Harness onSubmitSpy={onSubmitted} {...props} />);
   return { onSubmitted };
 };
 
@@ -149,10 +184,10 @@ describe('the POST, and where each answer lands', () => {
     // The two mutations this kills: sending every control's value, and dropping
     // `holdout_start` from the body.
     fetchMock.mockResolvedValue(jsonResponse(202, { run_id: 'new456', cell_count: 4 }));
-    const { onSubmitted } = setup();
+    setup();
     typeInto('strategy.min_put_premium', '0.65');
     fireEvent.click(submit());
-    await waitFor(() => expect(onSubmitted).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId('harness-accepted')).toBeTruthy());
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/v2/sims/run');
@@ -174,14 +209,13 @@ describe('the POST, and where each answer lands', () => {
 
   it('navigates to the NEW run’s arm on a 202, and says it is polling', async () => {
     fetchMock.mockResolvedValue(jsonResponse(202, { run_id: 'new456', cell_count: 4 }));
-    const { onSubmitted } = setup();
+    setup();
     typeInto('strategy.min_put_premium', '0.65');
     fireEvent.click(submit());
-    await waitFor(() => expect(onSubmitted).toHaveBeenCalled());
-    const target = onSubmitted.mock.calls[0][0];
-    expect(target.runId).toBe('new456');
-    expect(target.scenario).toBe('strategy_min_put_premium_0.65');
-    expect(target.notice).toContain('polls');
+    await waitFor(() => expect(screen.getByTestId('harness-accepted')).toBeTruthy());
+    expect(screen.getByTestId('harness-accepted').textContent).toBe(
+      'accepted:new456:strategy_min_put_premium_0.65',
+    );
   });
 
   it('navigates to the PRIOR run on a 200 and says nothing was replayed', async () => {
@@ -191,14 +225,13 @@ describe('the POST, and where each answer lands', () => {
     fetchMock.mockResolvedValue(
       jsonResponse(200, { run_id: 'prior123', deduplicated: true, sweep_key: 'k' }),
     );
-    const { onSubmitted } = setup();
+    setup();
     typeInto('strategy.min_put_premium', '0.65');
     fireEvent.click(submit());
-    await waitFor(() => expect(onSubmitted).toHaveBeenCalled());
-    const target = onSubmitted.mock.calls[0][0];
-    expect(target.runId).toBe('prior123');
-    expect(target.notice).toContain('NOTHING was replayed');
-    expect(target.notice).not.toContain('polls');
+    await waitFor(() => expect(screen.getByTestId('harness-accepted')).toBeTruthy());
+    expect(screen.getByTestId('harness-accepted').textContent).toBe(
+      'deduplicated:prior123:strategy_min_put_premium_0.65',
+    );
   });
 });
 
@@ -214,13 +247,13 @@ describe('every refusal, in the service’s own words', () => {
 
   it('reads a busy 409 as busy and LINKS the blocking run', async () => {
     const detail = 'this exact spec is already running as 9f2c1a4b7e0d3c55 (submitted via operator).';
-    const { onSubmitted } = await tweakAndSubmit(409, { detail, run_id: '9f2c1a4b7e0d3c55' });
+    await tweakAndSubmit(409, { detail, run_id: '9f2c1a4b7e0d3c55' });
     expect(screen.getByTestId('tweak-outcome').dataset.outcome).toBe('conflict');
     expect(screen.getByTestId('tweak-detail').textContent).toBe(detail);
     const link = screen.getByRole('link', { name: /Open run 9f2c1a4b7e0d3c55/ });
     expect(link.getAttribute('href')).toBe('/sims/9f2c1a4b7e0d3c55');
-    // A refusal is not an answer: nothing navigates.
-    expect(onSubmitted).not.toHaveBeenCalled();
+    // A refusal is not an answer: nothing is accepted.
+    expect(screen.queryByTestId('harness-accepted')).toBeNull();
   });
 
   it('reads the instance-lock 409 (run_id: NULL) as busy, with no link', async () => {

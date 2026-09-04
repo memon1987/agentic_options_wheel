@@ -238,7 +238,12 @@ describe('submitSim — one POST, and the status decides the outcome', () => {
   it('carries a cold-start sentence for the UI’s 502 branch to render', () => {
     expect(SIM_COLD_START_NOTE).toContain('cold-start');
     expect(SIM_COLD_START_NOTE).toContain('150 s');
-    expect(SIM_COLD_START_NOTE).toContain('Nothing was run.');
+    // R4: the client CANNOT know nothing ran — Cloud Run queues the request
+    // and the service can accept it after the proxy gave up. The note must say
+    // what the operator can actually check instead of asserting a fact.
+    expect(SIM_COLD_START_NOTE).not.toContain('Nothing was run');
+    expect(SIM_COLD_START_NOTE).toContain('not knowable from here');
+    expect(SIM_COLD_START_NOTE).toContain('Retry answers 409');
   });
 });
 

@@ -19,11 +19,9 @@ import type { PinOutcome } from '../../../hooks/useSweeps';
 export interface PinButtonProps {
   /** The built tweak spec, or `null` while the bar has nothing submittable. */
   spec: SweepSpec | null;
-  /** The arm the spec declares — used only for the default note. */
-  armName: string | null;
 }
 
-export default function PinButton({ spec, armName }: PinButtonProps) {
+export default function PinButton({ spec }: PinButtonProps) {
   const [open, setOpen] = useState(false);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -33,7 +31,9 @@ export default function PinButton({ spec, armName }: PinButtonProps) {
     if (!spec || busy) return;
     setBusy(true);
     setOutcome(null);
-    const result = await pinSpec(spec, note.trim() || (armName ?? ''));
+    // A blank note stays blank: `pinSpec` omits the field entirely rather
+    // than filling it with a derived arm name the operator never wrote.
+    const result = await pinSpec(spec, note);
     setBusy(false);
     setOutcome(result);
     if (result.kind === 'created') setOpen(false);
@@ -79,7 +79,7 @@ export default function PinButton({ spec, armName }: PinButtonProps) {
         )}
       </span>
 
-      {open && spec && !outcome && (
+      {open && spec && (
         <span data-testid="pin-rolling-note" className="text-[11px] text-gray-500">
           The window becomes a SHAPE: its length and its holdout length are re-anchored to the last
           settled session every Saturday, so this pin measures the same question over a window that

@@ -18,15 +18,16 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { SweepAllowlist, SweepRow, SweepSpec } from '../../../types/v2';
-import { submitSim, SIM_COLD_START_NOTE } from '../../../hooks/useSweeps';
+import { SIM_COLD_START_NOTE } from '../../../hooks/useSweeps';
 import type { SimSubmitOutcome } from '../../../hooks/useSweeps';
-import { validateSpec } from '../sims/specValidation';
+import { BASE_SCENARIO_NAME, validateSpec } from '../sims/specValidation';
 import {
   buildControls,
   buildTweak,
   editableControls,
 
   listOnlyControls,
+  parseRunArms,
   parseRunSpec,
   prefill,
 } from './tweakSpec';
@@ -46,7 +47,10 @@ export const TWEAK_BASE_ANCHOR =
   'Every comparison stays anchored to base. This submits a NEW run: your one changed field ' +
   'becomes an arm, and the runner replays `base` beside it, so the Δ you read on the ' +
   'destination is that arm against that run’s own base. The values below are THIS run’s ' +
-  'effective config, and only the field you change is sent as an override.';
+  'effective config, and only the field you change is sent as an override — every OTHER ' +
+  'field takes the sim service’s CURRENT config, which is not necessarily what is shown ' +
+  'here if the config has moved since this run. The new run’s `base_config_hash` is how ' +
+  'to tell: a different hash means a different base, and the comparison is against THAT.';
 
 export interface TweakBarProps {
   sweep: SweepRow;
@@ -55,14 +59,27 @@ export interface TweakBarProps {
   /** `base_config_json.effective`, parsed once by `Console`. */
   baseEffective: Record<string, unknown> | null;
   /** The cell on screen — the destination keeps the symbol and the split. */
+  scenario: string;
   symbol: string;
   split: string;
   /**
-   * Navigate to the answer. The NOTICE travels with it because this component
-   * unmounts on the way: the destination run's detail has to load, and the
-   * results region renders its loading shell in between.
+   * The submit is OWNED BY THE PAGE (review round 1, R5).
+   *
+   * A sim submit waits up to 150 s, and this component is keyed on the run: the
+   * operator selecting another run mid-flight unmounts it, and a `setState` in
+   * the promise's tail then lands on nothing — a 409 or a 422 the operator
+   * never sees, or a late 202 that yanks them off what they had moved on to
+   * read. So the request, its in-flight flag and its outcome all live on the
+   * page, keyed to the run it was submitted FROM, and this component only
+   * renders them.
    */
-  onSubmitted: (target: { runId: string; scenario: string; notice: string }) => void;
+  submitting: boolean;
+  outcome: SimRefusal | null;
+  onSubmit: (spec: SweepSpec, armName: string) => void;
+  /** Clear a stale outcome the moment the spec it belonged to changes (R8). */
+  onClearOutcome: () => void;
+  /** Open another cell of THIS run — the already-asked arm (R2). */
+  onOpenCell: (cell: { scenario: string; symbol: string; split: string }) => void;
 }
 
 const inputClass =
@@ -151,6 +168,8 @@ function Outcome({ outcome, onRetry }: { outcome: SimRefusal; onRetry: () => voi
   const box = (tone: 'bad' | 'warn', heading: string, body: React.ReactNode) => (
     <div
       data-testid="tweak-outcome"
+      role="status"
+      aria-live="polite"
       data-outcome={outcome.kind}
       className={`rounded border px-3 py-2 text-xs ${
         tone === 'bad'
@@ -261,21 +280,25 @@ export default function TweakBar({
   allowlist,
   allowlistError,
   baseEffective,
+  scenario,
   symbol,
   split,
-  onSubmitted,
+  submitting,
+  outcome,
+  onSubmit,
+  onClearOutcome,
+  onOpenCell,
 }: TweakBarProps) {
   const controls = useMemo(() => buildControls(allowlist, baseEffective), [allowlist, baseEffective]);
   const editable = useMemo(() => editableControls(controls), [controls]);
   const listOnly = useMemo(() => listOnlyControls(controls), [controls]);
   const basis = useMemo(() => parseRunSpec(sweep.spec_json), [sweep.spec_json]);
+  const arms = useMemo(() => parseRunArms(sweep.spec_json), [sweep.spec_json]);
 
   // Only the keys the operator has TOUCHED live in state; everything else falls
   // back to its prefill. So a late-arriving allowlist prefills correctly with no
-  // effect to synchronise, and "reset" is one `setFields({})`.
+  // effect to synchronise, and "reset" is one `setEdits({})`.
   const [edits, setEdits] = useState<FieldMap>({});
-  const [busy, setBusy] = useState(false);
-  const [outcome, setOutcome] = useState<SimRefusal | null>(null);
 
   const fields = useMemo<FieldMap>(() => {
     const merged: FieldMap = {};
@@ -284,8 +307,8 @@ export default function TweakBar({
   }, [controls, edits]);
 
   const build = useMemo(
-    () => buildTweak({ controls, fields, basis }),
-    [controls, fields, basis],
+    () => buildTweak({ controls, fields, basis, arms }),
+    [controls, fields, basis, arms],
   );
 
   // The SHARED validator the JSON editor uses (`specValidation.ts:198`) — the
@@ -303,46 +326,62 @@ export default function TweakBar({
     [build.spec, allowlist],
   );
 
-  const blocking = [...build.errors, ...(verdict?.issues.map((i) => i.message) ?? [])];
+  /**
+   * A `validateSpec` issue on this bar is never about a control: every field it
+   * checks — window, holdout, symbols, cash — is CARRIED from the run's own
+   * spec, unedited. Worded as a control error it reads as "fix your input" for
+   * an input that does not exist here (review round 1, LOW).
+   */
+  const carriedIssues = (verdict?.issues ?? []).map(
+    (issue) =>
+      `This run's own spec no longer satisfies the current caps (${issue.field}): ${issue.message} ` +
+      'Nothing on this bar can change it — re-submit the run from the form above with a window ' +
+      'that fits.',
+  );
+  const blocking = [...build.errors, ...carriedIssues];
   const spec: SweepSpec | null = build.spec && blocking.length === 0 ? build.spec : null;
 
-  const submit = async () => {
-    if (!spec || busy) return;
-    setBusy(true);
-    setOutcome(null);
-    const result = await submitSim(spec);
-    setBusy(false);
-    if (result.kind === 'accepted') {
-      onSubmitted({
-        runId: result.runId,
-        scenario: build.armName!,
-        notice:
-          `Run ${result.runId} accepted — replaying arm “${build.armName}”` +
-          `${result.cellCount === null ? '' : ` (${result.cellCount} cells)`}. ` +
-          'This page polls it until it finishes.',
-      });
-      return;
-    }
-    if (result.kind === 'deduplicated') {
-      onSubmitted({
-        runId: result.runId,
-        scenario: build.armName!,
-        notice:
-          `Answered from stored run ${result.runId} — an identical spec had already completed on ` +
-          'this engine and commit, so NOTHING was replayed. The evidence below is that run’s.',
-      });
-      return;
-    }
-    setOutcome(result);
+  const edit = (key: string, next: FieldMap[string]) => {
+    // R8: an outcome belongs to the spec that produced it. The moment the spec
+    // changes, a refusal on screen is about a request nobody would make again.
+    onClearOutcome();
+    setEdits((prev) => ({ ...prev, [key]: next }));
+  };
+
+  const submit = () => {
+    // R5/LOW: `submitting` is the page's flag, so a second click during the
+    // flight cannot start a second POST even though this component remounted.
+    if (!spec || submitting || !build.armName) return;
+    onSubmit(spec, build.armName);
+  };
+
+  const armOverrides = (arm: string) => {
+    const found = arms.find((a) => a.name === arm);
+    if (!found) return null;
+    const pairs = Object.entries(found.overrides).map(([k, v]) => `${k}: ${JSON.stringify(v)}`);
+    return pairs.length > 0 ? pairs.join(', ') : 'no overrides';
   };
 
   return (
-    <section data-testid="tweak-bar" className="rounded border border-gray-700 bg-gray-850 p-3 space-y-3">
+    <section data-testid="tweak-bar" className="rounded border border-gray-700 bg-gray-800 p-3 space-y-3">
       <div>
         <h3 className="text-sm font-semibold text-white">Tweak one field and re-run</h3>
         <p data-testid="tweak-base-anchor" className="mt-1 text-xs text-gray-400 leading-snug">
           {TWEAK_BASE_ANCHOR}
         </p>
+        {/* R2: the controls are the run's BASE values whatever cell is on
+            screen. Read as the selected arm's config they are simply wrong,
+            and the arm's own overrides are NOT carried into the tweak. */}
+        {scenario !== BASE_SCENARIO_NAME && (
+          <p data-testid="tweak-non-base-caption" className="mt-1 text-xs text-amber-400 leading-snug">
+            The controls below show this run&rsquo;s <strong>base</strong> values, not{' '}
+            <span className="font-mono">{scenario}</span>&rsquo;s.{' '}
+            <span className="font-mono">{scenario}</span>&rsquo;s own overrides
+            {armOverrides(scenario) ? ` (${armOverrides(scenario)})` : ''} are{' '}
+            <strong>not carried</strong> into the arm this bar builds — it is built from base plus
+            the one field you change.
+          </p>
+        )}
       </div>
 
       {allowlistError && (
@@ -352,10 +391,29 @@ export default function TweakBar({
         </p>
       )}
 
-      {!allowlistError && editable.length === 0 && (
+      {!allowlistError && !allowlist && (
         <p className="text-xs text-gray-400">Loading the allowlist…</p>
       )}
 
+      {/* LOW: a LOADED allowlist that types nothing is a served fact, not a
+          pending fetch, and "Loading…" for ever is the wrong reading of it. */}
+      {!allowlistError && allowlist && editable.length === 0 && (
+        <p data-testid="tweak-no-typed-keys" className="text-xs text-amber-400">
+          This deploy&rsquo;s allowlist types no editable keys ({(allowlist.allowed ?? []).length}{' '}
+          allowed, {Object.keys(allowlist.value_types ?? {}).length} typed), so there is nothing to
+          offer here. The JSON editor above still takes any allowed override.
+        </p>
+      )}
+
+      {/* A real form, so Enter in any field submits (review round 1, LOW). */}
+      <form
+        data-testid="tweak-form"
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
       {editable.length > 0 && (
         <div data-testid="tweak-controls" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {editable.map((control) => (
@@ -363,8 +421,8 @@ export default function TweakBar({
               key={control.key}
               control={control}
               field={fields[control.key]}
-              disabled={busy}
-              onChange={(next) => setEdits((prev) => ({ ...prev, [control.key]: next }))}
+              disabled={submitting}
+              onChange={(next) => edit(control.key, next)}
             />
           ))}
         </div>
@@ -377,6 +435,14 @@ export default function TweakBar({
         </p>
       )}
 
+      {build.warnings.length > 0 && (
+        <ul data-testid="tweak-warnings" className="space-y-1 text-xs text-amber-400">
+          {build.warnings.map((message) => (
+            <li key={message}>⚠ {message}</li>
+          ))}
+        </ul>
+      )}
+
       {blocking.length > 0 && (
         <ul data-testid="tweak-blocking" className="space-y-1 text-xs text-amber-400">
           {blocking.map((message) => (
@@ -385,31 +451,48 @@ export default function TweakBar({
         </ul>
       )}
 
-      <div className="flex flex-wrap items-center gap-2">
+      {/* R2b: the same question already answered on this run. A link, because
+          the remedy is to READ that cell, not to re-measure it. */}
+      {build.existingArm && (
         <button
           type="button"
+          data-testid="tweak-open-existing-arm"
+          className="text-xs text-blue-400 underline"
+          onClick={() =>
+            onOpenCell({ scenario: build.existingArm!.name, symbol, split })
+          }
+        >
+          Open {build.existingArm.name} / {symbol} / {split}
+        </button>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="submit"
           data-testid="tweak-submit"
-          disabled={!spec || busy}
-          onClick={submit}
+          disabled={!spec || submitting}
           className={`rounded px-3 py-1 text-xs font-medium ${
-            spec && !busy
+            spec && !submitting
               ? 'bg-blue-700 text-white hover:bg-blue-600'
               : 'bg-gray-700 text-gray-400 cursor-not-allowed'
           }`}
         >
-          {busy ? 'Submitting…' : 'Run this tweak'}
+          {submitting ? 'Submitting…' : 'Run this tweak'}
         </button>
-        <PinButton spec={spec} armName={build.armName} />
+        {/* Keyed on the arm: a pin outcome belongs to the spec that produced
+            it, and a changed field makes it a different question (R8). */}
+        <PinButton key={build.armName ?? ''} spec={spec} />
         <span className="text-[11px] text-gray-500">
           {verdict
-            ? `${verdict.cellCount} cells (this arm + base) x ${
+            ? `This submit is ${verdict.cellCount} cells (this arm + base) x ${
                 basis?.symbols.length ?? 0
-              } symbol(s) x ${verdict.splitCount} split(s); the service's cap is ${
-                allowlist?.caps.max_cells ?? '—'
-              } and IT validates.`
+              } symbol(s) x ${verdict.splitCount} split(s); the SIM SERVICE caps one interactive ` +
+              `run at ${allowlist?.caps.max_cells ?? '—'} cells and IT validates. A pin has its ` +
+              'own standing cap, enforced when you pin.'
             : `Lands on ${symbol} / ${split} of the new run.`}
         </span>
-      </div>
+        </div>
+      </form>
 
       {outcome && <Outcome outcome={outcome} onRetry={submit} />}
     </section>
