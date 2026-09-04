@@ -114,6 +114,21 @@ export interface VerdictStripProps {
   digestAbsence: string | null;
   /** The cell's stored object — the fill label's first and best source (F4). */
   artifact: SimArtifact | null;
+  /**
+   * PR-5. `'compare'` drops the digest block entirely: gross premium, fees and
+   * deployment are CLIENT-DERIVED and the guardrail table forbids them in the
+   * compare view's tile row, because two grey numbers side by side are compared
+   * whatever the caption says.
+   */
+  variant?: 'cell' | 'compare';
+  /**
+   * PR-5. Why the alignment matrix withheld this pair's numbers, in its own
+   * words. Non-empty ⇒ every return, ratio, Δ and benchmark tile is replaced by
+   * the reasons; the ACTIVITY COUNTS still render (the same posture the
+   * guardrail table gives an unmeasured cell: counts of what happened are not
+   * ratios of it). Empty ⇒ the strip is the PR-2 strip.
+   */
+  withheldReasons?: string[];
 }
 
 /**
@@ -201,9 +216,15 @@ export default function VerdictStrip({
   digest,
   digestAbsence,
   artifact,
+  variant = 'cell',
+  withheldReasons = [],
 }: VerdictStripProps) {
   const rendered = renderCell(row);
-  const measured = rendered.kind === 'return';
+  const withheld = withheldReasons.length > 0;
+  // A withheld pair is not an unmeasured cell — the cell measured fine, it is
+  // the COMPARISON that does not hold — so the two states are kept apart and
+  // both gate the same tiles.
+  const measured = rendered.kind === 'return' && !withheld;
   // Straight off the artifact, for the hover only — never rendered as a tile
   // and never compared with the row. `reconcile` is where it is pinned against
   // the engine's own `annualized_return_on_collateral`.
@@ -245,11 +266,29 @@ export default function VerdictStrip({
         </span>
       </header>
 
-      {!measured && (
+      {rendered.kind !== 'return' && (
         <p data-testid="unmeasured-notice" className="text-sm text-gray-400">
           This cell is <strong>{rendered.text}</strong>, so it carries no return, no return on
           collateral, no Δ against base and no benchmark comparison. {rendered.title}
         </p>
+      )}
+
+      {withheld && (
+        <div data-testid="tiles-withheld" className="text-sm text-amber-300 space-y-1">
+          <p>
+            The alignment matrix <strong>withheld</strong> this pair&rsquo;s returns, ratios, Δ and
+            benchmark. The cell is fine; the COMPARISON is not:
+          </p>
+          <ul className="list-disc ml-5 space-y-1 text-amber-400/90">
+            {withheldReasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+          <p className="text-gray-400">
+            The activity counts below still render: they are counts of what happened, not ratios of
+            it, and they do not become comparable or incomparable with the window.
+          </p>
+        </div>
       )}
 
       {/* --- the engine's numbers ------------------------------------------ */}
@@ -304,42 +343,60 @@ export default function VerdictStrip({
             />
           </>
         )}
-        <Tile
-          testId="tile-option-pnl"
-          label="Net option P&L"
-          value={fmtCurrency(row?.option_pnl)}
-          sub="engine, cash basis"
-          // Sign colour only on a MEASURED cell (review round 1, F9). A green
-          // +$40 of premium on an `insuf` or `low-act` cell reads as a verdict
-          // on a window whose whole point is that it produced none.
-          tone={measured ? toneOf(row?.option_pnl) : 'plain'}
-        />
-        <Tile
-          testId="tile-win-rate"
-          label="Win rate"
-          value={shareOrDash(row?.win_rate)}
-          sub={`assignment ${shareOrDash(row?.assignment_rate)}`}
-          title="The engine's definition (fitness.py:200): the share of completed cycles with a positive total P&L."
-        />
-        <Tile
-          testId="tile-drawdown"
-          label="Max drawdown"
-          value={pctOrDash(row?.max_drawdown)}
-          sub="peak-to-trough on equity"
-          tone={measured ? toneOf(row?.max_drawdown) : 'plain'}
-        />
+        {/* Dollars and ratios both go when the matrix withholds: a $ figure on
+            a different capital base and a rate over a different window are the
+            two things the withholding rows are ABOUT. */}
+        {!withheld && (
+          <>
+            <Tile
+              testId="tile-option-pnl"
+              label="Net option P&L"
+              value={fmtCurrency(row?.option_pnl)}
+              sub="engine, cash basis"
+              // Sign colour only on a MEASURED cell (review round 1, F9). A green
+              // +$40 of premium on an `insuf` or `low-act` cell reads as a verdict
+              // on a window whose whole point is that it produced none.
+              tone={measured ? toneOf(row?.option_pnl) : 'plain'}
+            />
+            <Tile
+              testId="tile-win-rate"
+              label="Win rate"
+              value={shareOrDash(row?.win_rate)}
+              sub={`assignment ${shareOrDash(row?.assignment_rate)}`}
+              title="The engine's definition (fitness.py:200): the share of completed cycles with a positive total P&L."
+            />
+            <Tile
+              testId="tile-drawdown"
+              label="Max drawdown"
+              value={pctOrDash(row?.max_drawdown)}
+              sub="peak-to-trough on equity"
+              tone={measured ? toneOf(row?.max_drawdown) : 'plain'}
+            />
+          </>
+        )}
         <Tile
           testId="tile-cycles"
           label="Cycles"
           value={`${fmtNumber(row?.cycles_completed)} done`}
           sub={`${fmtNumber(row?.cycles_open)} open · ${fmtNumber(row?.puts_sold)} puts / ${fmtNumber(row?.calls_sold)} calls`}
         />
-        <Tile
-          testId="tile-time-in-position"
-          label="Time in position"
-          value={shareOrDash(row?.days_in_position_fraction)}
-          sub={`${fmtNumber(row?.decision_days)} decision days`}
-        />
+        {!withheld && (
+          <Tile
+            testId="tile-time-in-position"
+            label="Time in position"
+            value={shareOrDash(row?.days_in_position_fraction)}
+            sub={`${fmtNumber(row?.decision_days)} decision days`}
+          />
+        )}
+        {withheld && (
+          <Tile
+            testId="tile-decision-days"
+            label="Decision days"
+            value={fmtNumber(row?.decision_days)}
+            sub="a count, not a rate"
+            title="Shown while the returns are withheld because it is a COUNT of days the engine made a decision on — not a fraction of a window, so it does not silently rescale when the windows differ."
+          />
+        )}
         <Tile
           testId="tile-sign-agreement"
           label="Sign agreement"
@@ -349,7 +406,18 @@ export default function VerdictStrip({
         />
       </div>
 
-      {/* --- the digest, fenced off ---------------------------------------- */}
+      {/* --- the digest, fenced off ----------------------------------------
+          ...and absent entirely in the compare view (guardrail table): gross
+          premium, fees and deployment are computed HERE, not by the engine, and
+          two client-derived numbers set side by side are compared by the reader
+          whatever the caption above them says. */}
+      {variant === 'compare' ? (
+        <p data-testid="digest-omitted" className="text-[11px] text-gray-500">
+          Ledger-derived figures (gross premium, fees, deployment) are not shown in a comparison:
+          they are computed by this page rather than by the engine, and nothing computed here may
+          be ranked or compared. Open either cell to read them.
+        </p>
+      ) : (
       <div data-testid="digest-tiles" className="space-y-1">
         <p className="text-[11px] uppercase tracking-wide text-gray-500">
           From this cell's stored artifact — display only, never ranked or compared
@@ -420,6 +488,7 @@ export default function VerdictStrip({
           </div>
         )}
       </div>
+      )}
     </section>
   );
 }

@@ -10,6 +10,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
+// PR-5 made every grid cell a compare <Link>, so the grid needs a router.
+import { MemoryRouter } from 'react-router-dom';
 import SweepResults from './SweepResults';
 import BiasFooter from './BiasFooter';
 import { normaliseReport } from './normaliseReport';
@@ -61,10 +63,10 @@ const unknownReport = () => normaliseReport(shapedUnknown, sweep())!;
 // the footer is genuinely last on the real page.
 const show = (report: SweepReport, row: SweepRow = sweep(), raw?: unknown) =>
   render(
-    <>
+    <MemoryRouter>
       <SweepResults sweep={row} report={report} raw={raw} />
       <BiasFooter report={report} />
-    </>,
+    </MemoryRouter>,
   );
 
 const cell = (scenario: string, symbol: string, split: string) =>

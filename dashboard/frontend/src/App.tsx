@@ -5,6 +5,7 @@ import OverviewV2 from './pages/v2/Overview';
 import SymbolDeepDiveV2 from './pages/v2/SymbolDeepDive';
 import BotHealthV2 from './pages/v2/BotHealth';
 import SimulationsV2 from './pages/v2/Simulations';
+import SimsCompareV2 from './pages/v2/SimsCompare';
 
 export default function App() {
   return (
@@ -20,6 +21,13 @@ export default function App() {
             <Route path="/bot-health"          element={<BotHealthV2 />} />
             {/* FC-060 Layer 4: scenario sweeps. Simulations, not the live book. */}
             <Route path="/sims"                element={<SimulationsV2 />} />
+            {/* PR-5: the compare view. Declared BEFORE `/sims/:runId` so the
+                order on the page matches the order in the ranking. React
+                Router 6 ranks a static segment above a dynamic one whatever
+                the source order, so `compare` is never read as a run id — the
+                position here is documentation, and `SimsRouting`'s test is the
+                enforcement. */}
+            <Route path="/sims/compare"        element={<SimsCompareV2 />} />
             {/* FC-096 Phase E (decision 4): the URL is the state. A deep link
                 addresses a run, or one cell of it; `main.py:72` serves
                 index.html for every non-`api/` path, so a reload lands on the
@@ -29,9 +37,6 @@ export default function App() {
               path="/sims/:runId/:scenario/:symbol/:split"
               element={<SimulationsV2 />}
             />
-            {/* PR-5 builds the compare view. Until then the query string is
-                dropped deliberately rather than half-rendered. */}
-            <Route path="/sims/compare"        element={<Navigate to="/sims" replace />} />
           </Route>
 
           {/* Bookmark redirects: every old path lands on the new equivalent. */}
