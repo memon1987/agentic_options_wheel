@@ -48,6 +48,7 @@ function Harness(props: Partial<React.ComponentProps<typeof TweakBar>> & {
         symbol="GOOGL"
         split="holdout"
         submitting={submitting}
+        submittingFrom={submitting ? sweep.run_id : null}
         outcome={outcome}
         onSubmit={(spec, armName) => {
           props.onSubmitSpy?.(spec, armName);
@@ -531,5 +532,52 @@ describe('the small things a reviewer checks (review LOW)', () => {
     typeInto('strategy.min_put_premium', '0.65');
     expect(screen.getByTestId('tweak-form').textContent).toContain('SIM SERVICE caps');
     expect(screen.getByTestId('tweak-form').textContent).toContain('A pin has its own standing cap');
+  });
+});
+
+describe('a flight on ANOTHER run (confirmation pass, regression 1 + 3)', () => {
+  it('disables this bar and NAMES the run holding the sim service', () => {
+    // It used to look submittable: the handler returned silently, so the
+    // operator clicked a live button and got nothing at all — where the first
+    // version at least POSTed and showed them the busy-409's words.
+    setup({ submitting: true, submittingFrom: 'aaaa1111bbbb2222' });
+    const message = screen.getByTestId('tweak-other-run-flight');
+    expect(message.textContent).toContain('aaaa1111bbbb2222');
+    expect(message.textContent).toContain('one spec at a time');
+    expect(submit()).toBeDisabled();
+  });
+
+  it('says nothing when the flight is this bar’s own', () => {
+    setup({ submitting: true, submittingFrom: sweep.run_id });
+    expect(screen.queryByTestId('tweak-other-run-flight')).toBeNull();
+  });
+
+  it('does not POST when the operator clicks during another run’s flight', () => {
+    setup({ submitting: true, submittingFrom: 'aaaa1111bbbb2222' });
+    fireEvent.click(submit());
+    fireEvent.submit(screen.getByTestId('tweak-form'));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('disables Retry on a stored 502 the remounted bar cannot resubmit', () => {
+    // Coming back to a run whose 502 is still stored, the controls have been
+    // prefilled afresh, so `spec` is null and Retry had nothing to send.
+    setup({
+      outcome: { kind: 'unreachable', detail: 'could not reach the sim service' },
+      submittingFrom: null,
+    });
+    expect(screen.getByTestId('tweak-retry')).toBeDisabled();
+    expect(screen.getByTestId('tweak-retry-disabled').textContent).toContain('change a field');
+    fireEvent.click(screen.getByTestId('tweak-retry'));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('enables Retry once a field is changed', () => {
+    setup({
+      outcome: { kind: 'unreachable', detail: 'could not reach the sim service' },
+      submittingFrom: null,
+    });
+    typeInto('strategy.min_put_premium', '0.65');
+    expect(screen.getByTestId('tweak-retry')).not.toBeDisabled();
   });
 });

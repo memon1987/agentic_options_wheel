@@ -105,6 +105,8 @@ export interface ConsoleProps {
   onTweakSubmit?: (spec: SweepSpec, armName: string) => void;
   /** The page's in-flight flag and refusal, both keyed to THIS run. */
   tweakSubmitting?: boolean;
+  /** The run whose submit is in flight — named on every OTHER run's bar. */
+  tweakSubmittingFrom?: string | null;
   tweakOutcome?: SimRefusal | null;
   onClearTweakOutcome?: () => void;
 }
@@ -122,6 +124,7 @@ export default function Console({
   allowlistError = null,
   onTweakSubmit,
   tweakSubmitting = false,
+  tweakSubmittingFrom = null,
   tweakOutcome = null,
   onClearTweakOutcome,
 }: ConsoleProps) {
@@ -396,6 +399,7 @@ export default function Console({
           symbol={symbol}
           split={split}
           submitting={tweakSubmitting}
+          submittingFrom={tweakSubmittingFrom}
           outcome={tweakOutcome}
           onSubmit={onTweakSubmit}
           onClearOutcome={onClearTweakOutcome ?? (() => undefined)}

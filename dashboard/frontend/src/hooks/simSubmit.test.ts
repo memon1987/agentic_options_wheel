@@ -290,6 +290,17 @@ describe('pinSpec — {spec, note}, one POST', () => {
     expect(await pinSpec(SPEC, '')).toEqual({ kind: 'conflict', detail });
   });
 
+  it('OMITS `note` entirely when the note is blank', async () => {
+    // The route takes `note` as optional. Sending `""` — or, as the first
+    // version did, the derived arm name — puts a string the operator never
+    // wrote into the pin list as if it were their own annotation.
+    fetchMock.mockResolvedValue(jsonResponse(201, { pin_id: 'pin_1', window_days: 365 }));
+    await pinSpec(SPEC, '   ');
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect('note' in body).toBe(false);
+    expect(body.spec).toEqual(SPEC);
+  });
+
   it('passes 422 and 403 through with the server’s words', async () => {
     fetchMock.mockResolvedValue(jsonResponse(422, { detail: 'a pinned spec may not set force' }));
     expect(await pinSpec(SPEC, '')).toEqual({

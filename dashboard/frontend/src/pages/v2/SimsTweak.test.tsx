@@ -264,7 +264,11 @@ describe('the notice sits ABOVE the shells (review R3)', () => {
     // submit, and the one most likely to read as a failure without it.
     const notice = screen.getByTestId('tweak-notice');
     expect(notice.textContent).toContain('new456');
-    expect(notice.compareDocumentPosition(lag) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const where = notice.compareDocumentPosition(lag);
+    // DISCONNECTED first: a detached node answers with PRECEDING|FOLLOWING bits
+    // set, so a bare FOLLOWING check passes on nodes that are not both on screen.
+    expect(where & Node.DOCUMENT_POSITION_DISCONNECTED).toBe(0);
+    expect(where & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 
@@ -303,5 +307,46 @@ describe('an in-flight submit outlives the bar (review R5)', () => {
     expect(screen.getByRole('link', { name: /Open run new456/ })).toBeTruthy();
     expect(navLog.length).toBe(before);
     expect(navLog.some((n) => n.pathname.startsWith('/sims/new456'))).toBe(false);
+  });
+});
+
+describe('another run’s bar cannot drop a pending refusal (confirmation pass, regression 2)', () => {
+  it('keeps run A’s refusal while the operator edits run B, and shows it on return', async () => {
+    // `clearTweakOutcome` used to be unconditional, so a keystroke in run B's
+    // bar destroyed run A's refusal before the operator ever went back to A —
+    // the exact loss the page-level move exists to prevent.
+    let release: (r: Response) => void = () => undefined;
+    simAnswer = new Promise<Response>((r) => (release = r));
+    await tweakAndSubmit();
+    await waitFor(() => expect(screen.getByTestId('tweak-submit')).toBeDisabled());
+
+    fireEvent.click(screen.getByText(OTHER_RUN));
+    await waitFor(() => expect(navLog.some((n) => n.pathname.includes(OTHER_RUN))).toBe(true));
+
+    release(posted(422, { detail: 'the service refused this spec' }));
+    // Run B's bar is a different run's bar: editing it must not touch A's.
+    await waitFor(() => expect(screen.getByLabelText('strategy.min_put_premium')).toBeTruthy());
+    fireEvent.change(screen.getByLabelText('strategy.min_put_premium'), {
+      target: { value: '0.7' },
+    });
+    expect(screen.queryByTestId('tweak-outcome')).toBeNull();
+
+    // Back to A: the refusal is still there, in the service's own words.
+    fireEvent.click(screen.getAllByText(RUN)[0]);
+    const outcome = await screen.findByTestId('tweak-outcome');
+    expect(outcome.dataset.outcome).toBe('invalid');
+    expect(screen.getByTestId('tweak-detail').textContent).toBe('the service refused this spec');
+  });
+
+  it('disables run B’s bar and names the run whose submit is in flight', async () => {
+    simAnswer = new Promise<Response>(() => undefined);
+    await tweakAndSubmit();
+    await waitFor(() => expect(screen.getByTestId('tweak-submit')).toBeDisabled());
+    fireEvent.click(screen.getByText(OTHER_RUN));
+    await waitFor(() => expect(screen.getByTestId('tweak-other-run-flight')).toBeTruthy());
+    expect(screen.getByTestId('tweak-other-run-flight').textContent).toContain(RUN);
+    const posts = fetchMock.mock.calls.filter((c) => c[0] === '/api/v2/sims/run').length;
+    fireEvent.click(screen.getByTestId('tweak-submit'));
+    expect(fetchMock.mock.calls.filter((c) => c[0] === '/api/v2/sims/run').length).toBe(posts);
   });
 });

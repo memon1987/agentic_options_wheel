@@ -74,6 +74,13 @@ export interface TweakBarProps {
    * renders them.
    */
   submitting: boolean;
+  /**
+   * The run whose submit is in flight. PAGE-WIDE (confirmation pass): one sim
+   * runs at a time, so a flight started from another run disables this bar too
+   * — and the operator is told which run holds it, rather than clicking a live
+   * button whose handler silently returns.
+   */
+  submittingFrom: string | null;
   outcome: SimRefusal | null;
   onSubmit: (spec: SweepSpec, armName: string) => void;
   /** Clear a stale outcome the moment the spec it belonged to changes (R8). */
@@ -164,7 +171,17 @@ function ControlRow({
 export type SimRefusal = Exclude<SimSubmitOutcome, { kind: 'accepted' } | { kind: 'deduplicated' }>;
 
 /** Every refusal, in the server's own words, under a heading that says which. */
-function Outcome({ outcome, onRetry }: { outcome: SimRefusal; onRetry: () => void }) {
+function Outcome({
+  outcome,
+  onRetry,
+  canRetry,
+}: {
+  outcome: SimRefusal;
+  onRetry: () => void;
+  /** False when the bar holds no submittable spec — a live button that does
+   *  nothing is worse than a disabled one that says why. */
+  canRetry: boolean;
+}) {
   const box = (tone: 'bad' | 'warn', heading: string, body: React.ReactNode) => (
     <div
       data-testid="tweak-outcome"
@@ -257,11 +274,22 @@ function Outcome({ outcome, onRetry }: { outcome: SimRefusal; onRetry: () => voi
           <button
             type="button"
             data-testid="tweak-retry"
-            className="mt-2 rounded border border-gray-600 px-2 py-1 text-gray-200 hover:bg-gray-700"
+            disabled={!canRetry}
+            className={`mt-2 rounded border px-2 py-1 ${
+              canRetry
+                ? 'border-gray-600 text-gray-200 hover:bg-gray-700'
+                : 'border-gray-700 text-gray-500 cursor-not-allowed'
+            }`}
             onClick={onRetry}
           >
             Retry
           </button>
+          {!canRetry && (
+            <p data-testid="tweak-retry-disabled" className="mt-1 text-gray-500">
+              This outcome is from a submit made before you navigated away, and the controls have
+              been prefilled again since — change a field to build the arm and submit it.
+            </p>
+          )}
         </>,
       );
     case 'disabled':
@@ -284,6 +312,7 @@ export default function TweakBar({
   symbol,
   split,
   submitting,
+  submittingFrom,
   outcome,
   onSubmit,
   onClearOutcome,
@@ -347,6 +376,8 @@ export default function TweakBar({
     onClearOutcome();
     setEdits((prev) => ({ ...prev, [key]: next }));
   };
+
+  const elsewhere = submitting && !!submittingFrom && submittingFrom !== sweep.run_id;
 
   const submit = () => {
     // R5/LOW: `submitting` is the page's flag, so a second click during the
@@ -443,6 +474,14 @@ export default function TweakBar({
         </ul>
       )}
 
+      {elsewhere && (
+        <p data-testid="tweak-other-run-flight" className="text-xs text-amber-400">
+          A submit from run <span className="font-mono">{submittingFrom}</span> is still in flight.
+          The sim service replays one spec at a time, so this bar waits for it — its answer will
+          appear on that run&rsquo;s screen.
+        </p>
+      )}
+
       {blocking.length > 0 && (
         <ul data-testid="tweak-blocking" className="space-y-1 text-xs text-amber-400">
           {blocking.map((message) => (
@@ -494,7 +533,7 @@ export default function TweakBar({
         </div>
       </form>
 
-      {outcome && <Outcome outcome={outcome} onRetry={submit} />}
+      {outcome && <Outcome outcome={outcome} onRetry={submit} canRetry={!!spec && !submitting} />}
     </section>
   );
 }

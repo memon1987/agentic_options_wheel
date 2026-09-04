@@ -238,13 +238,28 @@ export default function Simulations() {
   const [tweak, setTweak] = useState<TweakState>({ from: null, submitting: false, outcome: null });
   const [notice, setNotice] = useState<TweakNotice | null>(null);
 
+  /**
+   * Clear the outcome — but only the one belonging to the run on screen.
+   *
+   * The confirmation pass caught this: unconditional, typing in run B's bar
+   * dropped run A's pending refusal before the operator ever returned to A,
+   * which is the exact loss R5 exists to prevent. An outcome is cleared by the
+   * operator editing the spec THAT OUTCOME BELONGS TO, and by nothing else.
+   */
   const clearTweakOutcome = () => {
-    setTweak((prev) => (prev.outcome ? { ...prev, outcome: null } : prev));
+    setTweak((prev) =>
+      prev.outcome && prev.from === latestRunId.current ? { ...prev, outcome: null } : prev,
+    );
   };
 
   const onTweakSubmit = (spec: SweepSpec, armName: string) => {
     const from = selectedRunId;
     const cell = { symbol: symbol ?? '', split: split ?? '' };
+    // Unreachable from the UI — `tweak.submitting` is passed PAGE-WIDE, so the
+    // bar on every run is disabled while any submit is in flight and says
+    // which run holds it. Kept as the last word rather than the only one: a
+    // silent `return` here is what the confirmation pass found, and it left the
+    // operator clicking a live button that did nothing.
     if (!from || tweak.submitting) return;
     setTweak({ from, submitting: true, outcome: null });
     setNotice(null);
@@ -395,7 +410,10 @@ export default function Simulations() {
           allowlist={allowlist}
           allowlistError={allowlistError}
           onTweakSubmit={onTweakSubmit}
-          tweakSubmitting={tweak.submitting && tweak.from === selectedRunId}
+          // PAGE-WIDE, not per-run: one sim runs at a time, so a flight from
+          // another run disables this bar too — with that run named.
+          tweakSubmitting={tweak.submitting}
+          tweakSubmittingFrom={tweak.from}
           tweakOutcome={tweak.from === selectedRunId ? tweak.outcome : null}
           onClearTweakOutcome={clearTweakOutcome}
           // The answer belongs on the run that HOLDS it. When the operator had
@@ -510,6 +528,7 @@ function ResultsRegion({
   allowlistError,
   onTweakSubmit,
   tweakSubmitting,
+  tweakSubmittingFrom,
   tweakOutcome,
   onClearTweakOutcome,
   notice,
@@ -526,6 +545,8 @@ function ResultsRegion({
   allowlistError: string | null;
   onTweakSubmit: (spec: SweepSpec, armName: string) => void;
   tweakSubmitting: boolean;
+  /** The run whose submit is in flight, when one is. */
+  tweakSubmittingFrom: string | null;
   tweakOutcome: SimRefusal | null;
   onClearTweakOutcome: () => void;
   /** What the submit that brought us here said, or `null`. */
@@ -707,6 +728,7 @@ function ResultsRegion({
             allowlistError={allowlistError}
             onTweakSubmit={onTweakSubmit}
             tweakSubmitting={tweakSubmitting}
+            tweakSubmittingFrom={tweakSubmittingFrom}
             tweakOutcome={tweakOutcome}
             onClearTweakOutcome={onClearTweakOutcome}
             onSelectCell={onSelectCell}
