@@ -22,6 +22,7 @@ import {
 } from 'react-router-dom';
 import SimsCompare from './SimsCompare';
 import Simulations from './Simulations';
+import App from '../../App';
 import shaped13cc from '../../test/fixtures/sweep_shaped_13cc.json';
 import shapedA48d from '../../test/fixtures/sweep_shaped_a48d.json';
 import { resetArtifactCacheForTests } from '../../hooks/artifactCache';
@@ -484,5 +485,27 @@ describe('R8 / LOW — swap is a no-op on a pair with itself', () => {
     });
     expect(navLog.length).toBe(before);
     expect(screen.getByTestId('ab-refused').textContent).toContain('SAME cell');
+  });
+});
+
+describe('the REAL route table — `App`, not a re-declaration', () => {
+  // Every other routing test in this file declares its own <Routes>, which
+  // proves the page works but not that `App` wires it. This mounts `App`
+  // itself, so a `/sims/compare` route deleted from or mis-ordered in the real
+  // table fails here (review round 1, LOW).
+  it('serves the compare page at /sims/compare, not the run page', async () => {
+    window.history.pushState({}, '', `/sims/compare?a=${ref(RUN)}`);
+    render(<App />);
+    await screen.findByText('Compare two cells');
+    expect(screen.queryByText('Simulations')).toBeNull();
+    window.history.pushState({}, '', '/');
+  });
+
+  it('still serves the run page at /sims/<id> — `compare` is the special case', async () => {
+    window.history.pushState({}, '', `/sims/${RUN}`);
+    render(<App />);
+    await screen.findByText('Simulations');
+    expect(screen.queryByText('Compare two cells')).toBeNull();
+    window.history.pushState({}, '', '/');
   });
 });
