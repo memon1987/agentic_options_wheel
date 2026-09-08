@@ -1109,6 +1109,42 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §Closeout), the signed component inventory (FC-096 entry), FC-060 guardrails.
 
+### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 plan; live-verified on both services)
+**Size estimate:** S (deploy flag + fixture re-freeze) — a real-money precondition
+
+**Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. Worst seam: the buy-to-close leg fills, Cloud Run cuts the request at 300 s, the sell-to-open ladder never places — the book is left naked-short-of-cover by design of the timeout, not the strategy.
+
+**Proposal:** `--timeout=1800` on both bot services in ONE commit with the fixture re-freeze (next ledger deviation), plus a contract test asserting the service timeout ≥ the roller's budget + the scheduler deadline relationship. Precondition before any real-money roll.
+
+**Links:** FC-078, FC-100 (`docs/plans/fc-100.md` §Found while planning), `docs/CLAUDE.md` §Deploy/CI.
+
+### FC-108: `/regression` is roll-blind on both profiles
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 plan)
+**Size estimate:** S
+
+**Problem:** the hourly `/regression` monitor mirrors position and cost-basis policy but has no check on the roll path: a dead or paused roll scheduler, a roller that never evaluates, or a `/roll` returning 500 every day is invisible until someone reads the logs. The same detective gap FC-081 closed for deploys and FC-096 Phase A closed for the lake.
+
+**Proposal:** a `roll_freshness` check — on a trading day, assert a `roll_cycle_*` event (or the scheduler's own attempt) within the last 24 h for the profile; warn-not-fail on non-trading days; degraded event + nag policy like `lake_freshness`.
+
+**Links:** FC-100, FC-081, FC-096 Phase A (`lake_freshness`).
+
+### FC-109: the roller has no ex-dividend awareness on either profile
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 plan)
+**Size estimate:** S–M
+
+**Problem:** `CallRoller` prices imminence off extrinsic value alone; a short call with extrinsic below the coming dividend is an early-assignment candidate the roller does not see (the wheel's `imminence_extrinsic_threshold` is a pricing-mode switch, not a dividend input). The covered-call book (UNH ~$2.21/quarter) is more exposed than the wheel.
+
+**Proposal:** feed the earnings/dividend calendar the FC-013 gate already has into the roller's imminence test: when extrinsic < next dividend and ex-date < expiry, treat as imminent (roll or accept assignment deliberately). Applies to both profiles by Symmetry; the backtest engine already models ex-div early assignment (FC-042 Track C), so the sim can measure the change first.
+
+**Links:** FC-100, FC-013, FC-042 Track C.
+
 
 ## Completed
 
