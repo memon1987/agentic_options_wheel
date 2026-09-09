@@ -138,10 +138,19 @@ live-verified 2026-08-04 with `gcloud scheduler jobs list`):
 with the daily job. `cc-roll-daily` is the covered-call service's twin of
 `options-wheel-roll-daily`, created by FC-100 and **created PAUSED**: it is not
 resumed until FC-107 raises both bot services' Cloud Run `--timeout` from 300 s
-to 1800 s, because a roll cycle cut at 300 s returns a 504 to the scheduler that
-no alert policy watches while the handler thread survives, CPU-throttled, and
-places its remaining rungs on stale limits when the next request wakes the
-instance (`docs/plans/fc-100.md` DD-7). The CC service's other seven jobs are
+to 1800 s. What a cut at 300 s actually costs (the fc-100 amendment of
+2026-09-08 **withdrew** the earlier "stalls and resumes on the next request"
+account): the orphaned handler thread **keeps running under CPU throttling** —
+on 2026-08-13 an orphaned `/scan` thread emitted for ten minutes with no request
+in flight — so the ladder proceeds roughly on schedule and its terminals,
+`call_roll_naked_exposure` included, still fire **if the instance lives**. What
+is lost is the **scheduler's view** (a silent 504 no alert policy watches;
+retries are 0) and the `/roll` response. The dangerous residual is **instance
+scale-in mid-ladder**. The precondition stands for the right reason: the
+roller's cycle budget was sized against an 1800 s request and the 300 s flag
+silently undid it. The seam is near — STO rung-1 timeouts in 4 of the last 8
+executed wheel rolls (≈135 s each), cycles up to 259 s, so a 3-ITM day has
+roughly even odds of a cut. The CC service's other seven jobs are
 `cc-scan-hourly` (`:00`, 10–15), `cc-execute-hourly` (`:15`, 10–15),
 `cc-monitor-hourly` (`:55`, 9–14), `cc-regression-hourly` (`:45`, 10–15),
 `cc-activities-ingest` (`:07` hourly), `cc-portfolio-history-ingest` (16:33) and
@@ -447,7 +456,10 @@ Live covered-call management is, in full:
    (operator decision D-A; FC-112 re-decides the wheel's on measured numbers).
    The roll path does **not** read `universe.excluded_symbols` (FC-110): to opt
    a symbol out while it has an open short call, pause the roll job or close
-   the call.
+   the call. **FC-114, until it lands:** `_is_market_open()` has no holiday
+   calendar and the roll jobs' `1-5` cron fires on NYSE holidays — on Labor Day
+   2026-09-07 `/roll` placed a BTC into a closed market. **Pause
+   `cc-roll-daily` the day before an NYSE holiday.**
 
    `docs/plans/fc-075-phase-2.md` §Rolling scoped the roller *out* of the
    covered-call service ("Phase 3 must not schedule `/roll`"); that line is

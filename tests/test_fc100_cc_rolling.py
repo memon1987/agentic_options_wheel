@@ -207,8 +207,11 @@ class TestTheCCRollCycle:
     def test_c_a_098_ratio_is_not_a_roll_on_the_cc_profile(self):
         """(c) The operator's D-A decision, executable.
 
-        GOOGL 338.50 against its own C342.5 written 2 days earlier is ratio
-        0.988 — eligible under the wheel's 0.98, *not* under the CC's 1.00.
+        GOOGL 338.50 against its own C342.5 is ratio 0.988 — eligible under
+        the wheel's 0.98, *not* under the CC's 1.00. (The live instance of this
+        book on 2026-09-08 was a call sold that same session; the fixture pins
+        a fixed `OLD_EXPIRY` instead, because every horizon assertion in this
+        file is expiry-relative and a today-relative fixture would drift.)
         Under 0.98 the roller would buy back the engine's own fresh call at the
         ask and re-sell up to 14 days further out at any delta <= 0.60,
         bypassing the delta band, the DTE ceiling, the premium floor and the
@@ -449,6 +452,28 @@ class TestTheCCAlertPolicies:
                       "call_roll_execution_error",
                       "call_roll_order_refetch_failed"):
             assert event in f, f"{event} dropped from the CC twin"
+
+    def test_the_triage_query_can_actually_see_the_cycle_events(self):
+        """R1. `roll_cycle_started` / `roll_cycle_completed` are emitted by
+        `log_system_event`, which passes the name as the structlog **message**
+        (`logger.info(event_type, ...)`,
+        `src/utils/logging_events.py:270-271`). They therefore land under
+        `jsonPayload.event` and carry **no `event_type` field at all**.
+
+        A triage command filtering only on `jsonPayload.event_type` returns
+        every `call_roll_*` row and ZERO cycle rows — verified live on two wheel
+        cycles: 24 `call_roll_*`, no `roll_cycle_*`. That pair is precisely what
+        distinguishes a completed cycle from one cut by the Cloud Run timeout,
+        so the runbook's first command has to reach it.
+
+        *Catches:* the `jsonPayload.event` clause being "tidied away" as
+        redundant by someone reading the two filters as duplicates.
+        """
+        content = self._doc(
+            "cc_roll_executed_alert_policy.json")["documentation"]["content"]
+        assert 'jsonPayload.event=~"^roll_cycle_"' in content, (
+            "the triage command cannot see roll_cycle_started/completed — they "
+            "have no event_type field, only jsonPayload.event")
 
     def test_the_roll_runbook_is_written_for_this_service(self):
         """The runbook is the deliverable, not the filter. Every command in it

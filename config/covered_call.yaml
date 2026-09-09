@@ -136,6 +136,16 @@ earnings:
 # (15:15). A roll executes only when the placed LIMIT prices net a credit, so
 # a filled roll can never net a debit.
 #
+# `cc-roll-daily` DOES NOT EXIST YET. It is an operator step (fc-100 O3/O4),
+# created PAUSED, and resumed only after FC-107 raises both bot services' Cloud
+# Run --timeout to 1800 s. Until then `enabled: true` here has no caller: /roll
+# on this service is only ever reached by hand.
+#
+# RUNBOOK (FC-114): `_is_market_open()` has no holiday calendar and the job's
+# `1-5` cron fires on NYSE holidays — on Labor Day 2026-09-07 the wheel's /roll
+# placed a buy-to-close into a closed market. Until FC-114 lands, PAUSE
+# `cc-roll-daily` the day before an NYSE holiday.
+#
 # `itm_trigger_ratio: 1.00` DIFFERS from the wheel's 0.98 — operator decision
 # D-A, see docs/plans/fc-100.md DD-1 and FC-112. At 0.98 a 0.15-0.25-delta
 # short call is roll-eligible the day it is written (it is born at 97-99% of

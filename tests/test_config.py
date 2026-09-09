@@ -470,8 +470,13 @@ class TestTheRollerEnvLeversOnBothProfilesFC100:
     def test_the_durable_off_is_the_yaml_key(self, monkeypatch, tmp_path,
                                              profile):
         """The env override is wiped by the next deploy's --set-env-vars, so
-        `enabled: false` in the yaml is the durable stop. It must actually
-        stop the cycle on both profiles."""
+        `enabled: false` in the yaml is the durable stop.
+
+        Scope, stated precisely: this asserts `Config.rolling_enabled is
+        False`, which is the value the cycle gate reads — `run_rolling_cycle`
+        returns `{'skipped': 'rolling_disabled'}` on it before evaluating
+        anything (`src/strategy/wheel_engine.py:722`). It does not itself drive
+        the cycle; `tests/test_wheel_engine.py` owns that gate."""
         monkeypatch.delenv("ROLLER_ENABLED", raising=False)
         path_off = _profile_copy(tmp_path, profile, enabled=False)
         assert Config(path_off).rolling_enabled is False

@@ -232,6 +232,11 @@ liquidity check. It does *not* read `call_target_dte`, `min_call_premium`,
 `call_delta_range`, `universe.min_open_interest`, `universe.max_spread_pct` —
 nor `universe.excluded_symbols` (FC-110).
 
+> **Runbook (FC-114).** `_is_market_open()` has no holiday calendar and both
+> roll jobs run a `1-5` cron, so they fire on NYSE holidays — on Labor Day
+> 2026-09-07 `/roll` placed a buy-to-close into a closed market. Until FC-114
+> lands, **pause `cc-roll-daily` the day before an NYSE holiday**.
+
 > **Runbook (FC-110).** The roll path does not read
 > `universe.excluded_symbols`. To opt a symbol out while it has an open short
 > call, also **pause the roll job** (`gcloud scheduler jobs pause cc-roll-daily
