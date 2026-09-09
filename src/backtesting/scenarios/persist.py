@@ -1325,6 +1325,20 @@ def base_config_snapshot(config: Any) -> Dict[str, Any]:
             continue
         # `excluded_symbols` is a set; JSON needs a stable list.
         effective[key] = sorted(value) if isinstance(value, (set, frozenset)) else value
+    # FC-096 Phase C (review round 1, LOW). The covered-call REPLAY suspends
+    # `universe.max_spread_pct` (the modelled half-spread rejects every
+    # floor-clearing call by construction), but this snapshot is taken from the
+    # PROFILE — so it recorded `0.10` for a run in which the gate was not
+    # applied. A reader reconstructing the run from its stored base config would
+    # have got a gate the replay never used. Stamped rather than mutated: the
+    # profile's declared value stays visible beside the fact of the suspension.
+    try:
+        from ..engine.simulator import spread_gate_would_suspend
+
+        if spread_gate_would_suspend(config):
+            effective["universe.max_spread_pct_suspended_in_replay"] = True
+    except Exception:  # noqa: BLE001 - a provenance note must not fail a sweep
+        pass
     snapshot["effective"] = effective
     return snapshot
 

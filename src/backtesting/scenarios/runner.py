@@ -85,13 +85,22 @@ from ..data.bar_store import BarStore, CachedBarProvider
 from ..data.chain_builder import ChainBuilder
 from ..data.chain_store import ChainStore
 from ..data.dividends import load_default_schedule
-from ..engine.simulator import Materialised, Simulator, narrow_to_dte
+from ..engine.simulator import (
+    CC_CASH_FLOAT,
+    Materialised,
+    Simulator,
+    SyntheticLotPolicy,
+    is_wheel,
+    narrow_to_dte,
+    replay_strategy,
+    spread_gate_would_suspend,
+)
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
-from ..metrics.fitness import MIN_DAYS_IN_POSITION
+from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
 from .identity import scenario_arm_hash
 from .overrides import (
-    DTE_OVERRIDE_KEYS, apply_overrides, validate_overrides,
+    DTE_OVERRIDE_KEYS, MAX_SWEEPABLE_DTE, apply_overrides, validate_overrides,
 )
 
 logger = structlog.get_logger(__name__)
@@ -235,6 +244,32 @@ class ScenarioResult:
     # "this cell was never measured" are different statements.
     rolls_evaluated: Optional[int] = None
     rolls_executed: Optional[int] = None
+    # FC-096 Phase C. The covered-call half of the row. `strategy` and
+    # `capital_base` are populated on EVERY measured cell (a wheel row's base is
+    # its starting cash, and saying so is useful); the covered-call-only
+    # counters are `None` — never 0 — on a wheel cell and on an errored one, so
+    # "this is a wheel row" and "this covered-call cell measured zero" stay
+    # different statements.
+    #
+    # Like the roll counts above, these are NOT persisted by `rows_from_sweep`,
+    # which writes an explicit column list — they are in-process and reach a
+    # reader through the report and the cell artifact. A `scenario_runs` column
+    # for `premium_yield_on_lot` is a schema change that deserves its own
+    # argument once CC rows exist to fill it.
+    strategy: Optional[str] = None
+    premium_yield_on_lot: Optional[float] = None
+    net_basis_reduction: Optional[float] = None
+    capital_base: Optional[float] = None
+    coverage_fraction: Optional[float] = None
+    coverage_by_reason: Optional[Dict[str, int]] = None
+    calls_closed_early: Optional[int] = None
+    synthetic_lots_opened: Optional[int] = None
+    itm_rolls: Optional[int] = None
+    otm_roll_outs: Optional[int] = None
+    #: ``call_roll_skipped`` reason -> count (H3). On EVERY measured row, wheel
+    #: included: the roller runs on both profiles, and this is the only thing
+    #: that separates "declined 40 credit-only evaluations" from "blind".
+    roll_skips: Optional[Dict[str, int]] = None
     replay_seconds: Optional[float] = None
     error: Optional[str] = None
 
@@ -276,7 +311,20 @@ class ScenarioResult:
         table. They also answer different questions — "the window contained no
         cycle" is not "the wheel was barely deployed" — so the more specific
         verdict is the one that should be shown.
+
+        FC-096 Phase C: on a COVERED-CALL cell the test is ``coverage_fraction``
+        below ``MIN_COVERED_FRACTION``, not days-in-position. A CC replay holds
+        its lot on essentially every decision day by construction, so
+        ``days_in_position_fraction`` is ~1.0 always and the wheel's test would
+        be inert — it would report "measured" on a cell that never once managed
+        to write a call. The CC denominator also excludes the two stand-downs
+        that are the strategy WORKING (below basis, inside an earnings span), so
+        a symbol the cost-basis floor protected all quarter is not filed as
+        barely deployed.
         """
+        if self.ok and not self.insufficient and self.strategy not in (None, "wheel"):
+            return (self.coverage_fraction is not None
+                    and self.coverage_fraction < MIN_COVERED_FRACTION)
         return (
             self.ok
             and not self.insufficient
@@ -338,6 +386,16 @@ class SweepResult:
     # appending a fidelity warning it does not earn is how a footer stops being
     # read.
     effective_max_dte: int = 0
+    #: FC-096 Phase C. The strategy every arm of this sweep replayed under,
+    #: threaded like ``effective_max_dte`` (a run-level fact the footer and the
+    #: JSON both condition on). Defaults to ``wheel``, so a caller that predates
+    #: the field describes itself correctly.
+    strategy: str = "wheel"
+    #: Covered-call run-level counters, summed across cells. All zero on a wheel
+    #: sweep. ``spread_gate_suspended`` is what the MODEL_SPREAD_BIAS footer
+    #: line conditions on — the footer states a suspension that HAPPENED, never
+    #: one that might have.
+    spread_gate_suspended: bool = False
     # FC-013 coverage, unioned across every replay in this run: symbols absent
     # from the committed earnings table entirely. Non-empty means the gate was
     # silently pass-through for those symbols — which matters most for exactly
@@ -440,14 +498,65 @@ def config_target_dte(config, leg: str) -> int:
         return DEFAULT_TARGET_DTE
 
 
+def roll_horizon_reach(config) -> int:
+    """The reach a config's ROLLER needs, capped at what the lake stores.
+
+    FC-096 Phase C, review round 1 (H3). The entry path caps candidates at
+    ``*_target_dte``, but the roller's replacement search is bounded by
+    ``old_expiry + rolling.max_extension_days`` and by nothing else. On the
+    covered-call profile that is 14 + 14 = **28 DTE**, against a materialisation
+    that reached only 14 — so the replay's roller was choosing from less than
+    half the ladder its live twin sees, on EVERY roll rather than on an edge
+    case, and the first cut described that as a "partial" truncation.
+
+    Widened to the roll horizon and **capped at ``MAX_SWEEPABLE_DTE``** (21,
+    i.e. the lake's stored ``universe_dte = 22``), because beyond that the
+    contracts are simply not in the file: asking for them would not widen the
+    candidate set, it would only make the arm read as "nothing qualified". The
+    residual truncation — 28 wanted, 21 available — is what
+    ``ROLL_REACH_BIAS`` now states, with its direction.
+
+    **Zero for the WHEEL, deliberately, and it is not an oversight.** The wheel
+    carries the same arithmetic (7 + 14 = 21 against a 7-DTE materialisation),
+    so its roller is choosing from a truncated ladder too — but widening it here
+    would move every stored wheel number in the project at once, and §Behaviour
+    contract requires the wheel golden to stay byte-identical through Phase C.
+    That is a real finding about the wheel and it belongs to FC-112, which is
+    already the owner of the wheel's roll-trigger study; it is stated in
+    ``ROLL_REACH_BIAS`` rather than fixed as a side effect of a covered-call PR.
+
+    Zero, too, for a profile with rolling off, so nothing widens for a run whose
+    roller will never fire.
+    """
+    if is_wheel(config):
+        return 0
+    if not getattr(config, "rolling_enabled", False):
+        return 0
+    extension = int(getattr(config, "rolling_max_extension_days", 0) or 0)
+    if extension <= 0:
+        return 0
+    return min(config_target_dte(config, "call") + extension, MAX_SWEEPABLE_DTE)
+
+
 def arm_max_dte(config) -> int:
-    """The reach ONE arm's own config needs: the max over its two DTE targets.
+    """The reach ONE arm's own config needs.
+
+    The max over its two DTE targets AND (FC-096 Phase C, H3) its roll horizon.
 
     Both legs, because either one can be the longer: an arm overriding only
     ``call_target_dte`` still needs calls that far out, and the covered-call
     profile's base is already 14 on the call leg with no put leg at all.
+
+    The roll horizon is folded in here — not only into the sweep-wide reach —
+    because ``_replay_one`` masks each arm back to THIS number before replaying
+    it. Widening only the materialisation would have handed the mask straight
+    back the 14-DTE view the roller was starving on.
     """
-    return max(config_target_dte(config, "put"), config_target_dte(config, "call"))
+    return max(
+        config_target_dte(config, "put"),
+        config_target_dte(config, "call"),
+        roll_horizon_reach(config),
+    )
 
 
 def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
@@ -474,6 +583,9 @@ def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
     reach = max(
         config_target_dte(base_config, "put"),
         config_target_dte(base_config, "call"),
+        # FC-096 Phase C (H3). The roller's replacement search runs past both
+        # targets, so a materialisation sized to the targets alone starves it.
+        roll_horizon_reach(base_config),
     )
     for scenario in scenarios:
         for key in DTE_OVERRIDE_KEYS:
@@ -510,6 +622,7 @@ def _row_from_report(
     cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
     seconds: float, rolls_evaluated: Optional[int] = None,
     rolls_executed: Optional[int] = None,
+    roll_skips: Optional[Dict[str, int]] = None,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
@@ -546,6 +659,21 @@ def _row_from_report(
         # roll counts describe a run nothing else on the row came from.
         rolls_evaluated=rolls_evaluated,
         rolls_executed=rolls_executed,
+        # FC-096 Phase C. Off the SCORED report, never recomputed — the verdict
+        # above was reached with these exact numbers.
+        strategy=report.strategy,
+        premium_yield_on_lot=report.premium_yield_on_lot,
+        net_basis_reduction=report.net_basis_reduction,
+        capital_base=report.capital_base,
+        coverage_fraction=report.coverage_fraction,
+        coverage_by_reason=(dict(report.coverage_by_reason)
+                            if report.coverage_by_reason else None),
+        calls_closed_early=(None if report.is_wheel else report.calls_closed_early),
+        synthetic_lots_opened=(None if report.is_wheel
+                               else report.synthetic_lots_opened),
+        itm_rolls=(None if report.is_wheel else report.itm_rolls),
+        otm_roll_outs=(None if report.is_wheel else report.otm_roll_outs),
+        roll_skips=(dict(roll_skips) if roll_skips else None),
         replay_seconds=round(seconds, 3),
     )
 
@@ -682,6 +810,19 @@ def run_sweep(
     max_dte = effective_max_dte(base_config, scenarios)
     dividends = load_default_schedule()
     earnings_gaps: set = set()
+    # FC-096 Phase C. Resolved ONCE for the whole sweep, off the base config —
+    # `strategy_id` is not an allowlisted override, so no arm can move it and
+    # every arm of a sweep is the same strategy by construction (plan §Design
+    # decisions: one strategy per sweep).
+    strategy = replay_strategy(base_config)
+    lot_policy, cc_cash = strategy_replay_settings(base_config)
+    if cc_cash is not None:
+        # The covered-call float REPLACES the spec's starting cash for the
+        # replay. The spec's number is not silently honoured and not silently
+        # ignored: the capital base stamped on every cell is the LOT, the report
+        # says so, and `starting_cash` on the artifact is this float — the two
+        # are separate stamps precisely so a reader can see which is which.
+        starting_cash = cc_cash
 
     scenario_configs: Dict[str, Config] = {
         s.name: apply_overrides(base_config, s.overrides) for s in scenarios
@@ -707,6 +848,11 @@ def run_sweep(
         starting_cash=starting_cash,
         run_sensitivity=run_sensitivity,
         effective_max_dte=max_dte,
+        strategy=strategy,
+        # Asked of the same predicate the Simulator applies, so the footer
+        # states a suspension that the replays actually performed rather than
+        # one this module inferred from the strategy name.
+        spread_gate_suspended=spread_gate_would_suspend(base_config),
     )
     logger.info(
         "Scenario sweep starting",
@@ -790,6 +936,8 @@ def run_sweep(
                         engine_identity=engine_identity,
                         git_commit=git_commit,
                         sweep_max_dte=max_dte,
+                        strategy=strategy,
+                        synthetic_lots=lot_policy,
                     )
                     result.rows.append(row)
                     rkey = f"{scenario.name}:{symbol}:{split}"
@@ -897,12 +1045,34 @@ def _check_unique_names(scenarios: Sequence[Scenario]) -> None:
 def _simulator(
     config, provider, builder, symbol: str, start: date, end: date,
     *, starting_cash: float, max_dte: int, fill_haircut: float, dividends,
+    synthetic_lots=None,
 ) -> Simulator:
     return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte,
         fill_haircut=fill_haircut, dividend_schedule=dividends,
+        synthetic_lots=synthetic_lots,
     )
+
+
+def strategy_replay_settings(config) -> Tuple[Optional[SyntheticLotPolicy], float]:
+    """The seeding policy and starting cash a strategy's replay runs under.
+
+    FC-096 Phase C §C2/§C3. One function so the materialisation, the mid replay
+    and the bid-sensitivity replay cannot disagree about either — they are the
+    inputs that decide what the numbers MEAN, and three call sites deriving them
+    separately is how one of them ends up measuring a different strategy.
+
+    * wheel: no lot, and the caller's ``starting_cash`` (its $100k default).
+    * covered_call: a lot per the signed policy, and ``CC_CASH_FLOAT``. The
+      float is NOT the capital base — the lot is. It exists because the monitor
+      leg buys calls back and a roll pays a BTC debit before it collects the STO
+      credit, and it is pinned small so the stored equity return stays close to
+      the lot return instead of being diluted ~20x by a notional nobody staked.
+    """
+    if is_wheel(config):
+        return None, None
+    return SyntheticLotPolicy(), CC_CASH_FLOAT
 
 
 def _materialise_window(
@@ -948,6 +1118,8 @@ def _replay_one(
     engine_identity: Optional[str] = None,
     git_commit: Optional[str] = None,
     sweep_max_dte: Optional[int] = None,
+    strategy: str = "wheel",
+    synthetic_lots: Optional[SyntheticLotPolicy] = None,
 ) -> ScenarioResult:
     """Replay ONE arm against a view of the shared window masked to its reach.
 
@@ -1008,6 +1180,7 @@ def _replay_one(
             config, provider, builder, symbol, w_start, w_end,
             starting_cash=starting_cash, max_dte=max_dte,
             fill_haircut=haircut, dividends=dividends,
+            synthetic_lots=synthetic_lots,
         ).replay(view)
         # FC-096 A4. The single-symbol report surfaces this; a sweep did not, so
         # a candidate sweep said nothing at all about a symbol its earnings gate
@@ -1023,6 +1196,11 @@ def _replay_one(
                 config, provider, builder, symbol, w_start, w_end,
                 starting_cash=starting_cash, max_dte=max_dte,
                 fill_haircut=BID_FILL_HAIRCUT, dividends=dividends,
+                # The SAME seeding policy as the mid replay. A bid-sensitivity
+                # pass that seeded no lot would compare a covered-call
+                # programme against a flat account and report the whole
+                # difference as fill sensitivity.
+                synthetic_lots=synthetic_lots,
             ).replay(view)
             bid_report = _score(symbol, bid_result, bars, starting_cash, dividends)
             sensitivity = {
@@ -1041,6 +1219,7 @@ def _replay_one(
             seconds=time.perf_counter() - t0,
             rolls_evaluated=result.rolls_evaluated,
             rolls_executed=result.rolls_executed,
+            roll_skips=result.roll_skips,
         )
         if artifact_sink is not None:
             _emit_artifact(
@@ -1053,7 +1232,7 @@ def _replay_one(
                 sweep_max_dte=(materialised.max_dte if sweep_max_dte is None
                                else sweep_max_dte),
                 haircut=haircut, starting_cash=starting_cash,
-                report=report,
+                report=report, strategy=strategy,
             )
         if bars_sink is not None and scenario.name == BASE_SCENARIO_NAME:
             _emit_bars(
@@ -1061,6 +1240,10 @@ def _replay_one(
                 daily=result.daily, benchmark=report.benchmark,
                 dividends=dividends, run_id=run_id,
                 engine_identity=engine_identity, git_commit=git_commit,
+                # The SAME base the base arm's cell artifact carries. The
+                # console cross-checks the sidecar's curve against the cell's
+                # benchmark, so the two objects must divide by one number.
+                strategy=strategy, capital_base=report.capital_base,
             )
         return row
     except Exception as exc:  # noqa: BLE001 - one arm must not lose the others
@@ -1085,7 +1268,8 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
                    engine_identity: Optional[str], git_commit: Optional[str],
                    arm_max_dte: int,
                    sweep_max_dte: Optional[int], haircut: float,
-                   starting_cash: float, report) -> None:
+                   starting_cash: float, report,
+                   strategy: str = "wheel") -> None:
     """Build this cell's artifact and hand it to ``sink``. Swallows everything.
 
     The import is LOCAL on purpose: ``reporting.artifact`` pulls in the cycle
@@ -1119,11 +1303,23 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
             window_start=w_start, window_end=w_end,
             fill_haircut=haircut, starting_cash=starting_cash,
             benchmark=(None if report is None else report.benchmark),
-            # The wheel's capital base IS its starting cash. Phase C stamps a
-            # lot-based base for a covered-call replay; it is passed explicitly
-            # rather than defaulted here so the covered-call path has to make
-            # the choice rather than inherit the wheel's.
-            capital_base=starting_cash,
+            # FC-096 Phase C. The base the ENGINE divided by, read off the
+            # scored report rather than re-derived: the wheel's is its starting
+            # cash, the covered-call one is the float plus the time-weighted lot
+            # value, and `FitnessReport.capital_base` is the single definition
+            # both the verdict and this stamp use. Re-deriving it here is how the
+            # console ends up dividing by a number the report never used.
+            #
+            # A cell with no report (impossible on this path today, but the
+            # parameter is Optional) stamps `None` rather than `starting_cash`:
+            # the writer refuses to guess a base for a non-wheel strategy, and
+            # guessing one here would route around that refusal.
+            capital_base=(None if report is None else report.capital_base),
+            # M2: the SCORED return, taken over `capital_base`. The replay's own
+            # `total_return` divides by `starting_cash`, which on a covered-call
+            # cell is the $5,000 float against an equity that holds the lot.
+            total_return=(None if report is None else report.total_return),
+            strategy=strategy,
         )))
     except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
         logger.warning(
@@ -1138,7 +1334,9 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
 def _emit_bars(sink, bars, *, symbol: str, window: Tuple[str, date, date],
                daily, benchmark, dividends, run_id: Optional[str],
                engine_identity: Optional[str],
-               git_commit: Optional[str]) -> None:
+               git_commit: Optional[str],
+               strategy: Optional[str] = None,
+               capital_base: Optional[float] = None) -> None:
     """Build this window's bars sidecar and hand it to ``sink``. Swallows everything.
 
     FC-096 Phase E PR-1. Its own guard, separate from ``_emit_artifact``'s, for
@@ -1162,6 +1360,7 @@ def _emit_bars(sink, bars, *, symbol: str, window: Tuple[str, date, date],
             daily=daily, benchmark=benchmark, dividends=dividends,
             run_id=run_id, engine_identity=engine_identity,
             git_commit=git_commit,
+            strategy=strategy, capital_base=capital_base,
         ))
     except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell
         logger.warning(

@@ -21,6 +21,7 @@
 // operator can tell "checked and equal" from "not checked".
 
 import type { SimArtifact, SweepReport, SweepResultRow, SweepRow } from '../../../types/v2';
+import { artifactStrategy } from './normaliseArtifact';
 
 /** One side of the comparison, exactly as the URL spells it. */
 export interface CompareRef {
@@ -88,6 +89,13 @@ export interface CompareSide {
    * denominator its ratios used.
    */
   artifact: SimArtifact | null;
+  /**
+   * `spec_json.strategy` off the run row (FC-096 Phase C). The SPEC's answer,
+   * which takes precedence over the artifact's stamp in `artifactStrategy`
+   * because it is what the run was submitted as. `null`/absent means `wheel`,
+   * which is every run stored before Phase C.
+   */
+  specStrategy?: string | null;
   /** The run's status, so a non-`done` side is never compared as if it were. */
   status: string | null;
 }
@@ -96,6 +104,7 @@ export type AlignmentOutcome = 'aligned' | 'noted' | 'withheld' | 'refused' | 'u
 
 export type AlignmentRowId =
   | 'symbol'
+  | 'strategy'
   | 'split'
   | 'window'
   | 'arm_identity'
@@ -191,6 +200,23 @@ const windowText = (side: CompareSide): string => {
  * the stamp because that is the denominator every ratio on the cell used. The
  * label says which one is on screen so "declared" is never read as "measured".
  */
+/**
+ * The strategy this cell replayed under (FC-096 Phase C).
+ *
+ * Resolved through `artifactStrategy`, which is the ONE resolver the console
+ * uses everywhere — the premise banner, the digest and the series module all
+ * read it — so the compare view cannot decide a cell is covered-call while a
+ * chart on the same page decides it is not.
+ *
+ * Absence means `wheel`, on both sides, because every artifact and every spec
+ * written before Phase C has no such field and every one of them was a wheel
+ * run. That default is what keeps two legacy cells comparing as they always did
+ * rather than refusing each other on a field neither carries.
+ */
+export function strategyOf(side: CompareSide): string {
+  return artifactStrategy(side.specStrategy ?? null, side.artifact);
+}
+
 export function capitalBaseOf(side: CompareSide): { value: number | null; source: string } {
   if (side.stampedCapitalBase !== null && side.stampedCapitalBase !== undefined) {
     return { value: side.stampedCapitalBase, source: 'stamped on the cell artifact' };
@@ -342,6 +368,14 @@ const fillText = (fill: EffectiveFill): string =>
 // --------------------------------------------------------------------------- //
 
 /** Refusal text, in one place, because the page and the tests both need it. */
+export const STRATEGY_REFUSAL =
+  'Refused: these are two STRATEGIES, not two configs. A wheel cell and a covered-call cell of ' +
+  'the same symbol are not two settings of one thing — the covered-call side is measured against ' +
+  'a synthetic 100-share lot the engine created, its capital base is that lot rather than the ' +
+  'spec’s starting cash, and its benchmark is the same lot held rather than a full-investment ' +
+  'buy-and-hold. Every return on the two sides is a ratio over a different denominator, so a Δ ' +
+  'between them is arithmetic without a meaning. Open each cell instead.';
+
 export const SYMBOL_REFUSAL =
   'Refused: these are two SYMBOLS, not two configs. A wheel on one underlying and a wheel on ' +
   'another are two different questions, and putting their curves on one axis invites reading the ' +
@@ -413,7 +447,40 @@ export function alignCells(
     b: b.ref.symbol,
     detail: symbolAligned ? 'Same underlying.' : SYMBOL_REFUSAL,
   });
-  const refusal = symbolAligned ? null : SYMBOL_REFUSAL;
+  // --- strategy: the SECOND refusal (FC-096 Phase C) ---------------------- //
+  //
+  // Precondition added 2026-09-04, from the PR-5 review: without this row a
+  // covered-call cell and a wheel cell of the SAME symbol passed every check.
+  // The capital-base row was the last line of defence and it does not hold —
+  // a CC artifact that failed to stamp a base fell back to the spec's
+  // `starting_cash` and read "aligned" at $100k against a wheel cell. Phase C
+  // closes that from both ends (the writer now stamps `null` rather than
+  // guessing for a non-wheel cell), and this row makes the pair refusable on
+  // its own terms rather than on a denominator coincidence.
+  //
+  // A REFUSAL, not a withhold: withholding would still draw both curves on one
+  // axis, and a premium-harvesting programme on an assumed lot against a wheel
+  // on real assigned shares is not two pictures of one question.
+  const strategyA = strategyOf(a);
+  const strategyB = strategyOf(b);
+  const strategyAligned = strategyA === strategyB;
+  rows.push({
+    id: 'strategy',
+    label: 'Strategy',
+    outcome: strategyAligned ? 'aligned' : 'refused',
+    a: strategyA,
+    b: strategyB,
+    detail: strategyAligned
+      ? `Both cells replayed the \`${strategyA}\` strategy.`
+      : STRATEGY_REFUSAL,
+  });
+
+  // Symbol is checked first and keeps its own words when both differ: "these
+  // are two symbols" is the more basic statement, and an operator who fixes it
+  // then sees the strategy refusal on the next render.
+  const refusal = !symbolAligned
+    ? SYMBOL_REFUSAL
+    : (strategyAligned ? null : STRATEGY_REFUSAL);
 
   // --- split --------------------------------------------------------------- //
   const splitAligned = a.ref.split === b.ref.split;

@@ -42,7 +42,7 @@ import json
 from statistics import median
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..metrics.fitness import MIN_DAYS_IN_POSITION
+from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from .overrides import describe_allowlist
 from .runner import BASE_SCENARIO_NAME, ScenarioResult, SweepResult
 
@@ -155,6 +155,50 @@ SWEEP_BIASES = [
          "~1-2%/yr, which nothing here deducts.")),
 ]
 
+# --------------------------------------------------------------------------- #
+# M1 (review round 1) — the two SWEEP_BIASES lines that were calibrated on the
+# WHEEL and are FALSE on a covered-call run. Substituted by title, never by
+# index, so reordering the list above cannot silently swap the wrong caveat.
+#
+# A footer that states an untruth is worse than one that omits a caveat: the
+# reader who checks it stops believing the ones that are true.
+# --------------------------------------------------------------------------- #
+WHEEL_PROFIT_TAKING_TITLE = "One decision per day, and the replay gets the price it saw"
+WHEEL_EX_DIV_TITLE = (
+    "Dividends come from a static table; ex-dividend early assignment has never "
+    "fired on real data"
+)
+
+CC_PROFIT_TAKING_BIAS = (
+    "One decision per day — but profit-taking IS modelled on this profile", (
+        "Production scans and executes ~15 minutes apart; the replay does both "
+        "on one snapshot. Unlike the wheel replay, this one runs the /monitor "
+        "profit-taking leg, so the 52%-of-calls-closed-early divergence the "
+        "wheel footer carries does NOT apply here — see the monitor-leg note "
+        "below for the two divergences that remain (the bands are DTE-keyed to "
+        "<=7 against a 14-DTE target, and the buy-back limit is the engine's "
+        "haircut fill rather than production's ask x 0.95). What is still "
+        "unmodelled is intraday churn: a position closed and re-opened between "
+        "two decision points is one decision here."),
+)
+
+CC_EX_DIV_BIAS = (
+    "Dividends come from a static table, and ex-dividend early assignment CAN "
+    "fire on this profile", (
+        "Both legs collect from the same committed table, so the two stay on "
+        "one footing, but a window running past the table's coverage credits "
+        "nothing after that point on either. The wheel footer says early "
+        "assignment has never fired on real data, and that is a statement about "
+        "the WHEEL's universe: its dividend payers are exactly the symbols that "
+        "cannot clear the premium floor to open a position. This profile is "
+        "different — its universe is whatever the account holds, its calls are "
+        "written at 14 DTE, and a held payer with an ITM short call is the "
+        "ordinary case rather than an impossible one. Treat a non-zero "
+        "`ex_dividend_early_assignments` here as a real event, and a zero as a "
+        "fact about the window rather than about the model."),
+)
+
+
 # The reach above which a sweep's chains stop being the ones this engine was
 # measured on. 7 is the live `put_target_dte` and the reach every fidelity
 # figure quoted in `SWEEP_BIASES` was measured at.
@@ -189,16 +233,165 @@ DTE_REACH_BIAS = (
         "short comparison carries this on top of every bias listed here."),
 )
 
+# --------------------------------------------------------------------------- #
+# FC-096 Phase C — the covered-call footer. Appended ONLY to a covered-call run,
+# on the same conditional-footer mechanism as DTE_REACH_BIAS: a footer that
+# warns a wheel reader about a synthetic lot nobody seeded is a footer people
+# stop reading.
+# --------------------------------------------------------------------------- #
+SYNTHETIC_LOT_BIAS = (
+    "The stock leg is ASSUMED, not bought — every number here is relative to a "
+    "lot the engine created", (
+        "A covered-call cell seeds 100 shares at the window-start close and, "
+        "when they are called away, seeds a fresh lot at the NEXT session's "
+        "close (signed decision, 2026-09-08). So the stock leg is a CHAIN of "
+        "lots, each with its own basis, and the window is measured end to end "
+        "on every symbol rather than truncating at the first call-away — which "
+        "would have biased against exactly the names that ran up fastest. "
+        "Consequences to read with: the capital base is the lot, not the "
+        "`starting_cash` on the spec (that is a small stated buy-back float, "
+        "not a stake); the buy-and-hold benchmark is THE SAME LOT held and "
+        "never written against, so `excess_return` compares two uses of one "
+        "position; `premium_yield_on_lot` — the headline — is annualized net "
+        "premium over the TIME-WEIGHTED lot value, while `annualized_return` "
+        "is the equity return and therefore carries the shares' own price "
+        "move. A symbol whose shares fell can show a strong yield and a "
+        "negative return at once; both are true and they answer different "
+        "questions. Finally, because the lot is assumed, this says nothing "
+        "about entry: a real programme had to buy those shares somewhere, and "
+        "12-month windows on names that survived to be candidates carry the "
+        "usual selection bias on top. Re-entry is at the NEXT CLOSE AFTER the "
+        "call-away, which is typically ABOVE the strike just surrendered — so "
+        "the lot chain is momentum-following by construction and its "
+        "time-weighted basis resets upward after every assignment. Read a "
+        "chain of several lots as a series of forced re-entries at rising "
+        "prices, not as one position. Finally, the coverage split attributes a "
+        "day to `hold_uncovered` only when the chain offered NO strike above "
+        "the basis inside the delta band; every other stand-down lands in "
+        "`gate_rejected`, which is IN the coverage denominator — so a "
+        "misclassification makes the coverage ratio harsher, never "
+        "flattering."),
+)
+
+MODEL_SPREAD_BIAS = (
+    "The bid/ask spread GATE was suspended for this run, because the modelled "
+    "spread rejects every contract by construction", (
+        "`universe.max_spread_pct` is read off MODELLED bid/ask (FC-051), whose "
+        "half-spread is at least 5% of mark for an OTM contract — so the "
+        "covered-call profile's 0.10 rejected 10 of 10 premium-floor-clearing "
+        "calls in the probe, and the arm would have reported 'this strategy "
+        "never found a candidate' when what it never found was a spread the "
+        "model could produce. The gate is suspended HERE ONLY; the live "
+        "service still applies it. The bias is of UNKNOWN SIGN, not merely "
+        "unknown size, and the two halves pull opposite ways: suspending the "
+        "gate is optimistic (the replay writes calls the live inventory "
+        "validator might have refused for illiquidity), while the model itself "
+        "measures ~2.46x WIDER than the real book, which is pessimistic on "
+        "every price it feeds. Do not net them; do not assume this run flatters "
+        "the strategy. A "
+        "test pins the suspension to the spread model, so the day real spreads "
+        "arrive this fails loudly and the gate is restored deliberately rather "
+        "than staying off because nobody remembered it was."),
+)
+
+ROLL_REACH_BIAS = (
+    "Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and "
+    "credits are biased DOWN — and the fill model biases credits UP", (
+        "The roller's replacement search is bounded by `old_expiry + "
+        "rolling.max_extension_days` and by nothing else. On this profile that "
+        "is 14 + 14 = 28 DTE of chain for a full candidate set. The replay "
+        "materialises to 21 DTE — the roll horizon, capped at what the lake "
+        "stores (`universe_dte = 22`, FC-096 Phase A) — so the top 7 days of "
+        "that horizon are absent from every roll decision. Concretely: a "
+        "replacement can be extended only to about `21 - k` days past the old "
+        "expiry, where `k` is the days the old call still has to run, so the "
+        "shortfall is largest exactly when the roller is most useful — early in "
+        "a freshly-written call's life, which is when an ITM move is most "
+        "likely to need defending. Direction: FEWER candidates, never more. "
+        "Roll counts and captured credits are FLOORS, not estimates. "
+        "\n\nIn the OPPOSITE direction, and not netted against it: the live "
+        "roller places its buy-to-close at the old contract's ASK and its "
+        "sell-to-open at the candidate's BID, while this engine fills every "
+        "order at its haircut price from the mark. A modelled roll therefore "
+        "captures MORE credit than the same roll would live, on both legs. "
+        "Neither bias is measured, so they are both named rather than "
+        "combined into a single number that would look like an estimate. "
+        "\n\nThe WHEEL carries the same truncation, unmeasured and unfixed "
+        "here: its horizon is 7 + 14 = 21 against a 7-DTE materialisation. "
+        "Widening it would move every stored wheel number at once, so it is "
+        "left to FC-112 — which already owns the wheel's roll-trigger study — "
+        "rather than changed as a side effect of a covered-call release. "
+        "\n\nRead `roll_skips` beside the roll counts before concluding "
+        "anything about roller activity: a credit-only roller declining 40 "
+        "evaluations and a roller that could not price a single one both "
+        "report the same `rolls_executed`, and only the skip reasons separate "
+        "them."),
+)
+
+CC_ROLL_SPLIT_NOTE = (
+    "Rolls are split into ITM defences and OTM roll-outs, and only the first "
+    "is defence", (
+        "An ITM roll (stock/strike >= 1.0) acts when the stock is through the "
+        "strike and assignment is the alternative. An OTM roll-out (0.98-1.0) "
+        "is the roller re-writing a call that was never threatened — buying it "
+        "back at the ask and selling a higher strike up to 14 days further out "
+        "at any delta <= 0.60, which bypasses the delta band, the DTE ceiling, "
+        "the premium floor and the spread gate that the entry path applies. "
+        "The covered-call profile's `itm_trigger_ratio` is 1.00, so the second "
+        "bucket should be EMPTY here and a non-zero count is a finding. The "
+        "wheel's is 0.98, where the distinction is load-bearing (FC-112)."),
+)
+
+MONITOR_LEG_NOTE = (
+    "The covered-call replay runs the /monitor profit-taking leg; the wheel "
+    "replay does not", (
+        "52% of real covered calls are closed early at a DTE-banded profit "
+        "target rather than held to expiry, so a replay without that leg "
+        "measures a strategy nobody runs. It is modelled here for the "
+        "covered-call profile using `CallSeller.should_close_call_early` — the "
+        "real predicate, over the profile's own bands. Two divergences remain, "
+        "both named rather than corrected: the live bands are DTE-keyed to <=7 "
+        "while this profile writes at a 14-DTE target, so a fresh call sits "
+        "above the top band for its first week (FC-086); and production prices "
+        "the buy-back limit at ask x 0.95 while this engine fills at its "
+        "haircut price, because a one-decision-per-day replay has no intraday "
+        "path along which to test whether a limit was touched. The WHEEL "
+        "replay is deliberately untouched — adding the leg there would move "
+        "every stored wheel result at once, which needs its own FC and its own "
+        "re-baseline."),
+)
+
+
 def sweep_biases(result: SweepResult) -> List[Tuple[str, str]]:
-    """``SWEEP_BIASES``, plus ``DTE_REACH_BIAS`` for a run that reached past 7.
+    """``SWEEP_BIASES``, plus the caveats THIS run actually earned.
 
     One function so the markdown footer and the JSON ``known_biases`` cannot
     disagree about which caveats this run carries — the dashboard derives the
     same condition from the persisted spec (`services/sweeps.py`).
+
+    Every conditional is on a fact of the RUN, never on a possibility: the
+    covered-call lines appear iff a covered-call sweep produced them, and
+    ``MODEL_SPREAD_BIAS`` appears iff the gate was actually suspended.
     """
     biases = list(SWEEP_BIASES)
     if int(getattr(result, "effective_max_dte", 0) or 0) > DTE_REACH_BIAS_THRESHOLD:
         biases.append(DTE_REACH_BIAS)
+    if str(getattr(result, "strategy", "wheel") or "wheel") != "wheel":
+        # M1: swap the two wheel-calibrated lines for their covered-call
+        # counterparts, matched on TITLE so a reorder of SWEEP_BIASES cannot
+        # substitute the wrong one.
+        substitutions = {
+            WHEEL_PROFIT_TAKING_TITLE: CC_PROFIT_TAKING_BIAS,
+            WHEEL_EX_DIV_TITLE: CC_EX_DIV_BIAS,
+        }
+        biases = [substitutions.get(title, (title, detail))
+                  for title, detail in biases]
+        biases.append(SYNTHETIC_LOT_BIAS)
+        biases.append(MONITOR_LEG_NOTE)
+        biases.append(ROLL_REACH_BIAS)
+        biases.append(CC_ROLL_SPLIT_NOTE)
+        if getattr(result, "spread_gate_suspended", False):
+            biases.append(MODEL_SPREAD_BIAS)
     return biases
 
 
@@ -231,9 +424,20 @@ def _cell(row: Optional[ScenarioResult]) -> str:
         # The fraction is printed, not just the flag: "low-act 4%" and
         # "low-act 24%" are very different amounts of evidence, and collapsing
         # them into one label would hide which cells are nearly usable.
-        return f"`low-act {row.days_in_position_fraction:.0%}`"
+        #
+        # M3 (review round 1): on a covered-call row the flag is driven by
+        # COVERAGE, not by days-in-position (a CC replay holds its lot on
+        # essentially every day), so the number printed beside it has to be the
+        # one the flag was computed from or the label contradicts itself.
+        fraction = (row.days_in_position_fraction if _is_wheel_row(row)
+                    else row.coverage_fraction)
+        return f"`low-act {(fraction or 0.0):.0%}`"
     glyph = _VERDICT_GLYPH.get(row.verdict or "", "?")
     return f"{_pct(row.annualized_return)} {glyph}"
+
+
+def _is_wheel_row(row: ScenarioResult) -> bool:
+    return (row.strategy or "wheel") == "wheel"
 
 
 def _measured(rows: Sequence[ScenarioResult]) -> List[ScenarioResult]:
@@ -244,6 +448,56 @@ def _measured(rows: Sequence[ScenarioResult]) -> List[ScenarioResult]:
     three are counted in their own columns; none contributes to a median.
     """
     return [r for r in rows if r.measured]
+
+
+def _covered_call_table(result: SweepResult) -> str:
+    """Premium yield and the coverage split, per cell — the CC headline numbers.
+
+    M3 (review round 1). The grid prints one number per cell and, on a
+    covered-call run, that number is the equity return on the lot: it carries
+    the shares' own price move, so two cells with the same return can have
+    harvested very different amounts of premium. The headline a covered-call
+    programme is actually managed to — annualized premium yield on the lot — and
+    the coverage split the verdict gates on had nowhere to appear.
+
+    Empty string on a wheel run, so the wheel report is byte-identical.
+    """
+    if str(getattr(result, "strategy", "wheel") or "wheel") == "wheel":
+        return ""
+    rows = [r for r in result.rows if r.ok and r.premium_yield_on_lot is not None]
+    if not rows:
+        return ""
+    lines = [
+        "### Covered-call detail",
+        "",
+        "| scenario | symbol | split | lot return | premium yield | basis cut | "
+        "covered | below basis | earnings | gated | rolls (ITM/out) |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        by = row.coverage_by_reason or {}
+        lines.append(
+            f"| {row.scenario} | {row.symbol} | {row.split} "
+            f"| {_pct(row.total_return)} "
+            f"| {_pct(row.premium_yield_on_lot)} "
+            f"| {_pct(row.net_basis_reduction)} "
+            f"| {by.get('covered', 0)} "
+            f"| {by.get('hold_uncovered', 0)} "
+            f"| {by.get('earnings_span', 0)} "
+            f"| {by.get('gate_rejected', 0)} "
+            f"| {row.itm_rolls or 0}/{row.otm_roll_outs or 0} |")
+    lines.append("")
+    lines.append(
+        "**`lot return` is the verdict's number; `premium yield` is a "
+        "statement.** The two answer different questions — the first is what "
+        "the lot earned under this programme (premium plus the shares' move "
+        "minus the call-away drag, against the same lot held), the second is "
+        "how much premium the programme harvested. A symbol whose shares fell "
+        "can show a strong yield and a negative return at once. The coverage "
+        "columns are a PARTITION of the decision days, and only `covered` and "
+        "`gated` are in the denominator the `low-act` flag uses: standing down "
+        "below basis or inside an earnings span is the strategy working.")
+    return "\n".join(lines)
 
 
 def _scenario_rows(result: SweepResult, scenario: str, split: str) -> List[ScenarioResult]:
@@ -360,12 +614,29 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
     a("")
     a(_scenario_summary(result))
     a("")
-    a(f"Median/min/max are taken over **measured** cells only. A cell that is "
-      f"`insuf` (no completed cycle in the window), `low-act` (a position held on "
-      f"under {MIN_DAYS_IN_POSITION:.0%} of decision days, so its annualised "
-      f"number rests on capital that mostly sat idle) or errored contributes to "
-      f"its own count and to nothing else.")
+    if result.strategy == "wheel":
+        a(f"Median/min/max are taken over **measured** cells only. A cell that is "
+          f"`insuf` (no completed cycle in the window), `low-act` (a position held on "
+          f"under {MIN_DAYS_IN_POSITION:.0%} of decision days, so its annualised "
+          f"number rests on capital that mostly sat idle) or errored contributes to "
+          f"its own count and to nothing else.")
+    else:
+        a(f"Median/min/max are taken over **measured** cells only. A cell that is "
+          f"`insuf` (no lot seeded, or a window shorter than one call tenor), "
+          f"`low-act` (a call open on under {MIN_COVERED_FRACTION:.0%} of "
+          f"writable days) or errored contributes to its own count and to "
+          f"nothing else.")
     a("")
+    # Guarded on a NON-EMPTY table (confirmation pass, 2026-09-09). Appending
+    # the separators unconditionally put two blank lines into every WHEEL sweep
+    # report — `_covered_call_table` returns "" there — so the wheel markdown
+    # was not byte-identical, which is exactly what that function's docstring
+    # promises. Harmless to a reader, and a false claim in a docstring is the
+    # kind of thing the next person stops trusting the rest of.
+    _cc_table = _covered_call_table(result)
+    if _cc_table:
+        a(_cc_table)
+        a("")
 
     if result.has_holdout:
         a("## Fit vs holdout")
@@ -472,12 +743,30 @@ def _grid(result: SweepResult, split: str) -> str:
         label = f"**{name}**" if name == BASE_SCENARIO_NAME else name
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
     lines.append("")
-    lines.append(
-        f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no completed cycle "
-        f"in the window (**not** a return of zero) · "
-        f"`low-act N%` a position held on under {MIN_DAYS_IN_POSITION:.0%} of "
-        f"decision days, so the annualised number rests on idle capital · "
-        f"`err` never measured. Only the first three contribute to any median.")
+    # M3 (review round 1): the two flags MEAN different things on a
+    # covered-call run, so the legend that explains them has to change with the
+    # strategy. `insuf` there is never "no completed cycle" — a lot that was
+    # never called away completes no cycle and is the best outcome the strategy
+    # has — and `low-act` is a coverage floor, not a days-in-position one.
+    if str(getattr(result, "strategy", "wheel") or "wheel") == "wheel":
+        lines.append(
+            f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no completed "
+            f"cycle in the window (**not** a return of zero) · "
+            f"`low-act N%` a position held on under {MIN_DAYS_IN_POSITION:.0%} of "
+            f"decision days, so the annualised number rests on idle capital · "
+            f"`err` never measured. Only the first three contribute to any median.")
+    else:
+        lines.append(
+            f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no lot was "
+            f"ever seeded, or the window is shorter than one call tenor "
+            f"(**not** a return of zero, and **not** 'no cycle closed' — a lot "
+            f"never called away closes no cycle and is the programme working) · "
+            f"`low-act N%` a call was open on under {MIN_COVERED_FRACTION:.0%} "
+            f"of the days one COULD have been written, excluding below-basis "
+            f"and earnings-span stand-downs · `err` never measured. Only the "
+            f"first three contribute to any median. The percentage in each "
+            f"measured cell is the equity return on the LOT; see the "
+            f"covered-call table below for premium yield and coverage.")
     return "\n".join(lines)
 
 

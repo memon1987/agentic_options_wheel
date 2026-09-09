@@ -128,7 +128,26 @@ def config_hash(config) -> str:
         "min_put_premium", "min_call_premium", "max_position_size",
         "max_stock_price", "min_stock_price",
     ]
-    payload = {k: getattr(config, k, None) for k in keys}
+    # NOT `getattr(config, k, None)` (FC-096 Phase C, review round 1 B1).
+    #
+    # Four of these nine keys are PUT-side, and `Config`'s accessors for them are
+    # properties that index `_config["strategy"]` directly — so a profile without
+    # the key raises `KeyError` from INSIDE the property, and `getattr`'s default
+    # only swallows `AttributeError`. `config/covered_call.yaml` declares
+    # `call_target_dte` and no put keys at all, so the three-argument `getattr`
+    # raised `KeyError: 'put_target_dte'` on EVERY covered-call sweep, at all
+    # three call sites (`runner.run_sweep`, `main.run_sweep_cmd`,
+    # `sim_service`) — before a single day was replayed.
+    #
+    # `runner.config_target_dte` already carried this lesson; this reader did
+    # not. A profile that does not declare a knob hashes it as `None`, which is
+    # the honest statement: the run had no such setting.
+    payload = {}
+    for key in keys:
+        try:
+            payload[key] = getattr(config, key)
+        except Exception:  # noqa: BLE001 - an absent knob is not a hash failure
+            payload[key] = None
 
     # The verdict is not computed from config alone: these live as module
     # constants and a default argument, and changing any of them flips symbols.

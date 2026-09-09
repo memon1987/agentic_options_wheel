@@ -27,7 +27,9 @@ from .data.dividends import (
     load_default_schedule,
 )
 from .data.provider import StockBar
-from .engine.simulator import Materialised, SimulationResult, Simulator
+from .engine.simulator import (
+    Materialised, SimulationResult, Simulator, is_wheel,
+)
 from .metrics.cycles import build_cycles, count_rolls
 from .metrics.fitness import FitnessReport, compute_fitness
 
@@ -90,7 +92,16 @@ def evaluate_symbol(
     if use_cache and bar_provider is None:
         provider = CachedBarProvider(provider, BarStore())
     builder = ChainBuilder(provider, store=chain_store if use_cache else None)
-    max_dte = getattr(config, "put_target_dte", 7)
+    # FC-096 Phase C (review round 1, B1): the same `getattr`-does-not-swallow-
+    # KeyError trap `bq_writer.config_hash` fell into. `put_target_dte` is a
+    # property indexing `_config["strategy"]`, so a profile without the key
+    # raises from inside it and this default never applies. The covered-call
+    # profile has no put leg at all, and its reach is the CALL target — which is
+    # what `config_target_dte` answers, for either leg, without raising.
+    from .scenarios.runner import config_target_dte
+
+    max_dte = (config_target_dte(config, "call") if not is_wheel(config)
+               else config_target_dte(config, "put"))
     # ONE schedule for both legs. The wheel's dividends come from this table via
     # the broker ledger and the benchmark's from the same table via
     # total_between; loading them separately would let the two drift apart and
@@ -235,6 +246,9 @@ def _score(
         symbol, result.daily, cycles, starting_cash,
         benchmark_prices=prices, benchmark_dividends_per_share=bench_divs,
         data_quality=quality, rolls=count_rolls(cycles),
+        # FC-096 Phase C. The covered-call fields come off the replay itself so
+        # the report, the row and the artifact all divide by the same lot value.
+        result=result,
     )
 
 
@@ -247,6 +261,18 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
     return {
         "decision_days": len(result.daily),
         "days_with_a_qualifying_candidate": result.candidate_days,
+        # FC-096 Phase C. The strategy that ran, and — for the CC branch's
+        # `insufficient` cutoff — the call tenor it wrote at. Both are facts
+        # about the run that a stored result must not have to re-derive from a
+        # config it no longer has.
+        "strategy": result.strategy,
+        "call_target_dte": result.call_target_dte,
+        "synthetic_lots_opened": result.synthetic_lots_opened,
+        "time_weighted_lot_value": result.time_weighted_lot_value,
+        "coverage_by_reason": dict(result.coverage_by_reason or {}),
+        "calls_closed_early": result.calls_closed_early,
+        "itm_rolls": result.itm_rolls,
+        "otm_roll_outs": result.otm_roll_outs,
         "blocked_days_by_reason": result.rejections,
         "ledger_events": len(result.broker.ledger),
         "cycles_still_open_at_end": sum(1 for c in cycles if c.is_open),

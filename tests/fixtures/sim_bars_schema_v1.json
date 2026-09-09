@@ -24,6 +24,7 @@
   ],
   "provenance": [
     "bars_in_window",
+    "capital_base",
     "data_from",
     "data_to",
     "engine_identity",
@@ -34,6 +35,7 @@
     "run_id",
     "source",
     "split",
+    "strategy",
     "symbol",
     "window"
   ],

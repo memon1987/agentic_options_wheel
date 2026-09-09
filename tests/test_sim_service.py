@@ -373,10 +373,36 @@ class TestTheSpecIsTheJobs:
             "scenarios": [{"name": "tighter",
                            "overrides": {"strategy.put_delta_range": [0.1, 0.2]},
                            "fill_haircut": None}],
+            # FC-096 Phase C: present on BOTH normalised forms, `wheel`
+            # included. Dropping the wheel case from the KEY is
+            # `canonical_spec`'s job — asserted separately below — and doing it
+            # here instead would let the two sides' shapes diverge again.
+            "strategy": "wheel",
         }
         assert mine == theirs
         assert (sweep_key(mine, engine_version="v", engine_identity="i")
                 == sweep_key(theirs, engine_version="v", engine_identity="i"))
+
+    def test_a_wheel_strategy_on_the_spec_does_not_move_the_key(self):
+        """FC-096 Phase C §C1: canonicalisation by OMISSION.
+
+        Both normalised forms now always carry `strategy`, so without the
+        omission every sweep_key in the store would have moved on this merge —
+        every stored run would miss its own cache and the first Saturday after
+        would replay the whole battery.
+        """
+        from src.backtesting.scenarios.identity import sweep_key
+
+        legacy = sim.normalise_spec(spec())["spec"]
+        without = {k: v for k, v in legacy.items() if k != "strategy"}
+        explicit = dict(without, strategy="wheel")
+        cc = dict(without, strategy="covered_call")
+
+        key = lambda s: sweep_key(s, engine_version="v", engine_identity="e")  # noqa: E731
+        assert key(without) == key(explicit) == key(legacy)
+        assert key(cc) != key(legacy), (
+            "a covered-call sweep must not dedup into the wheel run of the "
+            "same window")
 
     def test_an_absent_starting_cash_uses_the_shared_default(self):
         from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH

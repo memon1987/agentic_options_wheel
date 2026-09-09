@@ -11,14 +11,19 @@
     "total_return"
   ],
   "counters": [
+    "calls_closed_early",
     "candidate_days",
     "decision_days",
     "dividends_credited",
     "early_assignments",
     "final_equity",
+    "itm_rolls",
     "ledger_events",
+    "otm_roll_outs",
     "rolls_evaluated",
     "rolls_executed",
+    "synthetic_lots_opened",
+    "time_weighted_lot_value",
     "total_return",
     "unpriced_ex_div_calls"
   ],
@@ -92,6 +97,12 @@
     "sell_call_open": [],
     "sell_put_open": [
       "collateral"
+    ],
+    "synthetic_lot_open": [
+      "cost_basis",
+      "lot_value",
+      "premise",
+      "shares"
     ]
   },
   "provenance": [
@@ -107,6 +118,7 @@
     "scenario_hash",
     "split",
     "starting_cash",
+    "strategy",
     "symbol",
     "window"
   ],
@@ -134,9 +146,11 @@
     "btc_order_id",
     "contracts",
     "day",
+    "itm_ratio",
     "net_credit",
     "new_strike",
     "old_strike",
+    "roll_kind",
     "stc_order_id",
     "success",
     "underlying"
@@ -146,6 +160,7 @@
     "benchmark",
     "binding_constraint",
     "counters",
+    "coverage_by_reason",
     "cycles",
     "daily",
     "earnings_coverage",
@@ -153,6 +168,7 @@
     "provenance",
     "rejections",
     "roll_records",
+    "roll_skips",
     "schema"
   ]
 }

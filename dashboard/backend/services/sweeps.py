@@ -39,6 +39,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services.sweep_report_text import (
     BASE_SCENARIO_NAME,
+    CC_EX_DIV_BIAS,
+    CC_PROFIT_TAKING_BIAS,
+    CC_ROLL_SPLIT_NOTE,
     CROSS_SCENARIO_CAVEAT,
     DTE_REACH_BIAS,
     DTE_REACH_BIAS_THRESHOLD,
@@ -47,8 +50,14 @@ from services.sweep_report_text import (
     HOLDOUT_SEMANTICS,
     IN_SAMPLE_BANNER,
     MIN_DAYS_IN_POSITION,
+    MODEL_SPREAD_BIAS,
+    MONITOR_LEG_NOTE,
+    ROLL_REACH_BIAS,
     SWEEP_BIASES,
+    SYNTHETIC_LOT_BIAS,
     TALLY_CAVEAT,
+    WHEEL_EX_DIV_TITLE,
+    WHEEL_PROFIT_TAKING_TITLE,
 )
 
 # The two stdlib-only engine modules. In the repo (and in the test suite) they
@@ -61,7 +70,8 @@ from services.sweep_report_text import (
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
         DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
-        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -70,7 +80,8 @@ try:  # repo / test environment
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
         DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
-        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -375,6 +386,10 @@ SYMBOL_RE = re.compile(r"^[A-Z][A-Z.]{0,5}\Z")
 SPEC_FIELDS = frozenset({
     "symbols", "start", "end", "holdout_start", "starting_cash",
     "run_sensitivity", "scenarios", "force",
+    # FC-096 Phase C §C1. The strategy PROFILE the replay runs under. Absent
+    # means `wheel`; `identity.canonical_spec` omits both the absent and the
+    # explicit-wheel case from the key, so no stored sweep loses its cache.
+    "strategy",
 })
 SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut"})
 
@@ -528,6 +543,24 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
     if not isinstance(force, bool):
         raise SweepValidationError("'force' must be true or false")
 
+    # -- strategy ----------------------------------------------------------
+    # FC-096 Phase C §C1. The ENUM lives in the validators, on both sides —
+    # never in `identity.py`, which is stdlib-only, flat-copied into this image
+    # and whose job is canonicalisation. The message names the closed set
+    # because the value selects a PROFILE FILE and is stamped on every row of
+    # the run: a typo must not silently become the wheel.
+    raw_strategy = spec.get("strategy")
+    if raw_strategy in (None, ""):
+        strategy = WHEEL_STRATEGY
+    else:
+        strategy = str(raw_strategy).strip()
+        if strategy not in STRATEGIES:
+            raise SweepValidationError(
+                f"'strategy' must be one of {sorted(STRATEGIES)}, got "
+                f"{raw_strategy!r}. Case matters — the value selects a profile "
+                f"file and is stamped on every row of the run."
+            )
+
     # -- symbols -----------------------------------------------------------
     raw_symbols = spec.get("symbols")
     if not isinstance(raw_symbols, list) or not raw_symbols:
@@ -649,7 +682,11 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
                 # reason (which cached chains store, which knob the replay never
                 # reads), which is the only kind of rejection a reader learns
                 # anything from.
-                validate_override_key(str(key), value)
+                # FC-096 Phase C §C4: strategy-conditional, so a covered-call
+                # spec overriding a put-side key is 422 HERE and refused by the
+                # Job in byte-identical words — both sides call this same
+                # function out of the same flat-copied module.
+                validate_override_key(str(key), value, strategy=strategy)
             except OverrideError as exc:
                 raise SweepValidationError(f"scenario '{name}': {exc}")
             # ...and then the VALUE. The runner's validator checks the key (plus
@@ -700,6 +737,11 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
         "starting_cash": cash,
         "run_sensitivity": run_sensitivity,
         "scenarios": scenarios,
+        # ALWAYS present, `wheel` included — the same shape the sim service's
+        # `normalise_spec` produces, which is what makes a sweep submitted here
+        # and the same sweep submitted there key identically. Dropping the wheel
+        # case is `canonical_spec`'s job, not this one's.
+        "strategy": strategy,
     }
     # Carried into the spec the Job receives, and EXCLUDED from `sweep_key`
     # (identity.NON_IDENTITY_FIELDS): a forced re-run must key identically to the
@@ -1776,25 +1818,47 @@ def _ordering(sweep_row: Dict[str, Any], run_rows: Sequence[Dict[str, Any]]):
     return scenarios, symbols, splits, spec
 
 
+# FC-096 Phase C (review round 1, H5). The covered-call profile's BASE
+# materialisation reach: `call_target_dte` (14) + `rolling.max_extension_days`
+# (14) = 28, capped at the chain lake's `MAX_SWEEPABLE_DTE` (21). It is the
+# number `runner.effective_max_dte` computes for that profile with no DTE arm,
+# and this side cannot compute it — it holds a spec, not a `Config`. Pinned
+# equal to the profile by `TestTheCoveredCallBaseReachIsNotAFork`, so a retune
+# of either knob fails the build rather than silently desynchronising the two
+# footers.
+CC_BASE_REACH = 21
+
+
 def spec_max_dte(spec: Dict[str, Any]) -> int:
     """The DTE reach a persisted spec's arms imply — the dashboard's half of
     ``runner.effective_max_dte``.
 
     The runner takes the max over the base config AND every arm's DTE overrides.
     This side cannot see the base config — it holds a spec, not a ``Config`` —
-    so the floor is ``DTE_REACH_BIAS_THRESHOLD``, which is the live profile's
-    own ``put_target_dte``. The two therefore agree on the only thing the answer
-    is used for: whether the run reached PAST 7. They would disagree if the
-    wheel profile's base DTE ever moved off 7, which is a config change that has
-    to update the threshold anyway (the fidelity figures in ``SWEEP_BIASES``
-    were measured at 7 and the constant says so).
+    so it uses a per-strategy FLOOR standing in for that base.
+
+    **Strategy-aware since FC-096 Phase C (review round 1, H5.)** The floor used
+    to be ``DTE_REACH_BIAS_THRESHOLD`` unconditionally, i.e. the WHEEL's
+    ``put_target_dte``. A covered-call run's base reach is not 7: its call
+    target is 14 and Phase C widens its materialisation to the roll horizon
+    (``call_target_dte + rolling.max_extension_days``, capped at the lake), which
+    is ``CC_BASE_REACH``. With a 7 floor this side computed 7 for every CC run
+    while the engine computed 21, so ``shape_results`` and ``report.py``
+    disagreed about whether the DTE caveat had been earned — the exact fork the
+    parity test exists to prevent, arriving through a strategy the test did not
+    cover.
+
+    ``CC_BASE_REACH`` is pinned to the profile by an equality test rather than
+    derived here, because this module is the dashboard's and holds no ``Config``.
 
     Reads the SPEC rather than the per-cell ``overrides_json`` because the spec
     is the run's declaration: an arm that errored in every cell still asked for
     its reach, and the caveat is about the DATA the window was built on, not
     about which cells came back.
     """
-    reach = DTE_REACH_BIAS_THRESHOLD
+    reach = (DTE_REACH_BIAS_THRESHOLD
+             if str(spec.get("strategy") or WHEEL_STRATEGY) == WHEEL_STRATEGY
+             else CC_BASE_REACH)
     for arm in (spec.get("scenarios") or []):
         if not isinstance(arm, dict):
             continue
@@ -2288,6 +2352,35 @@ def shape_results(sweep_row: Dict[str, Any],
     known_biases = list(SWEEP_BIASES)
     if effective_max_dte > DTE_REACH_BIAS_THRESHOLD:
         known_biases.append(DTE_REACH_BIAS)
+
+    # FC-096 Phase C. Derived from the PERSISTED spec, absent -> wheel — the
+    # `spec_max_dte` pattern above. Every run stored before Phase C has no
+    # `strategy` key and is a wheel run, which is exactly what absence means.
+    #
+    # `MODEL_SPREAD_BIAS` is emitted for every covered-call run rather than off
+    # a stored flag, because there is no column recording whether the gate was
+    # suspended and the suspension is unconditional on that profile (its
+    # `universe.max_spread_pct` is set). If a future CC profile ships without
+    # the key, this side would over-warn while the engine side (which asks the
+    # predicate) would not — over-warning is the safe direction, and the
+    # divergence is named here rather than left for a reader to find.
+    run_strategy = str(spec.get("strategy") or WHEEL_STRATEGY)
+    if run_strategy != WHEEL_STRATEGY:
+        # M1 (review round 1): the two SWEEP_BIASES lines calibrated on the
+        # WHEEL are FALSE on a covered-call run — profit-taking IS modelled
+        # here, and ex-dividend early assignment CAN fire on a holdings-derived
+        # universe of payers. Swapped by TITLE, exactly as the engine does it,
+        # so a reorder of the shared list cannot substitute the wrong caveat.
+        _cc_substitutions = {
+            WHEEL_PROFIT_TAKING_TITLE: CC_PROFIT_TAKING_BIAS,
+            WHEEL_EX_DIV_TITLE: CC_EX_DIV_BIAS,
+        }
+        known_biases = [_cc_substitutions.get(title, (title, detail))
+                        for title, detail in known_biases]
+        known_biases.extend([
+            SYNTHETIC_LOT_BIAS, MONITOR_LEG_NOTE, ROLL_REACH_BIAS,
+            CC_ROLL_SPLIT_NOTE, MODEL_SPREAD_BIAS,
+        ])
 
     # FC-096 A4. Read off the PERSISTED row, never re-derived: this is a
     # property of the earnings table as it stood when the run replayed, and a

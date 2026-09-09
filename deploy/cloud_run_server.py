@@ -45,32 +45,23 @@ def _underlyings_removed(before, after):
 
 
 def _call_only_opportunities(opportunities, strategy_id, log):
-    """Drop non-call opportunities (FC-075 Phase 2 DD-2, defense in depth).
+    """RE-EXPORT of ``src.strategy.strategy_gates.call_only_opportunities``.
 
-    A covered-call (non-wheel) service must NEVER execute a put. The put scan is
-    gated and the blob is strategy-keyed, so this only fires on a hand-written or
-    corrupted blob (expected live count: 0). Returns the call-only subset and
-    logs each refusal. The caller applies the result to BOTH the working list and
-    the blob snapshot, so a refused put is not then mislabeled `previously_failed`
-    by the ``_underlyings_removed`` diff. Extracted so both directions are unit-
-    testable (the covered-call service's ``/run`` is otherwise write-isolated off
-    until Seam 4).
+    FC-096 Phase C §C4 moved the body: the backtesting engine must apply the SAME
+    gate the covered-call service applies, and it cannot import this module
+    (importing it builds a Flask app, reads credentials and constructs an
+    ``AlpacaClient``). Forking the rule into the replay was the alternative, and
+    a forked gate is a gate that drifts.
+
+    This wrapper stays because it is a PUBLIC shape: existing tests patch
+    ``server.log_error_event`` and call this name. It forwards ``log`` through,
+    so a caller that patched the logger still observes its own object. The
+    emitted event's ``component`` is unchanged and pinned by a test — see the
+    gate module's docstring.
     """
-    kept = []
-    for opp in opportunities:
-        if strict_option_type(opp.get('option_symbol') or '') == 'call':
-            kept.append(opp)
-        else:
-            log_error_event(
-                log,
-                error_type="non_call_opportunity_refused",
-                error_message=f"Non-call opportunity refused on {strategy_id} profile",
-                component="cloud_run_server",
-                recoverable=True,
-                option_symbol=opp.get('option_symbol'),
-                symbol=opp.get('symbol'),
-            )
-    return kept
+    from src.strategy.strategy_gates import call_only_opportunities
+
+    return call_only_opportunities(opportunities, strategy_id, log)
 
 
 def _maybe_alert_long_exposure(config, alpaca_client, log):

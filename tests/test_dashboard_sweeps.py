@@ -160,6 +160,18 @@ class TestTheReportProseIsNotAFork:
         # FC-096 Phase A PR-2. Pinned here as a CONSTANT; whether it is emitted
         # is derived separately on each side — see TestTheDteReachCaveatIsNotAFork.
         "DTE_REACH_BIAS", "DTE_REACH_BIAS_THRESHOLD",
+        # FC-096 Phase C. Same posture as DTE_REACH_BIAS: the WORDS are pinned
+        # here, and each side derives emission its own way (the CLI off
+        # `SweepResult.strategy`, the dashboard off the persisted
+        # `spec_json.strategy`).
+        "SYNTHETIC_LOT_BIAS", "MODEL_SPREAD_BIAS", "ROLL_REACH_BIAS",
+        "CC_ROLL_SPLIT_NOTE", "MONITOR_LEG_NOTE",
+        # M1 (review round 1): the substitution's two KEYS and its two
+        # replacements. The keys are titles taken from SWEEP_BIASES, so a drift
+        # in either copy breaks the swap silently — matching on a title that no
+        # longer exists leaves the FALSE wheel line in a covered-call footer.
+        "WHEEL_PROFIT_TAKING_TITLE", "WHEEL_EX_DIV_TITLE",
+        "CC_PROFIT_TAKING_BIAS", "CC_EX_DIV_BIAS",
     ])
     def test_matches_report_py_exactly(self, name):
         assert getattr(T, name) == getattr(engine_report, name), (

@@ -1220,11 +1220,60 @@ because shortening the bound is the dangerous direction.
 - **Two additive stamps landed on the cell artifact in the same PR**, both
   REQUIRED: `benchmark` (this cell's scored buy-and-hold, or `null`) and
   `provenance.capital_base` (the denominator every ratio on this cell is taken
-  over — `starting_cash` for a wheel replay, the synthetic lot's value for a
-  Phase C covered-call one). The console divides by `capital_base`, never by
-  `starting_cash`. `provenance.git_commit` was also **null on every artifact
+  over — `starting_cash` for a wheel replay, the synthetic lot's TIME-WEIGHTED
+  value for a Phase C covered-call one). The console divides by `capital_base`,
+  never by `starting_cash`.
+
+  **`capital_base` on a covered-call cell EXCLUDES the cash float** (FC-096
+  Phase C, review round 1). A CC replay runs on a $5,000 liquidity reserve
+  (`simulator.CC_CASH_FLOAT`) so the monitor leg can buy a call back and a roll
+  can pay its BTC before collecting its STO credit. That reserve is not capital
+  the strategy is measured on: it is stamped in `starting_cash` and kept out of
+  every ratio, and the cell's benchmark divides by the same `capital_base`, so
+  `excess_return` subtracts two ratios over one number. A non-wheel artifact
+  with no explicit base stamps **`null`** and the console suppresses its ratio
+  tiles — it never falls back to `starting_cash`, which on a CC cell would be
+  the $5,000 float and would scale every ratio ~20x while looking plausible. `provenance.git_commit` was also **null on every artifact
   ever stored** until this PR: `run_sweep` had no parameter for it while both
   callers held the value.
+
+### The `strategy` spec field (FC-096 Phase C)
+
+A sweep spec carries `strategy: "wheel" | "covered_call"`, at the dashboard
+(`services/sweeps.validate_spec`), the sim service (`normalise_spec`), the
+Cloud Run Job and the CLI. It selects the **strategy profile the replay runs
+under** — gates, knobs, legs — and NEVER the **service context** (dataset,
+buckets, credentials, provenance), which belongs to the process. A covered-call
+sweep run by a wheel-context process replays `config/covered_call.yaml` and
+still writes its measurement rows to that process's own dataset, self-described
+by the `strategy` column. (The FC-075 DD-4 dataset-isolation doctrine protects
+TRADING writers; the scenario tables are a measurement store of hypotheses, and
+splitting them would orphan CC trend rows from every reader.)
+
+**No BigQuery ALTER is needed for any of this.** The field rides in
+`spec_json`, and every new per-cell number (`premium_yield_on_lot`, the
+coverage split, the roll-skip reasons, the ITM/OTM roll split) rides in the
+stored artifact. `scenario_runs` gains no column, so there is no schema
+migration and no window in which a reader sees a half-migrated table.
+
+**Canonicalisation is by OMISSION.** Absent, empty and explicit `"wheel"` all
+fold to absence in `identity.canonical_spec`, so every `sweep_key` already in
+the store is byte-stable and a dashboard submission (which always stamps a
+strategy) dedups against the identical CLI submission. Only `covered_call` is
+written into the key. The enum lives in the two VALIDATORS, never in
+`identity.py` — that module is stdlib-only and flat-copied into the dashboard
+image, and a validator maintained in two images drifts.
+
+**Deploy order matters, and it is not symmetric.** The dashboard image is
+promoted BEFORE the sim service and the Job. In that window the dashboard
+accepts and forwards a spec carrying `strategy`, while an un-promoted Job still
+refuses it as an unknown field (`load_spec_from_env`'s closed `SPEC_FIELDS`
+check) — so a covered-call submission fails loudly at the Job rather than
+silently replaying the wheel, which is the right failure. The same asymmetry is
+the rollback hazard: **rolling the Job back by SHA without rolling the
+dashboard back refuses every dashboard submission that carries `strategy`,
+including `strategy: "wheel"`**, because the dashboard always stamps the field.
+Roll both back together, or roll the dashboard back first.
 
 - **Nothing here is public any more** (FC-096 Phase D, 2026-09-02). The whole
   dashboard is behind IAP and `allUsers` is off the invoker policy, which closed

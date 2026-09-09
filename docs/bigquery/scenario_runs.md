@@ -718,3 +718,31 @@ something an operator can fix by editing a pin.
   that produced no `running` row by then is not running). A `running` row keeps
   the task-timeout + grace rule, because a cold sweep may legitimately still be
   replaying.
+
+
+## `strategy` (FC-096 Phase C)
+
+Sweeps can now be run under a strategy profile other than the wheel. **No
+column was added.** The strategy rides in `spec_json.strategy` on the run row,
+and every covered-call-specific number rides in the stored cell artifact
+(`premium_yield_on_lot`, `capital_base`, the coverage split, `roll_skips`, the
+ITM/OTM roll split). Nothing here needs an `ALTER TABLE`, and a reader that
+predates Phase C sees exactly the columns it always saw.
+
+Reading the table with covered-call rows in it:
+
+* **`spec_json.strategy` absent means `wheel`.** Every row written before Phase
+  C is in that state, and the canonicaliser folds an explicit `"wheel"` to
+  absence, so the field appears only on non-wheel runs.
+* **Do not compare `annualized_return` across strategies.** A wheel row's ratio
+  is over `starting_cash`; a covered-call row's is over the synthetic lot. They
+  are different denominators describing different premises, which is why the
+  console's compare view REFUSES a cross-strategy pair outright rather than
+  withholding its tiles.
+* **`base_config_hash` differs between the two profiles by construction**, so a
+  covered-call run can never dedup into the wheel run of the same window even
+  if a caller omits `strategy` from the spec. That is the second belt behind
+  `sweep_key`.
+* `verdict` on a covered-call row uses the covered-call cutoffs:
+  `insufficient` there means "no lot seeded, or a window shorter than one call
+  tenor", NOT "no cycle closed".

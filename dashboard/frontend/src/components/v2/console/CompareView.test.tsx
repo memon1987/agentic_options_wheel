@@ -249,6 +249,36 @@ describe('a symbol mismatch is refused', () => {
   });
 });
 
+// FC-096 Phase C, review round 1 (H4). The PAGE, not the matrix module.
+//
+// `toSide` dropped `specStrategy` entirely, so the strategy row saw `undefined`
+// on every real comparison and fell back to the artifact stamp alone. Only the
+// matrix's own test helper had ever set the field, which is why that suite
+// passed while the shipped page silently compared a covered-call cell against a
+// wheel cell. The `artifact: null` case is the one that matters: with no stamp
+// to fall back on, the resolver's only remaining input IS the spec.
+describe('a covered-call cell against a wheel cell is refused by the PAGE', () => {
+  it('refuses even when the CC side has no artifact to read a stamp from', () => {
+    show(
+      sideFor(shaped13cc, BASE),
+      sideFor(shaped13cc, BASE, {
+        strategy: 'covered_call',
+        artifact: null,
+        baseArtifact: null,
+        artifactAbsence: 'not found',
+      }),
+    );
+    expect(screen.getByTestId('compare-refusal').textContent).toContain(
+      'two STRATEGIES');
+    expect(screen.queryByTestId('ab-delta')).toBeNull();
+  });
+
+  it('still compares two wheel cells, so absence keeps meaning wheel', () => {
+    show(sideFor(shaped13cc, BASE), sideFor(shaped13cc, A));
+    expect(screen.queryByTestId('compare-refusal')).toBeNull();
+  });
+});
+
 describe('cross-run: 13cc vs a48d, the same spec across an engine move', () => {
   beforeEach(() => {
     show(sideFor(shaped13cc, BASE), sideFor(shapedA48d, BASE));

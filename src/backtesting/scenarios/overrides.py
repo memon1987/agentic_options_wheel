@@ -77,6 +77,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...utils.config import Config
 
 
+# FC-096 Phase C §C4. The legacy strategy, spelled locally for the same reason
+# everything else in this module is: it is STDLIB-ONLY and flat-copied into the
+# dashboard image, so it may not import `identity.py` (a different copy) or the
+# engine. Pinned equal to `identity.WHEEL_STRATEGY` and
+# `simulator.WHEEL_STRATEGY` by a test, which is this project's standing answer
+# to a constant that has to exist in more than one image.
+WHEEL_STRATEGY = "wheel"
+
+
 class OverrideError(ValueError):
     """A scenario override that is unknown, disallowed, or silently ineffective."""
 
@@ -230,8 +239,10 @@ REJECTED_OVERRIDES: Dict[str, str] = {
         "no GCS blob and no age to test (see simulator.py's module docstring)."
     ),
     "strategy_id": (
-        "the strategy profile is chosen by --config, not by an override. A "
-        "sweep that switched profiles mid-run would compare two engines."
+        "the strategy profile is chosen by the spec's `strategy` field (FC-096 "
+        "Phase C), not by an override. `strategy` selects the profile for the "
+        "WHOLE run; an arm that switched it mid-run would compare two engines "
+        "and call the difference a scenario result."
     ),
     "bigquery_dataset": (
         "a sweep never writes to BigQuery (FC-060 Layer 3 owns persistence), so "
@@ -289,7 +300,8 @@ def _reject_reason(key: str) -> Optional[str]:
     return None
 
 
-def validate_override_key(key: str, value: Any = None) -> None:
+def validate_override_key(key: str, value: Any = None,
+                          *, strategy: str = WHEEL_STRATEGY) -> None:
     """Raise ``OverrideError`` unless ``key`` (at ``value``) is a legal override.
 
     Order matters: a key with a *specific* reason gets that reason, and only a
@@ -309,6 +321,15 @@ def validate_override_key(key: str, value: Any = None) -> None:
     if reason is not None:
         raise OverrideError(
             f"scenario override '{key}' is refused: {reason}"
+        )
+    # FC-096 Phase C §C4. Checked AFTER the unconditional refusals so a key that
+    # is refused for everyone keeps its own, more specific reason, and BEFORE
+    # the allowlist so a put key gets "your profile writes no puts" rather than
+    # "unknown key" — the allowlist does list it, for the wheel.
+    strategy_reason = _strategy_reject_reason(key, strategy)
+    if strategy_reason is not None:
+        raise OverrideError(
+            f"scenario override '{key}' is refused: {strategy_reason}"
         )
     if key not in ALLOWED_OVERRIDES:
         raise OverrideError(
@@ -343,10 +364,52 @@ def validate_override_key(key: str, value: Any = None) -> None:
         )
 
 
-def validate_overrides(overrides: Mapping[str, Any]) -> None:
-    """Validate every key in one scenario. Raises on the first offender."""
+# --------------------------------------------------------------------------- #
+# Strategy-conditional refusals (FC-096 Phase C §C4)
+# --------------------------------------------------------------------------- #
+#: Override keys that only the WHEEL reads, with the leg each belongs to. A
+#: covered-call replay writes no puts at all — the put scan self-gates — so an
+#: arm turning one of these produces a row byte-identical to base, which reads
+#: as "this knob does not matter" rather than as "this knob was never consulted".
+#: That is the FC-057 dishonest-metric class, and it is refused rather than
+#: allowed-and-caveated for the same reason `risk.profit_taking.*` is.
+#:
+#: This lives HERE, in the one module all four entry points AND the dashboard
+#: share (it is stdlib-only and flat-copied into the dashboard image), so a CC
+#: spec overriding a put key is refused with byte-identical words at the API and
+#: at the Job. Nothing new is refused for the wheel.
+PUT_SIDE_OVERRIDES: Dict[str, str] = {
+    "strategy.put_delta_range": "the put delta band",
+    "strategy.min_put_premium": "the put premium floor",
+    "strategy.put_target_dte": "the put DTE target",
+    "earnings.blackout_days": "the PUT leg's symbol-level earnings blackout",
+}
+
+
+def _strategy_reject_reason(key: str, strategy: str) -> Optional[str]:
+    """Why ``strategy`` may not set ``key``, or None."""
+    if strategy == WHEEL_STRATEGY:
+        return None
+    leg = PUT_SIDE_OVERRIDES.get(key)
+    if leg is None:
+        return None
+    return (
+        f"{leg} is read only by the PUT leg, and the '{strategy}' profile "
+        f"writes no puts (its scan is call-only). Every arm setting it would "
+        f"return the base row, which reads as 'this knob does not matter' "
+        f"rather than as 'this knob was never consulted'."
+    )
+
+
+def validate_overrides(overrides: Mapping[str, Any],
+                       strategy: str = WHEEL_STRATEGY) -> None:
+    """Validate every key in one scenario. Raises on the first offender.
+
+    ``strategy`` defaults to the wheel so every existing caller is unchanged and
+    refuses exactly what it refused before.
+    """
     for key, value in overrides.items():
-        validate_override_key(key, value)
+        validate_override_key(key, value, strategy=strategy)
 
 
 def apply_overrides(config: Config, overrides: Mapping[str, Any]) -> Config:

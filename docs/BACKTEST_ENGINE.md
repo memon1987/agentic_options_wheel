@@ -896,3 +896,67 @@ recommendations. Given the engine is being adopted as a measurement tool only, t
 sequence is: run the Job, read the output, and treat the first few months as **data
 collection**. The `demote` column is a recommendation for a human, and the biases above
 are the reason it needs one.
+
+
+## The covered-call replay (FC-096 Phase C)
+
+A sweep whose spec says `strategy: covered_call` replays
+`config/covered_call.yaml` instead of the wheel profile. What it measures, and
+what it does not:
+
+**The premise.** The stock leg is ASSUMED, not bought: 100 shares seeded at the
+window-start close, at `cash_delta = 0`, recorded as a `synthetic_lot_open`
+ledger event carrying its premise. When the lot is called away a fresh one is
+seeded at the NEXT session's close (operator decision, 2026-09-08), so every
+symbol is measured over the full window rather than truncating at the first
+assignment — which would bias against exactly the names that ran up fastest.
+The stock leg is therefore a CHAIN of lots, each with its own basis.
+
+**The denominators.** `capital_base` is the TIME-WEIGHTED lot value. The
+numerator subtracts the SUM of seeded lot values, because each seeding puts
+value into equity without passing through cash; the denominator uses the
+time-weighted average, because a chain never holds every lot at once. They
+coincide for a single lot held throughout. The $5,000 cash float is a liquidity
+reserve, excluded from every ratio. The benchmark is THE SAME LOT held and never
+written against — 100 shares at the seeding close — not a full-investment
+buy-and-hold.
+
+**The headline vs the verdict.** `premium_yield_on_lot` (annualized net premium
+over the time-weighted lot value) is the number a covered-call programme is
+managed to, and it is reported as a STATEMENT. The VERDICT compares total
+return against the same lot's total return — premium-only against a benchmark
+that includes the shares' price move is not a comparison, and the plan's first
+cut of this WARN fired on windows the strategy had won.
+
+**`insufficient` does not invert.** A lot that was never called away closes no
+cycle and is the programme working. For a covered-call cell `insufficient`
+means no lot was ever seeded, or a window shorter than one call tenor.
+
+**Coverage is a five-way split, never one ratio:** covered / hold-uncovered /
+earnings-span / gate-rejected / post-call-away. Below-basis and earnings-span
+days are EXCLUDED from the denominator the `low_activity` floor uses — those
+are the guards working. `hold_uncovered` is derived from whether the chain
+offered a strike above the basis inside the delta band, not from
+`close < basis`.
+
+**Modelled, unlike the wheel replay:** the `/monitor` profit-taking leg (52% of
+real covered calls close early) and the daily credit-only roller at
+`itm_trigger_ratio: 1.00` (FC-100). Rolls are SPLIT into ITM defences and OTM
+roll-outs; at 1.00 the second bucket must be empty and a non-zero count is a
+finding. `call_roll_skipped` reasons are counted so "2 rolls executed" can be
+told from "the roller was blind".
+
+**Reach.** A covered-call window materialises to `call_target_dte +
+rolling.max_extension_days` = 28, capped at the lake's `MAX_SWEEPABLE_DTE` (21).
+The residual truncation biases roll counts and credits DOWN; the engine's
+haircut fill model biases roll credits UP against a live roller that places its
+BTC at the ask and its STO at the bid. Both are named in the footer; neither is
+measured. The WHEEL carries the same truncation (7 + 14 against a 7-DTE
+materialisation), unfixed here because widening it would move every stored
+wheel number — FC-112 owns it.
+
+**The spread gate is SUSPENDED** on model-built chains: the modelled
+half-spread is >= 5% of mark for an OTM contract, so the profile's
+`max_spread_pct: 0.10` rejects every floor-clearing call by construction (10/10
+probe). Suspended in the replay only; the live service still gates. A test pins
+the suspension to the model, so it fails loudly when real spreads arrive.

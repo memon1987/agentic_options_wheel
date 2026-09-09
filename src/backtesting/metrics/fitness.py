@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..engine.simulator import DailyState
 from .cycles import WheelCycle
@@ -44,6 +44,16 @@ RISK_FREE_RATE = 0.04
 # 0.35 and one open position per symbol in evaluate mode, equity simply cannot
 # fall 20%, so the old gate could never fire.
 MAX_DRAWDOWN_WARN = -0.08
+
+#: FC-096 Phase C §C3. The covered-call ``low_activity`` floor: a call must be
+#: open on at least 30% of the days the strategy COULD have written one. The
+#: denominator excludes below-basis and earnings-span stand-downs
+#: (``simulator.COVERAGE_NOT_A_STAND_DOWN``) — those are the guards working, and
+#: counting them here would demote the symbols the cost-basis floor protected.
+#: Deliberately NOT ``MIN_DAYS_IN_POSITION``: the wheel's 0.25 is a fraction of
+#: DECISION days with any position at all, and a CC replay holds a lot on
+#: essentially every day by construction, which would make that test inert.
+MIN_COVERED_FRACTION = 0.30
 
 
 @dataclass
@@ -130,15 +140,169 @@ class FitnessReport:
     data_quality: Dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
+    # FC-096 Phase C — the covered-call half. `strategy` stays `wheel` and
+    # `lot_capital` stays 0.0 on every wheel replay, so `capital_base` below is
+    # `starting_cash` exactly and no wheel number moves.
+    # ------------------------------------------------------------------ #
+    strategy: str = "wheel"
+    #: **The two lot aggregations, and why a covered-call replay needs both.**
+    #:
+    #: Rev 3 §C3 wrote one number — ``starting_cash + Σ seeded lot values`` —
+    #: and the 2026-09-08 re-seed decision wrote another, the TIME-WEIGHTED lot
+    #: value, for ``premium_yield_on_lot``. Under a chain of lots they are not
+    #: interchangeable, and each is correct in exactly one place:
+    #:
+    #: * ``lot_capital_injected`` (Σ) is the NUMERATOR's. Every seeding event
+    #:   puts value into ``final_equity`` without passing through cash, so each
+    #:   one must come back out or its whole value reads as profit. A lot seeded
+    #:   at $10k, called away at $11k, and replaced by an $11k lot has injected
+    #:   $21k; subtracting anything less books the difference as a gain nobody
+    #:   made. With Σ, ``total_pnl`` reconciles against the attribution rows
+    #:   exactly as it does on the wheel.
+    #: * ``lot_capital`` (time-weighted) is the DENOMINATOR's. That programme
+    #:   never held $21k at once — it held ~$10.5k throughout — and dividing by
+    #:   Σ would understate its return by half. This is also the denominator the
+    #:   signed decision names for the headline yield, so the two agree.
+    #:
+    #: They are EQUAL for a lot seeded on day one and held to the end, which is
+    #: the single-lot case both texts were describing.
+    lot_capital: float = 0.0
+    lot_capital_injected: float = 0.0
+    #: Calls closed by the CC monitor leg, and the coverage split, carried for
+    #: the report and the verdict. Never collapsed into one ratio.
+    calls_closed_early: int = 0
+    coverage_by_reason: Dict[str, int] = field(default_factory=dict)
+    synthetic_lots_opened: int = 0
+    itm_rolls: int = 0
+    otm_roll_outs: int = 0
+
+    # ------------------------------------------------------------------ #
+    @property
+    def is_wheel(self) -> bool:
+        return self.strategy == "wheel"
+
+    @property
+    def capital_base(self) -> float:
+        """The denominator EVERY ratio on this report is taken over.
+
+        ``starting_cash`` for a wheel replay; **``lot_capital`` alone** — the
+        time-weighted lot value — for a covered-call one.
+
+        This is the C3 fix for the defect round-1 review found: the synthetic
+        lot arrives at ``cash_delta = 0`` and is then marked to market, so a
+        base of ``starting_cash`` alone would book the ENTIRE lot value as
+        profit. A no-trade covered-call window returned "+2,900%" and read as
+        the best result in the sweep. Dividing by the capital the premise
+        assumed is what makes a no-trade window return 0.0%.
+
+        **The $5,000 cash float is EXCLUDED (review round 1, H1 — decided).**
+        The first cut used ``starting_cash + lot_capital``, which put the float
+        in the denominator of every ratio while the lot-sized benchmark divided
+        by the lot alone. Two denominators on one page: the cell's return was
+        computed over $15,000 and the sidecar's buy-and-hold over $10,000, so
+        ``excess_return`` compared two differently-scaled numbers and a window
+        that genuinely beat its benchmark could read as trailing it. The float
+        is a documented LIQUIDITY RESERVE — it exists so the monitor leg can buy
+        a call back and a roll can pay its BTC before collecting the STO credit
+        — and a reserve is not capital the strategy is measured on. It stays in
+        ``starting_cash`` (stamped separately on every artifact) and out of
+        every ratio; the benchmark's ``starting_cash`` is now this same number,
+        so both sides of ``excess_return`` divide by one base. That is also what
+        makes the footer sentence "the capital base is the lot" literally true.
+        """
+        if self.is_wheel:
+            return self.starting_cash
+        return self.lot_capital
+
     @property
     def total_pnl(self) -> float:
-        return self.final_equity - self.starting_cash
+        """Equity change, with the seeded lot removed.
+
+        The lot never passed through cash, so ``final_equity`` contains its full
+        market value while ``starting_cash`` contains none of it. Subtracting
+        the assumed capital is the other half of the same fix as
+        ``capital_base``: without it the numerator carries the lot as a gain and
+        no choice of denominator can make the ratio honest.
+
+        Uses ``lot_capital_injected`` (Σ), NOT ``capital_base``'s time-weighted
+        term — see the field docstring. Σ is what actually entered equity, so
+        this keeps ``reconciliation_gap`` at zero on a covered-call replay for
+        the same reason it is zero on a wheel one.
+        """
+        return self.final_equity - self.starting_cash - self.lot_capital_injected
 
     @property
     def total_return(self) -> float:
-        if self.starting_cash <= 0:
+        if self.capital_base <= 0:
             return 0.0
-        return self.total_pnl / self.starting_cash
+        return self.total_pnl / self.capital_base
+
+    @property
+    def net_premium(self) -> float:
+        """Premium received net of buybacks and fees — the CC numerator."""
+        return self.option_pnl
+
+    @property
+    def premium_yield_on_lot(self) -> Optional[float]:
+        """THE covered-call headline: annualized net premium ÷ lot value.
+
+        The denominator is the TIME-WEIGHTED average seeded lot value, which is
+        well-formed under both call-away postures: with a single lot it IS that
+        lot's value, and across the signed re-seed chain each lot contributes
+        its value times the days it was held, over the window's decision days.
+
+        Distinct from ``annualized_return``, which stays the corrected EQUITY
+        return (premium plus the lot's own price move plus dividends). Both are
+        reported and the footer says which is which: a covered-call programme is
+        judged on the premium it harvests against the shares it is holding, not
+        on whether the shares happened to go up.
+
+        ``None`` for a wheel replay (no lot) and for a window with no lot-days —
+        never 0.0, which would read as "this programme earned nothing".
+        """
+        if self.lot_capital <= 0 or self.days <= 0:
+            return None
+        return (self.net_premium / self.lot_capital) * (365.0 / self.days)
+
+    @property
+    def net_basis_reduction(self) -> Optional[float]:
+        """Cumulative net premium ÷ the lot basis — what CC programmes manage to.
+
+        Un-annualized on purpose: it answers "how much of the shares' cost has
+        this programme written off so far", which is a running total and not a
+        rate.
+        """
+        if self.lot_capital <= 0:
+            return None
+        return self.net_premium / self.lot_capital
+
+    @property
+    def coverage_fraction(self) -> Optional[float]:
+        """Covered days ÷ days the strategy could have been covered.
+
+        The denominator EXCLUDES ``hold_uncovered`` and ``earnings_span``
+        (``COVERAGE_NOT_A_STAND_DOWN``): standing down below basis is the
+        cost-basis floor working and an earnings-span day is the FC-013 gate
+        working, and a metric that counted either against the strategy would
+        demote exactly the symbols its guards protected. It also excludes
+        ``post_call_away``, which is not a day the lot existed to be covered.
+
+        ``None`` when the denominator is empty — a window in which the strategy
+        was never in a position to write has no coverage ratio, and printing
+        0% for it would read as a verdict.
+        """
+        from ..engine.simulator import (
+            COVERAGE_COVERED, COVERAGE_NOT_A_STAND_DOWN, COVERAGE_POST_CALL_AWAY,
+        )
+
+        eligible = sum(
+            days for reason, days in (self.coverage_by_reason or {}).items()
+            if reason not in COVERAGE_NOT_A_STAND_DOWN
+            and reason != COVERAGE_POST_CALL_AWAY
+        )
+        if eligible <= 0:
+            return None
+        return (self.coverage_by_reason or {}).get(COVERAGE_COVERED, 0) / eligible
 
     @property
     def days(self) -> int:
@@ -291,6 +455,8 @@ class FitnessReport:
 
     def verdict_reasons(self) -> List[str]:
         """Explicit, ordered reasons behind the verdict."""
+        if not self.is_wheel:
+            return self._covered_call_verdict_reasons()
         reasons: List[str] = []
 
         if not self.closed_cycles:
@@ -382,6 +548,129 @@ class FitnessReport:
             reasons.append("OK: profitable, beat buy-and-hold, premium-driven")
         return reasons
 
+    # ------------------------------------------------------------------ #
+    # The covered-call verdict (FC-096 Phase C §C3)
+    # ------------------------------------------------------------------ #
+    def _covered_call_verdict_reasons(self) -> List[str]:
+        """The CC branch, with its cutoffs — NOT the wheel's rules re-pointed.
+
+        The wheel's first test is "did a cycle close", and on a covered-call
+        replay that INVERTS: a lot that was never called away is the programme
+        working perfectly, and the wheel branch would have stamped the best
+        outcome ``insufficient`` on every symbol that held its shares. So the
+        CC branch never asks that question. Its ``insufficient`` means what the
+        word should mean here — the window or the data could not support a
+        judgement:
+
+        * fewer decision days than a single call tenor, so not one contract
+          could have been written and resolved; or
+        * no lot was ever seeded (no traded session to seed at).
+
+        Everything below that is a measurement:
+
+        * BLOCK on net premium <= 0 — a covered-call programme that paid to
+          write calls did the one thing it exists not to do.
+        * BLOCK on coverage below 30% of the days it COULD have written,
+          excluding hold-uncovered and earnings-span days. Standing down below
+          basis is the floor working; the exclusion is the point.
+        * WARN when the premium yield on the lot trails the same lot's
+          dividend-inclusive buy-and-hold. The comparison is against the LOT,
+          never a $100k full-invest benchmark.
+        * WARN when the shares were called away below basis — the assignment
+          terms, which is the loss a CC programme actually fears.
+        """
+        from ..engine.simulator import COVERAGE_COVERED
+
+        reasons: List[str] = []
+        tenor = int(self.data_quality.get("call_target_dte") or 0)
+        decision_days = self.decision_days
+
+        if self.synthetic_lots_opened <= 0:
+            return ["INSUFFICIENT: no synthetic lot was ever seeded — the "
+                    "symbol had no traded session in the window to assume a "
+                    "position at, so nothing was measured"]
+        if tenor and decision_days and decision_days < tenor:
+            return [
+                f"INSUFFICIENT: {decision_days} decision days is shorter than "
+                f"one {tenor}-day call tenor, so not a single contract could "
+                f"have been written and resolved inside the window — lengthen "
+                f"it to judge this symbol"
+            ]
+
+        coverage = self.coverage_fraction
+        if coverage is None:
+            reasons.append(
+                "INSUFFICIENT: every day in the window was a stand-down the "
+                "strategy is supposed to take (below basis, or inside an "
+                "earnings span), so there is no day on which its selection was "
+                "actually tested")
+            return reasons
+
+        if self.net_premium <= 0:
+            reasons.append(
+                f"BLOCK: net premium was ${self.net_premium:,.2f} — the "
+                f"programme paid to write calls rather than being paid to")
+
+        if coverage < MIN_COVERED_FRACTION:
+            covered_days = (self.coverage_by_reason or {}).get(COVERAGE_COVERED, 0)
+            reasons.append(
+                f"BLOCK: a call was open on only {covered_days} of the days the "
+                f"strategy could have written one ({coverage:.0%}, excluding "
+                f"below-basis and earnings-span stand-downs) — it cannot "
+                f"consistently find a contract on this symbol, so the yield "
+                f"below is not a meaningful sample")
+
+        # **The comparison the PLAN specified was the wrong one** (review round
+        # 1, H2 — both reviewers; recorded as a plan defect, decided).
+        #
+        # §C3 said to WARN when `premium_yield_on_lot` trails the lot's
+        # buy-and-hold. Those are not comparable quantities: the yield counts
+        # PREMIUM ONLY, while the benchmark counts the shares' whole price move.
+        # Against a lot that rose 58% the premium leg cannot win by
+        # construction, so the WARN fired on every rising window — including the
+        # ones where the strategy genuinely beat holding — and its sentence
+        # ("holding the shares and writing nothing would have done better") was
+        # then simply false.
+        #
+        # The honest comparison is total against total: what the lot EARNED
+        # under this programme (premium, plus the shares' move, minus the
+        # call-away drag) against what the same lot would have earned untouched.
+        # `total_return` and `benchmark.total_return` now divide by the same
+        # `capital_base` (H1), so this is a like-for-like subtraction — it IS
+        # `excess_return`.
+        excess = self.excess_return
+        if excess is not None and excess < 0:
+            bench = self.benchmark.total_return if self.benchmark else 0.0
+            reasons.append(
+                f"WARN: the lot returned {self.total_return:+.2%} under this "
+                f"programme against {bench:+.2%} for the SAME lot held and "
+                f"never written against — writing cost more in surrendered "
+                f"upside than it earned in premium")
+
+        called_below = [
+            c for c in self.cycles
+            if c.called_away and c.cost_basis is not None
+            and c.exit_price is not None and c.exit_price < c.cost_basis
+        ]
+        if called_below:
+            reasons.append(
+                f"WARN: {len(called_below)} lot(s) were called away BELOW their "
+                f"cost basis — the assignment terms, not the premium, are where "
+                f"this programme lost money")
+
+        if self.max_drawdown < MAX_DRAWDOWN_WARN:
+            reasons.append(
+                f"WARN: max account drawdown {self.max_drawdown:.1%}")
+
+        if not reasons:
+            reasons.append(
+                f"OK: the lot returned {self.total_return:+.2%} against "
+                f"{(self.benchmark.total_return if self.benchmark else 0.0):+.2%} "
+                f"for the same lot held; net premium ${self.net_premium:,.2f} "
+                f"({(self.premium_yield_on_lot or 0.0):+.2%} annualized yield on "
+                f"the lot), covered on {coverage:.0%} of writable days")
+        return reasons
+
 
 def compute_fitness(
     symbol: str,
@@ -393,8 +682,17 @@ def compute_fitness(
     benchmark_dividends_per_share: float = 0.0,
     data_quality: Optional[Dict] = None,
     rolls: int = 0,
+    result: Optional[Any] = None,
 ) -> FitnessReport:
-    """Assemble the scorecard from the equity curve and the cycle table."""
+    """Assemble the scorecard from the equity curve and the cycle table.
+
+    ``result`` is the replay's ``SimulationResult`` (FC-096 Phase C). Optional
+    so every existing caller and test keeps working unchanged and a wheel report
+    built without it is byte-identical; when it IS passed, the covered-call
+    fields come off it rather than being recomputed here from the ledger, so the
+    row, the report and the artifact cannot disagree about which lot value the
+    engine used.
+    """
     if not daily:
         raise ValueError("cannot compute fitness with an empty equity curve")
 
@@ -407,6 +705,25 @@ def compute_fitness(
         cycles=list(cycles),
         rolls=rolls,
         data_quality=dict(data_quality or {}),
+    )
+    if result is not None:
+        report.strategy = getattr(result, "strategy", "wheel")
+        report.lot_capital = float(getattr(result, "time_weighted_lot_value", 0.0) or 0.0)
+        report.coverage_by_reason = dict(
+            getattr(result, "coverage_by_reason", None) or {})
+        report.calls_closed_early = int(getattr(result, "calls_closed_early", 0) or 0)
+        report.synthetic_lots_opened = int(
+            getattr(result, "synthetic_lots_opened", 0) or 0)
+        report.itm_rolls = int(getattr(result, "itm_rolls", 0) or 0)
+        report.otm_roll_outs = int(getattr(result, "otm_roll_outs", 0) or 0)
+    # Σ of the seeded lot values, straight off the ledger events rather than
+    # off a counter: the events ARE the record of what entered equity without
+    # passing through cash, so the numerator's correction cannot drift from
+    # what the broker actually did.
+    report.lot_capital_injected = sum(
+        event.price * event.shares
+        for cycle in cycles for event in cycle.events
+        if event.kind == "synthetic_lot_open"
     )
 
     for cycle in cycles:
@@ -433,9 +750,38 @@ def compute_fitness(
     report.days_underwater = _days_underwater(daily, cycles, benchmark_prices or {})
 
     if benchmark_prices:
-        report.benchmark = _buy_and_hold(
-            daily, benchmark_prices, starting_cash, benchmark_dividends_per_share
-        )
+        # FC-096 Phase C §C3, the lot-sized benchmark. A covered-call replay is
+        # compared against THE SAME LOT held and not written against — 100
+        # shares, entered at the seeding close — not against a $100k
+        # full-investment buy-and-hold that would buy ~30x the shares. With the
+        # wrong benchmark `excess_return` compares two different investments and
+        # the verdict layer reads the size difference as skill.
+        #
+        # Two corrections from review round 1:
+        #
+        # H1 — the benchmark divides by the CELL's `capital_base`, so both sides
+        # of `excess_return` are ratios over one number. The first cut handed
+        # `_buy_and_hold` the first lot's value while the cell divided by
+        # lot + float, which scaled the two sides differently and could report a
+        # window that beat its benchmark as trailing it.
+        #
+        # M7 — the share count is `SYNTHETIC_LOT_SHARES`, not
+        # `int(cash // entry)`. The floor drops a share whenever the entry price
+        # does not divide the lot value exactly, which for a lot defined AS
+        # 100 x entry is a rounding artefact of the reconstruction rather than a
+        # fact about the position: at a seed of 143.37, `int(14337 // 143.37)`
+        # is 99. The lot is 100 shares by signed decision; the benchmark holds
+        # exactly those 100 shares and never writes against them.
+        if report.is_wheel:
+            report.benchmark = _buy_and_hold(
+                daily, benchmark_prices, starting_cash,
+                benchmark_dividends_per_share
+            )
+        else:
+            report.benchmark = _lot_buy_and_hold(
+                daily, benchmark_prices, report.capital_base,
+                benchmark_dividends_per_share
+            )
 
     return report
 
@@ -545,6 +891,42 @@ def _unrealized_stock_pnl(
             continue
         total += (price - cycle.cost_basis) * shares
     return total
+
+
+def _lot_buy_and_hold(
+    daily: Sequence[DailyState],
+    prices: Dict[date, float],
+    capital_base: float,
+    dividends_per_share: float = 0.0,
+) -> Optional[BuyAndHold]:
+    """The covered-call benchmark: THE LOT, held and never written against.
+
+    FC-096 Phase C, review round 1 (H1 + M7). Two things differ from
+    ``_buy_and_hold`` and each was a defect:
+
+    * ``shares`` is exactly ``SYNTHETIC_LOT_SHARES``. Deriving it as
+      ``int(capital_base // entry)`` re-floors a number that is 100 by
+      definition, and the floor bites on any price that does not divide the lot
+      value exactly — ~48% of prices, including a seed of 143.37, where it
+      yields 99 shares and understates the benchmark by one share's move.
+    * ``starting_cash`` is the cell's own ``capital_base``, so the benchmark's
+      ``total_return`` and the report's are ratios over ONE denominator and
+      ``excess_return`` is a real comparison.
+    """
+    from ..engine.simulator import SYNTHETIC_LOT_SHARES
+
+    entry_day, exit_day = daily[0].day, daily[-1].day
+    entry = prices.get(entry_day)
+    exit_ = prices.get(exit_day)
+    if not entry or not exit_ or entry <= 0 or capital_base <= 0:
+        return None
+    return BuyAndHold(
+        shares=SYNTHETIC_LOT_SHARES,
+        entry_price=entry,
+        exit_price=exit_,
+        starting_cash=capital_base,
+        dividends_per_share=dividends_per_share,
+    )
 
 
 def _buy_and_hold(
