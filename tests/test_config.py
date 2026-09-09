@@ -342,3 +342,151 @@ class TestLimitSpreadFractionsFC072:
                                            put_limit_spread_fraction=0.25))
         assert config.call_limit_spread_fraction == 0.10
         assert config.put_limit_spread_fraction == 0.25
+
+
+class TestTheRollingBlockOnBothProfilesFC100:
+    """T-1/T-2/T-5. FC-100 wires the roller for the covered-call profile.
+
+    The block is deliberately NOT dict-equal to the wheel's: `itm_trigger_ratio`
+    is 1.00 on CC and 0.98 on the wheel (operator decision D-A). So the census
+    is per key, and the divergence set is asserted to be *exactly* that one key
+    — a second silent divergence is the failure this class exists to catch, and
+    a dict-equality assertion could not tell the two apart.
+    """
+
+    KEYS = ('enabled', 'itm_trigger_ratio', 'max_extension_days',
+            'max_replacement_delta', 'min_net_credit_per_contract',
+            'imminence_extrinsic_threshold', 'btc_fill_timeout_seconds',
+            'fallback_strike_attempts')
+
+    EXPECTED_WHEEL = {
+        'enabled': True,
+        'itm_trigger_ratio': 0.98,
+        'max_extension_days': 14,
+        'max_replacement_delta': 0.60,
+        'min_net_credit_per_contract': 0.00,
+        'imminence_extrinsic_threshold': 0.20,
+        'btc_fill_timeout_seconds': 120,
+        'fallback_strike_attempts': 2,
+    }
+    EXPECTED_CC = dict(EXPECTED_WHEEL, itm_trigger_ratio=1.00)
+
+    @staticmethod
+    def _rolling(profile):
+        with open(REPO / 'config' / profile) as fh:
+            return yaml.safe_load(fh)['rolling']
+
+    @pytest.mark.parametrize("profile,expected", [
+        ('settings.yaml', EXPECTED_WHEEL),
+        ('covered_call.yaml', EXPECTED_CC),
+    ])
+    def test_each_profile_carries_every_key_at_its_expected_value(
+            self, profile, expected):
+        """*Catches:* a knob retuned on one profile and not the other (FC-069
+        S1 found six such keys), a typo'd key that silently falls to a default,
+        and the CC trigger drifting back to the wheel's 0.98."""
+        rolling = self._rolling(profile)
+        for key in self.KEYS:
+            assert key in rolling, f"{profile} is missing rolling.{key}"
+            assert rolling[key] == expected[key], f"{profile}:rolling.{key}"
+
+    def test_exactly_one_key_differs_between_the_profiles(self):
+        """The whole point of DD-1: seven keys mirror, one is a stated
+        difference. A second divergence must be a test failure, not a diff
+        nobody reads."""
+        wheel = self._rolling('settings.yaml')
+        cc = self._rolling('covered_call.yaml')
+        differing = {k for k in self.KEYS if wheel[k] != cc[k]}
+        assert differing == {'itm_trigger_ratio'}, differing
+        assert wheel['itm_trigger_ratio'] == 0.98
+        assert cc['itm_trigger_ratio'] == 1.00
+
+    def test_the_cc_config_reads_back_every_accessor(self):
+        """The yaml keys are only worth pinning if Config exposes them; a key
+        the loader never reads is the FC-069 corpse shape."""
+        config = Config(str(REPO / 'config' / 'covered_call.yaml'))
+        assert config.rolling_enabled is True
+        assert config.rolling_itm_trigger_ratio == 1.00
+        assert config.rolling_max_extension_days == 14
+        assert config.rolling_max_replacement_delta == 0.60
+        assert config.rolling_min_net_credit_per_contract == 0.00
+        assert config.rolling_imminence_extrinsic_threshold == 0.20
+        assert config.rolling_btc_fill_timeout_seconds == 120
+        assert config.rolling_fallback_strike_attempts == 2
+
+    def test_the_wheel_profile_is_untouched_by_fc100(self):
+        """T-5, the neutrality pin at the config layer. FC-100 is a CC-scope
+        change; the wheel's roller must read back exactly what it read before,
+        0.98 included."""
+        config = Config(str(REPO / 'config' / 'settings.yaml'))
+        assert config.rolling_enabled is True
+        assert config.rolling_itm_trigger_ratio == 0.98
+        assert config.rolling_max_extension_days == 14
+        assert config.rolling_max_replacement_delta == 0.60
+        assert config.rolling_min_net_credit_per_contract == 0.00
+        assert config.rolling_imminence_extrinsic_threshold == 0.20
+        assert config.rolling_btc_fill_timeout_seconds == 120
+        assert config.rolling_fallback_strike_attempts == 2
+
+
+def _profile_copy(tmp_path, profile, **rolling_overrides):
+    """A shipped profile copied to tmp with `rolling` keys overridden.
+
+    `_settings()` above is wheel-only (it always reads settings.yaml); the
+    kill-switch contract has to be exercised against BOTH shipped profiles,
+    so this takes the profile name.
+    """
+    with open(REPO / 'config' / profile) as fh:
+        data = yaml.safe_load(fh)
+    data.setdefault('rolling', {}).update(rolling_overrides)
+    path = tmp_path / profile
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+@pytest.mark.parametrize("profile", ['settings.yaml', 'covered_call.yaml'])
+class TestTheRollerEnvLeversOnBothProfilesFC100:
+    """T-2. The kill switch and the dry-run lever are per-process env reads, so
+    nothing about them is profile-specific *in the code* — which is exactly why
+    a profile can be wired for rolling and never checked. This roller places
+    live two-leg orders on two accounts now; its stop lever is asserted on both.
+    """
+
+    def test_the_env_kill_switch_beats_the_baked_yaml_value(
+            self, monkeypatch, tmp_path, profile):
+        """*Catches:* a profile on which ROLLER_ENABLED=false does not stop the
+        roller — the one lever that works without a build."""
+        path = _profile_copy(tmp_path, profile)
+
+        monkeypatch.delenv("ROLLER_ENABLED", raising=False)
+        assert Config(path).rolling_enabled is True, f"{profile} ships disabled"
+
+        monkeypatch.setenv("ROLLER_ENABLED", "false")
+        assert Config(path).rolling_enabled is False, f"{profile} ignored the kill"
+
+        monkeypatch.setenv("ROLLER_ENABLED", "TRUE")
+        assert Config(path).rolling_enabled is True
+
+    def test_the_durable_off_is_the_yaml_key(self, monkeypatch, tmp_path,
+                                             profile):
+        """The env override is wiped by the next deploy's --set-env-vars, so
+        `enabled: false` in the yaml is the durable stop. It must actually
+        stop the cycle on both profiles."""
+        monkeypatch.delenv("ROLLER_ENABLED", raising=False)
+        path_off = _profile_copy(tmp_path, profile, enabled=False)
+        assert Config(path_off).rolling_enabled is False
+
+    def test_dry_run_is_env_only_and_defaults_off_on_both(
+            self, monkeypatch, tmp_path, profile):
+        """No yaml key backs it — a profile must never ship in dry-run, and a
+        typo must not silently disarm the roller."""
+        path = _profile_copy(tmp_path, profile)
+
+        monkeypatch.delenv("ROLLER_DRY_RUN", raising=False)
+        assert Config(path).roller_dry_run is False
+
+        monkeypatch.setenv("ROLLER_DRY_RUN", "true")
+        assert Config(path).roller_dry_run is True
+
+        monkeypatch.setenv("ROLLER_DRY_RUN", "sometimes")
+        assert Config(path).roller_dry_run is False
