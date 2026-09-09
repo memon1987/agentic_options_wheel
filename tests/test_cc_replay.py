@@ -717,6 +717,49 @@ class TestCoverageIsSplitByReason:
         # And no chain at all is the floor's case too.
         assert not Simulator._floor_clearing_strike_exists(sim, None, 100.0)
 
+    def test_the_CLASSIFIER_uses_the_chain_and_not_the_close(self):
+        """The mutation that survived the first cut of this test.
+
+        Pinning `_floor_clearing_strike_exists` alone proved the helper worked
+        and NOT that `_coverage_reason` consults it — reverting the classifier
+        to `close < basis` left every assertion passing. This drives the
+        classifier itself, on a book where the two answers differ.
+        """
+        from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
+        from src.backtesting.engine.broker import BacktestBroker
+        from src.backtesting.engine.simulator import Simulator
+
+        days, closes, expirations = _rising_window()
+        sim = _cc_simulator("XYZ", closes, expirations, days)
+
+        broker = BacktestBroker(starting_cash=CC_CASH_FLOAT)
+        broker.deposit_shares("XYZ", 100, 100.0, date(2024, 6, 3),
+                              premise="test")
+        # Spot 90, basis 100 — BELOW basis, so the old proxy says
+        # `hold_uncovered` no matter what the chain holds.
+        below = {"XYZ": 90.0}
+
+        writable = ChainSnapshot(
+            underlying="XYZ", as_of=date(2024, 6, 3), underlying_price=90.0,
+            puts=[], calls=[ChainQuote(
+                symbol="XYZ240607C00105000", underlying="XYZ",
+                as_of=date(2024, 6, 3), expiration=date(2024, 6, 7),
+                strike=105.0, option_type="call", dte=4, underlying_price=90.0,
+                mark=1.1, bid=1.0, ask=1.2, implied_volatility=0.3,
+                delta=0.20, volume=100)])
+        barren = ChainSnapshot(
+            underlying="XYZ", as_of=date(2024, 6, 3), underlying_price=90.0,
+            puts=[], calls=[])
+
+        assert Simulator._coverage_reason(
+            sim, broker, "XYZ", below, set(), snapshot=barren
+        ) == COVERAGE_HOLD_UNCOVERED, "no writable strike IS the floor's case"
+        assert Simulator._coverage_reason(
+            sim, broker, "XYZ", below, set(), snapshot=writable
+        ) != COVERAGE_HOLD_UNCOVERED, (
+            "below basis with a floor-clearing in-band strike available is NOT "
+            "the floor standing the strategy down — something else refused it")
+
     def test_the_residual_bias_direction_is_named_in_the_footer(self):
         """The classification errs toward `gate_rejected`, which is IN the
         coverage denominator — so a misclassification makes the ratio harsher,

@@ -1,6 +1,0 @@
-#!/Users/zmemon/options_wheel-1/.claude/worktrees/agent-ae858d05489d48f68/.venv-ci/bin/python
-import sys
-from coverage.cmdline import main
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(main())
