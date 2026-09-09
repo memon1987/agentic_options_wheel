@@ -471,9 +471,17 @@ class TestTheCCAlertPolicies:
         """
         content = self._doc(
             "cc_roll_executed_alert_policy.json")["documentation"]["content"]
-        assert 'jsonPayload.event=~"^roll_cycle_"' in content, (
-            "the triage command cannot see roll_cycle_started/completed — they "
-            "have no event_type field, only jsonPayload.event")
+        # The assertion has to bind to the COMMAND, not to the prose that
+        # explains it: the paragraph below the query names the clause too, so a
+        # `in content` check passes even with the clause struck from the
+        # `gcloud` line — which is exactly what the mutation check found.
+        query_lines = [ln for ln in content.splitlines()
+                       if "gcloud logging read" in ln and "call_roll_" in ln]
+        assert query_lines, "the runbook has no triage query at all"
+        triage = query_lines[0]
+        assert 'jsonPayload.event=~"^roll_cycle_"' in triage, (
+            "the triage COMMAND cannot see roll_cycle_started/completed — they "
+            "have no event_type field, only jsonPayload.event:\n" + triage)
 
     def test_the_roll_runbook_is_written_for_this_service(self):
         """The runbook is the deliverable, not the filter. Every command in it
