@@ -235,6 +235,9 @@ def _score(
         symbol, result.daily, cycles, starting_cash,
         benchmark_prices=prices, benchmark_dividends_per_share=bench_divs,
         data_quality=quality, rolls=count_rolls(cycles),
+        # FC-096 Phase C. The covered-call fields come off the replay itself so
+        # the report, the row and the artifact all divide by the same lot value.
+        result=result,
     )
 
 
@@ -247,6 +250,18 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
     return {
         "decision_days": len(result.daily),
         "days_with_a_qualifying_candidate": result.candidate_days,
+        # FC-096 Phase C. The strategy that ran, and — for the CC branch's
+        # `insufficient` cutoff — the call tenor it wrote at. Both are facts
+        # about the run that a stored result must not have to re-derive from a
+        # config it no longer has.
+        "strategy": result.strategy,
+        "call_target_dte": result.call_target_dte,
+        "synthetic_lots_opened": result.synthetic_lots_opened,
+        "time_weighted_lot_value": result.time_weighted_lot_value,
+        "coverage_by_reason": dict(result.coverage_by_reason or {}),
+        "calls_closed_early": result.calls_closed_early,
+        "itm_rolls": result.itm_rolls,
+        "otm_roll_outs": result.otm_roll_outs,
         "blocked_days_by_reason": result.rejections,
         "ledger_events": len(result.broker.ledger),
         "cycles_still_open_at_end": sum(1 for c in cycles if c.is_open),

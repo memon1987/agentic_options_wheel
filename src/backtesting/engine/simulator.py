@@ -395,6 +395,10 @@ class SimulationResult:
     #: than inferred downstream: a reader of a stored artifact must not have to
     #: guess which engine produced it from the shape of its ledger.
     strategy: str = WHEEL_STRATEGY
+    #: The profile's call tenor, carried so a stored result can state the CC
+    #: `insufficient` cutoff (a window shorter than one tenor) without holding
+    #: the config it was replayed under.
+    call_target_dte: int = 0
     #: How many synthetic lots were seeded. Under the signed re-seed posture
     #: this is 1 + (call-aways that had a later session to re-seed into), so it
     #: is a count of LOTS and never of symbols.
@@ -1071,6 +1075,7 @@ class Simulator:
             # window, which is what makes the number a capital base rather than
             # a conditional average.
             strategy=self.strategy,
+            call_target_dte=int(getattr(self.config, "call_target_dte", 0) or 0),
             synthetic_lots_opened=self._synthetic_lots_opened,
             time_weighted_lot_value=(
                 round(self._lot_value_days / len(daily), 2) if daily else 0.0),
