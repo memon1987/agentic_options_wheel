@@ -1112,7 +1112,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-100 plan; live-verified on both services)
+**Status:** Plan drafted 2026-09-08 (`docs/plans/fc-107.md`, Draft rev 1 — two plan reviews next); found by the FC-100 plan; live-verified on both services
 **Size estimate:** S (deploy flag + fixture re-freeze) — a real-money precondition
 
 **Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. **Measured:** wheel `/roll` cycles with instant paper fills ran 14, 141, 140, 150, 124, 26 s for 2–4 positions — ~35 s/position of chain fetch and evaluation before any order. The covered-call arithmetic (two positions): ≈70 s evaluation + one BTC poll to timeout (120 s) + cancel settle (15 s) = **205 s before any STO is placed**; one STO rung to timeout (+135 s) ≈ **340 s > 300 s**. The cycle-budget guard assumes an 1800 s request and refuses nothing at 300. **What the cut does, precisely:** Cloud Run returns 504 to the scheduler (a job failure no alert policy watches; retries are 0). The handler thread is not killed — with no `--no-cpu-throttling` on either bot service (`--concurrency=10`) it is CPU-throttled and **resumes when the next inbound request wakes the instance** (`/monitor` at :55, `/regression` at :45, an ingest), placing the remaining STO rungs on limits computed minutes earlier, under a `strategy_lock` the waking request then queues behind. `call_roll_naked_exposure` is the dying thread's job, so the one alert wired for a stranded BTC never fires. The book is left uncovered by the timeout, not the strategy.
@@ -1180,6 +1180,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Proposal:** first real study on the FC-096 console — the wheel's standing battery set with `rolling.itm_trigger_ratio` ∈ {0.98, 1.00} (and `rolling.enabled: false` as the control), holdout discipline on, compared on total P&L, premium, called-away count and roll count; the roll-credit metric split into ITM rolls (ratio ≥ 1.0) vs OTM roll-outs (0.98–1.0) so re-writes are not counted as defence. Requires `rolling.*` on the sweep allowlist (it is — `overrides.py`) and FC-100's Phase C hand-off note on chain reach (target 7 + extension 14 needs ≥ 21 DTE, which the lake has). Decision recorded as an FC-078 amendment either way.
 
 **Links:** FC-078, FC-100 (CC profile at 1.00 — a stated Symmetry difference until this is decided), FC-096 Phase E (the console), FC-060 guardrails.
+
+### FC-113: the roller's per-position budget under-counts the cancel-settle legs
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-107 plan)
+**Size estimate:** S
+
+**Problem:** `_PER_POSITION_BUDGET_SECONDS = 600` assumes five 120 s legs; each leg also carries a 15 s `_CANCEL_SETTLE_TIMEOUT_SECONDS` on timeout, so the true worst case is 675 s per position and a cycle can end at ~1574 s, past the 1500 s `_CYCLE_BUDGET_SECONDS`. FC-107's 1800 s service timeout absorbs it with 225 s to spare, but the constants lie to the next reader.
+
+**Proposal:** derive the per-position budget from the leg constants (`legs × (poll + settle)`) and assert `cycle budget ≥ positions_cap × per_position` in a test; fold into FC-089 if that entry already owns roller budgets.
+
+**Links:** FC-107, FC-078, FC-089.
 
 
 ## Completed
