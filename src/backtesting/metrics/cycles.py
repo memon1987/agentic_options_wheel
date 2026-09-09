@@ -27,8 +27,10 @@ from ..engine.broker import LedgerEvent
 
 # Ledger kinds that move option premium.
 _OPTION_KINDS = {"sell_put_open", "sell_call_open", "buy_to_close"}
-# Ledger kinds that move shares.
-_STOCK_KINDS = {"put_assignment", "call_assignment"}
+# Ledger kinds that move shares. `synthetic_lot_open` is the covered-call
+# replay's seeding event (FC-096 Phase C): it moves shares with no cash, so it
+# belongs here and nowhere near the option kinds.
+_STOCK_KINDS = {"put_assignment", "call_assignment", "synthetic_lot_open"}
 
 
 @dataclass
@@ -51,6 +53,12 @@ class WheelCycle:
 
     assigned: bool = False
     called_away: bool = False
+    #: Synthetic lots seeded into this cycle (FC-096 Phase C). Deliberately NOT
+    #: folded into ``assigned``: a seeded lot is an assumption of the
+    #: measurement, and counting it as an assignment would put the covered-call
+    #: replay's ``assignment_rate`` at 100% on every symbol while saying nothing
+    #: about how often a put was actually put to it.
+    synthetic_lots: int = 0
     shares_acquired: int = 0
     cost_basis: Optional[float] = None
     exit_price: Optional[float] = None
@@ -155,6 +163,30 @@ def build_cycles(ledger: Iterable[LedgerEvent]) -> List[WheelCycle]:
             open_contracts[underlying] = open_contracts.get(underlying, 0) - event.contracts
         elif kind == "expire_worthless":
             open_contracts[underlying] = open_contracts.get(underlying, 0) - event.contracts
+        elif kind == "synthetic_lot_open":
+            # The covered-call premise, booked exactly as an assignment books a
+            # lot -- share-weighted basis, share count, cycle left OPEN -- and
+            # differing in the two ways that matter: no contracts are consumed
+            # (nothing was assigned) and `assigned` stays False.
+            #
+            # Recording it is what makes the rest of the cycle table true for a
+            # CC replay: `cost_basis` is the seeding close, so `call_assignment`
+            # below books REAL stock P&L against it instead of skipping the
+            # branch on a None basis; and because shares are now held, the
+            # flat-test at the bottom leaves the cycle open until the lot is
+            # called away. Under the signed re-seed posture the stock leg is a
+            # CHAIN of lots: call-away closes the cycle, the next session's
+            # seeding opens a fresh one, and each lot shows in the table with
+            # its own basis and its own `synthetic_lot_open`.
+            cycle.synthetic_lots += 1
+            prior_shares = cycle.shares_acquired
+            prior_basis = cycle.cost_basis or 0.0
+            cycle.shares_acquired = prior_shares + event.shares
+            cycle.cost_basis = (
+                (prior_basis * prior_shares + event.price * event.shares)
+                / cycle.shares_acquired
+            ) if cycle.shares_acquired else event.price
+            shares[underlying] = shares.get(underlying, 0) + event.shares
         elif kind == "put_assignment":
             cycle.assigned = True
             # Share-weighted, not last-wins. Two assignments at different

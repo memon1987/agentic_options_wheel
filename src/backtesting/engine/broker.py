@@ -358,6 +358,57 @@ class BacktestBroker:
                 symbol, underlying, option_type, strike, expiration, contracts, entry, collateral, opened
             )
 
+    def deposit_shares(self, underlying: str, shares: int, cost_basis: float,
+                       on_date: date, *, premise: str) -> None:
+        """Open a SYNTHETIC stock lot: shares appear, no cash moves (FC-096 C2).
+
+        The covered-call replay measures what an overwriting programme earns on
+        a lot it is HANDED, not on one it bought. There is no purchase to model:
+        the lot is the premise of the measurement, so the ledger records its
+        arrival with ``cash_delta = 0`` and says, in ``detail['premise']``, that
+        it was assumed rather than acquired.
+
+        **Zero cash is only honest alongside a strategy-aware capital base.** A
+        lot that costs nothing and is then marked to market makes the whole lot
+        value read as profit in ``final_equity`` — the C3 defect. The zero delta
+        stands here (a purchase the programme never made must not appear in the
+        cash ledger) and ``metrics.fitness`` divides by
+        ``starting_cash + Σ seeded lot values`` so the lot can never be counted
+        as a return. The two halves are one decision; neither is safe alone.
+
+        The lot itself is an ordinary ``StockLot`` at a REAL basis, which is what
+        makes the rest of the machine work unchanged: ``average_cost_basis`` — and
+        therefore ``alpaca_adapter.get_positions``' ``avg_entry_price`` — answers
+        with a positive number, so the covered-call floor binds and the roller's
+        ``CostBasisResolver`` resolves instead of failing closed on
+        ``no_broker_basis`` (FC-100 §Phase C hand-off, row 2).
+
+        Args:
+            underlying: the equity ticker.
+            shares: share count (100 per contract of writable cover).
+            cost_basis: per-share basis, i.e. the seeding close.
+            on_date: the session whose close ``cost_basis`` is.
+            premise: the human sentence describing the assumption, stamped on
+                the event so a stored ledger read months later carries it.
+        """
+        if shares <= 0:
+            raise ValueError(f"cannot deposit {shares} shares of {underlying}")
+        if cost_basis <= 0:
+            # A zero or negative basis silently disables the covered-call floor
+            # (`find_suitable_calls` warns and continues on a non-positive
+            # min_strike_price) — the same trap `_assign_put` guards.
+            raise ValueError(
+                f"cannot deposit a {underlying} lot at a non-positive basis "
+                f"({cost_basis}): the covered-call floor would be inert.")
+        self._add_stock(underlying, shares, float(cost_basis), on_date)
+        self._record(
+            "synthetic_lot_open", underlying, contracts=0, shares=shares,
+            price=float(cost_basis), cash_delta=0.0, event_date=on_date,
+            detail={"premise": premise, "shares": shares,
+                    "cost_basis": float(cost_basis),
+                    "lot_value": round(float(cost_basis) * shares, 2)},
+        )
+
     def _reduce_option(self, symbol: str, contracts: int) -> None:
         pos = self.options[symbol]
         if contracts >= pos.contracts:

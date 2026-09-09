@@ -101,10 +101,66 @@ def restrict_symbols(config: Config, symbols: Sequence[str]) -> Config:
 
     ``evaluate`` mode runs one symbol at a time, but ``OptionsScanner`` scans
     ``config.stock_symbols``. Deep-copied so the caller's config is untouched.
+
+    **The ``stocks:`` section may be ABSENT** (FC-096 Phase C, C2). It is on the
+    wheel profile and deliberately not on ``config/covered_call.yaml``, whose
+    universe is holdings-derived — so the old ``_config["stocks"]["symbols"] =``
+    raised ``KeyError`` on the one profile Phase C exists to replay, before a
+    single day was simulated. The section is CREATED when missing rather than
+    guarded around: a replay is always scoped to its symbols, and a covered-call
+    config that reached the scanner with no universe would scan nothing and read
+    as "this strategy never found a candidate".
     """
     narrowed = copy.deepcopy(config)
-    narrowed._config["stocks"]["symbols"] = list(symbols)
+    stocks = narrowed._config.get("stocks")
+    if not isinstance(stocks, dict):
+        stocks = {}
+        narrowed._config["stocks"] = stocks
+    stocks["symbols"] = list(symbols)
     return narrowed
+
+
+#: The strategy profiles this engine knows how to replay. ``wheel`` is the
+#: legacy path and every stored result predates the field, which is why absence
+#: canonicalises to it everywhere (``identity.canonical_spec``).
+WHEEL_STRATEGY = "wheel"
+COVERED_CALL_STRATEGY = "covered_call"
+KNOWN_STRATEGIES = (WHEEL_STRATEGY, COVERED_CALL_STRATEGY)
+
+
+def replay_strategy(config: Config) -> str:
+    """The strategy this config makes the replay run — ``config.strategy_id``.
+
+    One reader, so "which strategy is this" is never answered two ways. An
+    unrecognised ``strategy_id`` is returned AS IS rather than coerced to
+    ``wheel``: a profile nobody has taught the engine about must show up in the
+    stamps as itself, so the artifact says what ran.
+    """
+    return str(getattr(config, "strategy_id", WHEEL_STRATEGY) or WHEEL_STRATEGY)
+
+
+def is_wheel(config: Config) -> bool:
+    return replay_strategy(config) == WHEEL_STRATEGY
+
+
+#: The covered-call replay's cash float (FC-096 Phase C, C3). It is NOT the
+#: capital base — the lot is (see ``metrics.fitness.capital_base``). It exists
+#: because a covered-call programme still needs cash to buy a call back on the
+#: monitor leg and to pay the BTC side of a roll, and because pinning it small
+#: keeps the stored equity return close to the lot return instead of diluting it
+#: ~20x against the wheel's $100k default.
+CC_CASH_FLOAT = 5_000.0
+
+#: Shares in one synthetic lot. Fixed at 100 by signed decision D2 — one
+#: contract of writable cover, and the number that makes windows
+#: symbol-comparable. No knob without operator sign-off (plan §Design decisions).
+SYNTHETIC_LOT_SHARES = 100
+
+SYNTHETIC_LOT_PREMISE = (
+    "Synthetic lot: 100 shares assumed held at the window-start close (FC-096 "
+    "D2). No purchase was modelled and no cash moved; every figure measured "
+    "against this lot is relative to a position the engine created."
+)
 
 
 @dataclass(frozen=True)
@@ -226,6 +282,56 @@ def narrow_to_dte(materialised: Materialised, max_dte: int) -> Materialised:
     return dataclasses_replace(materialised, chains=chains, max_dte=max_dte)
 
 
+#: Coverage buckets, in the priority order ``_coverage_reason`` applies them.
+#: Exported because the report, the row and the tests must all name the same
+#: five strings, and a sixth spelling of "hold_uncovered" is how a split metric
+#: quietly stops adding up.
+COVERAGE_COVERED = "covered"
+COVERAGE_HOLD_UNCOVERED = "hold_uncovered"
+COVERAGE_EARNINGS_SPAN = "earnings_span"
+COVERAGE_GATE_REJECTED = "gate_rejected"
+COVERAGE_POST_CALL_AWAY = "post_call_away"
+COVERAGE_REASONS = (
+    COVERAGE_COVERED, COVERAGE_HOLD_UNCOVERED, COVERAGE_EARNINGS_SPAN,
+    COVERAGE_GATE_REJECTED, COVERAGE_POST_CALL_AWAY,
+)
+
+#: Buckets excluded from the CC ``low_activity`` test (plan C3). Standing down
+#: below basis is the strategy WORKING — the cost-basis floor refusing to sell
+#: the shares at a loss — and an earnings-span day is a gate doing its job. A
+#: coverage metric that punished either would demote exactly the symbols the
+#: floor protected.
+COVERAGE_NOT_A_STAND_DOWN = frozenset(
+    {COVERAGE_HOLD_UNCOVERED, COVERAGE_EARNINGS_SPAN})
+
+
+@dataclass(frozen=True)
+class SyntheticLotPolicy:
+    """How a covered-call replay seeds (and re-seeds) its stock leg.
+
+    FC-096 Phase C §C2, with the operator's 2026-09-08 posture signed in as the
+    default: **re-seed at the next close**. When the lot is called away the sim
+    buys a fresh one at the next session's close and keeps writing, so every
+    symbol is measured over the FULL window and the names called away earliest
+    are not the ones with the shortest measurement. The consequence, which the
+    report labels rather than hides: the stock leg is a CHAIN of lots, each with
+    its own basis and its own ``synthetic_lot_open`` event.
+
+    ``reseed=False`` is the rejected alternative, kept implementable because the
+    metrics are defined to be well-formed under both and a future study may want
+    the truncated posture as a comparison.
+
+    Attributes:
+        shares: 100, by signed decision. Not a sweepable knob.
+        reseed: re-seed after a call-away (the signed posture) or stop.
+        premise: the sentence stamped on every seeding event.
+    """
+
+    shares: int = SYNTHETIC_LOT_SHARES
+    reseed: bool = True
+    premise: str = SYNTHETIC_LOT_PREMISE
+
+
 @dataclass
 class DailyState:
     """One row of the equity curve."""
@@ -279,6 +385,46 @@ class SimulationResult:
     earnings_symbols_without_data: List[str] = field(default_factory=list)
     earnings_symbols_past_horizon: List[str] = field(default_factory=list)
 
+    # ---------------------------------------------------------------- #
+    # FC-096 Phase C — the covered-call measurement. Every field below is
+    # ZERO/EMPTY on a wheel replay (nothing seeds a lot, nothing runs the
+    # monitor leg), which is what keeps the golden wheel numbers byte-identical
+    # while the CC report has denominators it can defend.
+    # ---------------------------------------------------------------- #
+    #: The strategy the replay ran, off ``config.strategy_id``. Stamped rather
+    #: than inferred downstream: a reader of a stored artifact must not have to
+    #: guess which engine produced it from the shape of its ledger.
+    strategy: str = WHEEL_STRATEGY
+    #: How many synthetic lots were seeded. Under the signed re-seed posture
+    #: this is 1 + (call-aways that had a later session to re-seed into), so it
+    #: is a count of LOTS and never of symbols.
+    synthetic_lots_opened: int = 0
+    #: Σ over decision days of the seeded lot value held that day, divided by
+    #: the decision-day count — the TIME-WEIGHTED average lot value, and the
+    #: denominator of ``premium_yield_on_lot``. With a single never-called lot
+    #: it equals that lot's value exactly; across a chain of lots it weights
+    #: each by the days it was actually held, so a symbol called away on day 3
+    #: and re-seeded on day 4 is not measured against two lots' worth of
+    #: capital it never simultaneously had.
+    time_weighted_lot_value: float = 0.0
+    #: Decision days classified by WHY the lot was or was not covered, in the
+    #: priority order ``simulator._coverage_reason`` documents. A single
+    #: covered/uncovered ratio is forbidden in the CC report: standing down
+    #: below basis is the strategy working, and one ratio cannot say so.
+    coverage_by_reason: Dict[str, int] = field(default_factory=dict)
+    #: Calls bought back by the CC-only monitor leg at a DTE-band profit target.
+    #: 52% of real covered calls close early, so a replay that only ever let
+    #: them expire measured a strategy nobody runs.
+    calls_closed_early: int = 0
+    #: Executed rolls SPLIT by what the stock was doing (FC-100 §Phase C
+    #: hand-off, row 1). An ITM roll (stock/strike >= 1.0) is a defence against
+    #: assignment; an OTM roll-out (0.98-1.0) is the roller re-writing the
+    #: engine's own call before it was ever threatened, which must never be
+    #: counted as defence. Moot on the CC profile at ``itm_trigger_ratio: 1.00``
+    #: and load-bearing on the wheel's 0.98 (FC-112).
+    itm_rolls: int = 0
+    otm_roll_outs: int = 0
+
     @property
     def final_equity(self) -> float:
         return self.daily[-1].equity if self.daily else self.starting_cash
@@ -309,8 +455,39 @@ class Simulator:
         warmup_calendar_days: int = 60,
         earnings_calendar: Optional[object] = None,
         dividend_schedule: Optional[DividendSchedule] = None,
+        synthetic_lots: Optional["SyntheticLotPolicy"] = None,
     ) -> None:
         self.config = restrict_symbols(config, symbols)
+        # FC-096 Phase C. The strategy is read ONCE, off the resolved profile,
+        # and every CC-only behaviour below keys on it. Reading `strategy_id`
+        # at each use site is how one of them ends up disagreeing with the
+        # others about which strategy this replay is.
+        self.strategy = replay_strategy(self.config)
+        # --- The spread-gate suspension (C3), and why it is loud ------------ #
+        # `_check_call_criteria_detailed` reads `universe.max_spread_pct` off
+        # MODELLED bid/ask. The model's half-spread is >= 5% of mark for an OTM
+        # contract by construction, so the CC profile's 0.10 rejects every
+        # premium-floor-clearing call: a 10-of-10 probe found no survivors, and
+        # the arm would have read as "this strategy never found a candidate".
+        # The gate is SUSPENDED for the replay (never for the live service) and
+        # the suspension is stamped in the CC footer as MODEL_SPREAD_BIAS, the
+        # same posture FC-097 took for the open-interest floor. A test pins the
+        # suspension to the spread MODEL, so the day real spreads arrive it
+        # fails loudly and the gate is restored deliberately rather than staying
+        # off because nobody remembered it was.
+        self.spread_gate_suspended = False
+        if self.strategy != WHEEL_STRATEGY:
+            universe = self.config._config.get("universe")
+            if not isinstance(universe, dict):
+                universe = {}
+                self.config._config["universe"] = universe
+            if universe.get("max_spread_pct") is not None:
+                universe["max_spread_pct"] = None
+                self.spread_gate_suspended = True
+        # The seeding policy, or None for a replay that seeds nothing. Default
+        # None on EVERY path: the wheel must not acquire a lot it never bought
+        # because a default changed under it.
+        self.synthetic_lots = synthetic_lots
         self.provider = provider
         self.builder = builder
         self.symbols = list(symbols)
@@ -661,6 +838,15 @@ class Simulator:
         self._rolls_evaluated = 0
         self._rolls_executed = 0
         self._roll_records: List[Dict[str, Any]] = []
+        # FC-096 Phase C accumulators. All stay at their zero value on a wheel
+        # replay, so the golden numbers are untouched by their existence.
+        self._synthetic_lots_opened = 0
+        self._lot_value_days = 0.0
+        self._calls_closed_early = 0
+        self._itm_rolls = 0
+        self._otm_roll_outs = 0
+        self._coverage: Dict[str, int] = {}
+        self._seeded_symbols: Dict[str, bool] = {}
 
         # Swap the analytics singleton for a recorder: strategy code fetches it
         # from module scope, so there is no injection point. Restored on exit.
@@ -689,6 +875,20 @@ class Simulator:
                 # itself, which the real holder does not receive.
                 self._credit_dividends(broker, day, days[i - 1] if i else None)
 
+                # FC-096 Phase C §C2. Seed (and, under the signed posture,
+                # RE-SEED) the synthetic lot BEFORE the scan, at TODAY's close,
+                # so the first decision day already has cover to write against.
+                #
+                # Placing it here is what makes re-seeding land "at the next
+                # session's close" without any call-away bookkeeping: a lot
+                # called away is removed at `settle_expirations` below, i.e.
+                # AFTER this point on that day, so the very next iteration finds
+                # the symbol flat and seeds a fresh lot at that session's close.
+                # The event chain therefore reads exactly as the decision
+                # describes it, and nothing has to remember that a call-away
+                # happened.
+                self._seed_synthetic_lots(broker, day, closes_by_day[day])
+
                 try:
                     # Production's `_failed_symbols` clears roughly daily (Cloud
                     # Run cold start). Clearing once per RUN instead would let a
@@ -707,6 +907,21 @@ class Simulator:
                     # state, and FC-069 item 8 deleted the phase gates that
                     # used to make this call load-bearing.
                     engine.reconcile_positions()
+
+                    # /monitor, COVERED-CALL ONLY (FC-096 Phase C §C3).
+                    #
+                    # Production runs /monitor at 14:55, before /scan and /run,
+                    # and 52% of real covered calls are closed there at a
+                    # DTE-banded profit target rather than held to expiry. A
+                    # replay without it measures a strategy nobody runs.
+                    #
+                    # Gated to the CC profile deliberately and NOT extended to
+                    # the wheel: adding the leg to the wheel would change every
+                    # stored wheel result in the project at once, which is a
+                    # decision that deserves its own FC and its own re-baseline
+                    # (the wheel's existing 52%-early-close footer line stays,
+                    # naming the divergence it still carries).
+                    self._run_monitor_leg(broker, client, call_seller, day)
 
                     # /scan, verbatim: default max_results on both legs, because
                     # cloud_run_server passes no args. Diverging would measure a
@@ -745,10 +960,40 @@ class Simulator:
                     # chart marker asks. `**record` second so a future roller
                     # field named `day` wins rather than being silently
                     # overwritten by ours.
-                    self._roll_records.extend(
-                        {'day': day.isoformat(), **r}
-                        for r in (rolls.get('roll_details') or [])
-                        if r.get('success'))
+                    #
+                    # FC-100 §Phase C hand-off row 1: every executed roll is
+                    # SPLIT by what the stock was doing when it was taken. An
+                    # ITM roll (stock/old_strike >= 1.0) is a defence against
+                    # assignment; an OTM roll-out (0.98-1.0) is the roller
+                    # re-writing a call that was never threatened, bypassing
+                    # every entry gate. Counting the second as defence is the
+                    # measurement error FC-112 exists to settle on the wheel,
+                    # and it must not be baked in here.
+                    #
+                    # The ratio is recomputed from the day's close rather than
+                    # read off the roller's record (which carries no stock
+                    # price): the adapter's stock quote is bid == ask == close,
+                    # so the roller's own mid IS this close — the same number it
+                    # gated on, not an approximation of it.
+                    for record in (rolls.get('roll_details') or []):
+                        if not record.get('success'):
+                            continue
+                        stamped = {'day': day.isoformat(), **record}
+                        close = closes_by_day[day].get(record.get('underlying'))
+                        old_strike = float(record.get('old_strike') or 0.0)
+                        ratio = (close / old_strike
+                                 if close and old_strike > 0 else None)
+                        stamped.setdefault('itm_ratio',
+                                           None if ratio is None else round(ratio, 4))
+                        kind = None
+                        if ratio is not None:
+                            kind = 'itm_defence' if ratio >= 1.0 else 'otm_roll_out'
+                            if ratio >= 1.0:
+                                self._itm_rolls += 1
+                            else:
+                                self._otm_roll_outs += 1
+                        stamped.setdefault('roll_kind', kind)
+                        self._roll_records.append(stamped)
                 except Exception:
                     logger.exception(
                         "Strategy cycle raised during replay",
@@ -757,6 +1002,13 @@ class Simulator:
                         day=day.isoformat(),
                     )
                     raise
+
+                # FC-096 Phase C §C3, the coverage split. Tallied HERE — after
+                # the day's decisions, before settlement — because that is the
+                # state the strategy left the book in: a call written today is
+                # cover today, and a contract expiring tonight was still cover
+                # while the decision was being taken.
+                self._tally_coverage(broker, day, closes_by_day[day])
 
                 # Settle *after* deciding. A contract expiring today is still held
                 # when the strategy looks at its book — that is what the live bot
@@ -813,7 +1065,205 @@ class Simulator:
                 getattr(self.earnings_calendar, 'symbols_without_data', set()) or []),
             earnings_symbols_past_horizon=sorted(
                 getattr(self.earnings_calendar, 'symbols_past_horizon', set()) or []),
+            # FC-096 Phase C. `time_weighted_lot_value` divides by the DECISION
+            # DAY count, not by the days a lot happened to be held: a symbol
+            # that held no lot for part of the window is measured over the whole
+            # window, which is what makes the number a capital base rather than
+            # a conditional average.
+            strategy=self.strategy,
+            synthetic_lots_opened=self._synthetic_lots_opened,
+            time_weighted_lot_value=(
+                round(self._lot_value_days / len(daily), 2) if daily else 0.0),
+            coverage_by_reason={
+                reason: self._coverage[reason]
+                for reason in COVERAGE_REASONS if self._coverage.get(reason)
+            },
+            calls_closed_early=self._calls_closed_early,
+            itm_rolls=self._itm_rolls,
+            otm_roll_outs=self._otm_roll_outs,
         )
+
+    # ------------------------------------------------------------------ #
+    # The synthetic lot (FC-096 Phase C §C2)
+    # ------------------------------------------------------------------ #
+    def _seed_synthetic_lots(
+        self, broker: BacktestBroker, day: date, closes: Dict[str, float]
+    ) -> None:
+        """Seed a lot on any symbol that is flat today, at today's close.
+
+        A no-op with no policy, which is every wheel replay.
+
+        The flat test is ``broker.shares(symbol) == 0``, and it does the work of
+        three rules at once: it seeds each symbol on its FIRST traded day (a
+        symbol with no bar has no close here and is skipped until it trades),
+        it never double-seeds while a lot is held, and — because a call-away
+        removes the shares at settlement, after this point in the day — it
+        re-seeds on the session AFTER the lot was called away. That is the
+        operator's signed posture expressed as a single invariant rather than as
+        call-away bookkeeping that could get out of step with the ledger.
+
+        ``reseed=False`` restores the rejected alternative by refusing to seed a
+        symbol twice.
+        """
+        policy = self.synthetic_lots
+        if policy is None:
+            return
+        for symbol in self.symbols:
+            if broker.shares(symbol) > 0:
+                continue
+            close = closes.get(symbol)
+            if not close or close <= 0:
+                # No bar today (or an unusable one): the symbol did not trade,
+                # so there is no close to assume a purchase at. Skipped, not
+                # approximated — a lot seeded at a stale price would put a
+                # fictional basis under the cost-basis floor.
+                continue
+            if not policy.reseed and self._seeded_symbols.get(symbol):
+                continue
+            broker.deposit_shares(symbol, policy.shares, float(close), day,
+                                  premise=policy.premise)
+            self._seeded_symbols[symbol] = True
+            self._synthetic_lots_opened += 1
+
+    def _lot_value(self, broker: BacktestBroker) -> float:
+        """Today's seeded lot value across the universe: Σ shares × lot basis.
+
+        Read off the broker's own lots rather than off the seeding price, so a
+        chain of lots at different bases weights each one at what it actually
+        cost, and a partially-disposed lot contributes only what remains.
+        """
+        total = 0.0
+        for lots in broker.stock_lots.values():
+            for lot in lots:
+                total += lot.shares * lot.cost_basis
+        return total
+
+    # ------------------------------------------------------------------ #
+    # The covered-call monitor leg (FC-096 Phase C §C3)
+    # ------------------------------------------------------------------ #
+    def _run_monitor_leg(
+        self, broker: BacktestBroker, client: "BacktestAlpacaClient",
+        call_seller, day: date,
+    ) -> None:
+        """`/monitor`'s call half, for the covered-call profile only.
+
+        ``CallSeller.should_close_call_early`` is deterministic config math over
+        the position's own ``unrealized_pl`` / ``market_value`` and the DTE band
+        it falls in — exactly the numbers the adapter already reports — so this
+        is the REAL predicate, not a re-implementation of it.
+
+        The close is placed through ``place_option_order(side='buy')``, the same
+        call production makes, so the fill goes through the broker's documented
+        haircut model and lands a normal ``buy_to_close`` event. Production
+        prices the limit at ``ask × 0.95`` floored at the bid; the EOD replay
+        has one decision point per day and no intraday path along which to test
+        whether a limit was touched, which is why ``place_option_order`` ignores
+        the limit and fills at the haircut price for every order this engine has
+        ever placed. Passing a limit here would imply a precision the engine does
+        not have; the divergence is named in the CC footer instead.
+
+        Failures are counted, never raised: a contract with no bar today cannot
+        be closed, and that is a data fact about the day, not a broken run.
+        """
+        if self.strategy == WHEEL_STRATEGY:
+            return
+        # Snapshot the symbols first: the loop mutates `broker.options`.
+        shorts = [
+            (symbol, pos.contracts) for symbol, pos in broker.options.items()
+            if pos.option_type == "call" and pos.contracts > 0
+        ]
+        for symbol, contracts in shorts:
+            position = next(
+                (p for p in client.get_positions() if p.get("symbol") == symbol),
+                None,
+            )
+            if position is None:
+                continue
+            if not call_seller.should_close_call_early(position):
+                continue
+            result = client.place_option_order(
+                symbol=symbol, qty=contracts, side="buy", order_type="market")
+            if result.get("success"):
+                self._calls_closed_early += 1
+
+    # ------------------------------------------------------------------ #
+    # The coverage split (FC-096 Phase C §C3)
+    # ------------------------------------------------------------------ #
+    def _tally_coverage(
+        self, broker: BacktestBroker, day: date, closes: Dict[str, float]
+    ) -> None:
+        """Classify each symbol's decision day into exactly one coverage bucket.
+
+        Only runs for a seeding replay: the buckets are statements about a lot,
+        and a wheel replay has none until a put is assigned to it (whose
+        coverage story is the wheel's own, unmeasured here).
+
+        The classification is DERIVED from the state of the book, in the
+        priority order below, and is documented as derived rather than read off
+        the rejection tally — the tally counts a reason once per DAY across the
+        whole run, and this has to answer per symbol per day:
+
+        1. ``post_call_away`` — no shares. Under the signed re-seed posture this
+           can only be a symbol that has not traded yet (or one whose re-seed
+           had no close to land on), never a permanent state.
+        2. ``covered`` — an open short call against the lot. The strategy is
+           doing its job.
+        3. ``hold_uncovered`` — the close is below the lot basis, so the
+           cost-basis floor refuses every strike worth writing. NOT a failure:
+           this is the floor protecting the shares, and it is excluded from the
+           low-activity test for exactly that reason.
+        4. ``earnings_span`` — an earnings event falls inside the tenor a fresh
+           call would be written into (``call_target_dte``), which is the span
+           the FC-013 gate refuses to write across.
+        5. ``gate_rejected`` — everything else: the delta band, the premium
+           floor, an empty chain. This is the only bucket that means "the
+           strategy wanted to write and could not find a contract".
+        """
+        if self.synthetic_lots is None:
+            return
+        covered = {
+            pos.underlying for pos in broker.options.values()
+            if pos.option_type == "call" and pos.contracts > 0
+        }
+        for symbol in self.symbols:
+            reason = self._coverage_reason(broker, symbol, closes, covered)
+            self._coverage[reason] = self._coverage.get(reason, 0) + 1
+        self._lot_value_days += self._lot_value(broker)
+
+    def _coverage_reason(self, broker: BacktestBroker, symbol: str,
+                         closes: Dict[str, float], covered: set) -> str:
+        if broker.shares(symbol) <= 0:
+            return COVERAGE_POST_CALL_AWAY
+        if symbol in covered:
+            return COVERAGE_COVERED
+        basis = broker.average_cost_basis(symbol)
+        close = closes.get(symbol)
+        if basis is not None and close is not None and close < basis:
+            return COVERAGE_HOLD_UNCOVERED
+        if self._earnings_blocks(symbol):
+            return COVERAGE_EARNINGS_SPAN
+        return COVERAGE_GATE_REJECTED
+
+    def _earnings_blocks(self, symbol: str) -> bool:
+        """Would an earnings event fall inside a fresh call's tenor today?
+
+        The live gate is a per-candidate SPAN predicate (does this contract
+        expire past the event), so the closest honest day-level statement is
+        "an event falls within ``call_target_dte`` days" — the tenor the profile
+        writes at. Fails to ``False`` on anything unknown, which pushes the day
+        into ``gate_rejected``: over-attributing to the earnings gate would let
+        it take credit for stand-downs it had no part in.
+        """
+        if not self.config.earnings_enabled:
+            return False
+        calendar = self.earnings_calendar
+        if calendar is None:
+            return False
+        try:
+            return bool(calendar.earnings_within(
+                symbol, int(self.config.call_target_dte)))
+        except Exception:  # noqa: BLE001 - a classification must not fail a run
+            return False
 
     # ------------------------------------------------------------------ #
     # Dividends
