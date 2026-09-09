@@ -59,6 +59,12 @@ class WheelCycle:
     #: replay's ``assignment_rate`` at 100% on every symbol while saying nothing
     #: about how often a put was actually put to it.
     synthetic_lots: int = 0
+    #: Peak seeded-lot VALUE in this cycle (shares x basis at seeding).
+    #: Tracked at seeding rather than derived from `shares_acquired`, which
+    #: `call_assignment` decrements to zero — so a called-away cycle would
+    #: otherwise report no capital at risk at exactly the moment it had the
+    #: most.
+    max_lot_value: float = 0.0
     shares_acquired: int = 0
     cost_basis: Optional[float] = None
     exit_price: Optional[float] = None
@@ -84,8 +90,23 @@ class WheelCycle:
 
     @property
     def capital_at_risk(self) -> float:
-        """Peak collateral committed — the denominator for return on capital."""
-        return self.max_collateral
+        """Peak collateral committed — the denominator for return on capital.
+
+        **For a SEEDED cycle it is the lot, not the collateral** (FC-096 Phase C,
+        review round 1 M3). A covered call reserves no cash, so `max_collateral`
+        is 0 on every covered-call cycle — which sent `return_on_capital` and
+        `annualized_return` through their zero guards and printed `0.00%` in the
+        cycle table's `ann.` column for cycles that earned real premium. A
+        reader takes that as "this cycle made nothing", which is the opposite of
+        what happened.
+
+        The capital genuinely at risk on a covered-call cycle is the LOT: the
+        shares whose downside the writer carries. Wheel cycles are untouched —
+        they reserve collateral, so this returns exactly what it always did.
+        """
+        if self.max_collateral > 0:
+            return self.max_collateral
+        return self.max_lot_value
 
     @property
     def return_on_capital(self) -> float:
@@ -179,6 +200,8 @@ def build_cycles(ledger: Iterable[LedgerEvent]) -> List[WheelCycle]:
             # seeding opens a fresh one, and each lot shows in the table with
             # its own basis and its own `synthetic_lot_open`.
             cycle.synthetic_lots += 1
+            cycle.max_lot_value = max(
+                cycle.max_lot_value, event.price * event.shares)
             prior_shares = cycle.shares_acquired
             prior_basis = cycle.cost_basis or 0.0
             cycle.shares_acquired = prior_shares + event.shares

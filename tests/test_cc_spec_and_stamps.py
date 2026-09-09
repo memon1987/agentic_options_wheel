@@ -313,6 +313,23 @@ class TestStrategyConditionalRefusals:
         }
         assert S.validate_spec(spec)["strategy"] == "wheel"
 
+    def test_whitespace_is_stripped_identically_on_both_sides(self):
+        """Review round 1 (LOW). Both validators `.strip()`, and this pins it.
+
+        If one side stripped and the other did not, `"  covered_call  "` would
+        normalise to different values, canonicalise to different keys, and the
+        two entry points would silently stop deduping against each other.
+        """
+        from tests._dashboard_path import add_dashboard_backend_to_path
+
+        add_dashboard_backend_to_path()
+        from services import sweeps as S
+
+        for raw in ("  covered_call  ", " wheel ", "covered_call\t"):
+            spec = {"symbols": ["GOOGL"], "start": "2025-09-02",
+                    "end": "2026-08-29", "scenarios": [], "strategy": raw}
+            assert S.validate_spec(spec)["strategy"] == cli.spec_strategy(spec)
+
     def test_the_dashboard_refuses_an_unknown_strategy(self):
         from tests._dashboard_path import add_dashboard_backend_to_path
 

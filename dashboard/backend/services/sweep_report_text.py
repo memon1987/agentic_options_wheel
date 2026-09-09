@@ -224,14 +224,15 @@ MODEL_SPREAD_BIAS = ('The bid/ask spread GATE was suspended for this run, becaus
  "covered-call profile's 0.10 rejected 10 of 10 premium-floor-clearing calls "
  "in the probe, and the arm would have reported 'this strategy never found a "
  "candidate' when what it never found was a spread the model could produce. "
- 'The gate is suspended HERE ONLY; the live service still applies it. Read '
- 'this as an OPTIMISTIC bias of unknown size: the replay writes calls the '
- 'live inventory validator might have refused for illiquidity, and the '
- 'modelled spread measures ~2.46x wider than the real book, so the direction '
- 'is not even reliably one way. A test pins the suspension to the spread '
- 'model, so the day real spreads arrive this fails loudly and the gate is '
- 'restored deliberately rather than staying off because nobody remembered it '
- 'was.')
+ 'The gate is suspended HERE ONLY; the live service still applies it. The '
+ 'bias is of UNKNOWN SIGN, not merely unknown size, and the two halves pull '
+ 'opposite ways: suspending the gate is optimistic (the replay writes calls '
+ 'the live inventory validator might have refused for illiquidity), while '
+ 'the model itself measures ~2.46x WIDER than the real book, which is '
+ 'pessimistic on every price it feeds. Do not net them; do not assume this '
+ 'run flatters the strategy. A test pins the suspension to the spread model, '
+ 'so the day real spreads arrive this fails loudly and the gate is restored '
+ 'deliberately rather than staying off because nobody remembered it was.')
 
 ROLL_REACH_BIAS = ('Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and '
  'credits are biased DOWN — and the fill model biases credits UP',

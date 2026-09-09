@@ -42,7 +42,7 @@ import json
 from statistics import median
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..metrics.fitness import MIN_DAYS_IN_POSITION
+from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from .overrides import describe_allowlist
 from .runner import BASE_SCENARIO_NAME, ScenarioResult, SweepResult
 
@@ -282,10 +282,13 @@ MODEL_SPREAD_BIAS = (
         "calls in the probe, and the arm would have reported 'this strategy "
         "never found a candidate' when what it never found was a spread the "
         "model could produce. The gate is suspended HERE ONLY; the live "
-        "service still applies it. Read this as an OPTIMISTIC bias of unknown "
-        "size: the replay writes calls the live inventory validator might have "
-        "refused for illiquidity, and the modelled spread measures ~2.46x wider "
-        "than the real book, so the direction is not even reliably one way. A "
+        "service still applies it. The bias is of UNKNOWN SIGN, not merely "
+        "unknown size, and the two halves pull opposite ways: suspending the "
+        "gate is optimistic (the replay writes calls the live inventory "
+        "validator might have refused for illiquidity), while the model itself "
+        "measures ~2.46x WIDER than the real book, which is pessimistic on "
+        "every price it feeds. Do not net them; do not assume this run flatters "
+        "the strategy. A "
         "test pins the suspension to the spread model, so the day real spreads "
         "arrive this fails loudly and the gate is restored deliberately rather "
         "than staying off because nobody remembered it was."),
@@ -421,9 +424,20 @@ def _cell(row: Optional[ScenarioResult]) -> str:
         # The fraction is printed, not just the flag: "low-act 4%" and
         # "low-act 24%" are very different amounts of evidence, and collapsing
         # them into one label would hide which cells are nearly usable.
-        return f"`low-act {row.days_in_position_fraction:.0%}`"
+        #
+        # M3 (review round 1): on a covered-call row the flag is driven by
+        # COVERAGE, not by days-in-position (a CC replay holds its lot on
+        # essentially every day), so the number printed beside it has to be the
+        # one the flag was computed from or the label contradicts itself.
+        fraction = (row.days_in_position_fraction if _is_wheel_row(row)
+                    else row.coverage_fraction)
+        return f"`low-act {(fraction or 0.0):.0%}`"
     glyph = _VERDICT_GLYPH.get(row.verdict or "", "?")
     return f"{_pct(row.annualized_return)} {glyph}"
+
+
+def _is_wheel_row(row: ScenarioResult) -> bool:
+    return (row.strategy or "wheel") == "wheel"
 
 
 def _measured(rows: Sequence[ScenarioResult]) -> List[ScenarioResult]:
@@ -434,6 +448,56 @@ def _measured(rows: Sequence[ScenarioResult]) -> List[ScenarioResult]:
     three are counted in their own columns; none contributes to a median.
     """
     return [r for r in rows if r.measured]
+
+
+def _covered_call_table(result: SweepResult) -> str:
+    """Premium yield and the coverage split, per cell — the CC headline numbers.
+
+    M3 (review round 1). The grid prints one number per cell and, on a
+    covered-call run, that number is the equity return on the lot: it carries
+    the shares' own price move, so two cells with the same return can have
+    harvested very different amounts of premium. The headline a covered-call
+    programme is actually managed to — annualized premium yield on the lot — and
+    the coverage split the verdict gates on had nowhere to appear.
+
+    Empty string on a wheel run, so the wheel report is byte-identical.
+    """
+    if str(getattr(result, "strategy", "wheel") or "wheel") == "wheel":
+        return ""
+    rows = [r for r in result.rows if r.ok and r.premium_yield_on_lot is not None]
+    if not rows:
+        return ""
+    lines = [
+        "### Covered-call detail",
+        "",
+        "| scenario | symbol | split | lot return | premium yield | basis cut | "
+        "covered | below basis | earnings | gated | rolls (ITM/out) |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        by = row.coverage_by_reason or {}
+        lines.append(
+            f"| {row.scenario} | {row.symbol} | {row.split} "
+            f"| {_pct(row.total_return)} "
+            f"| {_pct(row.premium_yield_on_lot)} "
+            f"| {_pct(row.net_basis_reduction)} "
+            f"| {by.get('covered', 0)} "
+            f"| {by.get('hold_uncovered', 0)} "
+            f"| {by.get('earnings_span', 0)} "
+            f"| {by.get('gate_rejected', 0)} "
+            f"| {row.itm_rolls or 0}/{row.otm_roll_outs or 0} |")
+    lines.append("")
+    lines.append(
+        "**`lot return` is the verdict's number; `premium yield` is a "
+        "statement.** The two answer different questions — the first is what "
+        "the lot earned under this programme (premium plus the shares' move "
+        "minus the call-away drag, against the same lot held), the second is "
+        "how much premium the programme harvested. A symbol whose shares fell "
+        "can show a strong yield and a negative return at once. The coverage "
+        "columns are a PARTITION of the decision days, and only `covered` and "
+        "`gated` are in the denominator the `low-act` flag uses: standing down "
+        "below basis or inside an earnings span is the strategy working.")
+    return "\n".join(lines)
 
 
 def _scenario_rows(result: SweepResult, scenario: str, split: str) -> List[ScenarioResult]:
@@ -550,11 +614,20 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
     a("")
     a(_scenario_summary(result))
     a("")
-    a(f"Median/min/max are taken over **measured** cells only. A cell that is "
-      f"`insuf` (no completed cycle in the window), `low-act` (a position held on "
-      f"under {MIN_DAYS_IN_POSITION:.0%} of decision days, so its annualised "
-      f"number rests on capital that mostly sat idle) or errored contributes to "
-      f"its own count and to nothing else.")
+    if result.strategy == "wheel":
+        a(f"Median/min/max are taken over **measured** cells only. A cell that is "
+          f"`insuf` (no completed cycle in the window), `low-act` (a position held on "
+          f"under {MIN_DAYS_IN_POSITION:.0%} of decision days, so its annualised "
+          f"number rests on capital that mostly sat idle) or errored contributes to "
+          f"its own count and to nothing else.")
+    else:
+        a(f"Median/min/max are taken over **measured** cells only. A cell that is "
+          f"`insuf` (no lot seeded, or a window shorter than one call tenor), "
+          f"`low-act` (a call open on under {MIN_COVERED_FRACTION:.0%} of "
+          f"writable days) or errored contributes to its own count and to "
+          f"nothing else.")
+    a("")
+    a(_covered_call_table(result))
     a("")
 
     if result.has_holdout:
@@ -662,12 +735,30 @@ def _grid(result: SweepResult, split: str) -> str:
         label = f"**{name}**" if name == BASE_SCENARIO_NAME else name
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
     lines.append("")
-    lines.append(
-        f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no completed cycle "
-        f"in the window (**not** a return of zero) · "
-        f"`low-act N%` a position held on under {MIN_DAYS_IN_POSITION:.0%} of "
-        f"decision days, so the annualised number rests on idle capital · "
-        f"`err` never measured. Only the first three contribute to any median.")
+    # M3 (review round 1): the two flags MEAN different things on a
+    # covered-call run, so the legend that explains them has to change with the
+    # strategy. `insuf` there is never "no completed cycle" — a lot that was
+    # never called away completes no cycle and is the best outcome the strategy
+    # has — and `low-act` is a coverage floor, not a days-in-position one.
+    if str(getattr(result, "strategy", "wheel") or "wheel") == "wheel":
+        lines.append(
+            f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no completed "
+            f"cycle in the window (**not** a return of zero) · "
+            f"`low-act N%` a position held on under {MIN_DAYS_IN_POSITION:.0%} of "
+            f"decision days, so the annualised number rests on idle capital · "
+            f"`err` never measured. Only the first three contribute to any median.")
+    else:
+        lines.append(
+            f"Glyphs: `+` fit · `~` marginal · `-` unfit · `insuf` no lot was "
+            f"ever seeded, or the window is shorter than one call tenor "
+            f"(**not** a return of zero, and **not** 'no cycle closed' — a lot "
+            f"never called away closes no cycle and is the programme working) · "
+            f"`low-act N%` a call was open on under {MIN_COVERED_FRACTION:.0%} "
+            f"of the days one COULD have been written, excluding below-basis "
+            f"and earnings-span stand-downs · `err` never measured. Only the "
+            f"first three contribute to any median. The percentage in each "
+            f"measured cell is the equity return on the LOT; see the "
+            f"covered-call table below for premium yield and coverage.")
     return "\n".join(lines)
 
 

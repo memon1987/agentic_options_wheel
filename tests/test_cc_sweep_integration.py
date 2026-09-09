@@ -162,6 +162,33 @@ class TestTheSweepProducesUsableEvidence:
         assert WHEEL_EX_DIV_TITLE not in markdown
         assert "profit-taking IS modelled on this profile" in markdown
 
+    def test_the_markdown_carries_the_covered_call_detail_table(self, cc_sweep):
+        """M3. The grid prints ONE number per cell and on a CC run that is the
+        equity return on the lot — it carries the shares' price move. The
+        headline the programme is managed to (premium yield) and the coverage
+        split the verdict gates on had nowhere to appear."""
+        from src.backtesting.scenarios.report import render_markdown
+
+        result, _artifacts, _sidecars, _days, _closes = cc_sweep
+        markdown = render_markdown(result)
+        assert "### Covered-call detail" in markdown
+        assert "premium yield" in markdown
+        assert "below basis" in markdown
+        assert "rolls (ITM/out)" in markdown
+        assert "`lot return` is the verdict's number" in markdown
+
+    def test_the_legend_does_not_claim_insuf_means_no_closed_cycle(self, cc_sweep):
+        """M3. On a covered-call run that sentence is FALSE — and false in the
+        most damaging direction: a lot never called away closes no cycle and is
+        the best outcome the strategy has."""
+        from src.backtesting.scenarios.report import render_markdown
+
+        result, _artifacts, _sidecars, _days, _closes = cc_sweep
+        markdown = render_markdown(result)
+        assert "`insuf` no completed cycle" not in markdown
+        assert "no lot was ever seeded" in markdown
+        assert "closes no cycle and is the programme working" in markdown
+
     def test_the_json_render_is_serialisable(self, cc_sweep):
         from src.backtesting.scenarios.report import render_json
 

@@ -18,6 +18,9 @@ from dataclasses import asdict, is_dataclass
 from typing import List, Optional
 
 from ..engine.rejections import NOT_A_STAND_DOWN, stand_down_reasons
+from ..engine.simulator import (
+    SYNTHETIC_LOT_PREMISE, SYNTHETIC_LOT_SHARES,
+)
 from ..metrics.cycles import WheelCycle
 from ..metrics.fitness import FitnessReport
 
@@ -132,10 +135,26 @@ def render_markdown(report: FitnessReport) -> str:
     out: List[str] = []
     a = out.append
 
-    a(f"# Wheel fitness: {report.symbol}")
-    a("")
-    a(f"**{report.start} → {report.end}** ({report.days} days) · "
-      f"starting capital ${report.starting_cash:,.0f}")
+    # M3 (FC-096 Phase C, review round 1). A covered-call report is not a
+    # "Wheel fitness" report and does not have a "starting capital": its capital
+    # base is the synthetic lot, and its `starting_cash` is a $5,000 liquidity
+    # reserve deliberately excluded from every ratio. Printing the wheel's
+    # header over covered-call numbers mislabels the whole page.
+    if report.is_wheel:
+        a(f"# Wheel fitness: {report.symbol}")
+        a("")
+        a(f"**{report.start} → {report.end}** ({report.days} days) · "
+          f"starting capital ${report.starting_cash:,.0f}")
+    else:
+        a(f"# Covered-call fitness: {report.symbol}")
+        a("")
+        a(f"**{report.start} → {report.end}** ({report.days} days) · "
+          f"capital base ${report.capital_base:,.0f} "
+          f"(a SYNTHETIC {SYNTHETIC_LOT_SHARES}-share lot; "
+          f"${report.starting_cash:,.0f} cash reserve excluded from every "
+          f"ratio)")
+        a("")
+        a(f"_{SYNTHETIC_LOT_PREMISE}_")
     a("")
 
     verdict = report.verdict()
@@ -207,7 +226,16 @@ def render_markdown(report: FitnessReport) -> str:
     a("")
     a("| | total return | final value |")
     a("|---|---:|---:|")
-    a(f"| Wheel | {report.total_return:+.2%} | ${report.final_equity:,.0f} |")
+    if report.is_wheel:
+        a(f"| Wheel | {report.total_return:+.2%} | ${report.final_equity:,.0f} |")
+    else:
+        # M3: `final_equity` is NOT comparable to the benchmark's final value on
+        # a covered-call cell — it carries the cash reserve and the whole seeded
+        # lot chain, so the reviewer's rally cell printed $54,767 against
+        # $21,700 with $43,500 of injected lots. The lot-based figure is the one
+        # that means anything beside a lot-based benchmark.
+        a(f"| Covered call on the lot | {report.total_return:+.2%} | "
+          f"${report.capital_base * (1 + report.total_return):,.0f} |")
     if report.benchmark:
         b = report.benchmark
         a(f"| Buy & hold ({b.shares} sh @ ${b.entry_price:,.2f}) | "
@@ -216,8 +244,19 @@ def render_markdown(report: FitnessReport) -> str:
         verdict_word = "ahead of" if excess >= 0 else "behind"
         a(f"| **Difference** | **{excess:+.2%}** | |")
         a("")
-        a(f"The wheel finished **{abs(excess):.2%} {verdict_word}** simply owning "
+        leg = "wheel" if report.is_wheel else "covered-call programme"
+        a(f"The {leg} finished **{abs(excess):.2%} {verdict_word}** simply owning "
           f"{report.symbol} over the same window.")
+        if not report.is_wheel:
+            a("")
+            a(f"Net premium **${report.net_premium:,.2f}** — a "
+              f"**{(report.premium_yield_on_lot or 0.0):+.2%}** annualized "
+              f"yield on the lot, and a "
+              f"**{(report.net_basis_reduction or 0.0):+.2%}** reduction of its "
+              f"basis so far. That yield is a STATEMENT, not the verdict: the "
+              f"comparison above is total-return against total-return, because "
+              f"premium alone cannot be measured against a benchmark that "
+              f"includes the shares' price move.")
         if b.dividends:
             a("")
             a(f"Buy-and-hold's return includes **${b.dividends:,.0f}** of "
