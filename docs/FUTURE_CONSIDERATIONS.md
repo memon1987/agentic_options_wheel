@@ -1024,7 +1024,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
 **Scope:** covered_call
-**Status:** DECIDED 2026-09-08 — wire rolling (operator), with `itm_trigger_ratio: 1.00` on the covered-call profile (operator-confirmed after the plan review: true-ITM-only defence, a stated Symmetry difference; the wheel's 0.98 → FC-112); plan `docs/plans/fc-100.md` rev 2 in progress, lands before the FC-096 Phase C build. Originally: Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
+**Status:** BUILT — PR #127 merged `fc1a946` 2026-09-08 (config + alert twin + tests); operator steps O1–O9 pending, `cc-roll-daily` resume gated on FC-107. Decision: wire rolling, with `itm_trigger_ratio: 1.00` on the covered-call profile (operator-confirmed after the plan review: true-ITM-only defence, a stated Symmetry difference; the wheel's 0.98 → FC-112); plan `docs/plans/fc-100.md` rev 2 in progress, lands before the FC-096 Phase C build. Originally: Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
 **Size estimate:** S (decision) / S (build either way)
 **Owner:** zeshan (operator decision)
 **Plan file:** not yet
