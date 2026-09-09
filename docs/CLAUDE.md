@@ -129,12 +129,23 @@ live-verified 2026-08-04 with `gcloud scheduler jobs list`):
 | `execute-10-15am` … `execute-3-15pm` | `:15`, 10:15–15:15 ET | `/run` |
 | `monitor-9-55am` … `monitor-2-55pm` | `:55`, 09:55–14:55 ET | `/monitor` |
 | `options-wheel-roll-daily` | 15:30 ET | `/roll` |
+| `cc-roll-daily` (covered-call service) | 15:30 ET | `/roll` |
 | `regression-hourly` | `:45`, 10:45–15:45 ET | `/regression` |
 | `activities-ingest-market-hours` / `-off-hours` | every 15 min 09–16 ET / hourly otherwise | `/ingest-activities` |
 | `portfolio-history-ingest-daily` / `stock-history-ingest-daily` | 16:30 / 17:00 ET | ingest endpoints |
 
 `options-wheel-roll-friday` still exists but is **PAUSED** — FC-078 replaced it
-with the daily job. The scheduler owns all timing; no cadence knob in
+with the daily job. `cc-roll-daily` is the covered-call service's twin of
+`options-wheel-roll-daily`, created by FC-100 and **created PAUSED**: it is not
+resumed until FC-107 raises both bot services' Cloud Run `--timeout` from 300 s
+to 1800 s, because a roll cycle cut at 300 s returns a 504 to the scheduler that
+no alert policy watches while the handler thread survives, CPU-throttled, and
+places its remaining rungs on stale limits when the next request wakes the
+instance (`docs/plans/fc-100.md` DD-7). The CC service's other seven jobs are
+`cc-scan-hourly` (`:00`, 10–15), `cc-execute-hourly` (`:15`, 10–15),
+`cc-monitor-hourly` (`:55`, 9–14), `cc-regression-hourly` (`:45`, 10–15),
+`cc-activities-ingest` (`:07` hourly), `cc-portfolio-history-ingest` (16:33) and
+`cc-stock-history-ingest` (17:03). The scheduler owns all timing; no cadence knob in
 `config/settings.yaml` controls it (a `monitoring.check_interval_minutes` key
 used to read as if it did, and was deleted in FC-069 S1 for exactly that
 reason).
@@ -426,9 +437,21 @@ Live covered-call management is, in full:
 4. **The earnings span gate** — no call may expire on or after the next earnings
    date.
 5. **The daily credit-only roller** — when the underlying rallies through the
-   strike (`rolling.itm_trigger_ratio: 0.98`), roll up and out for a net credit
-   on the placed limit prices, within `max_extension_days: 14` of the *old*
-   expiry and under a `max_replacement_delta: 0.60` rail.
+   strike, roll up and out for a net credit on the placed limit prices, within
+   `max_extension_days: 14` of the *old* expiry and under a
+   `max_replacement_delta: 0.60` rail. **Live on both profiles since FC-100**;
+   the trigger is `rolling.itm_trigger_ratio: 0.98` on the wheel and **`1.00`
+   on the covered-call profile** — a true-ITM-only defence, because at 0.98 a
+   0.15–0.25-delta call is roll-eligible the same day it is written and the
+   roller would re-write the engine's own call, bypassing every entry gate
+   (operator decision D-A; FC-112 re-decides the wheel's on measured numbers).
+   The roll path does **not** read `universe.excluded_symbols` (FC-110): to opt
+   a symbol out while it has an open short call, pause the roll job or close
+   the call.
+
+   `docs/plans/fc-075-phase-2.md` §Rolling scoped the roller *out* of the
+   covered-call service ("Phase 3 must not schedule `/roll`"); that line is
+   **superseded by FC-100** (2026-09-08).
 
 ## Accepted amnesia (process-local state)
 
@@ -1615,4 +1638,12 @@ regression fails before anything deploys.
 `STRATEGY_CONFIG` selects the profile
 **Env levers that bypass a deploy**: `EARNINGS_ENABLED`, `ROLLER_ENABLED`,
 `ROLLER_DRY_RUN`. Use `gcloud run services update --update-env-vars`, **never**
-`--set-env-vars` — the latter wipes the entire env set.
+`--set-env-vars` — the latter wipes the entire env set. They apply to **both**
+bot services (`options-wheel-strategy` and, since FC-100 wired rolling there,
+`covered-call-engine` — `gcloud run services update covered-call-engine
+--region=us-central1 --update-env-vars ROLLER_ENABLED=false`). Neither service
+carries any `ROLLER_*` var in its deployed env: the yaml `rolling.enabled` key
+enables the roller and the env vars exist only to kill or debug it, so an
+override set this way lasts only until the next merge's `--set-env-vars`. The
+durable off is `rolling.enabled: false` in the profile, or pausing the roll
+job.
