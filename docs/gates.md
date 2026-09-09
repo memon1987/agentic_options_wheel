@@ -219,10 +219,34 @@ Rewritten by FC-078. The roller runs every trading day at 15:30 ET and is
 enforced on the limit prices actually placed, so a filled roll can never net a
 debit.
 
+**Both profiles run it since FC-100** (`options-wheel-strategy` at 15:30 via
+`options-wheel-roll-daily`; `covered-call-engine` at 15:30 via `cc-roll-daily`).
+The CC profile carries `rolling.itm_trigger_ratio: 1.00` where the wheel
+carries `0.98` — the one stated difference between the two `rolling:` blocks
+(operator decision D-A, `docs/plans/fc-100.md` DD-1; FC-112 re-decides the
+wheel's on measured numbers). At 0.98 a 0.15–0.25-delta call is roll-eligible
+the day it is written; 1.00 makes the CC roller a true-ITM-only defence.
+
+The `'roll'` criteria profile applies **only** the delta rail and the basic
+liquidity check. It does *not* read `call_target_dte`, `min_call_premium`,
+`call_delta_range`, `universe.min_open_interest`, `universe.max_spread_pct` —
+nor `universe.excluded_symbols` (FC-110).
+
+> **Runbook (FC-114).** `_is_market_open()` has no holiday calendar and both
+> roll jobs run a `1-5` cron, so they fire on NYSE holidays — on Labor Day
+> 2026-09-07 `/roll` placed a buy-to-close into a closed market. Until FC-114
+> lands, **pause `cc-roll-daily` the day before an NYSE holiday**.
+
+> **Runbook (FC-110).** The roll path does not read
+> `universe.excluded_symbols`. To opt a symbol out while it has an open short
+> call, also **pause the roll job** (`gcloud scheduler jobs pause cc-roll-daily
+> --location us-central1`) or close the call — excluding a symbol stops NEW
+> calls being written, not rolls of the ones already open.
+
 | # | Gate | Config | Notes |
 |---|---|---|---|
 | 20 | Open-order conflict | — | a live open order on the option symbol → skip; `/monitor`'s DAY buy-to-close limits outlive its 14:55 slot and the profit-taker has precedence |
-| 21 | ITM trigger ratio | `rolling.itm_trigger_ratio: 0.98` | OTM calls are the profit-taker's territory |
+| 21 | ITM trigger ratio | `rolling.itm_trigger_ratio: 0.98` (wheel) / `1.00` (covered call, FC-100) | OTM calls are the profit-taker's territory; at 1.00 only a stock through its strike is eligible |
 | 22 | Stock-quote quality | — | two-sided **and** `ask/bid <= 1.05`; **fails closed** (`stock_quote_unusable`) |
 | 23 | Cost-basis floor | — | shared `CostBasisResolver`, **fails closed** (FC-065 P2), alert-wired since FC-078 |
 | 24 | Earnings span on the **replacement** | `earnings.enabled` | `next_earnings_info` tri-state → `exclude_expiry_on_or_after`; `unknown` (or a missing calendar) skips the whole roll. **Fails closed** |
@@ -341,7 +365,9 @@ misfile.
 
 | Gate | Alerted? | Policy |
 |---|---|---|
-| Cost-basis floor (6, 7) | yes | `deploy/monitoring/cost_basis_alert_policy.json` |
+| Cost-basis floor (6, 7) | yes | wheel `deploy/monitoring/cost_basis_alert_policy.json`; covered call `deploy/monitoring/cc_cost_basis_alert_policy.json` (watches the `call_roll_skipped_cost_basis_*` pair too since FC-100) |
+| Roll path (20–27) — completed / stranded BTC / unknown disposition / execution error | yes | wheel `deploy/monitoring/roll_executed_alert_policy.json`; covered call `deploy/monitoring/cc_roll_executed_alert_policy.json` (FC-100; its error group also carries `roll_cycle_error` and `roll_position_error`, which the wheel's policy lacks — FC-108) |
+| Roll cycle **cut** by the Cloud Run timeout | no — a scheduler 504 nothing watches (FC-107 raises the timeout; FC-108/FC-111 the detection) |
 | Earnings **unknown** (2, 4) + `earnings_gate_unusable` | yes | `deploy/monitoring/earnings_gate_alert_policy.json` |
 | Earnings **blackout** (2, 9) | no, by design — a blackout skip is the gate working |
 | Everything else | no | — |

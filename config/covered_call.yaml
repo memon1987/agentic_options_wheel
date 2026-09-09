@@ -129,6 +129,54 @@ earnings:
   cache_ttl_hours: 24
   lookahead_days: 90
 
+# Call Rolling — wired for this profile by FC-100 (docs/plans/fc-100.md).
+#
+# Evaluated every trading day at 15:30 ET by the `cc-roll-daily` Cloud
+# Scheduler job, after the last /monitor (14:55), /scan (15:00) and /run
+# (15:15). A roll executes only when the placed LIMIT prices net a credit, so
+# a filled roll can never net a debit.
+#
+# `cc-roll-daily` DOES NOT EXIST YET. It is an operator step (fc-100 O3/O4),
+# created PAUSED, and resumed only after FC-107 raises both bot services' Cloud
+# Run --timeout to 1800 s. Until then `enabled: true` here has no caller: /roll
+# on this service is only ever reached by hand.
+#
+# RUNBOOK (FC-114): `_is_market_open()` has no holiday calendar and the job's
+# `1-5` cron fires on NYSE holidays — on Labor Day 2026-09-07 the wheel's /roll
+# placed a buy-to-close into a closed market. Until FC-114 lands, PAUSE
+# `cc-roll-daily` the day before an NYSE holiday.
+#
+# `itm_trigger_ratio: 1.00` DIFFERS from the wheel's 0.98 — operator decision
+# D-A, see docs/plans/fc-100.md DD-1 and FC-112. At 0.98 a 0.15-0.25-delta
+# short call is roll-eligible the day it is written (it is born at 97-99% of
+# its strike), so the roller would re-write the engine's own fresh call,
+# bypassing every entry gate. 1.00 makes this a true-ITM-only defence: it acts
+# when the stock is through the strike and assignment is the alternative. The
+# other seven keys mirror the wheel and tests/test_config.py T-1 pins each one
+# per profile, so a retune on either side is a reviewed edit on both files.
+#
+# Kill switch without a deploy: ROLLER_ENABLED=false (env wins over this key)
+#   gcloud run services update covered-call-engine --region=us-central1 \
+#     --update-env-vars ROLLER_ENABLED=false
+# It survives only until the next merge — `--set-env-vars` in cloudbuild.yaml
+# replaces the whole env set. The DURABLE off is `enabled: false` here (a
+# one-line PR) or `gcloud scheduler jobs pause cc-roll-daily`.
+# Debug without placing orders: ROLLER_DRY_RUN=true (env-only).
+#
+# RUNBOOK (FC-110): the roll path does NOT read `universe.excluded_symbols`.
+# To opt a symbol out while it has an open short call, also pause
+# `cc-roll-daily` or close the call — adding it to `excluded_symbols` stops
+# NEW calls being written, not rolls of the ones already open.
+rolling:
+  enabled: true
+  itm_trigger_ratio: 1.00               # DIFFERS from the wheel (0.98) — fc-100 DD-1
+  max_extension_days: 14                # replacement expiry <= OLD expiry + N
+  max_replacement_delta: 0.60           # upper rail only; no lower bound
+  min_net_credit_per_contract: 0.00     # $/contract on the placed limits
+  imminence_extrinsic_threshold: 0.20   # $/share extrinsic -> mid-based pricing
+  btc_fill_timeout_seconds: 120
+  fallback_strike_attempts: 2
+
 risk:
   # `max_portfolio_allocation` and `min_cash_reserve` deleted by FC-069 S1
   # (no consumer on either profile).
