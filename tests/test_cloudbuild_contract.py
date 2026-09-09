@@ -616,6 +616,195 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
 
 
 # --------------------------------------------------------------------------
+# 5a. The bot services' request timeout vs the roll seam (FC-107).
+#
+# `--timeout` on a bot service is Cloud Run's REQUEST timeout, and the request
+# it has to survive is `/roll`. It is NOT the build `timeout:` at the bottom of
+# cloudbuild.yaml (the serialize-builds budget), which has its own tests below
+# and never needs to agree with this number.
+#
+# What these tests pin is an INVARIANT, not a value: the latest second at which
+# `run_rolling_cycle` will still start a position, plus the worst case that
+# position can then take, plus a preamble allowance, must fit inside the
+# service timeout — which must in turn fit inside the roll scheduler's attempt
+# deadline. Every input is read from the code and the config that decide it, so
+# raising `_CYCLE_BUDGET_SECONDS`, `rolling.btc_fill_timeout_seconds` or
+# `rolling.fallback_strike_attempts` without raising the flag fails here.
+# --------------------------------------------------------------------------
+BOT_SERVICES = ("options-wheel-strategy", "covered-call-engine")
+
+#: The profile each bot deploy step selects via STRATEGY_CONFIG. The wheel step
+#: sets no STRATEGY_CONFIG at all, so it gets `strategy_config()`'s default
+#: (`config/settings.yaml`); both halves of this mapping are ASSERTED below
+#: rather than assumed.
+BOT_PROFILE = {
+    "deploy-bot-canary": "config/settings.yaml",
+    "deploy-cc-canary": "config/covered_call.yaml",
+}
+WHEEL_PROFILE = "config/settings.yaml"
+
+#: `options-wheel-roll-daily`'s `attemptDeadline`, live-verified 2026-09-08 and
+#: also Cloud Scheduler's maximum for an HTTP target. Documented, NOT read: the
+#: scheduler has no file in this repo and the suite is hermetic by conftest rule,
+#: so the rollout (docs/plans/fc-107.md §Rollout step 3) verifies it live.
+ROLL_SCHEDULER_ATTEMPT_DEADLINE_SECONDS = 1800
+
+#: Everything `/roll` does BEFORE `run_rolling_cycle`'s clock starts: the profile
+#: load, `WheelEngine` construction and the pre-loop position/order fetches. The
+#: 15:30 instance is warm from the 15:15 `/run`, so this is seconds. It does NOT
+#: cover the roller's RTT-blind polling (`_poll_order_fill` counts sleeps, not
+#: round-trips) or the lock wait between Cloud Run's admission clock and the
+#: cycle's — both are FC-113, and both eat this allowance, not a separate one.
+PREAMBLE_ALLOWANCE_SECONDS = 60
+
+#: Ladder rungs that exist regardless of config: the BTC, rung 1 (the primary at
+#: its re-checked limit) and rung 2 (the primary at the invariant floor price,
+#: conditional on the BTC filling better than its limit). `CallRoller._rungs`
+#: yields rungs 3+ from `fallback_strike_attempts`.
+LADDER_FIXED_LEGS = 3
+
+
+def service_timeout_seconds(step):
+    """The `--timeout=` seconds on this deploy step, as an int."""
+    found = [f for f in deploy_flags(step) if f.startswith("--timeout=")]
+    assert len(found) == 1, (
+        f"{step.get('id')} must pass exactly one --timeout flag; got {found}."
+    )
+    return int(found[0].split("=", 1)[1])
+
+
+def rolling_leg_params(profile_path):
+    """`(btc_fill_timeout_seconds, fallback_strike_attempts, sources)` for a profile.
+
+    A profile with no `rolling` block — or a `rolling` block missing one of these
+    keys — inherits the wheel's, exactly as `Config` does. `config/covered_call.yaml`
+    has no `rolling` block today; FC-100 adds one. `sources` names the file each
+    value actually came from, so a failure message says which file to edit.
+    """
+    wheel = (yaml.safe_load((REPO_ROOT / WHEEL_PROFILE).read_text())
+             .get("rolling") or {})
+    profile = (yaml.safe_load((REPO_ROOT / profile_path).read_text())
+               .get("rolling") or {})
+    values, sources = {}, {}
+    for key in ("btc_fill_timeout_seconds", "fallback_strike_attempts"):
+        if key in profile:
+            values[key], sources[key] = profile[key], profile_path
+        else:
+            values[key], sources[key] = wheel[key], (
+                f"{WHEEL_PROFILE} (fallback: {profile_path} has no {key})"
+            )
+    return (values["btc_fill_timeout_seconds"],
+            values["fallback_strike_attempts"], sources)
+
+
+def test_the_bot_steps_select_the_profiles_this_section_reasons_about(by_id):
+    """BOT_PROFILE is checked against the deploy steps, not assumed.
+
+    If the CC step's STRATEGY_CONFIG ever moves, or the wheel step gains one, the
+    seam test below would silently reason about the wrong `rolling.*` values.
+    """
+    wheel_env = [f for f in deploy_flags(by_id["deploy-bot-canary"])
+                 if f.startswith("--set-env-vars=")]
+    assert wheel_env and "STRATEGY_CONFIG" not in wheel_env[0], (
+        "deploy-bot-canary must NOT set STRATEGY_CONFIG — the wheel service runs "
+        "on the server's default profile, config/settings.yaml. "
+        f"Got: {wheel_env}"
+    )
+    cc_env = [f for f in deploy_flags(by_id["deploy-cc-canary"])
+              if f.startswith("--set-env-vars=")]
+    assert cc_env and "STRATEGY_CONFIG=config/covered_call.yaml" in cc_env[0], (
+        "deploy-cc-canary must select the covered-call profile via "
+        "STRATEGY_CONFIG=config/covered_call.yaml; the seam test reads that "
+        f"file's rolling.* config. Got: {cc_env}"
+    )
+
+
+@pytest.mark.parametrize("service", BOT_SERVICES)
+def test_bot_service_timeout_covers_the_roll_seam_invariant(service, by_id):
+    """The service's request timeout covers the worst `/roll` this profile can run.
+
+    latest_start + per_position_worst + PREAMBLE_ALLOWANCE <= --timeout, where
+    latest_start is the last elapsed second at which `run_rolling_cycle` still
+    STARTS a position (wheel_engine's budget guard) and per_position_worst is the
+    full ladder at this profile's fill timeout. The seam this protects is a filled
+    buy-to-close with no sell-to-open: at the old 300 s the request was cut
+    mid-ladder as soon as a rung timed out on a busy day.
+
+    Imports are function-local by the module's convention: both modules are
+    import-safe (module-level constants; the `Config` class is imported, never
+    instantiated), but nothing else in this file needs `src/` at collection time.
+    """
+    from src.strategy.call_roller import _CANCEL_SETTLE_TIMEOUT_SECONDS
+    from src.strategy.wheel_engine import (_CYCLE_BUDGET_SECONDS,
+                                           _PER_POSITION_BUDGET_SECONDS)
+
+    step_id = CHAINS[service]["deploy"]
+    timeout = service_timeout_seconds(by_id[step_id])
+    profile = BOT_PROFILE[step_id]
+    btc_poll, fallbacks, sources = rolling_leg_params(profile)
+
+    latest_start = _CYCLE_BUDGET_SECONDS - _PER_POSITION_BUDGET_SECONDS
+    legs = LADDER_FIXED_LEGS + fallbacks
+    per_position_worst = legs * (btc_poll + _CANCEL_SETTLE_TIMEOUT_SECONDS)
+    needed = latest_start + per_position_worst + PREAMBLE_ALLOWANCE_SECONDS
+
+    assert needed <= timeout, (
+        f"{step_id} (--timeout={timeout}) cannot cover the roll seam for "
+        f"{profile}: a position may START at {latest_start}s "
+        f"(_CYCLE_BUDGET_SECONDS {_CYCLE_BUDGET_SECONDS} - "
+        f"_PER_POSITION_BUDGET_SECONDS {_PER_POSITION_BUDGET_SECONDS}) and then "
+        f"run {legs} legs x ({btc_poll}s poll + "
+        f"{_CANCEL_SETTLE_TIMEOUT_SECONDS}s cancel settle) = "
+        f"{per_position_worst}s, plus {PREAMBLE_ALLOWANCE_SECONDS}s of preamble "
+        f"= {needed}s > {timeout}s. Cloud Run would return 504 mid-ladder: the "
+        "thread is NOT killed and keeps trading unobserved, and if the instance "
+        "scales in the buy-to-close stands with no sell-to-open (uncovered long "
+        f"stock). Raise --timeout on {step_id} in cloudbuild.yaml AND re-freeze "
+        "tests/fixtures/cloudbuild_contract.json, or lower the inputs. Sources: "
+        f"btc_fill_timeout_seconds <- {sources['btc_fill_timeout_seconds']}; "
+        f"fallback_strike_attempts <- {sources['fallback_strike_attempts']}."
+    )
+
+
+def test_both_bot_services_share_one_request_timeout(by_id):
+    """Wheel and covered-call must not split — they run the same roller.
+
+    The two deploy steps are edited by hand, one after the other. This is what
+    stops a PR raising one and leaving the other at a value its own profile's
+    ladder crosses.
+    """
+    values = {CHAINS[svc]["deploy"]: service_timeout_seconds(
+        by_id[CHAINS[svc]["deploy"]]) for svc in BOT_SERVICES}
+    assert len(set(values.values())) == 1, (
+        f"The two bot services' --timeout values diverged: {values}. Both run the "
+        "same image and the same roller; change them in ONE commit."
+    )
+
+
+@pytest.mark.parametrize("service", BOT_SERVICES)
+def test_bot_service_timeout_does_not_exceed_the_roll_schedulers_attempt_deadline(
+        service, by_id):
+    """A bot service timeout above the scheduler's deadline buys nothing.
+
+    `options-wheel-roll-daily` gives up at `attemptDeadline: 1800s` (and 1800 s is
+    Cloud Scheduler's HTTP-target maximum), so a larger service timeout only
+    extends a request no caller is still waiting on. The scheduler value is
+    DOCUMENTED here, not read — there is no scheduler file in this repo and the
+    suite is hermetic — and docs/plans/fc-107.md §Rollout step 3 verifies it live
+    with `gcloud scheduler jobs describe`. Regression caught: a "why not use Cloud
+    Run's 3600 s maximum" edit.
+    """
+    step_id = CHAINS[service]["deploy"]
+    timeout = service_timeout_seconds(by_id[step_id])
+    assert timeout <= ROLL_SCHEDULER_ATTEMPT_DEADLINE_SECONDS, (
+        f"{step_id} --timeout={timeout} exceeds the roll scheduler's documented "
+        f"attemptDeadline ({ROLL_SCHEDULER_ATTEMPT_DEADLINE_SECONDS}s). The "
+        "scheduler would report DEADLINE_EXCEEDED on a cycle still running and "
+        "nothing would be waiting for the response."
+    )
+
+
+# --------------------------------------------------------------------------
 # 5b. The scenario-sweep Cloud Run Job (FC-060 Layer 3, D9).
 # --------------------------------------------------------------------------
 SWEEP_JOB_STEP = "deploy-sweep-job"
