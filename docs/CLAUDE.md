@@ -484,10 +484,24 @@ this list — not any single plan — is where readiness is judged. Status as of
 | Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open |
 | Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 | both | FC-088 | filed |
 | `AlpacaClient` HTTP calls have no socket timeout; a hung lock-holder has no in-session bound (Cloud Run's cut does not stop the thread) | both | FC-089 | filed |
-| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 675 s per-position constant | both | FC-113 | filed |
+| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case | both | FC-113 | filed |
 | `_is_market_open()` has no holiday calendar — orders can be placed into a closed market (09-07 IWM) | both | FC-114 | filed |
-| Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | this plan |
-| Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | plan approved |
+| Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | PR #128; verify live per §Deploy / CI |
+| Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | merged (#127); policy not yet deployed |
+
+**The fee note.** `rolling.min_net_credit_per_contract: 0.00` makes the roller
+credit-only on the *placed limit prices* — gross. A live account pays roughly
+$0.10/contract in OCC and regulatory fees on each leg, so a roll priced at
+exactly the floor is a small net **debit** once filled, and "credit-only" is
+false on real money in a way it is not on paper. This is **not** a gate: it does
+not block trading, it changes what the floor means, and the fix is a pricing
+decision owned by FC-088 / FC-100, not a readiness precondition.
+
+The same goes for the §Accepted amnesia items below (`_closed_today` and its
+siblings, and the FC-009 duplicate buy-to-close they permit): they are known,
+accepted weaknesses that are *deliberately* excluded from the list above. The
+gates are the things that must be true before the first real-money order; these
+are things to keep watching after it.
 
 ## Accepted amnesia (process-local state)
 
@@ -1553,8 +1567,11 @@ schedule and its terminal events still fire if the instance lives; the `/roll`
 response is lost; and if the instance scales in mid-ladder the buy-to-close
 stands with no sell-to-open and no event (uncovered long stock until the next
 `/run` re-covers). `tests/test_cloudbuild_contract.py` pins the seam invariant —
-latest position start + the per-position worst case from each profile's
-`rolling.*` + a preamble allowance ≤ service timeout ≤ scheduler deadline — on
+latest position start + the per-position worst case from each profile's leg
+parameters, read through `Config(profile)` exactly as the service reads them
+(including Config's hard-coded 120 s / 2 defaults when a profile omits the keys
+— Config does *not* layer `settings.yaml` under a profile), + a preamble
+allowance ≤ service timeout ≤ scheduler deadline — on
 both bot services, so raising the budget, a fill timeout or
 `fallback_strike_attempts` without the flag (or the flag without the fixture)
 fails the suite. Not covered by the flag: the roller's RTT-blind polling and the
