@@ -1205,6 +1205,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-107 (§Found while planning 7), FC-078, FC-100.
 
+### FC-115: `Config` validates no bound on `rolling.itm_trigger_ratio` (or `enabled`, `btc_fill_timeout_seconds`, `fallback_strike_attempts`)
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 PR review)
+**Size estimate:** S
+
+**Problem:** `src/utils/config.py` validates four rolling knobs and not the trigger: a `10.0` typo silently makes every position `not_itm_enough` (the roller looks alive and never rolls); `0.5` makes every call eligible. The only guard today is the shipped-value test (`test_config.py` T-1), which catches drift in the repo, not a live `--update-env-vars` or a hand-edited profile.
+
+**Proposal:** bounds at load time — `itm_trigger_ratio` in `[0.9, 1.05]`, `enabled` bool, `btc_fill_timeout_seconds` in `[5, 600]`, `fallback_strike_attempts` in `[0, 4]` — failing loudly per §Config discipline; tests on both profiles.
+
+**Links:** FC-100, FC-112, `docs/CLAUDE.md` §Config discipline.
+
 
 ## Completed
 
