@@ -134,12 +134,19 @@ live-verified 2026-08-04 with `gcloud scheduler jobs list`):
 | `activities-ingest-market-hours` / `-off-hours` | every 15 min 09–16 ET / hourly otherwise | `/ingest-activities` |
 | `portfolio-history-ingest-daily` / `stock-history-ingest-daily` | 16:30 / 17:00 ET | ingest endpoints |
 
-`options-wheel-roll-friday` still exists but is **PAUSED** — FC-078 replaced it
-with the daily job. `cc-roll-daily` is the covered-call service's twin of
-`options-wheel-roll-daily`, created by FC-100 and **created PAUSED**: it is not
-resumed until FC-107 raises both bot services' Cloud Run `--timeout` from 300 s
-to 1800 s. What a cut at 300 s actually costs (the fc-100 amendment of
-2026-09-08 **withdrew** the earlier "stalls and resumes on the next request"
+`options-wheel-roll-friday` is **PAUSED and is deleted by FC-107's rollout step
+6** — FC-078 replaced it with the daily job, and nothing references it. It
+carries the 180 s default `attemptDeadline`: applied to the last 22 wheel roll
+cycles that deadline would have reported `DEADLINE_EXCEEDED` on three of them
+(187 s, 199 s, 259 s), so resumed by mistake it would report failures on
+ordinary days. The daily job's deadline is 1800 s.
+
+`cc-roll-daily` is the covered-call service's twin of `options-wheel-roll-daily`,
+created by FC-100 and **created PAUSED**: it is resumed once FC-107's
+`--timeout=1800` is verified live on `covered-call-engine` (§Deploy / CI, and
+that plan's rollout step 2 — the flag is live only from the first promote after
+the merge that set it). What a cut at 300 s actually cost (the fc-100 amendment
+of 2026-09-08 **withdrew** the earlier "stalls and resumes on the next request"
 account): the orphaned handler thread **keeps running under CPU throttling** —
 on 2026-08-13 an orphaned `/scan` thread emitted for ten minutes with no request
 in flight — so the ladder proceeds roughly on schedule and its terminals,
@@ -149,7 +156,7 @@ retries are 0) and the `/roll` response. The dangerous residual is **instance
 scale-in mid-ladder**. The precondition stands for the right reason: the
 roller's cycle budget was sized against an 1800 s request and the 300 s flag
 silently undid it. The seam is near — STO rung-1 timeouts in 4 of the last 8
-executed wheel rolls (≈135 s each), cycles up to 259 s, so a 3-ITM day has
+executed wheel rolls (≈135 s each), cycles up to 259 s, so a 3-ITM day had
 roughly even odds of a cut. The CC service's other seven jobs are
 `cc-scan-hourly` (`:00`, 10–15), `cc-execute-hourly` (`:15`, 10–15),
 `cc-monitor-hourly` (`:55`, 9–14), `cc-regression-hourly` (`:45`, 10–15),
@@ -464,6 +471,23 @@ Live covered-call management is, in full:
    `docs/plans/fc-075-phase-2.md` §Rolling scoped the roller *out* of the
    covered-call service ("Phase 3 must not schedule `/roll`"); that line is
    **superseded by FC-100** (2026-09-08).
+
+### Real-money gates
+
+Every item below is a precondition before **either** profile places a
+real-money order. They are independent: passing one passes nothing else, and
+this list — not any single plan — is where readiness is judged. Status as of
+2026-09-08.
+
+| Gate | Profile | Owner | Status |
+|---|---|---|---|
+| Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open |
+| Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 | both | FC-088 | filed |
+| `AlpacaClient` HTTP calls have no socket timeout; a hung lock-holder has no in-session bound (Cloud Run's cut does not stop the thread) | both | FC-089 | filed |
+| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 675 s per-position constant | both | FC-113 | filed |
+| `_is_market_open()` has no holiday calendar — orders can be placed into a closed market (09-07 IWM) | both | FC-114 | filed |
+| Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | this plan |
+| Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | plan approved |
 
 ## Accepted amnesia (process-local state)
 
@@ -1513,6 +1537,37 @@ against the 1500 s timeout, i.e. **~165 s** of headroom. `timeout:` therefore
 stays 1500 s. **Escalation rule:** if the measured post-merge single-build max
 exceeds **1000 s**, raise `timeout:` to 1800 s AND `BUILD_TIMEOUT_SECONDS` in
 `serialize-builds` in ONE commit — a contract test asserts the two stay equal.
+
+**The bot services' request timeout is one real-money gate among several — see
+§Real-money gates.** `deploy-bot-canary` and `deploy-cc-canary` pass
+`--timeout=1800` — Cloud Run's *request* timeout on the two bot services, a
+different thing from the build `timeout:` above (1500 s, the serialize-builds
+budget; the two never need to agree). It is 1800 because `/roll`'s cycle budget
+is `_CYCLE_BUDGET_SECONDS = 1500` (`src/strategy/wheel_engine.py`), sized by
+FC-078 against the daily roll job's 1800 s `attemptDeadline`, a position may
+*start* at 900 s and run five 135 s legs, and measured cycles already reach
+259 s with STO rung-1 timeouts in half of the executed rolls. What a cut does,
+measured 2026-08-13: Cloud Run returns 504 to the scheduler (a silent job
+failure) and does **not** kill the thread — the ladder keeps running roughly on
+schedule and its terminal events still fire if the instance lives; the `/roll`
+response is lost; and if the instance scales in mid-ladder the buy-to-close
+stands with no sell-to-open and no event (uncovered long stock until the next
+`/run` re-covers). `tests/test_cloudbuild_contract.py` pins the seam invariant —
+latest position start + the per-position worst case from each profile's
+`rolling.*` + a preamble allowance ≤ service timeout ≤ scheduler deadline — on
+both bot services, so raising the budget, a fill timeout or
+`fallback_strike_attempts` without the flag (or the flag without the fixture)
+fails the suite. Not covered by the flag: the roller's RTT-blind polling and the
+lock-wait blind spot (FC-113), and a hung lock-holder, for which FC-089's lock
+guard is now the only in-session bound. **Before either profile trades real
+money:** `gcloud run services describe <service> --region=us-central1
+--format='value(spec.template.spec.timeoutSeconds)'` must print `1800` on the
+service that will roll, and its roll job's `attemptDeadline` must be `1800s` —
+the flag is live only from the first promote after the merge that set it, and an
+out-of-band `services update --timeout` lasts exactly until the next merge.
+(`startup-cpu-boost: 'true'` on both bot services is not in `cloudbuild.yaml`
+either: it persists from hand provisioning, like the secret bindings, and a
+deploy without `--[no-]cpu-boost` leaves it alone.) FC-107.
 
 History, for the reasoning: under the old 1200 s timeout the pre-sim figures
 left **~42 s** of headroom at 798 s — and ~13 s at the measured 827 s — which is
