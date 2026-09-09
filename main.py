@@ -775,13 +775,21 @@ def battery_standing_specs(config: Config, *, today=None) -> list:
     day the lake is structurally incapable of holding (today's chain is still
     forming), which is the trailing-gap shape PR-c's coverage review found.
 
-    Wheel-only until Phase C: the replay has no profile awareness yet, so a
-    covered-call standing set would be the wheel's numbers under another name.
+    **Still wheel-only, now by CHOICE rather than by incapacity.** Phase C gave
+    the replay profile awareness, so a covered-call standing set is buildable —
+    and it is deliberately not built here in the same commit that makes it
+    possible. A CC standing set doubles the weekly cell count and its rows would
+    be the first covered-call measurements this project has ever taken; turning
+    it on belongs with an operator who is watching the first Saturday, not with
+    the merge that makes it possible. Each spec now STATES `strategy: wheel`, so
+    flipping the set is a one-line change per item with nothing implicit left.
     """
     from datetime import timedelta
 
     from src.backtesting.data.bar_store import last_settled_day
-    from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH
+    from src.backtesting.scenarios.identity import (
+        DEFAULT_STARTING_CASH, WHEEL_STRATEGY,
+    )
     from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
 
     end = last_settled_day(today)
@@ -806,6 +814,13 @@ def battery_standing_specs(config: Config, *, today=None) -> list:
             # the wrong place to pay for it.
             'run_sensitivity': False,
             'scenarios': [],
+            # FC-096 Phase C. STATED, not left to the absent-means-wheel
+            # default, so the stored spec_json says which strategy the weekly
+            # trend point measures and `validate_spec(spec) == spec` round-trips
+            # (the API normalises the field in either way). It costs nothing in
+            # the key: `canonical_spec` omits the wheel case, so every stored
+            # battery run keeps its sweep_key and its dedup.
+            'strategy': WHEEL_STRATEGY,
         })
     return specs
 

@@ -24,6 +24,8 @@ import {
   overridesDiff,
   parseCellRef,
   sameRef,
+  STRATEGY_REFUSAL,
+  SYMBOL_REFUSAL,
   type CompareRef,
   type CompareSide,
 } from './compareAlignment';
@@ -45,6 +47,7 @@ const side = (
     capitalBase?: number | null;
     artifact?: SimArtifact | null;
     status?: string | null;
+    specStrategy?: string | null;
   } = {},
 ): CompareSide => {
   const { sweep, report } = detail(payload);
@@ -58,11 +61,15 @@ const side = (
     stampedCapitalBase: over.capitalBase === undefined ? 100000 : over.capitalBase,
     artifact: over.artifact ?? null,
     status: over.status ?? 'done',
+    specStrategy: over.specStrategy ?? null,
   };
 };
 
 const outcome = (a: ReturnType<typeof alignCells>, id: string) =>
   a.rows.find((r) => r.id === id)?.outcome;
+
+const detailOf = (a: ReturnType<typeof alignCells>, id: string) =>
+  a.rows.find((r) => r.id === id)?.detail ?? '';
 
 describe('parseCellRef / formatCellRef — the URL round-trip', () => {
   it('round-trips a four-part ref', () => {
@@ -129,6 +136,10 @@ describe('the real pair: 13cc vs a48d — same spec, one engine move', () => {
   it('reports every row, including the ones that pass — checked ≠ unchecked', () => {
     expect(alignment.rows.map((r) => r.id)).toEqual([
       'symbol',
+      // FC-096 Phase C: the second refusal, checked right after symbol — both
+      // are "this is not two configs" statements and belong together, before
+      // any row that would otherwise draw two curves on one axis.
+      'strategy',
       'split',
       'window',
       'arm_identity',
@@ -427,5 +438,79 @@ describe('overridesDiff — the union of both arms’ keys, with each run’s ba
     const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' });
     const nested = { risk: { max_position_size: 0.1 } };
     expect(overridesDiff(a, b, nested, nested)[0].baseA).toBe('—');
+  });
+});
+
+// ==========================================================================
+// FC-096 Phase C — the strategy row (precondition added 2026-09-04, PR-5 review)
+// ==========================================================================
+describe('the strategy row refuses cross-strategy pairs', () => {
+  const wheelSide = () =>
+    side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' });
+  const ccSide = () =>
+    side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' },
+         { specStrategy: 'covered_call' });
+
+  it('REFUSES a covered-call cell against a wheel cell of the SAME symbol', () => {
+    // The exact hole the precondition names: same symbol, same window, same
+    // arm, same base config, same engine — every other row passes, and before
+    // this row the pair compared as if it were two settings of one strategy.
+    const alignment = alignCells(wheelSide(), ccSide());
+    expect(outcome(alignment, 'symbol')).toBe('aligned');
+    expect(outcome(alignment, 'strategy')).toBe('refused');
+    expect(alignment.refusal).toBe(STRATEGY_REFUSAL);
+    expect(alignment.allowsDelta).toBe(false);
+    expect(alignment.deltaRefusal).toBe(STRATEGY_REFUSAL);
+    expect(differenceOfDeltas(alignment, wheelSide(), ccSide())).toBeNull();
+  });
+
+  it('refuses even when both sides declare the SAME capital base', () => {
+    // The capital-base row was the only thing standing between a CC cell and a
+    // wheel cell, and it is not a guard: `capitalBaseOf` falls back to the
+    // spec's `starting_cash`, so an unstamped CC cell read "aligned" at $100k
+    // against a wheel cell. The strategy row must not depend on it.
+    const a = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' },
+                   { capitalBase: null });
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' },
+                   { capitalBase: null, specStrategy: 'covered_call' });
+    const alignment = alignCells(a, b);
+    expect(outcome(alignment, 'capital_base')).toBe('aligned');
+    expect(outcome(alignment, 'strategy')).toBe('refused');
+    expect(alignment.allowsDelta).toBe(false);
+  });
+
+  it('aligns two covered-call cells, and says which strategy they are', () => {
+    const alignment = alignCells(ccSide(), ccSide());
+    expect(outcome(alignment, 'strategy')).toBe('aligned');
+    expect(detailOf(alignment, 'strategy')).toContain('covered_call');
+  });
+
+  it('treats absence as wheel, so two legacy cells still compare', () => {
+    // Every artifact and every spec written before Phase C carries no
+    // strategy. If absence did not resolve to `wheel`, this merge would have
+    // refused every stored pair in the console.
+    const alignment = alignCells(wheelSide(), wheelSide());
+    expect(outcome(alignment, 'strategy')).toBe('aligned');
+    expect(detailOf(alignment, 'strategy')).toContain('wheel');
+    expect(alignment.refusal).toBeNull();
+  });
+
+  it('reads the ARTIFACT stamp when the spec says nothing', () => {
+    const stamped = {
+      provenance: { strategy: 'covered_call' },
+    } as unknown as SimArtifact;
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' },
+                   { artifact: stamped });
+    expect(outcome(alignCells(wheelSide(), b), 'strategy')).toBe('refused');
+  });
+
+  it('keeps the SYMBOL words when both symbol and strategy differ', () => {
+    // "These are two symbols" is the more basic statement; an operator who
+    // fixes it sees the strategy refusal on the next render.
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'UNH', split: 'fit' },
+                   { specStrategy: 'covered_call' });
+    const alignment = alignCells(wheelSide(), b);
+    expect(alignment.refusal).toBe(SYMBOL_REFUSAL);
+    expect(outcome(alignment, 'strategy')).toBe('refused');
   });
 });
