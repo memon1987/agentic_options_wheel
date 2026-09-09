@@ -263,6 +263,39 @@ class TestTheSweepProducesUsableEvidence:
 # --------------------------------------------------------------------------- #
 # H3 — the widened reach, on a real sweep
 # --------------------------------------------------------------------------- #
+class TestTheWheelMarkdownIsUnchanged:
+    """The claim `_covered_call_table` makes about itself, enforced.
+
+    It returns "" on a wheel run, but the separators around it were appended
+    unconditionally — so every wheel sweep report grew two blank lines.
+    Harmless to a reader and a false statement in a docstring, which is the
+    kind of thing that makes the next person stop trusting the rest of it.
+    Byte-checked here rather than eyeballed.
+    """
+
+    def test_a_wheel_sweep_report_has_no_stray_blank_run(self):
+        from src.backtesting.scenarios.report import render_markdown
+        from src.backtesting.scenarios.runner import Scenario, run_sweep
+        from src.utils.config import Config
+
+        from tests.test_backtest_simulator import dip_then_recovering_window
+
+        days, closes, expirations = dip_then_recovering_window()
+        result = run_sweep(
+            Config(),
+            [Scenario(name="tighter", overrides={"strategy.min_put_premium": 0.6})],
+            ["XYZ"], days[0], days[-1],
+            chain_store=_NoChainStore(),
+            bar_provider=ScriptedProvider("XYZ", closes, expirations),
+        )
+        markdown = render_markdown(result)
+        assert result.strategy == "wheel"
+        assert "### Covered-call detail" not in markdown
+        assert "\n\n\n" not in markdown, (
+            "the wheel report grew a blank run where the covered-call table "
+            "would have gone")
+
+
 class TestTheRollHorizonReach:
     def test_a_covered_call_sweep_materialises_to_the_roll_horizon(self, cc_sweep):
         result, artifacts, _sidecars, _days, _closes = cc_sweep
