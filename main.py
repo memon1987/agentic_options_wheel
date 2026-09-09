@@ -20,7 +20,18 @@ from src.api.market_data import MarketDataManager
 def main():
     """Main application entry point."""
     parser = argparse.ArgumentParser(description='Options Wheel Strategy')
-    parser.add_argument('--config', default='config/settings.yaml', help='Configuration file path')
+    # DEFAULT None (FC-096 Phase C §C1), not the wheel yaml. The flag now has to
+    # answer two questions, and a non-None default answered the second one
+    # wrongly: "which config does this PROCESS run under" (still the wheel yaml
+    # — see the bootstrap below, which substitutes it) and "did the operator
+    # SUPPLY an override for the sweep's replay profile". With the old default
+    # every invocation looked like a supplied wheel profile, so a
+    # `strategy: covered_call` spec would have been refused as contradictory on
+    # every path, the deployed Jobs included.
+    parser.add_argument('--config', default=None,
+                        help='Configuration file path (default: config/settings.yaml; '
+                             'for `sweep`, leaving it unset lets the spec\'s '
+                             '`strategy` choose the replay profile)')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
                        choices=['scan', 'status', 'report', 'backtest', 'screen',
@@ -76,8 +87,13 @@ def main():
         setup_logging(args.log_level)
         logger = get_logger(__name__)
 
-        # Load configuration
-        config = Config(args.config)
+        # Load configuration. This is the PROCESS CONTEXT — the dataset every
+        # writer uses, the analytics singleton's profile, the credentials — and
+        # it resolves to the wheel yaml whenever `--config` is absent, exactly
+        # as it did before `--config` gained a None default. Only the sweep's
+        # REPLAY config follows a spec's `strategy` (FC-096 Phase C, the
+        # strategy/context split); nothing here moves with it.
+        config = Config(args.config or DEFAULT_CONFIG_FILE)
 
         # FC-075 Seam 4: hand this process's profile to the AnalyticsWriter
         # singleton before anything can reach for it. The CLI selects its
@@ -92,7 +108,7 @@ def main():
                    event_category="system",
                    event_type="application_started",
                    command=args.command,
-                   config_file=args.config)
+                   config_file=str(config.config_path))
         
         # Backtesting builds its own data stack and must not touch the live
         # trading client, so it dispatches before those are constructed.
@@ -1417,7 +1433,106 @@ def _scenarios_from_entries(raw, where: str):
 SPEC_FIELDS = frozenset({
     'symbols', 'start', 'end', 'holdout_start', 'starting_cash',
     'run_sensitivity', 'scenarios', 'force',
+    # FC-096 Phase C §C1. Which STRATEGY PROFILE the replay runs under. Absent
+    # means `wheel`, and `identity.canonical_spec` omits both the absent and the
+    # explicit-wheel case from the key, so every legacy sweep_key is byte-stable.
+    'strategy',
 })
+
+#: Profile file per strategy. The mapping is here — in the entry point that
+#: resolves it — rather than on `Config`, because it is a fact about how THIS
+#: process is deployed (which yaml files ship in the image), not about what a
+#: config means.
+STRATEGY_CONFIG_FILES = {
+    'wheel': 'config/settings.yaml',
+    'covered_call': 'config/covered_call.yaml',
+}
+
+#: The process's own profile when `--config` is not supplied. Named rather than
+#: repeated so the bootstrap and the wheel branch of `resolve_replay_config`
+#: cannot drift apart about what "the default profile" is.
+DEFAULT_CONFIG_FILE = STRATEGY_CONFIG_FILES['wheel']
+
+
+def spec_strategy(spec: dict) -> str:
+    """The strategy a spec selects, validated. Absent -> ``wheel``.
+
+    The ENUM LIVES HERE (and in the dashboard's `validate_spec`), never in
+    `identity.py`: that module is stdlib-only and flat-copied into the dashboard
+    image, and a validator maintained in two images is a validator that drifts.
+    Its job is canonicalisation; this one's is refusal with a message.
+    """
+    from src.backtesting.scenarios.identity import STRATEGIES, WHEEL_STRATEGY
+
+    raw = spec.get('strategy')
+    if raw is None or str(raw).strip() == '':
+        return WHEEL_STRATEGY
+    value = str(raw).strip()
+    if value not in STRATEGIES:
+        raise SystemExit(
+            f"sweep spec: 'strategy' must be one of {sorted(STRATEGIES)}, got "
+            f"{raw!r}. Case matters — the value selects a profile file and is "
+            f"stamped on every row of the run."
+        )
+    return value
+
+
+def resolve_replay_config(args, spec: dict, process_config):
+    """The Config the REPLAY runs under — never the process's storage context.
+
+    FC-096 Phase C, the strategy/context split. A spec's ``strategy`` selects
+    the strategy PROFILE (gates, knobs, legs). It never selects the SERVICE
+    CONTEXT — dataset, buckets, credentials, provenance — which belongs to the
+    process and is ``process_config`` here. That is why a covered-call sweep run
+    by this process still writes its measurement rows to this process's own
+    dataset, self-described by the ``strategy`` column.
+
+    Resolution order, pinned because three ambiguous implementations existed:
+
+    1. A SUPPLIED ``--config`` is an override and wins.
+    2. Otherwise the spec's ``strategy`` selects the profile file.
+    3. A supplied ``--config`` whose ``strategy_id`` CONTRADICTS the spec's
+       ``strategy`` is refused loudly rather than silently picking one.
+
+    The override test is ``args.config is not None`` — the CLI FLAG — and never
+    the ``process_config`` object passed positionally into ``run_sweep_cmd``.
+    That object is process context; reading it as an override would refuse every
+    covered-call standing item the battery submits, because the deployed Jobs
+    pass no ``--config`` at all and would be seen as "supplied wheel profile
+    contradicts covered_call".
+    """
+    from src.utils.config import Config
+
+    declared = spec.get('strategy') not in (None, '')
+    strategy = spec_strategy(spec)
+    supplied = getattr(args, 'config', None)
+    if supplied is not None:
+        override = Config(supplied)
+        supplied_strategy = str(getattr(override, 'strategy_id', '') or '')
+        if declared and supplied_strategy != strategy:
+            # Only a spec that SAYS a strategy can contradict a supplied
+            # profile. A CLI sweep is `--scenarios <yaml> --config <profile>`
+            # with no spec at all, and treating its silence as an assertion of
+            # `wheel` would refuse the one command the rollout asks an operator
+            # to run first (`--config config/covered_call.yaml`).
+            raise SystemExit(
+                f"sweep: --config {supplied} declares strategy_id "
+                f"{supplied_strategy!r} but the spec asks for strategy "
+                f"{strategy!r}. Refusing rather than guessing which one you "
+                f"meant: the replay would measure one strategy and the rows "
+                f"would be stamped with the other."
+            )
+        # An undeclared spec takes its strategy FROM the supplied profile, so
+        # the rows and the artifacts are stamped with what actually ran.
+        return override, (strategy if declared else supplied_strategy or strategy)
+    profile = STRATEGY_CONFIG_FILES.get(strategy)
+    if profile is None:  # pragma: no cover - spec_strategy already refused
+        raise SystemExit(f"sweep: no profile file is mapped for {strategy!r}")
+    # The wheel profile IS the process default, so resolving it again would
+    # re-read and re-validate the same yaml for nothing.
+    if strategy == 'wheel' and process_config is not None:
+        return process_config, strategy
+    return Config(profile), strategy
 
 # Cloud Run caps a container's whole environment at 32 KiB and the spec is one
 # variable among several, so it gets a conservative slice of that. The dashboard
@@ -1749,6 +1864,26 @@ def run_sweep_cmd(args, config: Config, logger, *,
     if not symbols:
         raise SystemExit("sweep has no symbols: pass --symbols or configure stocks.symbols")
 
+    # --- the strategy/context split (FC-096 Phase C §C1) ------------------- #
+    #
+    # `replay_config` is what the SIMULATOR runs under: gates, knobs, legs, and
+    # the two config hashes that key the dedup. `config` — the positional
+    # argument — stays the PROCESS CONTEXT: the writer's dataset, the artifact
+    # bucket, the credentials, the analytics singleton already configured
+    # against it in `main()`.
+    #
+    # This is the FC-075 DD-4 exception, argued on the record in the plan: the
+    # dataset-isolation doctrine protects TRADING writers from contaminating
+    # each other, and the scenario tables are a MEASUREMENT store of hypotheses.
+    # One store with a `strategy` column is the design; splitting it would
+    # orphan every covered-call trend row from every reader.
+    #
+    # Note where the default symbols came from ABOVE: `config.stock_symbols`,
+    # the process (wheel) profile. That is deliberate — the covered-call profile
+    # has no `stocks:` section at all, because its live universe is
+    # holdings-derived, so a CC sweep iterates the wheel's live universe.
+    replay_config, strategy = resolve_replay_config(args, spec or {}, config)
+
     # Validate every override BEFORE anything is written or launched.
     # `run_sweep` validates too, but by then a `running` row exists and the
     # operator has a failed sweep in the store for what is a typo. This costs
@@ -1763,7 +1898,11 @@ def run_sweep_cmd(args, config: Config, logger, *,
     from src.backtesting.scenarios.overrides import validate_overrides
 
     for scenario in scenarios:
-        validate_overrides(scenario.overrides)
+        # FC-096 Phase C §C4: strategy-conditional. A covered-call spec that
+        # overrides a put-side key is refused HERE, before the store section, in
+        # the same words the dashboard refuses it in — both sides import the
+        # same `overrides.py`.
+        validate_overrides(scenario.overrides, strategy)
 
     # `base` is implicit UNLESS the file already declares it, so the banner must
     # not blindly add one — a file with an explicit `base` would be announced as
@@ -1802,6 +1941,11 @@ def run_sweep_cmd(args, config: Config, logger, *,
              'fill_haircut': s.fill_haircut}
             for s in scenarios
         ],
+        # FC-096 Phase C. Carried on the payload so the stored spec says which
+        # strategy ran. `canonical_spec` OMITS it when it is `wheel`, so every
+        # pre-existing sweep_key is byte-stable and no stored run loses its
+        # cache to this line.
+        'strategy': strategy,
     }
 
     persist = job_mode or bool(getattr(args, 'persist', False))
@@ -1831,7 +1975,12 @@ def run_sweep_cmd(args, config: Config, logger, *,
     identity = engine_identity()
     key = compute_sweep_key(spec_payload, engine_version=ENGINE_VERSION,
                             engine_identity=identity)
-    snapshot = sweep_store.base_config_snapshot(config)
+    # THE REPLAY's config, not the process's (FC-096 Phase C). This snapshot and
+    # its hash are what the dedup matches on, so keying them off the profile the
+    # simulator actually ran under is what makes `base_config_hash` the dedup
+    # belt across strategies: a wheel run and a covered-call run of the same
+    # window can never be served as each other's cached result.
+    snapshot = sweep_store.base_config_snapshot(replay_config)
     effective_hash = sweep_store.base_config_hash(snapshot)
     provenance = dict(
         run_id=run_id,
@@ -1857,7 +2006,7 @@ def run_sweep_cmd(args, config: Config, logger, *,
         # engine hash is still stored, separately, for the `backtest_runs`
         # linkage.
         base_config_hash=sweep_store.base_config_hash(snapshot),
-        engine_config_hash=config_hash(config),
+        engine_config_hash=config_hash(replay_config),
         # FC-096 Phase B B4. NULL on every run that is not a pin's; the battery
         # passes the pin it is re-measuring, and it is what makes that pin's
         # weekly history — and therefore the 3-week nag — queryable.
@@ -1953,7 +2102,7 @@ def run_sweep_cmd(args, config: Config, logger, *,
                 # `failed` row rather than a silent orphan.
                 chain_store = ChainStore.from_env()
                 result = run_sweep(
-                    config, scenarios, symbols, start, end,
+                    replay_config, scenarios, symbols, start, end,
                     holdout_start=holdout_start,
                     starting_cash=starting_cash,
                     run_sensitivity=run_sensitivity,

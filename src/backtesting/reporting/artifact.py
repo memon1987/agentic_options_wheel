@@ -143,6 +143,13 @@ class ArtifactMeta:
     git_commit: Optional[str] = None
     benchmark: Optional[BuyAndHold] = None
     capital_base: Optional[float] = None
+    #: The strategy profile this cell replayed under (FC-096 Phase C). Stamped
+    #: so the console's premise banner, the compare view's strategy row and the
+    #: digest all read ONE field rather than inferring the strategy from the
+    #: shape of the ledger. Absent/`None` means ``wheel`` — every artifact
+    #: written before Phase C is in that state, and the frontend's
+    #: ``artifactStrategy`` already resolves absence that way.
+    strategy: Optional[str] = None
 
 
 def _num(value: Any) -> Optional[float]:
@@ -336,6 +343,31 @@ def _benchmark_block(benchmark: Optional[BuyAndHold],
     }
 
 
+#: Absence of a `strategy` stamp means the wheel — every artifact written before
+#: FC-096 Phase C is in that state, and the frontend resolves it the same way.
+_WHEEL = "wheel"
+
+
+def _capital_base(meta: ArtifactMeta, result: SimulationResult) -> Optional[float]:
+    """The stamped capital base, or ``None`` for a non-wheel cell without one.
+
+    FC-096 Phase C (precondition added 2026-09-03). The wheel's capital base IS
+    its starting cash, so falling back to it there is a restatement of a fact.
+    For any other strategy it is a GUESS, and a wrong capital base is the worst
+    kind of console defect: every ratio on the page is scaled by it and every one
+    of them still looks like a number. `None` is refused-and-visible; a plausible
+    wrong number is not.
+    """
+    if meta.capital_base is not None:
+        return meta.capital_base
+    strategy = meta.strategy or getattr(result, "strategy", None) or _WHEEL
+    if strategy != _WHEEL:
+        return None
+    if meta.starting_cash is not None:
+        return meta.starting_cash
+    return result.starting_cash
+
+
 def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any]:
     """One cell's full detail artifact, ready for ``json.dumps``.
 
@@ -397,11 +429,25 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
         # covered-call one it is the synthetic lot's value, and the two are NOT
         # interchangeable. Stamped separately so the console divides by a number
         # the engine chose rather than by whichever field happens to be present.
-        "capital_base": _num(meta.capital_base
-                             if meta.capital_base is not None
-                             else meta.starting_cash
-                             if meta.starting_cash is not None
-                             else result.starting_cash),
+        # **The fallback is WHEEL-ONLY (FC-096 Phase C, precondition added
+        # 2026-09-03 from the Phase E PR-2 review).** As shipped, an unstamped
+        # base fell back to `starting_cash` for ANY strategy — so a covered-call
+        # cell that forgot the stamp would have shipped `capital_base` = the
+        # $5,000 buy-back float, the console would have trusted that positive
+        # number as authoritative, and every ratio on the page would have been
+        # divided by a number ~20x too small. It would have looked entirely
+        # plausible doing it, and §D-4's suppression path — the one that exists
+        # for exactly this — would have been unreachable.
+        #
+        # So a non-wheel artifact with no explicit base stamps `null` and
+        # REFUSES to guess. `null` is a state the console already renders (it
+        # suppresses the ratios and says why); a wrong number is not.
+        "capital_base": _num(_capital_base(meta, result)),
+        # FC-096 Phase C. Additive: the key is NEW on every artifact, and
+        # `None` on one built without the stamp. Consumers resolve absence to
+        # `wheel` (frontend `artifactStrategy`, and `_capital_base` below), which
+        # is what makes every artifact written before Phase C still readable.
+        "strategy": meta.strategy,
     }
 
     return {
@@ -442,7 +488,21 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
             "rolls_executed": int(result.rolls_executed),
             "final_equity": _num(result.final_equity),
             "total_return": _num(result.total_return),
+            # FC-096 Phase C. Zero/empty on every wheel cell. The roll SPLIT is
+            # carried beside `rolls_executed` rather than replacing it: an ITM
+            # defence and an OTM re-write of the engine's own call are both
+            # rolls, and only one of them is defence (FC-100 §Phase C hand-off).
+            "synthetic_lots_opened": int(getattr(result, "synthetic_lots_opened", 0) or 0),
+            "time_weighted_lot_value": _num(
+                getattr(result, "time_weighted_lot_value", 0.0)),
+            "calls_closed_early": int(getattr(result, "calls_closed_early", 0) or 0),
+            "itm_rolls": int(getattr(result, "itm_rolls", 0) or 0),
+            "otm_roll_outs": int(getattr(result, "otm_roll_outs", 0) or 0),
         },
+        # The coverage split, never a single ratio (plan §C3): covered /
+        # hold-uncovered / earnings-span / gate-rejected / post-call-away. Empty
+        # on a wheel cell.
+        "coverage_by_reason": dict(getattr(result, "coverage_by_reason", None) or {}),
         # FC-013 coverage, both reported rather than assumed away: a window that
         # reaches past a symbol's last table date stops gating it silently.
         "earnings_coverage": {
@@ -563,6 +623,8 @@ def bars_artifact(
     run_id: Optional[str] = None,
     engine_identity: Optional[str] = None,
     git_commit: Optional[str] = None,
+    strategy: Optional[str] = None,
+    capital_base: Optional[float] = None,
 ) -> Dict[str, Any]:
     """One window's bars sidecar: the closes the replay saw, and the B&H curve.
 
@@ -626,6 +688,15 @@ def bars_artifact(
             "data_from": _iso(all_dates[0]) if all_dates else None,
             "data_to": _iso(all_dates[-1]) if all_dates else None,
             "bars_in_window": len(rows),
+            # FC-096 Phase C (precondition added 2026-09-03). The sidecar
+            # carries the SAME two stamps as the cell artifact, for the same
+            # reason: the console reads a curve off here and a ratio off there,
+            # and a page that divided the two by different denominators would be
+            # wrong in a way neither object could reveal on its own. `None` on a
+            # wheel window, where the base is the starting cash and the B&H
+            # block below already states it.
+            "strategy": strategy,
+            "capital_base": _num(capital_base) if capital_base is not None else None,
         },
         "bars": rows,
         "buy_and_hold": _buy_and_hold_block(

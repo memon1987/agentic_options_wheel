@@ -375,14 +375,31 @@ class TestTheSchemaIsFrozen:
     def test_the_stamp_cannot_clobber_a_future_roller_field(self):
         """`{'day': ..., **record}` — ours first, the roller's second — so a
         roller that one day emits its own `day` wins rather than being silently
-        overwritten by the replay's."""
-        import inspect
+        overwritten by the replay's.
 
-        from src.backtesting.engine import simulator as sim
+        Asserted on BEHAVIOUR rather than on the source text. The source grep it
+        replaced broke the moment FC-096 Phase C renamed the loop variable while
+        preserving the exact guarantee — a test that fails on a rename and would
+        pass on a genuine reversal of the merge order is testing the wrong
+        thing. The two Phase C stamps (`itm_ratio`, `roll_kind`) use
+        `setdefault` for the same reason and are covered by the same assertion.
+        """
+        from src.backtesting.engine.simulator import Simulator
 
-        source = inspect.getsource(sim.Simulator.replay)
-        assert "{'day': day.isoformat(), **r}" in source, (
-            "the merge order is load-bearing: `**r` must come SECOND")
+        stamped = Simulator._stamp_roll_record(
+            {"success": True, "underlying": "AAA", "old_strike": 100.0,
+             "day": "roller-owns-this", "itm_ratio": "roller-owns-this-too"},
+            day=date(2024, 6, 3), close=105.0)
+        assert stamped["day"] == "roller-owns-this", (
+            "the merge order is load-bearing: the roller's own `day` must WIN")
+        assert stamped["itm_ratio"] == "roller-owns-this-too"
+
+        ours = Simulator._stamp_roll_record(
+            {"success": True, "underlying": "AAA", "old_strike": 100.0},
+            day=date(2024, 6, 3), close=105.0)
+        assert ours["day"] == "2024-06-03"
+        assert ours["itm_ratio"] == 1.05
+        assert ours["roll_kind"] == "itm_defence"
 
     def test_shares_held_is_on_every_daily_row(self):
         """M9's item: equity alone cannot tell a cash account from an assigned

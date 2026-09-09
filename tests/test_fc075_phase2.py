@@ -361,8 +361,16 @@ class TestCallOnlyFilter:
         return {"option_symbol": sym, "symbol": "AAPL", "type": "put"}
 
     def test_drops_puts_keeps_calls_and_logs(self, server):
+        # FC-096 Phase C §C4 moved the body to `src.strategy.strategy_gates` so
+        # the covered-call REPLAY can apply the same gate the covered-call
+        # SERVICE applies (the engine cannot import `cloud_run_server`). The
+        # patch target moves with it; `server._call_only_opportunities` is a
+        # re-export and is still what this test calls, which is the half of the
+        # move that must not be observable from outside.
+        from src.strategy import strategy_gates
+
         events = []
-        with patch.object(server, "log_error_event",
+        with patch.object(strategy_gates, "log_error_event",
                           side_effect=lambda *a, **k: events.append(k.get("error_type"))):
             kept = server._call_only_opportunities(
                 [self._call(), self._put(), self._call("NVDA260220C00500000")],

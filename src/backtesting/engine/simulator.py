@@ -982,21 +982,13 @@ class Simulator:
                     for record in (rolls.get('roll_details') or []):
                         if not record.get('success'):
                             continue
-                        stamped = {'day': day.isoformat(), **record}
-                        close = closes_by_day[day].get(record.get('underlying'))
-                        old_strike = float(record.get('old_strike') or 0.0)
-                        ratio = (close / old_strike
-                                 if close and old_strike > 0 else None)
-                        stamped.setdefault('itm_ratio',
-                                           None if ratio is None else round(ratio, 4))
-                        kind = None
-                        if ratio is not None:
-                            kind = 'itm_defence' if ratio >= 1.0 else 'otm_roll_out'
-                            if ratio >= 1.0:
-                                self._itm_rolls += 1
-                            else:
-                                self._otm_roll_outs += 1
-                        stamped.setdefault('roll_kind', kind)
+                        stamped = self._stamp_roll_record(
+                            record, day=day,
+                            close=closes_by_day[day].get(record.get('underlying')))
+                        if stamped.get('roll_kind') == 'itm_defence':
+                            self._itm_rolls += 1
+                        elif stamped.get('roll_kind') == 'otm_roll_out':
+                            self._otm_roll_outs += 1
                         self._roll_records.append(stamped)
                 except Exception:
                     logger.exception(
@@ -1087,6 +1079,48 @@ class Simulator:
             itm_rolls=self._itm_rolls,
             otm_roll_outs=self._otm_roll_outs,
         )
+
+    # ------------------------------------------------------------------ #
+    # Roll records (FC-078 stamp + FC-096 Phase C split)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _stamp_roll_record(record: Dict[str, Any], *, day: date,
+                           close: Optional[float]) -> Dict[str, Any]:
+        """The replay's three stamps on one executed roll's success record.
+
+        ``day`` because ``execute_roll``'s record carries none — in production
+        the log line's timestamp IS the date, and a stored artifact read months
+        later has no such context.
+
+        ``itm_ratio`` and ``roll_kind`` because a roll count alone cannot
+        distinguish a DEFENCE (the stock is through the strike and assignment is
+        the alternative) from a ROLL-OUT (the roller re-writing the engine's own
+        freshly-sold call, which is OTM by construction and bypasses every entry
+        gate on its way to a higher strike). FC-100 §Phase C hand-off requires
+        the split: it is moot on the covered-call profile, whose
+        ``itm_trigger_ratio`` is 1.00, and load-bearing on the wheel's 0.98,
+        which is exactly what FC-112 is meant to settle with measurement.
+
+        The ratio is computed from the day's CLOSE over the old strike. That is
+        not an approximation of what the roller saw — it is the same number: the
+        backtest adapter's stock quote is ``bid == ask == close``, so the mid the
+        roller gated on IS this close.
+
+        **All three are `setdefault`, ours first, the roller's second.** If
+        ``CallRoller`` ever emits its own ``day``, ``itm_ratio`` or ``roll_kind``,
+        the producer's value wins rather than being silently overwritten by the
+        replay's reconstruction.
+        """
+        stamped: Dict[str, Any] = {'day': day.isoformat(), **record}
+        old_strike = float(record.get('old_strike') or 0.0)
+        ratio = close / old_strike if close and old_strike > 0 else None
+        stamped.setdefault(
+            'itm_ratio', None if ratio is None else round(ratio, 4))
+        stamped.setdefault(
+            'roll_kind',
+            None if ratio is None
+            else ('itm_defence' if ratio >= 1.0 else 'otm_roll_out'))
+        return stamped
 
     # ------------------------------------------------------------------ #
     # The synthetic lot (FC-096 Phase C §C2)

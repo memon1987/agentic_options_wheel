@@ -273,6 +273,16 @@ DEFAULT_FILL_HAIRCUT = 0.25
 # would never be comparable and a second force would never dedup either.
 NON_IDENTITY_FIELDS = frozenset({"force"})
 
+# FC-096 Phase C §C1. The strategy profile a spec selects, and the LEGACY value
+# that canonicalises to absence. Duplicated from ``engine.simulator`` for the
+# same reason ``BASE_SCENARIO_NAME`` and ``DEFAULT_FILL_HAIRCUT`` are: this
+# module is stdlib-only and flat-copied into the dashboard image, which imports
+# no engine. Pinned equal by a test.
+WHEEL_STRATEGY = "wheel"
+COVERED_CALL_STRATEGY = "covered_call"
+#: The closed set the validators accept. Order is the display order.
+STRATEGIES = (WHEEL_STRATEGY, COVERED_CALL_STRATEGY)
+
 
 def _canonical_number(value: Any) -> Any:
     """Fold numeric leaves so ``1000`` and ``1000.0`` hash the same.
@@ -371,7 +381,24 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
     symbols: Sequence[Any] = spec.get("symbols") or []
     holdout = spec.get("holdout_start")
     cash = spec.get("starting_cash")
-    return {
+    # FC-096 Phase C §C1 — CANONICALISATION BY OMISSION.
+    #
+    # Absent OR explicit `"wheel"` -> the key is not written at all; only a
+    # non-wheel strategy appears. Probe-verified: writing `"wheel"` in changes
+    # EVERY legacy sweep_key, so every stored run would miss its own cache and
+    # the first Saturday after the merge would replay the entire battery.
+    # Folding the EXPLICIT value matters as much as the absent one, because the
+    # dashboard's normalised spec always stamps a strategy — without the fold, a
+    # dashboard submission and the identical CLI submission would key
+    # differently and never dedup against each other.
+    #
+    # No enum validation here, deliberately: `identity.py` is stdlib-only and
+    # flat-copied into the dashboard image, and a validator in two images is a
+    # validator that drifts. The enum lives in the VALIDATORS — `main`'s
+    # SPEC_FIELDS check and `sweeps.validate_spec` — which is where a bad value
+    # gets a message a submitter can act on.
+    strategy = spec.get("strategy")
+    canonical = {
         "symbols": sorted({str(s).strip().upper() for s in symbols}),
         "start": str(spec.get("start") or ""),
         "end": str(spec.get("end") or ""),
@@ -380,6 +407,9 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
         "run_sensitivity": bool(spec.get("run_sensitivity", False)),
         "scenarios": scenarios,
     }
+    if strategy is not None and str(strategy).strip() != WHEEL_STRATEGY:
+        canonical["strategy"] = str(strategy).strip()
+    return canonical
     # `force` is deliberately absent — see NON_IDENTITY_FIELDS.
 
 
