@@ -381,6 +381,19 @@ steps:
   # confirmed to exist afterwards. The retry covers Cloud Run's optimistic-concurrency
   # error from an OUT-OF-BAND write (an operator `services update` mid-build); it can
   # no longer race another build, because serialize-builds ran first.
+  #
+  # --timeout=1800  Cloud Run's REQUEST timeout on this service — not the build
+  #                 `timeout:` at the bottom of this file, which is the
+  #                 serialize-builds budget and is unchanged. /roll's cycle
+  #                 budget is 1500 s (src/strategy/wheel_engine.py
+  #                 _CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
+  #                 attempt-deadline, and a position may START at 900 s and run
+  #                 5 legs x 135 s. At the old 300 s Cloud Run returned 504 to
+  #                 the scheduler mid-ladder; the thread kept trading unobserved
+  #                 (the response and duration were lost) and died if the
+  #                 instance scaled in. FC-107. Pinned as a seam invariant from
+  #                 the roller's constants + this profile's rolling.* config by
+  #                 tests/test_cloudbuild_contract.py.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     env:
@@ -410,7 +423,7 @@ steps:
             --concurrency=10 \
             --max-instances=1 \
             --min-instances=0 \
-            --timeout=300 \
+            --timeout=1800 \
             --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,GIT_COMMIT=$COMMIT_SHA,CHAIN_LAKE_BUCKET=options-wheel-chain-lake \
             --no-traffic \
             --tag=canary \
@@ -558,6 +571,19 @@ steps:
   # -cc secrets, FINNHUB_API_KEY) are a separate list that --set-env-vars does
   # not touch; do NOT add --set-secrets here (a typo'd name would break the
   # service — bindings persist from provisioning, docs/plans/fc-075-cc-deploy-step.md).
+  #
+  # --timeout=1800  Cloud Run's REQUEST timeout on this service — not the build
+  #                 `timeout:` at the bottom of this file, which is the
+  #                 serialize-builds budget and is unchanged. /roll's cycle
+  #                 budget is 1500 s (src/strategy/wheel_engine.py
+  #                 _CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
+  #                 attempt-deadline, and a position may START at 900 s and run
+  #                 5 legs x 135 s. At the old 300 s Cloud Run returned 504 to
+  #                 the scheduler mid-ladder; the thread kept trading unobserved
+  #                 (the response and duration were lost) and died if the
+  #                 instance scaled in. FC-107. Pinned as a seam invariant from
+  #                 the roller's constants + this profile's rolling.* config by
+  #                 tests/test_cloudbuild_contract.py.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     env:
@@ -580,7 +606,7 @@ steps:
             --concurrency=10 \
             --max-instances=1 \
             --min-instances=0 \
-            --timeout=300 \
+            --timeout=1800 \
             --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,STRATEGY_CONFIG=config/covered_call.yaml,GIT_COMMIT=$COMMIT_SHA \
             --no-traffic \
             --tag=canary \
