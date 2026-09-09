@@ -1024,7 +1024,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
 **Scope:** covered_call
-**Status:** DECIDED 2026-09-08 — wire rolling (operator); plan `docs/plans/fc-100.md` next, lands before the FC-096 Phase C build. Originally: Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
+**Status:** DECIDED 2026-09-08 — wire rolling (operator), with `itm_trigger_ratio: 1.00` on the covered-call profile (operator-confirmed after the plan review: true-ITM-only defence, a stated Symmetry difference; the wheel's 0.98 → FC-112); plan `docs/plans/fc-100.md` rev 2 in progress, lands before the FC-096 Phase C build. Originally: Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
 **Size estimate:** S (decision) / S (build either way)
 **Owner:** zeshan (operator decision)
 **Plan file:** not yet
@@ -1144,6 +1144,42 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Proposal:** feed the earnings/dividend calendar the FC-013 gate already has into the roller's imminence test: when extrinsic < next dividend and ex-date < expiry, treat as imminent (roll or accept assignment deliberately). Applies to both profiles by Symmetry; the backtest engine already models ex-div early assignment (FC-042 Track C), so the sim can measure the change first.
 
 **Links:** FC-100, FC-013, FC-042 Track C.
+
+### FC-110: the roll path ignores `universe.excluded_symbols`
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 plan review)
+**Size estimate:** S
+
+**Problem:** only the scanner reads `universe.excluded_symbols` (`options_scanner.py`). An operator who excludes a symbol while a short call is open stops new writes, but `/roll` will still buy-to-close and sell-to-open a replacement on that symbol — the key's stated contract ("never write calls against") is violated by the roller. Interim runbook line (FC-100): to opt out of a symbol with an open short call, also pause the roll job or close the call.
+
+**Proposal:** `CallRoller` skips excluded underlyings with an `excluded_by_config` terminal event; the wheel is byte-identical because its set is empty. Test on both profiles.
+
+**Links:** FC-100, FC-075, `docs/gates.md` §roll path.
+
+### FC-111: the `/regression` monitor's covered-call instance reads the WHEEL's logs
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (found by the FC-100 plan review)
+**Size estimate:** S
+
+**Problem:** `tools/testing/regression_monitor.py` hardcodes `resource.labels.service_name="options-wheel-strategy"` in its log checks, so `cc-regression-hourly` reads the wheel's logs while reporting on the covered-call service; and its `severity>=ERROR` filter matches nothing on either service because app events land with empty severity (the Cloud Run plain-text/JSON gotcha already known from FC-030). FC-082 derived the dataset from the profile but not the service name. Net: no covered-call runtime error can move a `/regression` check.
+
+**Proposal:** derive the service name from the profile (or an env the deploy step sets), filter on `jsonPayload.event_category` / `event_type` instead of severity, and add a test that the CC instance's queries name the CC service. Pairs with FC-108 (roll blindness).
+
+**Links:** FC-082, FC-100, FC-108, FC-030.
+
+### FC-112: revisit the wheel's roll trigger (`itm_trigger_ratio: 0.98`) with measured evidence
+
+**Scope:** wheel
+**Status:** Filed 2026-09-08 (operator, after the FC-100 discussion: the covered-call profile is set to 1.00; the wheel's 0.98 is an FC-078 decision to be re-decided on numbers)
+**Size estimate:** S (a simulation study on the console; a config change only if the numbers say so)
+
+**Problem:** the roll trigger fires at 98% of the strike. Both profiles write short-dated calls at 0.15–0.25 delta, which are born at 97–99% of the strike, so the roller can same-day re-write the engine's own call — buy back at the ask, sell a higher strike up to 14 days further out at any delta ≤ 0.60, bypassing every entry gate (delta band, DTE target, premium/spread floors). Live evidence: the wheel's IWM call was rolled on 09-04 and again on 09-08 (+$100 net credit, longer tenor, higher delta). Whether that is defence or churn has never been measured; FC-078 accepted 0.98 on the wheel by analogy, not data.
+
+**Proposal:** first real study on the FC-096 console — the wheel's standing battery set with `rolling.itm_trigger_ratio` ∈ {0.98, 1.00} (and `rolling.enabled: false` as the control), holdout discipline on, compared on total P&L, premium, called-away count and roll count; the roll-credit metric split into ITM rolls (ratio ≥ 1.0) vs OTM roll-outs (0.98–1.0) so re-writes are not counted as defence. Requires `rolling.*` on the sweep allowlist (it is — `overrides.py`) and FC-100's Phase C hand-off note on chain reach (target 7 + extension 14 needs ≥ 21 DTE, which the lake has). Decision recorded as an FC-078 amendment either way.
+
+**Links:** FC-078, FC-100 (CC profile at 1.00 — a stated Symmetry difference until this is decided), FC-096 Phase E (the console), FC-060 guardrails.
 
 
 ## Completed
