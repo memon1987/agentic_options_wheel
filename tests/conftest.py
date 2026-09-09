@@ -207,6 +207,26 @@ def _isolated_bars_cache(monkeypatch, request, _bars_cache_root):
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _deterministic_alpaca_credentials_for_module_scoped_fixtures():
+    """The session-scoped twin of `_deterministic_alpaca_credentials` below.
+
+    A function-scoped autouse fixture runs AFTER every module- or
+    session-scoped fixture in the same test, so a module-scoped fixture that
+    builds a real `Config` (the FC-096 Phase C covered-call replay fixtures)
+    saw no credentials in Cloud Build and errored at setup — 39 errors on
+    2026-09-09, the eleventh instance of the ambient-environment class. Every
+    developer venv passed because the repo's `.env` supplied the keys. This
+    pin runs once before anything else and is undone at session end; the
+    function-scoped fixture keeps re-asserting the same values per test.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("ALPACA_API_KEY", "test_api_key")
+    mp.setenv("ALPACA_SECRET_KEY", "test_secret_key")
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_alpaca_credentials(monkeypatch):
     """Every test sees the same fake Alpaca credentials.
