@@ -174,3 +174,95 @@ FORECAST_REFUSAL_IN_SAMPLE = (
     'This run is IN-SAMPLE ONLY, so there is no forecast. The range needs two '
     'windows — a fit rate and a holdout rate — and an in-sample run has only '
     'the window it was chosen from. Re-run with a holdout.')
+
+# --------------------------------------------------------------------------- #
+# FC-096 Phase C — the covered-call footer, copied from `report.py`.
+#
+# Emitted conditionally on BOTH sides and by different routes, exactly as
+# DTE_REACH_BIAS is: the CLI reads `SweepResult.strategy`, and the dashboard
+# reads the persisted `spec_json.strategy` (absent -> wheel). The parity test
+# pins the WORDS; each side owns its own condition.
+# --------------------------------------------------------------------------- #
+SYNTHETIC_LOT_BIAS = ('The stock leg is ASSUMED, not bought — every number here is relative to a '
+ 'lot the engine created',
+ 'A covered-call cell seeds 100 shares at the window-start close and, when '
+ "they are called away, seeds a fresh lot at the NEXT session's close "
+ '(signed decision, 2026-09-08). So the stock leg is a CHAIN of lots, each '
+ 'with its own basis, and the window is measured end to end on every symbol '
+ 'rather than truncating at the first call-away — which would have biased '
+ 'against exactly the names that ran up fastest. Consequences to read with: '
+ 'the capital base is the lot, not the `starting_cash` on the spec (that is '
+ 'a small stated buy-back float, not a stake); the buy-and-hold benchmark is '
+ 'THE SAME LOT held and never written against, so `excess_return` compares '
+ 'two uses of one position; `premium_yield_on_lot` — the headline — is '
+ 'annualized net premium over the TIME-WEIGHTED lot value, while '
+ "`annualized_return` is the equity return and therefore carries the shares' "
+ 'own price move. A symbol whose shares fell can show a strong yield and a '
+ 'negative return at once; both are true and they answer different '
+ 'questions. Finally, because the lot is assumed, this says nothing about '
+ 'entry: a real programme had to buy those shares somewhere, and 12-month '
+ 'windows on names that survived to be candidates carry the usual selection '
+ 'bias on top.')
+
+MODEL_SPREAD_BIAS = ('The bid/ask spread GATE was suspended for this run, because the modelled '
+ 'spread rejects every contract by construction',
+ '`universe.max_spread_pct` is read off MODELLED bid/ask (FC-051), whose '
+ 'half-spread is at least 5% of mark for an OTM contract — so the '
+ "covered-call profile's 0.10 rejected 10 of 10 premium-floor-clearing calls "
+ "in the probe, and the arm would have reported 'this strategy never found a "
+ "candidate' when what it never found was a spread the model could produce. "
+ 'The gate is suspended HERE ONLY; the live service still applies it. Read '
+ 'this as an OPTIMISTIC bias of unknown size: the replay writes calls the '
+ 'live inventory validator might have refused for illiquidity, and the '
+ 'modelled spread measures ~2.46x wider than the real book, so the direction '
+ 'is not even reliably one way. A test pins the suspension to the spread '
+ 'model, so the day real spreads arrive this fails loudly and the gate is '
+ 'restored deliberately rather than staying off because nobody remembered it '
+ 'was.')
+
+ROLL_REACH_BIAS = ('Covered-call ROLL credits and roll counts are biased DOWN by the chain '
+ "lake's reach",
+ "The roller's replacement search runs to `old_expiry + max_extension_days` "
+ '= 14 days, and the covered-call profile writes at a 14-DTE target, so a '
+ 'full candidate set needs 28 DTE of chain. The lake is built at 22 (FC-096 '
+ 'Phase A). The truncation is PARTIAL, not total: it bites only when the old '
+ 'call was written at the 14-DTE ceiling AND is evaluated early in its life '
+ '— replacement expiries in the 23-28 DTE band are simply absent from the '
+ 'file. A call written at <=8 DTE, or evaluated >=6 days into a 14-DTE life, '
+ 'sees its whole legal set. Direction: FEWER candidates, never more, so the '
+ "replay's roll counts and captured credits are floors rather than "
+ 'estimates, and the miss is concentrated in early-ITM moves on '
+ 'freshly-written calls. Separately, and in the OPPOSITE direction: the live '
+ 'roller places its BTC at the old ask and its STO at the candidate bid, '
+ 'while this engine fills every order at its haircut price from mid — so a '
+ 'modelled roll captures more credit than the same roll would live. The two '
+ 'biases are not netted here because neither is measured; they are both '
+ 'named.')
+
+CC_ROLL_SPLIT_NOTE = ('Rolls are split into ITM defences and OTM roll-outs, and only the first is '
+ 'defence',
+ 'An ITM roll (stock/strike >= 1.0) acts when the stock is through the '
+ 'strike and assignment is the alternative. An OTM roll-out (0.98-1.0) is '
+ 'the roller re-writing a call that was never threatened — buying it back at '
+ 'the ask and selling a higher strike up to 14 days further out at any delta '
+ '<= 0.60, which bypasses the delta band, the DTE ceiling, the premium floor '
+ 'and the spread gate that the entry path applies. The covered-call '
+ "profile's `itm_trigger_ratio` is 1.00, so the second bucket should be "
+ "EMPTY here and a non-zero count is a finding. The wheel's is 0.98, where "
+ 'the distinction is load-bearing (FC-112).')
+
+MONITOR_LEG_NOTE = ('The covered-call replay runs the /monitor profit-taking leg; the wheel '
+ 'replay does not',
+ '52% of real covered calls are closed early at a DTE-banded profit target '
+ 'rather than held to expiry, so a replay without that leg measures a '
+ 'strategy nobody runs. It is modelled here for the covered-call profile '
+ 'using `CallSeller.should_close_call_early` — the real predicate, over the '
+ "profile's own bands. Two divergences remain, both named rather than "
+ 'corrected: the live bands are DTE-keyed to <=7 while this profile writes '
+ 'at a 14-DTE target, so a fresh call sits above the top band for its first '
+ 'week (FC-086); and production prices the buy-back limit at ask x 0.95 '
+ 'while this engine fills at its haircut price, because a '
+ 'one-decision-per-day replay has no intraday path along which to test '
+ 'whether a limit was touched. The WHEEL replay is deliberately untouched — '
+ 'adding the leg there would move every stored wheel result at once, which '
+ 'needs its own FC and its own re-baseline.')

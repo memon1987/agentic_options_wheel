@@ -197,6 +197,10 @@ _WORKER: Optional[threading.Thread] = None
 
 _CONFIG: Any = None
 _CONFIG_LOCK = threading.Lock()
+#: FC-096 Phase C §C1: the per-STRATEGY replay profiles, built lazily at most
+#: once each. Separate from `_CONFIG`, which is the PROCESS CONTEXT (dataset,
+#: buckets, credentials) and never moves with a spec's strategy.
+_STRATEGY_CONFIGS: Dict[str, Any] = {}
 _WRITER: Any = None
 _WRITER_LOCK = threading.Lock()
 _BARS: Any = None
@@ -216,21 +220,84 @@ class SpecRefused(Exception):
 # --------------------------------------------------------------------------- #
 # Lazily-built process singletons
 # --------------------------------------------------------------------------- #
-def get_config():
-    """The service's ``Config``, built once.
+def get_config(strategy: Optional[str] = None):
+    """The service's ``Config`` for one STRATEGY, built once PER STRATEGY.
 
-    Once, because ``Config()`` reads and validates a yaml and the account
-    interlock, and because every request must see the same effective
-    configuration: the dedup's ``base_config_hash`` is computed from it, and a
-    config that changed between two requests of one process would make two
-    identical specs key differently.
+    Once per strategy, because ``Config()`` reads and validates a yaml and the
+    account interlock, and because every request must see the same effective
+    configuration PER STRATEGY: the dedup's ``base_config_hash`` is computed
+    from it, and a config that changed between two requests of one process
+    would make two identical specs key differently.
+
+    FC-096 Phase C §C1. ``strategy=None`` is the PROCESS CONTEXT — the profile
+    this deployment runs under, from ``STRATEGY_CONFIG`` as before — and it is
+    what the writer's dataset, the artifact bucket and the bar provider resolve
+    against. A named strategy returns that strategy's REPLAY profile. The two
+    are deliberately different questions (the strategy/context split): a
+    covered-call spec submitted to this wheel-context service replays the
+    covered-call profile and still writes its measurement rows here.
+
+    Both profiles are loaded lazily, at most once each, and cached for the life
+    of the process.
     """
     global _CONFIG
+    from src.utils.config import Config
+
+    if strategy is None:
+        with _CONFIG_LOCK:
+            if _CONFIG is None:
+                _CONFIG = Config()
+            return _CONFIG
     with _CONFIG_LOCK:
-        if _CONFIG is None:
-            from src.utils.config import Config
-            _CONFIG = Config()
-        return _CONFIG
+        cached = _STRATEGY_CONFIGS.get(strategy)
+        if cached is not None:
+            return cached
+    # Built OUTSIDE the lock: `Config()` reads a file and validates, and the
+    # process-context branch above must not block on a replay profile's I/O.
+    # A benign race builds it twice and the loser is discarded — the object is
+    # immutable in practice and both copies hash identically, which is the
+    # property the dedup depends on.
+    import main as cli
+
+    profile = cli.STRATEGY_CONFIG_FILES.get(strategy)
+    if profile is None:
+        raise SpecRefused(422, f"no profile is mapped for strategy {strategy!r}")
+    built = Config(profile)
+    with _CONFIG_LOCK:
+        return _STRATEGY_CONFIGS.setdefault(strategy, built)
+
+
+def _spec_strategy_or_wheel(spec: Any) -> str:
+    """The spec's strategy for a validator that runs BEFORE the enum check.
+
+    The override loop needs to know the strategy in order to refuse a put key,
+    and it runs before `spec_strategy` has had its say. An unrecognised value
+    resolves to `wheel` HERE and is refused with its own message a few lines
+    later — refusing "your profile writes no puts" for a strategy that does not
+    exist would answer the wrong question.
+    """
+    from src.backtesting.scenarios.identity import STRATEGIES, WHEEL_STRATEGY
+
+    raw = spec.get("strategy") if isinstance(spec, dict) else None
+    value = str(raw).strip() if raw not in (None, "") else WHEEL_STRATEGY
+    return value if value in STRATEGIES else WHEEL_STRATEGY
+
+
+def replay_config_for(spec: Dict[str, Any]):
+    """The Config a normalised spec's replay runs under. Never the context."""
+    from src.backtesting.scenarios.identity import WHEEL_STRATEGY
+
+    strategy = str(spec.get("strategy") or WHEEL_STRATEGY)
+    context = get_config()
+    # The short-circuit is on what the PROCESS CONFIG ACTUALLY IS, never on
+    # "wheel is the default so it must be the context". This service is deployed
+    # today with the wheel profile, but the same image behind `STRATEGY_CONFIG=
+    # config/covered_call.yaml` would otherwise have replayed every `wheel` spec
+    # against the covered-call profile while stamping the rows `wheel` — a wrong
+    # answer that nothing downstream could detect.
+    if str(getattr(context, "strategy_id", "") or "") == strategy:
+        return context
+    return get_config(strategy)
 
 
 def get_writer():
@@ -278,6 +345,7 @@ def reset_for_tests() -> None:
     global _CONFIG, _WRITER, _BARS, _CURRENT, _WORKER
     with _CONFIG_LOCK:
         _CONFIG = None
+        _STRATEGY_CONFIGS.clear()
     with _WRITER_LOCK:
         _WRITER = None
     with _BARS_LOCK:
@@ -386,7 +454,11 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
                 f"every delta is measured against, and it is added "
                 f"automatically")
         try:
-            validate_overrides(scenario.overrides)
+            # Strategy-conditional (FC-096 Phase C §C4). `strategy` is resolved
+            # below, so it is read here through the same enum helper rather
+            # than re-derived — a put-side override on a covered-call spec is
+            # refused in the Job's exact words.
+            validate_overrides(scenario.overrides, _spec_strategy_or_wheel(spec))
         except OverrideError as exc:
             raise SpecRefused(422, f"scenario '{scenario.name}': {exc}")
 
@@ -435,6 +507,14 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
     if not isinstance(force, bool):
         raise SpecRefused(422, "'force' must be true or false")
 
+    # FC-096 Phase C §C1. `main.spec_strategy` is the ENUM, reused rather than
+    # re-implemented for the same reason every other check on this path is: two
+    # parsers is how an API accepts a spec the Job then refuses.
+    try:
+        strategy = cli.spec_strategy(spec)
+    except SystemExit as exc:
+        raise SpecRefused(422, str(exc))
+
     normalised: Dict[str, Any] = {
         "symbols": symbols,
         "start": start.isoformat(),
@@ -447,9 +527,15 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
              "fill_haircut": s.fill_haircut}
             for s in scenarios
         ],
+        # Always present on the normalised form, `wheel` included. It is the
+        # CANONICALISER (`identity.canonical_spec`) that drops the wheel case
+        # from the key, not this shape — which is what lets a stored spec_json
+        # say which strategy ran while every legacy key stays byte-stable.
+        "strategy": strategy,
     }
     return {"spec": normalised, "scenarios": scenarios, "start": start,
-            "end": end, "holdout_start": holdout_start, "force": force}
+            "end": end, "holdout_start": holdout_start, "force": force,
+            "strategy": strategy}
 
 
 def _release_minutes(row: Dict[str, Any]) -> int:
@@ -689,7 +775,9 @@ def _replay(run: "_Run") -> None:
     try:
         run.chain_store = ChainStore.from_env()
         run.result = run_sweep(
-            get_config(), run.scenarios, run.spec["symbols"],
+            # The REPLAY profile (FC-096 Phase C). The writer's dataset and the
+            # artifact bucket below are unchanged — they are process context.
+            replay_config_for(run.spec), run.scenarios, run.spec["symbols"],
             run.start, run.end,
             holdout_start=run.holdout_start,
             starting_cash=run.spec["starting_cash"],
@@ -1030,7 +1118,12 @@ def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None)
     identity = engine_identity()
     key = compute_sweep_key(spec, engine_version=ENGINE_VERSION,
                             engine_identity=identity)
-    snapshot = sweep_store.base_config_snapshot(get_config())
+    # The REPLAY profile's snapshot (FC-096 Phase C). `base_config_hash` is what
+    # the dedup matches on, so taking it over the config the simulator will
+    # actually run under is what makes it the dedup belt ACROSS strategies: a
+    # wheel run and a covered-call run of the same window can never be served as
+    # each other's cached result.
+    snapshot = sweep_store.base_config_snapshot(replay_config_for(spec))
     effective_hash = sweep_store.base_config_hash(snapshot)
 
     if not parsed["force"]:
@@ -1114,7 +1207,7 @@ def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None)
             spec=spec,
             base_config=snapshot,
             base_config_hash=effective_hash,
-            engine_config_hash=config_hash(get_config()),
+            engine_config_hash=config_hash(replay_config_for(spec)),
             # Read by `services/sweeps.row_liveness_seconds`. It rides in the
             # provenance dict so EVERY row of this run carries it: `submitted`,
             # `running` and the terminal one all go through

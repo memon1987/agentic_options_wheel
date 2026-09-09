@@ -143,6 +143,20 @@ def is_wheel(config: Config) -> bool:
     return replay_strategy(config) == WHEEL_STRATEGY
 
 
+def spread_gate_would_suspend(config: Config) -> bool:
+    """Whether a replay under ``config`` suspends the modelled spread gate.
+
+    The PREDICATE, extracted so the footer and the replay cannot disagree about
+    whether a suspension happened. Pure: it reads two values and opens nothing,
+    which is why the runner can ask it without building a Simulator (whose
+    constructor loads the earnings table and the dividend schedule).
+    """
+    if is_wheel(config):
+        return False
+    universe = config._config.get("universe")
+    return isinstance(universe, dict) and universe.get("max_spread_pct") is not None
+
+
 #: The covered-call replay's cash float (FC-096 Phase C, C3). It is NOT the
 #: capital base — the lot is (see ``metrics.fitness.capital_base``). It exists
 #: because a covered-call programme still needs cash to buy a call back on the

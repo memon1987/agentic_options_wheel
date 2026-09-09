@@ -39,6 +39,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services.sweep_report_text import (
     BASE_SCENARIO_NAME,
+    CC_ROLL_SPLIT_NOTE,
     CROSS_SCENARIO_CAVEAT,
     DTE_REACH_BIAS,
     DTE_REACH_BIAS_THRESHOLD,
@@ -47,7 +48,11 @@ from services.sweep_report_text import (
     HOLDOUT_SEMANTICS,
     IN_SAMPLE_BANNER,
     MIN_DAYS_IN_POSITION,
+    MODEL_SPREAD_BIAS,
+    MONITOR_LEG_NOTE,
+    ROLL_REACH_BIAS,
     SWEEP_BIASES,
+    SYNTHETIC_LOT_BIAS,
     TALLY_CAVEAT,
 )
 
@@ -61,7 +66,8 @@ from services.sweep_report_text import (
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
         DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
-        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -70,7 +76,8 @@ try:  # repo / test environment
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
         DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
-        SCENARIO_NAME_RE, canonical_spec, sweep_key, validate_scenario_name,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -375,6 +382,10 @@ SYMBOL_RE = re.compile(r"^[A-Z][A-Z.]{0,5}\Z")
 SPEC_FIELDS = frozenset({
     "symbols", "start", "end", "holdout_start", "starting_cash",
     "run_sensitivity", "scenarios", "force",
+    # FC-096 Phase C §C1. The strategy PROFILE the replay runs under. Absent
+    # means `wheel`; `identity.canonical_spec` omits both the absent and the
+    # explicit-wheel case from the key, so no stored sweep loses its cache.
+    "strategy",
 })
 SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut"})
 
@@ -528,6 +539,24 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
     if not isinstance(force, bool):
         raise SweepValidationError("'force' must be true or false")
 
+    # -- strategy ----------------------------------------------------------
+    # FC-096 Phase C §C1. The ENUM lives in the validators, on both sides —
+    # never in `identity.py`, which is stdlib-only, flat-copied into this image
+    # and whose job is canonicalisation. The message names the closed set
+    # because the value selects a PROFILE FILE and is stamped on every row of
+    # the run: a typo must not silently become the wheel.
+    raw_strategy = spec.get("strategy")
+    if raw_strategy in (None, ""):
+        strategy = WHEEL_STRATEGY
+    else:
+        strategy = str(raw_strategy).strip()
+        if strategy not in STRATEGIES:
+            raise SweepValidationError(
+                f"'strategy' must be one of {sorted(STRATEGIES)}, got "
+                f"{raw_strategy!r}. Case matters — the value selects a profile "
+                f"file and is stamped on every row of the run."
+            )
+
     # -- symbols -----------------------------------------------------------
     raw_symbols = spec.get("symbols")
     if not isinstance(raw_symbols, list) or not raw_symbols:
@@ -649,7 +678,11 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
                 # reason (which cached chains store, which knob the replay never
                 # reads), which is the only kind of rejection a reader learns
                 # anything from.
-                validate_override_key(str(key), value)
+                # FC-096 Phase C §C4: strategy-conditional, so a covered-call
+                # spec overriding a put-side key is 422 HERE and refused by the
+                # Job in byte-identical words — both sides call this same
+                # function out of the same flat-copied module.
+                validate_override_key(str(key), value, strategy=strategy)
             except OverrideError as exc:
                 raise SweepValidationError(f"scenario '{name}': {exc}")
             # ...and then the VALUE. The runner's validator checks the key (plus
@@ -700,6 +733,11 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
         "starting_cash": cash,
         "run_sensitivity": run_sensitivity,
         "scenarios": scenarios,
+        # ALWAYS present, `wheel` included — the same shape the sim service's
+        # `normalise_spec` produces, which is what makes a sweep submitted here
+        # and the same sweep submitted there key identically. Dropping the wheel
+        # case is `canonical_spec`'s job, not this one's.
+        "strategy": strategy,
     }
     # Carried into the spec the Job receives, and EXCLUDED from `sweep_key`
     # (identity.NON_IDENTITY_FIELDS): a forced re-run must key identically to the
@@ -2288,6 +2326,24 @@ def shape_results(sweep_row: Dict[str, Any],
     known_biases = list(SWEEP_BIASES)
     if effective_max_dte > DTE_REACH_BIAS_THRESHOLD:
         known_biases.append(DTE_REACH_BIAS)
+
+    # FC-096 Phase C. Derived from the PERSISTED spec, absent -> wheel — the
+    # `spec_max_dte` pattern above. Every run stored before Phase C has no
+    # `strategy` key and is a wheel run, which is exactly what absence means.
+    #
+    # `MODEL_SPREAD_BIAS` is emitted for every covered-call run rather than off
+    # a stored flag, because there is no column recording whether the gate was
+    # suspended and the suspension is unconditional on that profile (its
+    # `universe.max_spread_pct` is set). If a future CC profile ships without
+    # the key, this side would over-warn while the engine side (which asks the
+    # predicate) would not — over-warning is the safe direction, and the
+    # divergence is named here rather than left for a reader to find.
+    run_strategy = str(spec.get("strategy") or WHEEL_STRATEGY)
+    if run_strategy != WHEEL_STRATEGY:
+        known_biases.extend([
+            SYNTHETIC_LOT_BIAS, MONITOR_LEG_NOTE, ROLL_REACH_BIAS,
+            CC_ROLL_SPLIT_NOTE, MODEL_SPREAD_BIAS,
+        ])
 
     # FC-096 A4. Read off the PERSISTED row, never re-derived: this is a
     # property of the earnings table as it stood when the run replayed, and a

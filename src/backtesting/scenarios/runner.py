@@ -93,6 +93,7 @@ from ..engine.simulator import (
     is_wheel,
     narrow_to_dte,
     replay_strategy,
+    spread_gate_would_suspend,
 )
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
@@ -788,6 +789,10 @@ def run_sweep(
         run_sensitivity=run_sensitivity,
         effective_max_dte=max_dte,
         strategy=strategy,
+        # Asked of the same predicate the Simulator applies, so the footer
+        # states a suspension that the replays actually performed rather than
+        # one this module inferred from the strategy name.
+        spread_gate_suspended=spread_gate_would_suspend(base_config),
     )
     logger.info(
         "Scenario sweep starting",
