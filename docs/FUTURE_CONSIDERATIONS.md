@@ -832,15 +832,15 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
-### FC-089: `AlpacaClient` HTTP calls have no socket timeout — a hung data call holds `strategy_lock` for 300 s
+### FC-089: `AlpacaClient` HTTP calls have no socket timeout — a hung data call holds `strategy_lock` with no in-session bound
 
 **Scope:** shared
-**Status:** Filed 2026-08-28 (FC-072 rev 2 reliability review)
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reliability review); premise re-stated 2026-09-08 by the FC-107 plan — a real-money precondition
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem:** alpaca-py passes no `timeout` to `requests` (it retries only 429/504, 3× with 3 s sleep). A hung socket to `data.alpaca.markets` stalls the calling endpoint until Cloud Run's 300 s cutoff; the request thread then still holds `strategy_lock` (shared by `/scan`, `/run`, `/monitor`, `/roll`), so every later endpoint on that instance queues. Pre-existing for every wrapper call (`/monitor` and the roller already call `get_option_quote` under the lock); FC-072 adds one such call per order to `/run`. Fix direction: a `requests.Session` with `(connect, read)` timeouts on all three alpaca-py clients, and a lock-timeout/abandon guard on the endpoints.
+**Problem:** alpaca-py passes no `timeout` to `requests` (it retries only 429/504, 3× with 3 s sleep). A hung socket to `data.alpaca.markets` stalls the calling endpoint; Cloud Run's request timeout (300 s today, **1800 s once FC-107 lands**) only returns a 504 to the caller — it does not kill the thread (measured 2026-08-13), so the request thread keeps holding `strategy_lock` (shared by `/scan`, `/run`, `/monitor`, `/roll`) for as long as the socket hangs, and every later endpoint on that instance queues. After FC-107 this entry's lock-timeout/abandon guard is the **only** RTH bound on a hung lock-holder — a `/roll` queued behind one at 15:30 loses its whole session. Pre-existing for every wrapper call (`/monitor` and the roller already call `get_option_quote` under the lock); FC-072 adds one such call per order to `/run`. Fix direction: a `requests.Session` with `(connect, read)` timeouts on all three alpaca-py clients, and a lock-timeout/abandon guard on the endpoints.
 
 **Links:** `src/api/alpaca_client.py` (`__init__`), `deploy/cloud_run_server.py` (`strategy_lock`), FC-072.
 
@@ -1112,10 +1112,10 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
 
 **Scope:** shared
-**Status:** Plan drafted 2026-09-08 (`docs/plans/fc-107.md`, Draft rev 1 — two plan reviews next); found by the FC-100 plan; live-verified on both services
+**Status:** Plan drafted 2026-09-08 (`docs/plans/fc-107.md`, Draft rev 2 — round-1 reviews dispositioned); found by the FC-100 plan; live-verified on both services
 **Size estimate:** S (deploy flag + fixture re-freeze) — a real-money precondition
 
-**Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. **Measured:** wheel `/roll` cycles with instant paper fills ran 14, 141, 140, 150, 124, 26 s for 2–4 positions — ~35 s/position of chain fetch and evaluation before any order. The covered-call arithmetic (two positions): ≈70 s evaluation + one BTC poll to timeout (120 s) + cancel settle (15 s) = **205 s before any STO is placed**; one STO rung to timeout (+135 s) ≈ **340 s > 300 s**. The cycle-budget guard assumes an 1800 s request and refuses nothing at 300. **What the cut does, precisely:** Cloud Run returns 504 to the scheduler (a job failure no alert policy watches; retries are 0). The handler thread is not killed — with no `--no-cpu-throttling` on either bot service (`--concurrency=10`) it is CPU-throttled and **resumes when the next inbound request wakes the instance** (`/monitor` at :55, `/regression` at :45, an ingest), placing the remaining STO rungs on limits computed minutes earlier, under a `strategy_lock` the waking request then queues behind. `call_roll_naked_exposure` is the dying thread's job, so the one alert wired for a stranded BTC never fires. The book is left uncovered by the timeout, not the strategy.
+**Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. **Measured:** wheel `/roll` cycles with instant paper fills ran 14, 141, 140, 150, 124, 26 s for 2–4 positions — ~35 s/position of chain fetch and evaluation before any order. The covered-call arithmetic (two positions): ≈70 s evaluation + one BTC poll to timeout (120 s) + cancel settle (15 s) = **205 s before any STO is placed**; one STO rung to timeout (+135 s) ≈ **340 s > 300 s**. The cycle-budget guard assumes an 1800 s request and refuses nothing at 300. Measured (wheel, last 22 cycles): durations up to 259 s; STO rung 1 timed out in 4 of 8 executed rolls since 08-28; 09-07 IWM a genuine BTC timeout. **What the cut does, measured (2026-08-13 `/scan`: 504 at 300.0 s, thread kept emitting for 10 more minutes with no request in flight):** Cloud Run returns 504 to the scheduler (a job failure no alert policy watches; retries are 0) and does **not** kill the handler thread. CPU throttling slows an I/O-bound poll loop; it does not park it — the ladder keeps running roughly on schedule, its terminals (`call_roll_completed`, `call_roll_naked_exposure`) still fire if the instance lives, and the `/roll` response (`duration_seconds`, `results`) is lost. The dangerous residual is instance **scale-in mid-ladder** (~15 min with no request — unlikely in the roll window given the 15-min ingest cadence, but real): BTC filled, STO never placed, no terminal event — uncovered long stock until the next `/run` re-covers.
 
 **Proposal:** `--timeout=1800` on both bot services in ONE commit with the fixture re-freeze (next ledger deviation), plus a contract test asserting the service timeout ≥ the roller's budget + the scheduler deadline relationship. Precondition before any real-money roll — and, per the FC-100 plan (rev 2, DD-7), a precondition for resuming `cc-roll-daily` on the paper covered-call service.
 
@@ -1184,14 +1184,26 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-113: the roller's per-position budget under-counts the cancel-settle legs
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-107 plan)
+**Status:** Filed 2026-09-08 (found by the FC-107 plan); WIDENED 2026-09-08 by the FC-107 round-1 reviews — a real-money precondition
+**Size estimate:** S–M
+
+**Problem:** three ways the roller's deadline accounting is blind, all on the same seam (BTC filled, STO not yet placed). (a) `_PER_POSITION_BUDGET_SECONDS = 600` assumes five 120 s legs; each leg also carries a 15 s `_CANCEL_SETTLE_TIMEOUT_SECONDS` on timeout, so the true worst case is 675 s and a position started at the latest permitted 900 s ends at 1575 s, past the 1500 s `_CYCLE_BUDGET_SECONDS`. (b) `_poll_order_fill` counts only `elapsed += poll_interval` (`call_roller.py:1124`) — the 24 `get_order_by_id` round-trips per 120 s poll, the settle polls, the cancel and the place calls are unaccounted: per-position worst ≈ 730 s at 0.3 s RTT, ≈ 825 s at 1 s, ≈ 960 s at 2 s; under FC-107's 1800 s the margin is ≈ 160 s at normal RTT and NEGATIVE at ≥ ~1.7 s. (c) Cloud Run's clock starts at admission but the cycle's starts after `strategy_lock` (`cloud_run_server.py:1305` vs `wheel_engine.py:721`), so a `/roll` queued N s behind a slow `/run`/`/monitor` (observed lock-holders 63 s, 79 s, 300 s) has 1800 − N platform seconds while believing it has 1500.
+
+**Proposal:** wall-clock deadline accounting in `_poll_order_fill` (monotonic elapsed, not summed sleeps); an admission-time deadline passed into `run_rolling_cycle` from `/roll` (or a lock-acquire timeout on `/roll` — coordinate with FC-089 so exactly one owns it); derive the per-position budget from the leg constants (`legs × (poll + settle)` = 675 s) and assert it in a test alongside FC-107's seam-invariant contract test. Both profiles by Symmetry.
+
+**Links:** FC-107 (D1, D4), FC-078 §4, FC-089.
+
+### FC-114: `_is_market_open()` has no holiday calendar — orders placed into a closed market
+
+**Scope:** shared
+**Status:** Filed 2026-09-08 (FC-107 round-1 trading review) — a real-money precondition
 **Size estimate:** S
 
-**Problem:** `_PER_POSITION_BUDGET_SECONDS = 600` assumes five 120 s legs; each leg also carries a 15 s `_CANCEL_SETTLE_TIMEOUT_SECONDS` on timeout, so the true worst case is 675 s per position and a cycle can end at ~1574 s, past the 1500 s `_CYCLE_BUDGET_SECONDS`. FC-107's 1800 s service timeout absorbs it with 225 s to spare, but the constants lie to the next reader.
+**Problem:** `_is_market_open()` (`deploy/cloud_run_server.py:961-978`) is weekday + 09:30–16:00 ET only. On Labor Day 2026-09-07 the wheel's `/roll` ran at 15:30, evaluated 4 positions (`stock_quote_unusable` × 3) and **placed a BTC on IWM into a closed market**, which sat 120 s and was canceled (`call_roll_btc_timeout_canceled`). On a live account that is a real order queued to Tuesday's open. `/monitor` and `/roll` share the guard; `/run` has no market-open guard at all (its scheduler slots are its only gate).
 
-**Proposal:** derive the per-position budget from the leg constants (`legs × (poll + settle)`) and assert `cycle budget ≥ positions_cap × per_position` in a test; fold into FC-089 if that entry already owns roller budgets.
+**Proposal:** an NYSE holiday (and early-close) calendar in `_is_market_open`, applied to both profiles; add the guard to `/run` or state why not; a test pinning 2026-09-07 15:30 ET → closed (and a half-day at 13:30 → closed). Consider Alpaca's `get_clock()` as the source with the static calendar as fallback.
 
-**Links:** FC-107, FC-078, FC-089.
+**Links:** FC-107 (§Found while planning 7), FC-078, FC-100.
 
 
 ## Completed
