@@ -1217,6 +1217,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-100, FC-112, `docs/CLAUDE.md` §Config discipline.
 
+### FC-116: the replay fills rolls at the haircut-from-mid price, not at the placed limits
+
+**Scope:** shared (backtest engine)
+**Status:** Filed 2026-09-09 (found by the FC-096 Phase C build — a conflict between the FC-100 hand-off and the wheel golden contract)
+**Size estimate:** S–M
+
+**Problem:** `BacktestBroker` fills every order at the haircut price from mid (the engine's single fill model), while the live roller is credit-only at the PLACED limits (BTC at the ask, STO at the bid or mid−$0.05). The FC-100 hand-off required the replay to mirror that, but a fill-model change on the roll path alters every wheel replay's numbers and breaks the "wheel golden byte-identical" contract Phase C is bound by. Phase C therefore kept the haircut fills and labels the bias: replay roll credits biased UP vs live (haircut fills), counts/credits biased DOWN vs live (22-DTE lake vs a 28-DTE need). Two opposing biases on one metric is the honest interim, not the answer.
+
+**Proposal:** a per-order-kind fill mode — roll legs fill at the placed limit (or not at all within the leg's timeout, mirroring `_poll_order_fill`), entry legs keep the haircut — behind a config key on the sim spec so the wheel golden can be re-baselined deliberately in one PR (new golden fixtures, engine identity moves once); the report footer then drops the "credits biased up" clause. Decide whether FC-112's wheel trigger study should wait for this (it should: the study's roll-credit metric is exactly what this fixes).
+
+**Links:** FC-096 Phase C (PR #129 body, deviation 1), FC-100 §Phase C hand-off, FC-112.
+
 
 ## Completed
 
