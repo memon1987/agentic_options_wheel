@@ -415,14 +415,61 @@ class TestTheCapitalBase:
             "sanity: dividing by the cash float alone should still look "
             "spectacular, which is why the base had to move")
 
-    def test_the_base_is_the_lot_plus_the_stated_float_not_the_specs_cash(
-            self, cc_rising):
+    def test_the_base_is_the_LOT_and_the_cash_float_is_excluded(self, cc_rising):
+        """Review round 1, H1 — one denominator on both sides of the page.
+
+        The first cut used `starting_cash + lot_capital`, so the cell divided by
+        $15,000 while the lot-sized benchmark divided by $10,000. Two
+        denominators on one page make `excess_return` a comparison of
+        differently-scaled numbers. The $5,000 is a LIQUIDITY RESERVE (the
+        monitor leg's buy-backs, a roll's BTC before its STO credit), not
+        capital the strategy is measured on: it stays in `starting_cash`, which
+        is stamped separately, and out of every ratio.
+        """
         days, closes, expirations, result = cc_rising
         report = _scored(days, closes, expirations, result)
         assert report.starting_cash == CC_CASH_FLOAT == 5_000.0
         assert report.lot_capital == pytest.approx(closes[days[0]] * 100)
-        assert report.capital_base == pytest.approx(
-            CC_CASH_FLOAT + closes[days[0]] * 100)
+        assert report.capital_base == pytest.approx(closes[days[0]] * 100), (
+            "the cash float must not be in the denominator")
+        assert report.benchmark.starting_cash == report.capital_base, (
+            "the benchmark must divide by the SAME base as the cell, or "
+            "excess_return subtracts two differently-scaled ratios")
+
+    def test_a_window_that_beat_its_benchmark_reports_a_positive_excess(
+            self, cc_rising):
+        """The consequence H1 exists for, on a real replay.
+
+        With the float in the denominator the cell's return was scaled down by
+        2/3 against a benchmark that was not, and this window — which genuinely
+        out-earned holding — reported a NEGATIVE excess.
+        """
+        days, closes, expirations, result = cc_rising
+        report = _scored(days, closes, expirations, result)
+        assert report.excess_return is not None
+        assert report.excess_return > 0, (
+            f"lot return {report.total_return:.2%} vs benchmark "
+            f"{report.benchmark.total_return:.2%}")
+
+    def test_the_benchmark_holds_exactly_100_shares_at_an_awkward_price(self):
+        """M7: `int(cash // entry)` drops a share on ~48% of prices.
+
+        143.37 is the reviewer's case: `int(14337 // 143.37) == 99`, which
+        understates the benchmark by one share's move for a lot that is 100
+        shares by signed decision.
+        """
+        from src.backtesting.engine.simulator import DailyState
+        from src.backtesting.metrics.fitness import _lot_buy_and_hold
+
+        days = [date(2024, 6, 3), date(2024, 6, 28)]
+        daily = [DailyState(day=d, equity=1.0, cash=1.0, reserved_collateral=0.0,
+                            open_options=0, shares_held={}) for d in days]
+        prices = {days[0]: 143.37, days[1]: 150.00}
+        bench = _lot_buy_and_hold(daily, prices, 143.37 * 100)
+        assert bench.shares == SYNTHETIC_LOT_SHARES == 100
+        assert int(143.37 * 100 // 143.37) == 99, "the old floor's answer"
+        assert bench.total_return == pytest.approx(
+            (150.00 - 143.37) * 100 / (143.37 * 100))
 
     def test_attribution_still_reconciles_across_a_chain_of_lots(
             self, cc_rally):
@@ -498,6 +545,50 @@ class TestTheCoveredCallVerdict:
         assert report.verdict() != "insufficient"
         assert not any(r.startswith("INSUFFICIENT")
                        for r in report.verdict_reasons())
+        # Review round 1, H2: assert the VERDICT, not merely that it is not
+        # `insufficient`. This window kept its shares, kept its premium and beat
+        # the same lot held — the best outcome a covered-call programme has —
+        # and it must read as `fit`, with no reason at all.
+        assert report.verdict() == "fit", report.verdict_reasons()
+        assert report.verdict_reasons()[0].startswith("OK:")
+
+    def test_a_window_that_beat_holding_does_NOT_warn_that_holding_was_better(
+            self, cc_rising):
+        """The plan's own comparison was wrong, and both reviewers found it.
+
+        §C3 said to WARN when `premium_yield_on_lot` trails the lot's
+        buy-and-hold. Premium-only against total-return is not a comparison: on
+        any rising lot the premium leg loses by construction, so the WARN fired
+        on windows the strategy actually won and asserted, falsely, that holding
+        would have done better.
+        """
+        days, closes, expirations, result = cc_rising
+        report = _scored(days, closes, expirations, result)
+        assert report.excess_return > 0
+        assert not any("would have done better" in r
+                       for r in report.verdict_reasons())
+        assert not any("writing cost more" in r
+                       for r in report.verdict_reasons())
+
+    def test_the_warn_fires_on_total_return_when_writing_actually_cost_upside(
+            self, cc_rally):
+        """The rally: the call-away drag is real, so the lot under this
+        programme genuinely trails the lot held. THAT is the warning."""
+        days, closes, expirations, result = cc_rally
+        report = _scored(days, closes, expirations, result)
+        assert report.excess_return < 0, (
+            "the rally window should surrender upside to call-aways")
+        warns = [r for r in report.verdict_reasons() if "writing cost more" in r]
+        assert warns, report.verdict_reasons()
+        assert "surrendered upside" in warns[0]
+
+    def test_the_yield_is_reported_as_a_yield_never_as_the_warn_driver(
+            self, cc_rising):
+        days, closes, expirations, result = cc_rising
+        report = _scored(days, closes, expirations, result)
+        ok = report.verdict_reasons()[0]
+        assert "annualized yield on the lot" in ok
+        assert report.premium_yield_on_lot is not None
 
     def test_a_window_shorter_than_one_tenor_is_insufficient(self):
         days, closes, expirations = _flat_window()

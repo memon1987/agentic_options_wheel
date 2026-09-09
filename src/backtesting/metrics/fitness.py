@@ -185,10 +185,8 @@ class FitnessReport:
     def capital_base(self) -> float:
         """The denominator EVERY ratio on this report is taken over.
 
-        ``starting_cash`` for a wheel replay; ``starting_cash + lot_capital``
-        for a covered-call one, where ``starting_cash`` is the small stated
-        buy-back float (``simulator.CC_CASH_FLOAT``) and ``lot_capital`` is the
-        time-weighted lot value.
+        ``starting_cash`` for a wheel replay; **``lot_capital`` alone** — the
+        time-weighted lot value — for a covered-call one.
 
         This is the C3 fix for the defect round-1 review found: the synthetic
         lot arrives at ``cash_delta = 0`` and is then marked to market, so a
@@ -196,8 +194,25 @@ class FitnessReport:
         profit. A no-trade covered-call window returned "+2,900%" and read as
         the best result in the sweep. Dividing by the capital the premise
         assumed is what makes a no-trade window return 0.0%.
+
+        **The $5,000 cash float is EXCLUDED (review round 1, H1 — decided).**
+        The first cut used ``starting_cash + lot_capital``, which put the float
+        in the denominator of every ratio while the lot-sized benchmark divided
+        by the lot alone. Two denominators on one page: the cell's return was
+        computed over $15,000 and the sidecar's buy-and-hold over $10,000, so
+        ``excess_return`` compared two differently-scaled numbers and a window
+        that genuinely beat its benchmark could read as trailing it. The float
+        is a documented LIQUIDITY RESERVE — it exists so the monitor leg can buy
+        a call back and a roll can pay its BTC before collecting the STO credit
+        — and a reserve is not capital the strategy is measured on. It stays in
+        ``starting_cash`` (stamped separately on every artifact) and out of
+        every ratio; the benchmark's ``starting_cash`` is now this same number,
+        so both sides of ``excess_return`` divide by one base. That is also what
+        makes the footer sentence "the capital base is the lot" literally true.
         """
-        return self.starting_cash + self.lot_capital
+        if self.is_wheel:
+            return self.starting_cash
+        return self.lot_capital
 
     @property
     def total_pnl(self) -> float:
@@ -605,16 +620,32 @@ class FitnessReport:
                 f"consistently find a contract on this symbol, so the yield "
                 f"below is not a meaningful sample")
 
-        yield_on_lot = self.premium_yield_on_lot
-        bench = self.benchmark.total_return if self.benchmark else None
-        if yield_on_lot is not None and bench is not None:
-            bench_annualized = bench * (365.0 / self.days) if self.days > 0 else 0.0
-            if yield_on_lot < bench_annualized:
-                reasons.append(
-                    f"WARN: {yield_on_lot:+.2%} annualized premium yield on the "
-                    f"lot trails the SAME lot's buy-and-hold "
-                    f"({bench_annualized:+.2%}) — holding the shares and "
-                    f"writing nothing would have done better")
+        # **The comparison the PLAN specified was the wrong one** (review round
+        # 1, H2 — both reviewers; recorded as a plan defect, decided).
+        #
+        # §C3 said to WARN when `premium_yield_on_lot` trails the lot's
+        # buy-and-hold. Those are not comparable quantities: the yield counts
+        # PREMIUM ONLY, while the benchmark counts the shares' whole price move.
+        # Against a lot that rose 58% the premium leg cannot win by
+        # construction, so the WARN fired on every rising window — including the
+        # ones where the strategy genuinely beat holding — and its sentence
+        # ("holding the shares and writing nothing would have done better") was
+        # then simply false.
+        #
+        # The honest comparison is total against total: what the lot EARNED
+        # under this programme (premium, plus the shares' move, minus the
+        # call-away drag) against what the same lot would have earned untouched.
+        # `total_return` and `benchmark.total_return` now divide by the same
+        # `capital_base` (H1), so this is a like-for-like subtraction — it IS
+        # `excess_return`.
+        excess = self.excess_return
+        if excess is not None and excess < 0:
+            bench = self.benchmark.total_return if self.benchmark else 0.0
+            reasons.append(
+                f"WARN: the lot returned {self.total_return:+.2%} under this "
+                f"programme against {bench:+.2%} for the SAME lot held and "
+                f"never written against — writing cost more in surrendered "
+                f"upside than it earned in premium")
 
         called_below = [
             c for c in self.cycles
@@ -633,9 +664,11 @@ class FitnessReport:
 
         if not reasons:
             reasons.append(
-                f"OK: net premium ${self.net_premium:,.2f} at "
-                f"{(yield_on_lot or 0.0):+.2%} annualized on the lot, covered on "
-                f"{coverage:.0%} of writable days")
+                f"OK: the lot returned {self.total_return:+.2%} against "
+                f"{(self.benchmark.total_return if self.benchmark else 0.0):+.2%} "
+                f"for the same lot held; net premium ${self.net_premium:,.2f} "
+                f"({(self.premium_yield_on_lot or 0.0):+.2%} annualized yield on "
+                f"the lot), covered on {coverage:.0%} of writable days")
         return reasons
 
 
@@ -724,19 +757,31 @@ def compute_fitness(
         # wrong benchmark `excess_return` compares two different investments and
         # the verdict layer reads the size difference as skill.
         #
-        # `_buy_and_hold` derives the share count from the cash it is handed
-        # (`int(cash // entry)`), so passing the FIRST lot's value yields
-        # exactly that lot's share count at exactly its entry price.
-        bench_cash = starting_cash
-        if not report.is_wheel and report.lot_capital_injected > 0:
-            first_seed = next(
-                (event for cycle in cycles for event in cycle.events
-                 if event.kind == "synthetic_lot_open"), None)
-            if first_seed is not None:
-                bench_cash = first_seed.price * first_seed.shares
-        report.benchmark = _buy_and_hold(
-            daily, benchmark_prices, bench_cash, benchmark_dividends_per_share
-        )
+        # Two corrections from review round 1:
+        #
+        # H1 — the benchmark divides by the CELL's `capital_base`, so both sides
+        # of `excess_return` are ratios over one number. The first cut handed
+        # `_buy_and_hold` the first lot's value while the cell divided by
+        # lot + float, which scaled the two sides differently and could report a
+        # window that beat its benchmark as trailing it.
+        #
+        # M7 — the share count is `SYNTHETIC_LOT_SHARES`, not
+        # `int(cash // entry)`. The floor drops a share whenever the entry price
+        # does not divide the lot value exactly, which for a lot defined AS
+        # 100 x entry is a rounding artefact of the reconstruction rather than a
+        # fact about the position: at a seed of 143.37, `int(14337 // 143.37)`
+        # is 99. The lot is 100 shares by signed decision; the benchmark holds
+        # exactly those 100 shares and never writes against them.
+        if report.is_wheel:
+            report.benchmark = _buy_and_hold(
+                daily, benchmark_prices, starting_cash,
+                benchmark_dividends_per_share
+            )
+        else:
+            report.benchmark = _lot_buy_and_hold(
+                daily, benchmark_prices, report.capital_base,
+                benchmark_dividends_per_share
+            )
 
     return report
 
@@ -846,6 +891,42 @@ def _unrealized_stock_pnl(
             continue
         total += (price - cycle.cost_basis) * shares
     return total
+
+
+def _lot_buy_and_hold(
+    daily: Sequence[DailyState],
+    prices: Dict[date, float],
+    capital_base: float,
+    dividends_per_share: float = 0.0,
+) -> Optional[BuyAndHold]:
+    """The covered-call benchmark: THE LOT, held and never written against.
+
+    FC-096 Phase C, review round 1 (H1 + M7). Two things differ from
+    ``_buy_and_hold`` and each was a defect:
+
+    * ``shares`` is exactly ``SYNTHETIC_LOT_SHARES``. Deriving it as
+      ``int(capital_base // entry)`` re-floors a number that is 100 by
+      definition, and the floor bites on any price that does not divide the lot
+      value exactly — ~48% of prices, including a seed of 143.37, where it
+      yields 99 shares and understates the benchmark by one share's move.
+    * ``starting_cash`` is the cell's own ``capital_base``, so the benchmark's
+      ``total_return`` and the report's are ratios over ONE denominator and
+      ``excess_return`` is a real comparison.
+    """
+    from ..engine.simulator import SYNTHETIC_LOT_SHARES
+
+    entry_day, exit_day = daily[0].day, daily[-1].day
+    entry = prices.get(entry_day)
+    exit_ = prices.get(exit_day)
+    if not entry or not exit_ or entry <= 0 or capital_base <= 0:
+        return None
+    return BuyAndHold(
+        shares=SYNTHETIC_LOT_SHARES,
+        entry_price=entry,
+        exit_price=exit_,
+        starting_cash=capital_base,
+        dividends_per_share=dividends_per_share,
+    )
 
 
 def _buy_and_hold(
