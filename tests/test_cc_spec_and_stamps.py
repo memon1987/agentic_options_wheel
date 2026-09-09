@@ -198,6 +198,40 @@ class TestProfileResolution:
             {k: v for k, v in specs[0].items() if k != "strategy"})
 
 
+class TestSingleSymbolCommandsRefuseANonWheelProfile:
+    """Review round 1 (LOW). `backtest` and `screen` build a Simulator with NO
+    seeding policy — only `run_sweep` resolves one — so a covered-call profile
+    would replay with no shares and report a verdict about a run it never had
+    the inputs for. `screen` would also PERSIST that verdict to `backtest_runs`
+    in the profile's own dataset."""
+
+    class _Args:
+        symbol = "GOOGL"
+        start = "2025-09-02"
+        end = "2026-08-29"
+
+    def test_backtest_refuses_and_names_the_way_out(self):
+        from src.utils.config import Config
+
+        with pytest.raises(SystemExit) as exc:
+            cli.run_backtest(self._Args(), Config("config/covered_call.yaml"), None)
+        assert "does not support the 'covered_call' profile" in str(exc.value)
+        assert "--command sweep" in str(exc.value)
+
+    def test_screen_refuses_before_it_can_write_a_row(self):
+        from src.utils.config import Config
+
+        with pytest.raises(SystemExit) as exc:
+            cli.run_screen_cmd(self._Args(), Config("config/covered_call.yaml"), None)
+        assert "does not support the 'covered_call' profile" in str(exc.value)
+
+    def test_the_wheel_is_unaffected(self):
+        from src.utils.config import Config
+
+        # Returns None (does not raise) — the guard is a no-op on the wheel.
+        assert cli._refuse_non_wheel_single_symbol(Config(), "backtest") is None
+
+
 class TestTheSimServiceResolvesPerStrategy:
     def test_it_caches_one_config_per_strategy(self):
         import deploy.sim_service as svc

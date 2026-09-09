@@ -410,6 +410,37 @@ def generate_report(tracker: PortfolioTracker, logger):
         print(f"\nReport generation failed: {str(e)}")
 
 
+
+def _refuse_non_wheel_single_symbol(config: Config, command: str) -> None:
+    """Refuse `backtest`/`screen` on a non-wheel profile (FC-096 Phase C, LOW).
+
+    These two commands build a ``Simulator`` with NO ``synthetic_lots`` policy —
+    only ``run_sweep`` resolves one — so a covered-call profile would replay
+    with no shares, write no calls, and produce a confident "this symbol is
+    unfit" from a run in which the strategy had nothing to work with. Worse, the
+    screen path WRITES to ``backtest_runs`` in the profile's own dataset, so the
+    verdict would be persisted.
+
+    Refused loudly rather than silently seeded here: seeding is the sweep's
+    decision and carries the premise stamps, the capital base and the footer
+    that make a covered-call number readable. A single-symbol covered-call
+    replay is a real thing to want; it needs its own entry point, not an
+    accidental one.
+    """
+    strategy = str(getattr(config, "strategy_id", "wheel") or "wheel")
+    if strategy == "wheel":
+        return
+    raise SystemExit(
+        f"--command {command} does not support the {strategy!r} profile: it "
+        f"replays with no synthetic lot, so the strategy would hold no shares, "
+        f"write no calls, and report a verdict about a run it never had the "
+        f"inputs for. Use `--command sweep` with a spec carrying "
+        f"`\"strategy\": \"{strategy}\"` (or --config on this profile), which "
+        f"seeds the lot and stamps the premise, the capital base and the "
+        f"covered-call footer on every result."
+    )
+
+
 def run_backtest(args, config: Config, logger):
     """Evaluate one symbol's wheel fitness over a historical window (FC-032)."""
     from datetime import date, datetime
@@ -419,6 +450,7 @@ def run_backtest(args, config: Config, logger):
 
     if not args.symbol or not args.start:
         raise SystemExit("backtest requires --symbol and --start (YYYY-MM-DD)")
+    _refuse_non_wheel_single_symbol(config, "backtest")
 
     start = datetime.strptime(args.start, '%Y-%m-%d').date()
     end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
@@ -1319,6 +1351,8 @@ def run_screen_cmd(args, config: Config, logger) -> int:
     from datetime import date, datetime
 
     from src.backtesting.screen import run_screen, render_screen_summary
+
+    _refuse_non_wheel_single_symbol(config, "screen")
 
     start = datetime.strptime(args.start, '%Y-%m-%d').date() if args.start else None
     end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
