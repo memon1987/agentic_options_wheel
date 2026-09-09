@@ -675,6 +675,59 @@ class TestCoverageIsSplitByReason:
             f"stand-down: {result.coverage_by_reason}")
 
 
+    def test_below_basis_is_NOT_hold_uncovered_when_a_floor_clearing_strike_exists(
+            self):
+        """M4 (review round 1). `close < basis` was a PROXY, and it misfires.
+
+        A stock below its basis can still offer a strike above that basis inside
+        the delta band — a high-IV name at 0.90x basis routinely does — and that
+        day is not the floor standing the strategy down. Filing it as
+        `hold_uncovered` matters twice over: the bucket that means "the guard
+        worked" absorbs ordinary gate rejections, and because it is EXCLUDED
+        from the coverage denominator, doing so silently inflates the coverage
+        ratio the verdict gates on.
+        """
+        from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
+        from src.backtesting.engine.simulator import Simulator
+
+        days, closes, expirations = _rising_window()
+        sim = _cc_simulator("XYZ", closes, expirations, days)
+
+        def _call(strike, delta):
+            return ChainQuote(
+                symbol=f"XYZ240607C{int(strike * 1000):08d}", underlying="XYZ",
+                as_of=date(2024, 6, 3), expiration=date(2024, 6, 7),
+                strike=strike, option_type="call", dte=4,
+                underlying_price=90.0, mark=1.1, bid=1.0, ask=1.2,
+                implied_volatility=0.3, delta=delta, volume=100)
+
+        def _snap(quotes):
+            return ChainSnapshot(underlying="XYZ", as_of=date(2024, 6, 3),
+                                 underlying_price=90.0, puts=[], calls=quotes)
+
+        # Basis 100, spot 90 — below basis EITHER WAY. The difference is the
+        # chain: one offers a 105 strike at 0.20 delta, the other does not.
+        with_strike = _snap([_call(105.0, 0.20)])
+        without = _snap([_call(95.0, 0.20), _call(105.0, 0.80)])
+
+        assert Simulator._floor_clearing_strike_exists(sim, with_strike, 100.0)
+        assert not Simulator._floor_clearing_strike_exists(sim, without, 100.0), (
+            "a strike below the basis, and one above it outside the delta "
+            "band, are both unwritable — that IS the floor standing us down")
+        # And no chain at all is the floor's case too.
+        assert not Simulator._floor_clearing_strike_exists(sim, None, 100.0)
+
+    def test_the_residual_bias_direction_is_named_in_the_footer(self):
+        """The classification errs toward `gate_rejected`, which is IN the
+        coverage denominator — so a misclassification makes the ratio harsher,
+        never flattering. Stated in the footer, not only in a docstring."""
+        from src.backtesting.scenarios.report import SYNTHETIC_LOT_BIAS
+
+        detail = SYNTHETIC_LOT_BIAS[1]
+        assert "gate_rejected" in detail
+        assert "harsher" in detail
+
+
 class TestTheMonitorLeg:
     def test_it_closes_a_decayed_call_at_the_bands_target(self, cc_flat):
         """52% of real covered calls close early; a replay without this leg

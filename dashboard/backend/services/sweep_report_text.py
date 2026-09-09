@@ -206,7 +206,16 @@ SYNTHETIC_LOT_BIAS = ('The stock leg is ASSUMED, not bought — every number her
  'questions. Finally, because the lot is assumed, this says nothing about '
  'entry: a real programme had to buy those shares somewhere, and 12-month '
  'windows on names that survived to be candidates carry the usual selection '
- 'bias on top.')
+ 'bias on top. Re-entry is at the NEXT CLOSE AFTER the call-away, which is '
+ 'typically ABOVE the strike just surrendered — so the lot chain is '
+ 'momentum-following by construction and its time-weighted basis resets '
+ 'upward after every assignment. Read a chain of several lots as a series of '
+ 'forced re-entries at rising prices, not as one position. Finally, the '
+ 'coverage split attributes a day to `hold_uncovered` only when the chain '
+ 'offered NO strike above the basis inside the delta band; every other '
+ 'stand-down lands in `gate_rejected`, which is IN the coverage denominator '
+ '— so a misclassification makes the coverage ratio harsher, never '
+ 'flattering.')
 
 MODEL_SPREAD_BIAS = ('The bid/ask spread GATE was suspended for this run, because the modelled '
  'spread rejects every contract by construction',

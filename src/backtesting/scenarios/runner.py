@@ -1315,6 +1315,10 @@ def _emit_artifact(sink, result, *, scenario: str, symbol: str,
             # the writer refuses to guess a base for a non-wheel strategy, and
             # guessing one here would route around that refusal.
             capital_base=(None if report is None else report.capital_base),
+            # M2: the SCORED return, taken over `capital_base`. The replay's own
+            # `total_return` divides by `starting_cash`, which on a covered-call
+            # cell is the $5,000 float against an equity that holds the lot.
+            total_return=(None if report is None else report.total_return),
             strategy=strategy,
         )))
     except Exception as exc:  # noqa: BLE001 - evidence must not fail a cell

@@ -143,6 +143,11 @@ class ArtifactMeta:
     git_commit: Optional[str] = None
     benchmark: Optional[BuyAndHold] = None
     capital_base: Optional[float] = None
+    #: The SCORED total return (M2, review round 1) — the one taken over
+    #: ``capital_base``, not over ``starting_cash``. ``None`` leaves a wheel
+    #: cell reading the replay's own value (they agree there) and a non-wheel
+    #: cell reading ``null`` rather than a lot-inflated number.
+    total_return: Optional[float] = None
     #: The strategy profile this cell replayed under (FC-096 Phase C). Stamped
     #: so the console's premise banner, the compare view's strategy row and the
     #: digest all read ONE field rather than inferring the strategy from the
@@ -368,6 +373,32 @@ def _capital_base(meta: ArtifactMeta, result: SimulationResult) -> Optional[floa
     return result.starting_cash
 
 
+def _is_wheel_cell(meta: ArtifactMeta, result: SimulationResult) -> bool:
+    strategy = meta.strategy or getattr(result, "strategy", None) or _WHEEL
+    return strategy == _WHEEL
+
+
+def _total_return(meta: ArtifactMeta, result: SimulationResult) -> Optional[float]:
+    """The cell's CORRECTED total return (M2, review round 1).
+
+    ``SimulationResult.total_return`` divides equity change by ``starting_cash``.
+    On a covered-call cell that equity CONTAINS the seeded lot while
+    ``starting_cash`` is the $5,000 float alone, so the raw value read +995% on
+    the rally cell — the lot-as-profit number the capital-base fix exists to
+    remove, stored one field away from the corrected one and just as
+    machine-readable.
+
+    The scored value is passed in by the caller. For a non-wheel cell without it
+    the answer is ``None``: an absent number renders as an absence, and a wrong
+    one renders as a triumph.
+    """
+    if meta.total_return is not None:
+        return meta.total_return
+    if _is_wheel_cell(meta, result):
+        return result.total_return
+    return None
+
+
 def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any]:
     """One cell's full detail artifact, ready for ``json.dumps``.
 
@@ -475,7 +506,13 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
                                else None),
         "counters": {
             "decision_days": len(result.daily),
-            "candidate_days": int(result.candidate_days),
+            # M2. `candidate_days` counts `stage_7_complete_found`, which is
+            # the PUT leg's stage. A covered-call replay never runs it, so this
+            # is structurally 0 there and would read as "the chain never offered
+            # a candidate" — a damning-looking number that is an artifact of
+            # which stage the counter watches. `None` for a non-wheel cell.
+            "candidate_days": (int(result.candidate_days)
+                               if _is_wheel_cell(meta, result) else None),
             "ledger_events": len(result.broker.ledger),
             "dividends_credited": _num(result.dividends_credited),
             "early_assignments": int(result.early_assignments),
@@ -487,7 +524,18 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
             "rolls_evaluated": int(result.rolls_evaluated),
             "rolls_executed": int(result.rolls_executed),
             "final_equity": _num(result.final_equity),
-            "total_return": _num(result.total_return),
+            # M2 (review round 1). `SimulationResult.total_return` is
+            # `(final_equity - starting_cash) / starting_cash`, which on a
+            # covered-call cell divides an equity that CONTAINS the seeded lot
+            # by the $5,000 float alone — it read +995% on the rally cell. That
+            # is the lot-as-profit number the whole capital-base fix exists to
+            # remove, stored one field away from the corrected one.
+            #
+            # The scored `FitnessReport.total_return` is the corrected value and
+            # the caller passes it in. `None` — never the raw number — when it
+            # was not passed for a non-wheel cell: a console that finds nothing
+            # renders an absence, and one that finds +995% renders a triumph.
+            "total_return": _num(_total_return(meta, result)),
             # FC-096 Phase C. Zero/empty on every wheel cell. The roll SPLIT is
             # carried beside `rolls_executed` rather than replacing it: an ITM
             # defence and an OTM re-write of the engine's own call are both

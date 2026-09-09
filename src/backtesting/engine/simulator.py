@@ -1025,7 +1025,7 @@ class Simulator:
                 # state the strategy left the book in: a call written today is
                 # cover today, and a contract expiring tonight was still cover
                 # while the decision was being taken.
-                self._tally_coverage(broker, day, closes_by_day[day])
+                self._tally_coverage(broker, day, closes_by_day[day], chains)
 
                 # Settle *after* deciding. A contract expiring today is still held
                 # when the strategy looks at its book — that is what the live bot
@@ -1251,7 +1251,8 @@ class Simulator:
     # The coverage split (FC-096 Phase C §C3)
     # ------------------------------------------------------------------ #
     def _tally_coverage(
-        self, broker: BacktestBroker, day: date, closes: Dict[str, float]
+        self, broker: BacktestBroker, day: date, closes: Dict[str, float],
+        chains: Optional[Dict[str, Dict[date, ChainSnapshot]]] = None,
     ) -> None:
         """Classify each symbol's decision day into exactly one coverage bucket.
 
@@ -1287,23 +1288,74 @@ class Simulator:
             if pos.option_type == "call" and pos.contracts > 0
         }
         for symbol in self.symbols:
-            reason = self._coverage_reason(broker, symbol, closes, covered)
+            reason = self._coverage_reason(
+                broker, symbol, closes, covered,
+                snapshot=(chains or {}).get(symbol, {}).get(day))
             self._coverage[reason] = self._coverage.get(reason, 0) + 1
         self._lot_value_days += self._lot_value(broker)
 
     def _coverage_reason(self, broker: BacktestBroker, symbol: str,
-                         closes: Dict[str, float], covered: set) -> str:
+                         closes: Dict[str, float], covered: set,
+                         snapshot: Optional[ChainSnapshot] = None) -> str:
         if broker.shares(symbol) <= 0:
             return COVERAGE_POST_CALL_AWAY
         if symbol in covered:
             return COVERAGE_COVERED
         basis = broker.average_cost_basis(symbol)
-        close = closes.get(symbol)
-        if basis is not None and close is not None and close < basis:
+        if basis is not None and not self._floor_clearing_strike_exists(
+                snapshot, basis):
             return COVERAGE_HOLD_UNCOVERED
         if self._earnings_blocks(symbol):
             return COVERAGE_EARNINGS_SPAN
         return COVERAGE_GATE_REJECTED
+
+    def _floor_clearing_strike_exists(
+        self, snapshot: Optional[ChainSnapshot], basis: float
+    ) -> bool:
+        """Is there a call at or above ``basis`` inside the profile's delta band?
+
+        **M4 (review round 1).** The first cut asked ``close < basis``, which is
+        a PROXY for the cost-basis floor and misfires in both directions. A
+        stock trading below its basis can still offer a floor-clearing strike in
+        the band — a high-IV name at 0.90x basis routinely does — and that day
+        was filed as "the floor stood us down" when the floor allowed a write
+        and something else refused it. The bucket that is supposed to mean "the
+        guard worked" then absorbs ordinary gate rejections, and because it is
+        EXCLUDED from the coverage denominator, absorbing them silently inflates
+        the coverage ratio the verdict gates on.
+
+        This asks the question the floor actually asks: does the chain contain a
+        call whose strike clears the basis AND whose delta is inside the band the
+        profile writes at? No such strike ⇒ the floor genuinely left nothing to
+        write, which is the strategy working. One exists ⇒ whatever declined it
+        was a gate, and the day belongs in ``gate_rejected``.
+
+        **Residual bias, stated rather than hidden** (and named in
+        ``SYNTHETIC_LOT_BIAS``): this checks the delta band and the floor, not
+        the premium floor, the DTE ceiling or the spread gate. A day with a
+        floor-clearing, in-band strike that failed the PREMIUM floor lands in
+        ``gate_rejected`` — correctly, since premium is a gate — so the split
+        attributes to the floor only what the floor decided. It errs toward
+        ``gate_rejected``, which is the honest direction: that bucket is IN the
+        coverage denominator, so a misclassification makes the coverage ratio
+        harsher, never flattering.
+
+        No snapshot (a day the symbol did not trade) ⇒ ``False``: with no chain
+        there was nothing to write, and the floor is the standing reason.
+        """
+        if snapshot is None:
+            return False
+        band = getattr(self.config, "call_delta_range", None) or [0.0, 1.0]
+        low, high = float(band[0]), float(band[1])
+        for quote in snapshot.calls:
+            if quote.strike < basis:
+                continue
+            delta = quote.delta
+            if delta is None:
+                continue
+            if low <= abs(delta) <= high:
+                return True
+        return False
 
     def _earnings_blocks(self, symbol: str) -> bool:
         """Would an earnings event fall inside a fresh call's tenor today?
