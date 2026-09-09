@@ -1504,6 +1504,26 @@ class TestStoLadder:
 
         assert not hasattr(roller, 'wheel_state')
 
+    def test_the_ladders_fixed_rungs_are_exactly_two(self, roller):
+        """FC-107: `LADDER_FIXED_LEGS = 3` is 1 BTC + these, derived not pinned.
+
+        With no fallback candidates to draw on, `_rungs` yields the primary at
+        its re-checked limit and the primary at the invariant floor — two — and
+        the seam arithmetic in tests/test_cloudbuild_contract.py counts on that
+        being the config-independent part. A third unconditional rung would
+        lengthen every ladder by 135 s without failing any timeout test.
+        """
+        from tests.test_cloudbuild_contract import LADDER_FIXED_LEGS
+
+        opp = {'min_credit_per_share': 0.25, 'new_option_symbol': 'X',
+               'stc_limit': 5.00, 'new_strike': 380.0, 'imminent': False,
+               'fallback_candidates': [{'new_option_symbol': 'X'}]}
+        rungs = list(roller._rungs(opp, 4.00))  # BTC beat its limit -> floor rung
+
+        assert len(rungs) == 2, [r[0] for r in rungs]
+        assert LADDER_FIXED_LEGS == 1 + len(rungs)
+
+
 
 # --------------------------------------------------------------------------- #
 # T-12 — state deletion
