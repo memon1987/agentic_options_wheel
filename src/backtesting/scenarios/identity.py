@@ -407,8 +407,13 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
         "run_sensitivity": bool(spec.get("run_sensitivity", False)),
         "scenarios": scenarios,
     }
-    if strategy is not None and str(strategy).strip() != WHEEL_STRATEGY:
-        canonical["strategy"] = str(strategy).strip()
+    # `None`, `""` and `"wheel"` are ONE state — absence — and all three fold
+    # away. The empty string reaches here from a form field that was cleared
+    # and from a JSON round-trip that renders a null as one; writing it through
+    # would give that spec a key nothing else in the store can match.
+    folded = str(strategy).strip() if strategy is not None else ""
+    if folded and folded != WHEEL_STRATEGY:
+        canonical["strategy"] = folded
     return canonical
     # `force` is deliberately absent — see NON_IDENTITY_FIELDS.
 
