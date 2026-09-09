@@ -31,7 +31,9 @@ import pytest
 from src.backtesting.data.chain_store import ChainStore
 from src.backtesting.data.provider import StockBar
 from src.backtesting.engine.broker import BacktestBroker
-from src.backtesting.engine.simulator import DailyState, SimulationResult
+from src.backtesting.engine.simulator import (
+    SYNTHETIC_LOT_PREMISE, DailyState, SimulationResult,
+)
 from src.backtesting.metrics.cycles import build_cycles
 from src.backtesting.metrics.fitness import BuyAndHold
 from src.backtesting.reporting import artifact_store as store_module
@@ -108,9 +110,16 @@ def _hand_built_result() -> SimulationResult:
     """One underlying driven through every branch the broker can record.
 
     Hand-built rather than replayed because the frozen-fixture test has to see
-    all seven ``LedgerEvent`` kinds in one object, and no short replay reliably
+    all EIGHT ``LedgerEvent`` kinds in one object, and no short replay reliably
     produces an early assignment AND an expiry AND a buy-to-close. The broker is
     the real one, so the ``detail`` payloads are the real ones.
+
+    The eighth kind is FC-096 Phase C's ``synthetic_lot_open`` (review round 1,
+    M5). Its ``detail`` is pinned here AND cross-checked against a real
+    covered-call replay by
+    ``TestTheSeedingDetailMatchesARealReplay`` — the hand-built payload is only
+    trustworthy because the producer is the same broker method, and that test is
+    what keeps saying so.
     """
     broker = BacktestBroker(100_000.0, fees_per_contract=0.04, fill_haircut=0.25)
 
@@ -132,6 +141,12 @@ def _hand_built_result() -> SimulationResult:
                              mark=1.5, bid=1.3, opened=date(2024, 6, 17))
     broker.credit_dividend("AAA", 0.5, date(2024, 6, 18))
     broker.settle_expirations(date(2024, 6, 21), {"AAA": 100.0})
+
+    # 8. synthetic_lot_open — the covered-call premise (FC-096 Phase C). Placed
+    # before the second call so the lot is the cover that call is written
+    # against, exactly as a CC replay orders them.
+    broker.deposit_shares("AAA", 100, 101.5, date(2024, 6, 24),
+                          premise=SYNTHETIC_LOT_PREMISE)
 
     # 7. call_assignment, via the ex-dividend early-assignment path.
     call_b = "AAA240628C00104000"
@@ -324,15 +339,47 @@ class TestTheSchemaIsFrozen:
             assert got[section] == expected[section], section
         assert sorted(got) == sorted(expected), "a whole SECTION appeared or vanished"
 
-    def test_all_seven_ledger_kinds_are_covered_by_the_fixture(self):
+    def test_all_eight_ledger_kinds_are_covered_by_the_fixture(self):
         """The `detail` pin is only worth anything if the fixture actually sees
         every kind — a fixture built from a run that never assigned would pin
-        four kinds and wave three through."""
+        four kinds and wave the rest through.
+
+        Eight since FC-096 Phase C: `synthetic_lot_open` is a ledger kind a
+        stored artifact can carry, so it is pinned like the other seven.
+        """
         expected = json.loads(FIXTURE.read_text())["ledger_detail_by_kind"]
         assert set(expected) == {
             "sell_put_open", "buy_to_close", "put_assignment", "sell_call_open",
             "dividend", "expire_worthless", "call_assignment",
+            "synthetic_lot_open",
         }
+        assert expected["synthetic_lot_open"] == [
+            "cost_basis", "lot_value", "premise", "shares"]
+
+    def test_the_seeding_detail_matches_a_REAL_covered_call_replay(self):
+        """FC-096 Phase C, review round 1 (M5).
+
+        The fixture is hand-built, which is only trustworthy while the hand-built
+        `synthetic_lot_open` carries exactly what the PRODUCER emits. This asserts
+        that against a real covered-call replay rather than against the literal
+        above — a field added to `deposit_shares` fails HERE rather than silently
+        never reaching a stored artifact.
+        """
+        from tests.test_cc_replay import _cc_simulator, _rising_window
+
+        days, closes, expirations = _rising_window()
+        result = _cc_simulator("XYZ", closes, expirations, days).run()
+        seeds = [e for e in result.broker.ledger
+                 if e.kind == "synthetic_lot_open"]
+        assert seeds, "the covered-call replay seeded no lot"
+
+        pinned = json.loads(FIXTURE.read_text())["ledger_detail_by_kind"]
+        assert sorted(seeds[0].detail) == pinned["synthetic_lot_open"]
+        # And the values are the premise, not a placeholder.
+        assert seeds[0].detail["shares"] == 100
+        assert seeds[0].detail["cost_basis"] == closes[days[0]]
+        assert seeds[0].detail["lot_value"] == round(closes[days[0]] * 100, 2)
+        assert "Synthetic lot" in seeds[0].detail["premise"]
 
     def test_the_roll_record_shape_is_the_ROLLERS_shape(self):
         """The pin that the first cut of this file got wrong.

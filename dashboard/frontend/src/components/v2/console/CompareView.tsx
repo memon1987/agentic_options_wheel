@@ -134,6 +134,17 @@ const toSide = (d: CompareSideData): CompareSide => ({
   stampedCapitalBase: d.artifact?.provenance.capital_base ?? null,
   artifact: d.artifact,
   status: d.status,
+  // FC-096 Phase C (review round 1, H4). The SHIPPED page dropped this: the
+  // strategy row was reading `undefined` on every real comparison and falling
+  // back to the artifact stamp alone, so a covered-call cell whose artifact had
+  // not loaded (or 404'd) compared against a wheel cell as if both were wheels
+  // — the exact pair the row exists to refuse. Only the test helper had ever
+  // set it, which is why the row's own suite passed while the page did not.
+  //
+  // `d.strategy` is already resolved by `SimsCompare` through
+  // `artifactStrategy(specStrategy(sweep), artifact)`, i.e. spec first, stamp
+  // second, absence means wheel — one resolver for the whole console.
+  specStrategy: d.strategy,
 });
 
 const cellPathOf = (ref: CompareRef): string =>

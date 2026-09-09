@@ -182,6 +182,9 @@ class RejectionTally:
         # class of dishonest metric this review round existed to remove.
         self._seen: set = set()
         self._candidate_days: set = set()
+        # FC-096 Phase C (H3): roll skip reasons -> event count. Plain dict, not
+        # a Counter, so `summary`-style consumers get an ordinary JSON object.
+        self._roll_skips: Dict[str, int] = {}
         self._prev_config: Optional[dict] = None
         self._binding = None
 
@@ -216,6 +219,22 @@ class RejectionTally:
             # earlier stage blocks, stage 7 never runs.
             if event_type == "stage_7_complete_found" and day is not None:
                 self._candidate_days.add(day)
+            # FC-096 Phase C (review round 1, H3). The roller's terminal skip
+            # reasons, counted per EVENT rather than per day.
+            #
+            # Per event on purpose, unlike the day-keyed buckets above: a cycle
+            # evaluates every open short call, and "the roller declined 40 times
+            # for `no_credit_candidate`" and "it declined on 40 days" are
+            # different facts. Without this a cell reporting `rolls_executed: 2`
+            # is indistinguishable from a roller that was BLIND — the deep-ITM
+            # `btc_quote_unavailable` / `no_credit_candidate` streak looks
+            # exactly like a credit-only roller correctly declining, and only
+            # the reason counts tell them apart.
+            if event_type == "call_roll_skipped":
+                reason = event_dict.get("skip_reason")
+                if reason:
+                    self._roll_skips[str(reason)] = (
+                        self._roll_skips.get(str(reason), 0) + 1)
         except Exception:  # noqa: BLE001 - diagnostics must never break a run
             pass
         return event_dict
@@ -292,6 +311,15 @@ class RejectionTally:
     def summary(self) -> Dict[str, int]:
         """Distinct DAYS blocked, per reason, descending. Order is deterministic."""
         return dict(self._ranked())
+
+    def roll_skip_summary(self) -> Dict[str, int]:
+        """``call_roll_skipped`` reason -> EVENT count, most common first.
+
+        Deterministic for the same reason ``_ranked`` is: ties break on the
+        reason name, so two equally-common reasons always order the same way.
+        """
+        return dict(sorted(self._roll_skips.items(),
+                           key=lambda item: (-item[1], item[0])))
 
     def binding_constraint(self) -> Optional[str]:
         """The reason that blocked the most days, if any.

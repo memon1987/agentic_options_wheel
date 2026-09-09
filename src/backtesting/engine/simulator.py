@@ -442,6 +442,13 @@ class SimulationResult:
     #: and load-bearing on the wheel's 0.98 (FC-112).
     itm_rolls: int = 0
     otm_roll_outs: int = 0
+    #: ``call_roll_skipped`` reason -> event count (FC-096 Phase C, review
+    #: round 1 H3). Populated on EVERY replay, wheel included — the roller runs
+    #: on both — because "the roller executed 2 rolls" and "the roller was
+    #: blind" produce the same `rolls_executed` and are told apart only here.
+    #: A deep-ITM streak of `btc_quote_unavailable` / `no_credit_candidate`
+    #: looks exactly like a credit-only roller correctly declining.
+    roll_skips: Dict[str, int] = field(default_factory=dict)
 
     @property
     def final_equity(self) -> float:
@@ -1062,6 +1069,7 @@ class Simulator:
             daily=daily,
             broker=broker,
             rejections=tally.summary(),
+            roll_skips=tally.roll_skip_summary(),
             candidate_days=tally.candidate_days,
             dividends_credited=sum(
                 e.cash_delta for e in broker.ledger if e.kind == "dividend"

@@ -503,6 +503,11 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
         # hold-uncovered / earnings-span / gate-rejected / post-call-away. Empty
         # on a wheel cell.
         "coverage_by_reason": dict(getattr(result, "coverage_by_reason", None) or {}),
+        # FC-096 Phase C (review round 1, H3). Why the roller DECLINED, by
+        # reason and by event. `rolls_executed: 2` alone cannot distinguish a
+        # credit-only roller correctly passing on 40 evaluations from a roller
+        # that could not see a quote on any of them; these counts can.
+        "roll_skips": dict(getattr(result, "roll_skips", None) or {}),
         # FC-013 coverage, both reported rather than assumed away: a window that
         # reaches past a symbol's last table date stops gating it silently.
         "earnings_coverage": {

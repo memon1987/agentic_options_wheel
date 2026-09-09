@@ -182,6 +182,10 @@ FORECAST_REFUSAL_IN_SAMPLE = (
 # DTE_REACH_BIAS is: the CLI reads `SweepResult.strategy`, and the dashboard
 # reads the persisted `spec_json.strategy` (absent -> wheel). The parity test
 # pins the WORDS; each side owns its own condition.
+#
+# The two WHEEL_* titles are the KEYS of the M1 substitution — the two
+# SWEEP_BIASES lines that are false on a covered-call run are swapped by
+# title, never by index, on both sides.
 # --------------------------------------------------------------------------- #
 SYNTHETIC_LOT_BIAS = ('The stock leg is ASSUMED, not bought — every number here is relative to a '
  'lot the engine created',
@@ -220,24 +224,39 @@ MODEL_SPREAD_BIAS = ('The bid/ask spread GATE was suspended for this run, becaus
  'restored deliberately rather than staying off because nobody remembered it '
  'was.')
 
-ROLL_REACH_BIAS = ('Covered-call ROLL credits and roll counts are biased DOWN by the chain '
- "lake's reach",
- "The roller's replacement search runs to `old_expiry + max_extension_days` "
- '= 14 days, and the covered-call profile writes at a 14-DTE target, so a '
- 'full candidate set needs 28 DTE of chain. The lake is built at 22 (FC-096 '
- 'Phase A). The truncation is PARTIAL, not total: it bites only when the old '
- 'call was written at the 14-DTE ceiling AND is evaluated early in its life '
- '— replacement expiries in the 23-28 DTE band are simply absent from the '
- 'file. A call written at <=8 DTE, or evaluated >=6 days into a 14-DTE life, '
- 'sees its whole legal set. Direction: FEWER candidates, never more, so the '
- "replay's roll counts and captured credits are floors rather than "
- 'estimates, and the miss is concentrated in early-ITM moves on '
- 'freshly-written calls. Separately, and in the OPPOSITE direction: the live '
- 'roller places its BTC at the old ask and its STO at the candidate bid, '
- 'while this engine fills every order at its haircut price from mid — so a '
- 'modelled roll captures more credit than the same roll would live. The two '
- 'biases are not netted here because neither is measured; they are both '
- 'named.')
+ROLL_REACH_BIAS = ('Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and '
+ 'credits are biased DOWN — and the fill model biases credits UP',
+ "The roller's replacement search is bounded by `old_expiry + "
+ 'rolling.max_extension_days` and by nothing else. On this profile that is '
+ '14 + 14 = 28 DTE of chain for a full candidate set. The replay '
+ 'materialises to 21 DTE — the roll horizon, capped at what the lake stores '
+ '(`universe_dte = 22`, FC-096 Phase A) — so the top 7 days of that horizon '
+ 'are absent from every roll decision. Concretely: a replacement can be '
+ 'extended only to about `21 - k` days past the old expiry, where `k` is the '
+ 'days the old call still has to run, so the shortfall is largest exactly '
+ "when the roller is most useful — early in a freshly-written call's life, "
+ 'which is when an ITM move is most likely to need defending. Direction: '
+ 'FEWER candidates, never more. Roll counts and captured credits are FLOORS, '
+ 'not estimates. \n'
+ '\n'
+ 'In the OPPOSITE direction, and not netted against it: the live roller '
+ "places its buy-to-close at the old contract's ASK and its sell-to-open at "
+ "the candidate's BID, while this engine fills every order at its haircut "
+ 'price from the mark. A modelled roll therefore captures MORE credit than '
+ 'the same roll would live, on both legs. Neither bias is measured, so they '
+ 'are both named rather than combined into a single number that would look '
+ 'like an estimate. \n'
+ '\n'
+ 'The WHEEL carries the same truncation, unmeasured and unfixed here: its '
+ 'horizon is 7 + 14 = 21 against a 7-DTE materialisation. Widening it would '
+ 'move every stored wheel number at once, so it is left to FC-112 — which '
+ "already owns the wheel's roll-trigger study — rather than changed as a "
+ 'side effect of a covered-call release. \n'
+ '\n'
+ 'Read `roll_skips` beside the roll counts before concluding anything about '
+ 'roller activity: a credit-only roller declining 40 evaluations and a '
+ 'roller that could not price a single one both report the same '
+ '`rolls_executed`, and only the skip reasons separate them.')
 
 CC_ROLL_SPLIT_NOTE = ('Rolls are split into ITM defences and OTM roll-outs, and only the first is '
  'defence',
@@ -266,3 +285,33 @@ MONITOR_LEG_NOTE = ('The covered-call replay runs the /monitor profit-taking leg
  'whether a limit was touched. The WHEEL replay is deliberately untouched — '
  'adding the leg there would move every stored wheel result at once, which '
  'needs its own FC and its own re-baseline.')
+
+WHEEL_PROFIT_TAKING_TITLE = 'One decision per day, and the replay gets the price it saw'
+
+WHEEL_EX_DIV_TITLE = ('Dividends come from a static table; ex-dividend early assignment has never '
+ 'fired on real data')
+
+CC_PROFIT_TAKING_BIAS = ('One decision per day — but profit-taking IS modelled on this profile',
+ 'Production scans and executes ~15 minutes apart; the replay does both on '
+ 'one snapshot. Unlike the wheel replay, this one runs the /monitor '
+ 'profit-taking leg, so the 52%-of-calls-closed-early divergence the wheel '
+ 'footer carries does NOT apply here — see the monitor-leg note below for '
+ 'the two divergences that remain (the bands are DTE-keyed to <=7 against a '
+ "14-DTE target, and the buy-back limit is the engine's haircut fill rather "
+ "than production's ask x 0.95). What is still unmodelled is intraday churn: "
+ 'a position closed and re-opened between two decision points is one '
+ 'decision here.')
+
+CC_EX_DIV_BIAS = ('Dividends come from a static table, and ex-dividend early assignment CAN '
+ 'fire on this profile',
+ 'Both legs collect from the same committed table, so the two stay on one '
+ "footing, but a window running past the table's coverage credits nothing "
+ 'after that point on either. The wheel footer says early assignment has '
+ "never fired on real data, and that is a statement about the WHEEL's "
+ 'universe: its dividend payers are exactly the symbols that cannot clear '
+ 'the premium floor to open a position. This profile is different — its '
+ 'universe is whatever the account holds, its calls are written at 14 DTE, '
+ 'and a held payer with an ITM short call is the ordinary case rather than '
+ 'an impossible one. Treat a non-zero `ex_dividend_early_assignments` here '
+ 'as a real event, and a zero as a fact about the window rather than about '
+ 'the model.')

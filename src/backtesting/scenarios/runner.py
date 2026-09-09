@@ -100,7 +100,7 @@ from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
 from .identity import scenario_arm_hash
 from .overrides import (
-    DTE_OVERRIDE_KEYS, apply_overrides, validate_overrides,
+    DTE_OVERRIDE_KEYS, MAX_SWEEPABLE_DTE, apply_overrides, validate_overrides,
 )
 
 logger = structlog.get_logger(__name__)
@@ -266,6 +266,10 @@ class ScenarioResult:
     synthetic_lots_opened: Optional[int] = None
     itm_rolls: Optional[int] = None
     otm_roll_outs: Optional[int] = None
+    #: ``call_roll_skipped`` reason -> count (H3). On EVERY measured row, wheel
+    #: included: the roller runs on both profiles, and this is the only thing
+    #: that separates "declined 40 credit-only evaluations" from "blind".
+    roll_skips: Optional[Dict[str, int]] = None
     replay_seconds: Optional[float] = None
     error: Optional[str] = None
 
@@ -494,14 +498,65 @@ def config_target_dte(config, leg: str) -> int:
         return DEFAULT_TARGET_DTE
 
 
+def roll_horizon_reach(config) -> int:
+    """The reach a config's ROLLER needs, capped at what the lake stores.
+
+    FC-096 Phase C, review round 1 (H3). The entry path caps candidates at
+    ``*_target_dte``, but the roller's replacement search is bounded by
+    ``old_expiry + rolling.max_extension_days`` and by nothing else. On the
+    covered-call profile that is 14 + 14 = **28 DTE**, against a materialisation
+    that reached only 14 — so the replay's roller was choosing from less than
+    half the ladder its live twin sees, on EVERY roll rather than on an edge
+    case, and the first cut described that as a "partial" truncation.
+
+    Widened to the roll horizon and **capped at ``MAX_SWEEPABLE_DTE``** (21,
+    i.e. the lake's stored ``universe_dte = 22``), because beyond that the
+    contracts are simply not in the file: asking for them would not widen the
+    candidate set, it would only make the arm read as "nothing qualified". The
+    residual truncation — 28 wanted, 21 available — is what
+    ``ROLL_REACH_BIAS`` now states, with its direction.
+
+    **Zero for the WHEEL, deliberately, and it is not an oversight.** The wheel
+    carries the same arithmetic (7 + 14 = 21 against a 7-DTE materialisation),
+    so its roller is choosing from a truncated ladder too — but widening it here
+    would move every stored wheel number in the project at once, and §Behaviour
+    contract requires the wheel golden to stay byte-identical through Phase C.
+    That is a real finding about the wheel and it belongs to FC-112, which is
+    already the owner of the wheel's roll-trigger study; it is stated in
+    ``ROLL_REACH_BIAS`` rather than fixed as a side effect of a covered-call PR.
+
+    Zero, too, for a profile with rolling off, so nothing widens for a run whose
+    roller will never fire.
+    """
+    if is_wheel(config):
+        return 0
+    if not getattr(config, "rolling_enabled", False):
+        return 0
+    extension = int(getattr(config, "rolling_max_extension_days", 0) or 0)
+    if extension <= 0:
+        return 0
+    return min(config_target_dte(config, "call") + extension, MAX_SWEEPABLE_DTE)
+
+
 def arm_max_dte(config) -> int:
-    """The reach ONE arm's own config needs: the max over its two DTE targets.
+    """The reach ONE arm's own config needs.
+
+    The max over its two DTE targets AND (FC-096 Phase C, H3) its roll horizon.
 
     Both legs, because either one can be the longer: an arm overriding only
     ``call_target_dte`` still needs calls that far out, and the covered-call
     profile's base is already 14 on the call leg with no put leg at all.
+
+    The roll horizon is folded in here — not only into the sweep-wide reach —
+    because ``_replay_one`` masks each arm back to THIS number before replaying
+    it. Widening only the materialisation would have handed the mask straight
+    back the 14-DTE view the roller was starving on.
     """
-    return max(config_target_dte(config, "put"), config_target_dte(config, "call"))
+    return max(
+        config_target_dte(config, "put"),
+        config_target_dte(config, "call"),
+        roll_horizon_reach(config),
+    )
 
 
 def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
@@ -528,6 +583,9 @@ def effective_max_dte(base_config, scenarios: Sequence[Scenario]) -> int:
     reach = max(
         config_target_dte(base_config, "put"),
         config_target_dte(base_config, "call"),
+        # FC-096 Phase C (H3). The roller's replacement search runs past both
+        # targets, so a materialisation sized to the targets alone starves it.
+        roll_horizon_reach(base_config),
     )
     for scenario in scenarios:
         for key in DTE_OVERRIDE_KEYS:
@@ -564,6 +622,7 @@ def _row_from_report(
     cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
     seconds: float, rolls_evaluated: Optional[int] = None,
     rolls_executed: Optional[int] = None,
+    roll_skips: Optional[Dict[str, int]] = None,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
@@ -614,6 +673,7 @@ def _row_from_report(
                                else report.synthetic_lots_opened),
         itm_rolls=(None if report.is_wheel else report.itm_rolls),
         otm_roll_outs=(None if report.is_wheel else report.otm_roll_outs),
+        roll_skips=(dict(roll_skips) if roll_skips else None),
         replay_seconds=round(seconds, 3),
     )
 
@@ -1159,6 +1219,7 @@ def _replay_one(
             seconds=time.perf_counter() - t0,
             rolls_evaluated=result.rolls_evaluated,
             rolls_executed=result.rolls_executed,
+            roll_skips=result.roll_skips,
         )
         if artifact_sink is not None:
             _emit_artifact(

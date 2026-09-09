@@ -97,6 +97,12 @@
     "sell_call_open": [],
     "sell_put_open": [
       "collateral"
+    ],
+    "synthetic_lot_open": [
+      "cost_basis",
+      "lot_value",
+      "premise",
+      "shares"
     ]
   },
   "provenance": [
@@ -162,6 +168,7 @@
     "provenance",
     "rejections",
     "roll_records",
+    "roll_skips",
     "schema"
   ]
 }

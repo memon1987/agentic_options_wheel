@@ -166,6 +166,12 @@ class TestTheReportProseIsNotAFork:
         # `spec_json.strategy`).
         "SYNTHETIC_LOT_BIAS", "MODEL_SPREAD_BIAS", "ROLL_REACH_BIAS",
         "CC_ROLL_SPLIT_NOTE", "MONITOR_LEG_NOTE",
+        # M1 (review round 1): the substitution's two KEYS and its two
+        # replacements. The keys are titles taken from SWEEP_BIASES, so a drift
+        # in either copy breaks the swap silently — matching on a title that no
+        # longer exists leaves the FALSE wheel line in a covered-call footer.
+        "WHEEL_PROFIT_TAKING_TITLE", "WHEEL_EX_DIV_TITLE",
+        "CC_PROFIT_TAKING_BIAS", "CC_EX_DIV_BIAS",
     ])
     def test_matches_report_py_exactly(self, name):
         assert getattr(T, name) == getattr(engine_report, name), (

@@ -39,6 +39,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services.sweep_report_text import (
     BASE_SCENARIO_NAME,
+    CC_EX_DIV_BIAS,
+    CC_PROFIT_TAKING_BIAS,
     CC_ROLL_SPLIT_NOTE,
     CROSS_SCENARIO_CAVEAT,
     DTE_REACH_BIAS,
@@ -54,6 +56,8 @@ from services.sweep_report_text import (
     SWEEP_BIASES,
     SYNTHETIC_LOT_BIAS,
     TALLY_CAVEAT,
+    WHEEL_EX_DIV_TITLE,
+    WHEEL_PROFIT_TAKING_TITLE,
 )
 
 # The two stdlib-only engine modules. In the repo (and in the test suite) they
@@ -1814,25 +1818,47 @@ def _ordering(sweep_row: Dict[str, Any], run_rows: Sequence[Dict[str, Any]]):
     return scenarios, symbols, splits, spec
 
 
+# FC-096 Phase C (review round 1, H5). The covered-call profile's BASE
+# materialisation reach: `call_target_dte` (14) + `rolling.max_extension_days`
+# (14) = 28, capped at the chain lake's `MAX_SWEEPABLE_DTE` (21). It is the
+# number `runner.effective_max_dte` computes for that profile with no DTE arm,
+# and this side cannot compute it — it holds a spec, not a `Config`. Pinned
+# equal to the profile by `TestTheCoveredCallBaseReachIsNotAFork`, so a retune
+# of either knob fails the build rather than silently desynchronising the two
+# footers.
+CC_BASE_REACH = 21
+
+
 def spec_max_dte(spec: Dict[str, Any]) -> int:
     """The DTE reach a persisted spec's arms imply — the dashboard's half of
     ``runner.effective_max_dte``.
 
     The runner takes the max over the base config AND every arm's DTE overrides.
     This side cannot see the base config — it holds a spec, not a ``Config`` —
-    so the floor is ``DTE_REACH_BIAS_THRESHOLD``, which is the live profile's
-    own ``put_target_dte``. The two therefore agree on the only thing the answer
-    is used for: whether the run reached PAST 7. They would disagree if the
-    wheel profile's base DTE ever moved off 7, which is a config change that has
-    to update the threshold anyway (the fidelity figures in ``SWEEP_BIASES``
-    were measured at 7 and the constant says so).
+    so it uses a per-strategy FLOOR standing in for that base.
+
+    **Strategy-aware since FC-096 Phase C (review round 1, H5.)** The floor used
+    to be ``DTE_REACH_BIAS_THRESHOLD`` unconditionally, i.e. the WHEEL's
+    ``put_target_dte``. A covered-call run's base reach is not 7: its call
+    target is 14 and Phase C widens its materialisation to the roll horizon
+    (``call_target_dte + rolling.max_extension_days``, capped at the lake), which
+    is ``CC_BASE_REACH``. With a 7 floor this side computed 7 for every CC run
+    while the engine computed 21, so ``shape_results`` and ``report.py``
+    disagreed about whether the DTE caveat had been earned — the exact fork the
+    parity test exists to prevent, arriving through a strategy the test did not
+    cover.
+
+    ``CC_BASE_REACH`` is pinned to the profile by an equality test rather than
+    derived here, because this module is the dashboard's and holds no ``Config``.
 
     Reads the SPEC rather than the per-cell ``overrides_json`` because the spec
     is the run's declaration: an arm that errored in every cell still asked for
     its reach, and the caveat is about the DATA the window was built on, not
     about which cells came back.
     """
-    reach = DTE_REACH_BIAS_THRESHOLD
+    reach = (DTE_REACH_BIAS_THRESHOLD
+             if str(spec.get("strategy") or WHEEL_STRATEGY) == WHEEL_STRATEGY
+             else CC_BASE_REACH)
     for arm in (spec.get("scenarios") or []):
         if not isinstance(arm, dict):
             continue
@@ -2340,6 +2366,17 @@ def shape_results(sweep_row: Dict[str, Any],
     # divergence is named here rather than left for a reader to find.
     run_strategy = str(spec.get("strategy") or WHEEL_STRATEGY)
     if run_strategy != WHEEL_STRATEGY:
+        # M1 (review round 1): the two SWEEP_BIASES lines calibrated on the
+        # WHEEL are FALSE on a covered-call run — profit-taking IS modelled
+        # here, and ex-dividend early assignment CAN fire on a holdings-derived
+        # universe of payers. Swapped by TITLE, exactly as the engine does it,
+        # so a reorder of the shared list cannot substitute the wrong caveat.
+        _cc_substitutions = {
+            WHEEL_PROFIT_TAKING_TITLE: CC_PROFIT_TAKING_BIAS,
+            WHEEL_EX_DIV_TITLE: CC_EX_DIV_BIAS,
+        }
+        known_biases = [_cc_substitutions.get(title, (title, detail))
+                        for title, detail in known_biases]
         known_biases.extend([
             SYNTHETIC_LOT_BIAS, MONITOR_LEG_NOTE, ROLL_REACH_BIAS,
             CC_ROLL_SPLIT_NOTE, MODEL_SPREAD_BIAS,
