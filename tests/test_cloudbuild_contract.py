@@ -162,6 +162,18 @@ def deploy_flags(step):
         (i for i, ln in enumerate(lines) if "gcloud run deploy" in ln), None
     )
     assert start is not None, f"no `gcloud run deploy` in step {step.get('id')}"
+    # The anchor is a plain substring match, so a COMMENT inside the script that
+    # happens to contain the literal is picked up as the command and the flag set
+    # is silently scraped out of prose (reproduced FC-107: a one-line comment
+    # reduced deploy-bot-canary's ten flags to `['--timeout=1800']`, and the seam
+    # test then read its number off the comment). Prose about the deploy belongs
+    # in a YAML comment ABOVE the step, where the parser never sees it.
+    occurrences = [ln for ln in lines if "gcloud run deploy" in ln]
+    assert len(occurrences) == 1, (
+        f"step {step.get('id')} contains `gcloud run deploy` "
+        f"{len(occurrences)} times: {occurrences}. Exactly one — the command "
+        "itself — may carry that literal inside the script."
+    )
 
     joined = []
     i = start
@@ -641,7 +653,6 @@ BOT_PROFILE = {
     "deploy-bot-canary": "config/settings.yaml",
     "deploy-cc-canary": "config/covered_call.yaml",
 }
-WHEEL_PROFILE = "config/settings.yaml"
 
 #: `options-wheel-roll-daily`'s `attemptDeadline`, live-verified 2026-09-08 and
 #: also Cloud Scheduler's maximum for an HTTP target. Documented, NOT read: the
@@ -649,12 +660,18 @@ WHEEL_PROFILE = "config/settings.yaml"
 #: so the rollout (docs/plans/fc-107.md §Rollout step 3) verifies it live.
 ROLL_SCHEDULER_ATTEMPT_DEADLINE_SECONDS = 1800
 
-#: Everything `/roll` does BEFORE `run_rolling_cycle`'s clock starts: the profile
-#: load, `WheelEngine` construction and the pre-loop position/order fetches. The
-#: 15:30 instance is warm from the 15:15 `/run`, so this is seconds. It does NOT
-#: cover the roller's RTT-blind polling (`_poll_order_fill` counts sleeps, not
-#: round-trips) or the lock wait between Cloud Run's admission clock and the
-#: cycle's — both are FC-113, and both eat this allowance, not a separate one.
+#: Everything that runs BEFORE `run_rolling_cycle`'s clock starts. That clock is
+#: `start_time = clock.now()` on the FIRST line of the cycle
+#: (`wheel_engine.py:720`), so the position and open-order fetches at `:740+`
+#: are INSIDE the 1500 s budget, not in this allowance. What is genuinely
+#: outside it: the `strategy_lock` wait, `_is_market_open()`, `strategy_config()`
+#: and `WheelEngine(config)` — 3–18 ms on a warm instance (the 15:30 instance is
+#: warm from the 15:15 `/run`), with one 14.1 s outlier on the 2026-09-07 Labor
+#: Day cold start. 60 s covers that with margin. It does NOT cover two things
+#: that are unbounded in principle: the roller's RTT-blind polling
+#: (`_poll_order_fill` counts sleeps, not round-trips) and a long lock wait
+#: (observed lock-holders 63 s, 79 s, 300 s) — FC-113 and FC-089 own those, and
+#: neither is bought off by raising this number.
 PREAMBLE_ALLOWANCE_SECONDS = 60
 
 #: Ladder rungs that exist regardless of config: the BTC, rung 1 (the primary at
@@ -674,27 +691,31 @@ def service_timeout_seconds(step):
 
 
 def rolling_leg_params(profile_path):
-    """`(btc_fill_timeout_seconds, fallback_strike_attempts, sources)` for a profile.
+    """`(btc_fill_timeout_seconds, fallback_strike_attempts)` as PRODUCTION reads them.
 
-    A profile with no `rolling` block — or a `rolling` block missing one of these
-    keys — inherits the wheel's, exactly as `Config` does. `config/covered_call.yaml`
-    has no `rolling` block today; FC-100 adds one. `sources` names the file each
-    value actually came from, so a failure message says which file to edit.
+    Through `Config`, not raw yaml, because the two disagree on the case that
+    matters. `Config` loads exactly ONE file and does NOT layer
+    `config/settings.yaml` underneath a profile: a profile that omits a rolling
+    key gets a HARD-CODED literal — `Config.rolling_btc_fill_timeout_seconds`
+    defaults to 120 and `.rolling_fallback_strike_attempts` to 2
+    (`src/utils/config.py`). Reading the wheel's yaml as the fallback would
+    under-count the covered-call seam the moment those literals and the wheel's
+    values diverge — e.g. raising the literal default to 4 would run a 7-leg
+    ladder on a profile with no `rolling` block while this test read the wheel's
+    2 and passed.
+
+    Hermetic: `Config(path)` reads the yaml and substitutes env vars, and
+    conftest pins ALPACA_API_KEY / ALPACA_SECRET_KEY / FINNHUB_API_KEY
+    unconditionally in autouse fixtures, so `_load_secret` never reaches Secret
+    Manager. Precedent: `tests/test_config.py`'s
+    `test_the_shipped_wheel_config_reads_back_both_knobs` builds a real `Config`
+    from the shipped profile the same way.
     """
-    wheel = (yaml.safe_load((REPO_ROOT / WHEEL_PROFILE).read_text())
-             .get("rolling") or {})
-    profile = (yaml.safe_load((REPO_ROOT / profile_path).read_text())
-               .get("rolling") or {})
-    values, sources = {}, {}
-    for key in ("btc_fill_timeout_seconds", "fallback_strike_attempts"):
-        if key in profile:
-            values[key], sources[key] = profile[key], profile_path
-        else:
-            values[key], sources[key] = wheel[key], (
-                f"{WHEEL_PROFILE} (fallback: {profile_path} has no {key})"
-            )
-    return (values["btc_fill_timeout_seconds"],
-            values["fallback_strike_attempts"], sources)
+    from src.utils.config import Config
+
+    config = Config(str(REPO_ROOT / profile_path))
+    return (config.rolling_btc_fill_timeout_seconds,
+            config.rolling_fallback_strike_attempts)
 
 
 def test_the_bot_steps_select_the_profiles_this_section_reasons_about(by_id):
@@ -741,7 +762,7 @@ def test_bot_service_timeout_covers_the_roll_seam_invariant(service, by_id):
     step_id = CHAINS[service]["deploy"]
     timeout = service_timeout_seconds(by_id[step_id])
     profile = BOT_PROFILE[step_id]
-    btc_poll, fallbacks, sources = rolling_leg_params(profile)
+    btc_poll, fallbacks = rolling_leg_params(profile)
 
     latest_start = _CYCLE_BUDGET_SECONDS - _PER_POSITION_BUDGET_SECONDS
     legs = LADDER_FIXED_LEGS + fallbacks
@@ -760,9 +781,12 @@ def test_bot_service_timeout_covers_the_roll_seam_invariant(service, by_id):
         "thread is NOT killed and keeps trading unobserved, and if the instance "
         "scales in the buy-to-close stands with no sell-to-open (uncovered long "
         f"stock). Raise --timeout on {step_id} in cloudbuild.yaml AND re-freeze "
-        "tests/fixtures/cloudbuild_contract.json, or lower the inputs. Sources: "
-        f"btc_fill_timeout_seconds <- {sources['btc_fill_timeout_seconds']}; "
-        f"fallback_strike_attempts <- {sources['fallback_strike_attempts']}."
+        f"tests/fixtures/cloudbuild_contract.json, or lower the inputs. The two "
+        f"leg inputs are read through Config({profile}), which is what the "
+        "service does: btc_fill_timeout_seconds and fallback_strike_attempts "
+        "come from that file's `rolling` block, or from Config's hard-coded "
+        "defaults (120 / 2) when the block omits them — never from another "
+        "profile."
     )
 
 
