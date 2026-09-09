@@ -675,17 +675,16 @@ class TestCoverageIsSplitByReason:
             f"stand-down: {result.coverage_by_reason}")
 
 
-    def test_below_basis_is_NOT_hold_uncovered_when_a_floor_clearing_strike_exists(
-            self):
-        """M4 (review round 1). `close < basis` was a PROXY, and it misfires.
+    def test_the_floor_predicate_separates_all_three_states(self):
+        """M4, corrected by the confirmation pass (2026-09-09).
 
-        A stock below its basis can still offer a strike above that basis inside
-        the delta band — a high-IV name at 0.90x basis routinely does — and that
-        day is not the floor standing the strategy down. Filing it as
-        `hold_uncovered` matters twice over: the bucket that means "the guard
-        worked" absorbs ordinary gate rejections, and because it is EXCLUDED
-        from the coverage denominator, doing so silently inflates the coverage
-        ratio the verdict gates on.
+        The predicate must fire ONLY on the floor's own case. The first cut
+        answered `False` for three unrelated states and the caller turned every
+        one of them into `hold_uncovered` — including "the band was empty" and
+        "there was no chain", neither of which the floor had any part in. Since
+        `hold_uncovered` is EXCLUDED from the coverage denominator, that misfile
+        INFLATED coverage, and it did so on days the stock was far ABOVE its
+        basis, where the floor cannot be the reason at all.
         """
         from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
         from src.backtesting.engine.simulator import Simulator
@@ -705,29 +704,38 @@ class TestCoverageIsSplitByReason:
             return ChainSnapshot(underlying="XYZ", as_of=date(2024, 6, 3),
                                  underlying_price=90.0, puts=[], calls=quotes)
 
-        # Basis 100, spot 90 — below basis EITHER WAY. The difference is the
-        # chain: one offers a 105 strike at 0.20 delta, the other does not.
-        with_strike = _snap([_call(105.0, 0.20)])
-        without = _snap([_call(95.0, 0.20), _call(105.0, 0.80)])
+        # 1. In-band strikes exist and ALL sit below basis -> the floor's case.
+        assert Simulator._floor_blocks_writing(
+            sim, _snap([_call(95.0, 0.20), _call(98.0, 0.15)]), 100.0)
 
-        assert Simulator._floor_clearing_strike_exists(sim, with_strike, 100.0)
-        assert not Simulator._floor_clearing_strike_exists(sim, without, 100.0), (
-            "a strike below the basis, and one above it outside the delta "
-            "band, are both unwritable — that IS the floor standing us down")
-        # And no chain at all is the floor's case too.
-        assert not Simulator._floor_clearing_strike_exists(sim, None, 100.0)
+        # 2. An in-band strike clears the basis -> something else refused it.
+        assert not Simulator._floor_blocks_writing(
+            sim, _snap([_call(95.0, 0.20), _call(105.0, 0.15)]), 100.0)
+
+        # 3. The band is EMPTY -> a selection failure, NOT the floor. This is
+        #    the regression: every one of these strikes clears the basis by a
+        #    mile, so calling it a floor stand-down is exactly backwards.
+        assert not Simulator._floor_blocks_writing(
+            sim, _snap([_call(150.0, 0.80), _call(160.0, 0.90)]), 100.0), (
+            "an empty delta band is the selector finding nothing; the floor "
+            "never got a candidate to refuse")
+
+        # 4. No chain at all -> a data fact, and it must stay in the denominator.
+        assert not Simulator._floor_blocks_writing(sim, None, 100.0)
 
     def test_the_CLASSIFIER_uses_the_chain_and_not_the_close(self):
-        """The mutation that survived the first cut of this test.
+        """The classifier consults the chain, and files each state correctly.
 
-        Pinning `_floor_clearing_strike_exists` alone proved the helper worked
-        and NOT that `_coverage_reason` consults it — reverting the classifier
-        to `close < basis` left every assertion passing. This drives the
-        classifier itself, on a book where the two answers differ.
+        Pinning the helper alone proved it worked and NOT that
+        `_coverage_reason` consults it — reverting the classifier to
+        `close < basis` left every assertion passing. This drives the
+        classifier, on books where the answers differ.
         """
         from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
         from src.backtesting.engine.broker import BacktestBroker
-        from src.backtesting.engine.simulator import Simulator
+        from src.backtesting.engine.simulator import (
+            COVERAGE_GATE_REJECTED, Simulator,
+        )
 
         days, closes, expirations = _rising_window()
         sim = _cc_simulator("XYZ", closes, expirations, days)
@@ -735,40 +743,136 @@ class TestCoverageIsSplitByReason:
         broker = BacktestBroker(starting_cash=CC_CASH_FLOAT)
         broker.deposit_shares("XYZ", 100, 100.0, date(2024, 6, 3),
                               premise="test")
-        # Spot 90, basis 100 — BELOW basis, so the old proxy says
-        # `hold_uncovered` no matter what the chain holds.
+
+        def _call(strike, delta):
+            return ChainQuote(
+                symbol=f"XYZ240607C{int(strike * 1000):08d}", underlying="XYZ",
+                as_of=date(2024, 6, 3), expiration=date(2024, 6, 7),
+                strike=strike, option_type="call", dte=4, underlying_price=90.0,
+                mark=1.1, bid=1.0, ask=1.2, implied_volatility=0.3,
+                delta=delta, volume=100)
+
+        def _snap(quotes):
+            return ChainSnapshot(underlying="XYZ", as_of=date(2024, 6, 3),
+                                 underlying_price=90.0, puts=[], calls=quotes)
+
+        # Spot 90, basis 100 — BELOW basis, so the old `close < basis` proxy
+        # said `hold_uncovered` no matter what the chain held.
         below = {"XYZ": 90.0}
 
-        writable = ChainSnapshot(
-            underlying="XYZ", as_of=date(2024, 6, 3), underlying_price=90.0,
-            puts=[], calls=[ChainQuote(
-                symbol="XYZ240607C00105000", underlying="XYZ",
-                as_of=date(2024, 6, 3), expiration=date(2024, 6, 7),
-                strike=105.0, option_type="call", dte=4, underlying_price=90.0,
-                mark=1.1, bid=1.0, ask=1.2, implied_volatility=0.3,
-                delta=0.20, volume=100)])
-        barren = ChainSnapshot(
-            underlying="XYZ", as_of=date(2024, 6, 3), underlying_price=90.0,
-            puts=[], calls=[])
+        # In-band strikes, all under the basis: the floor really is the reason.
+        assert Simulator._coverage_reason(
+            sim, broker, "XYZ", below, set(),
+            snapshot=_snap([_call(95.0, 0.20)])
+        ) == COVERAGE_HOLD_UNCOVERED
 
+        # Below basis, but an in-band strike CLEARS it: not the floor.
         assert Simulator._coverage_reason(
-            sim, broker, "XYZ", below, set(), snapshot=barren
-        ) == COVERAGE_HOLD_UNCOVERED, "no writable strike IS the floor's case"
-        assert Simulator._coverage_reason(
-            sim, broker, "XYZ", below, set(), snapshot=writable
+            sim, broker, "XYZ", below, set(),
+            snapshot=_snap([_call(105.0, 0.20)])
         ) != COVERAGE_HOLD_UNCOVERED, (
             "below basis with a floor-clearing in-band strike available is NOT "
             "the floor standing the strategy down — something else refused it")
 
-    def test_the_residual_bias_direction_is_named_in_the_footer(self):
-        """The classification errs toward `gate_rejected`, which is IN the
-        coverage denominator — so a misclassification makes the ratio harsher,
-        never flattering. Stated in the footer, not only in a docstring."""
+        # THE REGRESSION (confirmation pass): every strike clears the basis by a
+        # mile and none is in the band. The floor had nothing to do with it, and
+        # filing it as `hold_uncovered` drops the day from the coverage
+        # denominator — flattering coverage on a stock far ABOVE its basis.
+        above = {"XYZ": 150.0}
+        assert Simulator._coverage_reason(
+            sim, broker, "XYZ", above, set(),
+            snapshot=_snap([_call(150.0, 0.80), _call(160.0, 0.90)])
+        ) == COVERAGE_GATE_REJECTED
+
+        # No chain at all is a data fact, and it stays in the denominator too.
+        assert Simulator._coverage_reason(
+            sim, broker, "XYZ", above, set(), snapshot=None
+        ) == COVERAGE_GATE_REJECTED
+
+    def test_an_above_basis_empty_band_lands_in_the_denominator(self):
+        """The confirmation pass's own probe, pinned as a regression test.
+
+        The rising window under a [0.10, 0.20] arm: on four sessions the basis
+        is 100 against closes of 145-154, every listed call clears the basis,
+        and none falls in the band. Those days were being filed as
+        `hold_uncovered` and DROPPED from the coverage denominator, reporting
+        100% coverage where the truth is 90% — and the CLI printed "below basis
+        4" about a stock 50% ABOVE its basis.
+        """
+        from src.backtesting.scenarios.overrides import apply_overrides
+        from src.backtesting.engine.simulator import COVERAGE_GATE_REJECTED
+
+        days, closes, expirations = _rising_window()
+        arm = apply_overrides(_cc_config(),
+                              {"strategy.call_delta_range": [0.10, 0.20]})
+        result = _cc_simulator("XYZ", closes, expirations, days,
+                               config=arm).run()
+
+        assert COVERAGE_HOLD_UNCOVERED not in result.coverage_by_reason, (
+            f"a stock far ABOVE its basis cannot be held back BY the basis "
+            f"floor: {result.coverage_by_reason}")
+        assert result.coverage_by_reason[COVERAGE_GATE_REJECTED] == 4
+        assert result.coverage_by_reason[COVERAGE_COVERED] == 36
+        assert sum(result.coverage_by_reason.values()) == len(days)
+
+        report = _scored(days, closes, expirations, result)
+        assert report.coverage_fraction == pytest.approx(0.9), (
+            "the four empty-band days must be IN the denominator; excluding "
+            "them reports 100% coverage for a strategy covered on 36 of 40 days")
+
+    def test_the_footers_never_flattering_claim_is_TRUE_of_the_classifier(self):
+        """The footer claims a DIRECTION; this checks the code has it.
+
+        `SYNTHETIC_LOT_BIAS` says the split "errs toward `gate_rejected` …
+        harsher, never flattering". That sentence was FALSE as first written:
+        an empty band and an absent chain both fell into `hold_uncovered`, which
+        is excluded from the denominator, so the error ran the flattering way.
+        Asserting the words alone would have passed throughout.
+
+        Every state that is not unambiguously the floor's must therefore land in
+        a bucket the denominator can see.
+        """
+        from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
+        from src.backtesting.engine.broker import BacktestBroker
+        from src.backtesting.engine.simulator import (
+            COVERAGE_NOT_A_STAND_DOWN, Simulator,
+        )
         from src.backtesting.scenarios.report import SYNTHETIC_LOT_BIAS
 
         detail = SYNTHETIC_LOT_BIAS[1]
-        assert "gate_rejected" in detail
-        assert "harsher" in detail
+        assert "gate_rejected" in detail and "harsher" in detail
+
+        days, closes, expirations = _rising_window()
+        sim = _cc_simulator("XYZ", closes, expirations, days)
+        broker = BacktestBroker(starting_cash=CC_CASH_FLOAT)
+        broker.deposit_shares("XYZ", 100, 100.0, date(2024, 6, 3),
+                              premise="test")
+
+        def _snap(*strikes_deltas):
+            return ChainSnapshot(
+                underlying="XYZ", as_of=date(2024, 6, 3), underlying_price=90.0,
+                puts=[], calls=[ChainQuote(
+                    symbol=f"XYZ240607C{int(k * 1000):08d}", underlying="XYZ",
+                    as_of=date(2024, 6, 3), expiration=date(2024, 6, 7),
+                    strike=k, option_type="call", dte=4, underlying_price=90.0,
+                    mark=1.1, bid=1.0, ask=1.2, implied_volatility=0.3,
+                    delta=d, volume=100) for k, d in strikes_deltas])
+
+        # Every book in which the floor is NOT unambiguously the reason must
+        # produce a bucket that COUNTS toward coverage.
+        ambiguous = [
+            ("empty band, all above basis", _snap((150.0, 0.80))),
+            ("empty chain", _snap()),
+            ("no chain at all", None),
+            ("in-band strike clears basis", _snap((105.0, 0.20))),
+        ]
+        for label, snapshot in ambiguous:
+            reason = Simulator._coverage_reason(
+                sim, broker, "XYZ", {"XYZ": 90.0}, set(), snapshot=snapshot)
+            assert reason not in COVERAGE_NOT_A_STAND_DOWN, (
+                f"{label}: filed as {reason!r}, which is EXCLUDED from the "
+                f"coverage denominator — that is the flattering direction the "
+                f"footer promises the code does not take")
 
 
 class TestTheMonitorLeg:

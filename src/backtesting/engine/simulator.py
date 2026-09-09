@@ -1270,10 +1270,15 @@ class Simulator:
            had no close to land on), never a permanent state.
         2. ``covered`` — an open short call against the lot. The strategy is
            doing its job.
-        3. ``hold_uncovered`` — the close is below the lot basis, so the
-           cost-basis floor refuses every strike worth writing. NOT a failure:
-           this is the floor protecting the shares, and it is excluded from the
-           low-activity test for exactly that reason.
+        3. ``hold_uncovered`` — the chain offered strikes inside the delta band
+           and EVERY ONE of them sits below the lot basis, so the cost-basis
+           floor refuses them all. NOT a failure: this is the floor protecting
+           the shares, and it is excluded from the low-activity denominator for
+           exactly that reason. It is deliberately NOT "the close is below the
+           basis" (a proxy that misfires both ways) and NOT "no writable strike
+           was found" — a band that contained no strike at all, or a day with no
+           chain, is a SELECTION failure and falls through to 5 below, where the
+           denominator can see it. See ``_floor_blocks_writing``.
         4. ``earnings_span`` — an earnings event falls inside the tenor a fresh
            call would be written into (``call_target_dte``), which is the span
            the FC-013 gate refuses to write across.
@@ -1302,60 +1307,74 @@ class Simulator:
         if symbol in covered:
             return COVERAGE_COVERED
         basis = broker.average_cost_basis(symbol)
-        if basis is not None and not self._floor_clearing_strike_exists(
-                snapshot, basis):
+        if basis is not None and self._floor_blocks_writing(snapshot, basis):
             return COVERAGE_HOLD_UNCOVERED
         if self._earnings_blocks(symbol):
             return COVERAGE_EARNINGS_SPAN
         return COVERAGE_GATE_REJECTED
 
-    def _floor_clearing_strike_exists(
+    def _floor_blocks_writing(
         self, snapshot: Optional[ChainSnapshot], basis: float
     ) -> bool:
-        """Is there a call at or above ``basis`` inside the profile's delta band?
+        """Did the COST-BASIS FLOOR leave nothing writable today?
 
-        **M4 (review round 1).** The first cut asked ``close < basis``, which is
-        a PROXY for the cost-basis floor and misfires in both directions. A
-        stock trading below its basis can still offer a floor-clearing strike in
-        the band — a high-IV name at 0.90x basis routinely does — and that day
-        was filed as "the floor stood us down" when the floor allowed a write
-        and something else refused it. The bucket that is supposed to mean "the
-        guard worked" then absorbs ordinary gate rejections, and because it is
-        EXCLUDED from the coverage denominator, absorbing them silently inflates
-        the coverage ratio the verdict gates on.
+        True in exactly one situation: the chain offered strikes inside the
+        profile's delta band, and **every one of them sits below the lot's
+        basis**. That is the floor doing its job — refusing to sell the shares
+        for less than they cost — and it is the only day that belongs in
+        ``hold_uncovered``.
 
-        This asks the question the floor actually asks: does the chain contain a
-        call whose strike clears the basis AND whose delta is inside the band the
-        profile writes at? No such strike ⇒ the floor genuinely left nothing to
-        write, which is the strategy working. One exists ⇒ whatever declined it
-        was a gate, and the day belongs in ``gate_rejected``.
+        **This replaces a predicate that answered a different question**
+        (confirmation pass, 2026-09-09). The first cut asked "does a
+        floor-clearing in-band strike EXIST", and answered ``False`` for three
+        unrelated states: the floor's case above, a band that contained no
+        strike at all, and a day with no chain. The last two were then filed as
+        ``hold_uncovered`` — which is EXCLUDED from the coverage denominator, so
+        the misfile *inflated* coverage instead of depressing it, and it did so
+        precisely on a stock far ABOVE its basis, where the floor cannot
+        possibly be the reason.
 
-        **Residual bias, stated rather than hidden** (and named in
-        ``SYNTHETIC_LOT_BIAS``): this checks the delta band and the floor, not
-        the premium floor, the DTE ceiling or the spread gate. A day with a
-        floor-clearing, in-band strike that failed the PREMIUM floor lands in
-        ``gate_rejected`` — correctly, since premium is a gate — so the split
-        attributes to the floor only what the floor decided. It errs toward
-        ``gate_rejected``, which is the honest direction: that bucket is IN the
-        coverage denominator, so a misclassification makes the coverage ratio
-        harsher, never flattering.
+        Measured on the rising window (band [0.10, 0.20]): on 2024-07-15, -16,
+        -22 and -23 the basis was 100 against closes of 145-154, all 50 of the
+        50 listed calls cleared the basis, and none fell in the band. Those four
+        days were reported as "below basis" and dropped from the denominator,
+        putting coverage at 100% where the truth is 90%.
 
-        No snapshot (a day the symbol did not trade) ⇒ ``False``: with no chain
-        there was nothing to write, and the floor is the standing reason.
+        So the three states are now separated at the source:
+
+        * in-band strikes exist, all below basis  -> ``hold_uncovered``
+        * in-band strikes exist, one clears basis -> some other gate refused it
+        * **no in-band strike at all, or no chain -> ``gate_rejected``**
+
+        The third is the correction: an empty band is a SELECTION failure, not a
+        floor stand-down, and it belongs in the denominator the coverage ratio
+        is taken over.
+
+        **Residual bias, and now it is really in the stated direction.** This
+        checks the delta band and the floor, not the premium floor, the DTE
+        ceiling or the spread gate — so a day with a floor-clearing in-band
+        strike that failed the premium floor lands in ``gate_rejected``.
+        Every remaining misclassification therefore pushes days INTO the
+        denominator, which makes the coverage ratio harsher and never
+        flattering. That is what ``SYNTHETIC_LOT_BIAS`` claims, and it was not
+        true until this change.
         """
         if snapshot is None:
+            # No chain at all: nothing was writable, but the floor is not why.
+            # A day the symbol did not trade is a data fact, and filing it under
+            # the floor would hide it from the coverage denominator.
             return False
         band = getattr(self.config, "call_delta_range", None) or [0.0, 1.0]
         low, high = float(band[0]), float(band[1])
-        for quote in snapshot.calls:
-            if quote.strike < basis:
-                continue
-            delta = quote.delta
-            if delta is None:
-                continue
-            if low <= abs(delta) <= high:
-                return True
-        return False
+        in_band = [
+            quote for quote in snapshot.calls
+            if quote.delta is not None and low <= abs(quote.delta) <= high
+        ]
+        if not in_band:
+            # The band was empty. That is the selector finding nothing, which is
+            # a gate rejection — the floor never got a candidate to refuse.
+            return False
+        return all(quote.strike < basis for quote in in_band)
 
     def _earnings_blocks(self, symbol: str) -> bool:
         """Would an earnings event fall inside a fresh call's tenor today?

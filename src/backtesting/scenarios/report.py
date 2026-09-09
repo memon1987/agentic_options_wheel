@@ -627,8 +627,16 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
           f"writable days) or errored contributes to its own count and to "
           f"nothing else.")
     a("")
-    a(_covered_call_table(result))
-    a("")
+    # Guarded on a NON-EMPTY table (confirmation pass, 2026-09-09). Appending
+    # the separators unconditionally put two blank lines into every WHEEL sweep
+    # report — `_covered_call_table` returns "" there — so the wheel markdown
+    # was not byte-identical, which is exactly what that function's docstring
+    # promises. Harmless to a reader, and a false claim in a docstring is the
+    # kind of thing the next person stops trusting the rest of.
+    _cc_table = _covered_call_table(result)
+    if _cc_table:
+        a(_cc_table)
+        a("")
 
     if result.has_holdout:
         a("## Fit vs holdout")
