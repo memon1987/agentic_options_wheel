@@ -1194,7 +1194,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-116: the replay fills rolls at the haircut-from-mid price, not at the placed limits
 
 **Scope:** shared (backtest engine)
-**Status:** Filed 2026-09-09 (found by the FC-096 Phase C build — a conflict between the FC-100 hand-off and the wheel golden contract)
+**Status:** IN PLANNING 2026-09-11 (operator: proceed) — plan `docs/plans/fc-116.md` (Fable) → two plan reviews → build. FC-112 follows it. Originally filed 2026-09-09 from the Phase C build.
 **Size estimate:** S–M
 
 **Problem:** `BacktestBroker` fills every order at the haircut price from mid (the engine's single fill model), while the live roller is credit-only at the PLACED limits (BTC at the ask, STO at the bid or mid−$0.05). The FC-100 hand-off required the replay to mirror that, but a fill-model change on the roll path alters every wheel replay's numbers and breaks the "wheel golden byte-identical" contract Phase C is bound by. Phase C therefore kept the haircut fills and labels the bias: replay roll credits biased UP vs live (haircut fills), counts/credits biased DOWN vs live (22-DTE lake vs a 28-DTE need). Two opposing biases on one metric is the honest interim, not the answer.
@@ -1202,6 +1202,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Proposal:** a per-order-kind fill mode — roll legs fill at the placed limit (or not at all within the leg's timeout, mirroring `_poll_order_fill`), entry legs keep the haircut — behind a config key on the sim spec so the wheel golden can be re-baselined deliberately in one PR (new golden fixtures, engine identity moves once); the report footer then drops the "credits biased up" clause. Decide whether FC-112's wheel trigger study should wait for this (it should: the study's roll-credit metric is exactly what this fixes).
 
 **Links:** FC-096 Phase C (PR #129 body, deviation 1), FC-100 §Phase C hand-off, FC-112.
+
+### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
+
+**Scope:** shared
+**Status:** Filed 2026-09-11 (operator decision: "wheel and covered call should have the same underlying mechanisms"); queued behind FC-116
+**Size estimate:** S–M
+
+**Problem:** `main.py --command battery` submits the wheel's standing set only (base config, one sweep per live wheel symbol, trailing year, 90-day holdout) — Phase C left it wheel-only by choice. The covered-call profile therefore has no weekly trend series: its results exist only when someone submits a sim by hand.
+
+**Proposal:** the battery composes a second standing set from `config/covered_call.yaml`'s symbols with `strategy: covered_call` (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (each CC cell is a ~4 s replay, so ≈ +2 min); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
+
+**Links:** FC-096 Phase B (`docs/plans/fc-096-b.md` battery), Phase C (`docs/plans/fc-096-c.md` — "battery stays wheel-only by choice"), FC-116.
 
 
 ## Completed
