@@ -1206,12 +1206,12 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
 
 **Scope:** shared
-**Status:** Draft rev 2 — confirmation next (`docs/plans/fc-117.md`; rev 1 reviewed by two adversarial plan reviews 2026-09-11, the union addressed in rev 2 §Amendments; FC-118/FC-119 filed from them); queued behind FC-116 for the build. Operator decision 2026-09-11: same mechanisms for both strategies.
+**Status:** Plan APPROVED 2026-09-11 (`docs/plans/fc-117.md` rev 3 — two adversarial plan reviews, union addressed in rev 2, scoped confirmation's five text defects fixed in rev 3; FC-118/FC-119 filed from the reviews). Build queued behind FC-116's. Operator decision 2026-09-11: same mechanisms for both strategies.
 **Size estimate:** S–M
 
 **Problem:** `main.py --command battery` submits the wheel's standing set only (base config, one sweep per live wheel symbol, trailing year, 90-day holdout) — Phase C left it wheel-only by choice. The covered-call profile therefore has no weekly trend series: its results exist only when someone submits a sim by hand.
 
-**Proposal:** the battery composes a second standing set over the SAME universe as the wheel's (the covered-call profile has no `stocks:` list — its live universe is holdings-derived — so "same mechanisms" means the wheel's 14 symbols measured under `strategy: covered_call`) (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (each CC cell is a ~4 s replay, so ≈ +2 min); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
+**Proposal:** the battery composes a second standing set over the SAME universe as the wheel's (the covered-call profile has no `stocks:` list — its live universe is holdings-derived — so "same mechanisms" means the wheel's 14 symbols measured under `strategy: covered_call`) (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (a CC item is a local-hit materialisation plus ~1 s/cell replay, ≈ 3–4 min for the half best case and ≤ 12 min worst (DD-2)); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
 
 **Links:** FC-096 Phase B (`docs/plans/fc-096-b.md` battery), Phase C (`docs/plans/fc-096-c.md` — "battery stays wheel-only by choice"), FC-116, FC-118, FC-119.
 
