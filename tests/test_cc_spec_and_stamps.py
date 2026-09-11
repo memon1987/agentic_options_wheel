@@ -9,6 +9,7 @@ the replay is right, and the failure is silent in every case.
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
@@ -89,6 +90,51 @@ class TestCanonicalisationByOmission:
         Canonicalisation must not refuse — the VALIDATORS do."""
         assert ident.canonical_spec(
             dict(LEGACY_SPEC, strategy="nonsense"))["strategy"] == "nonsense"
+
+    # -- FC-116 T8 -------------------------------------------------------- #
+    # Literal pins, computed on the tree BEFORE `roll_fill_mode` existed
+    # (`1e292a2`) and pasted here. No test pinned a literal arm hash until
+    # now, which is exactly how FC-116 could have shipped a payload that
+    # writes `"roll_fill_mode": null` as a fixed key and silently moved EVERY
+    # arm hash -> every `scenario_hash`, `sweep_key` and standing pin in the
+    # store. A hash that moves here is that bug, not a rebase artefact: these
+    # literals must survive every future change to `identity.py` unless the
+    # store is deliberately being invalidated.
+    LEGACY_ARM_HASH_NO_HAIRCUT = "c908ee20abc31f39"
+    LEGACY_ARM_HASH_HAIRCUT_05 = "f1be989a61b68a05"
+    LEGACY_TIGHTER_ARM_HASH = "245a9c1cf695f82e"
+    LEGACY_CANONICAL_JSON = (
+        '{"end": "2026-08-29", "holdout_start": "2026-06-01", '
+        '"run_sensitivity": false, "scenarios": [{"hash": '
+        '"245a9c1cf695f82e", "name": "tighter"}], "start": "2025-09-02", '
+        '"starting_cash": 100000.0, "symbols": ["GOOGL", "UNH"]}'
+    )
+
+    def test_a_legacy_arm_hash_is_a_literal_and_does_not_move(self):
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, None
+        ) == self.LEGACY_ARM_HASH_NO_HAIRCUT
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, 0.5
+        ) == self.LEGACY_ARM_HASH_HAIRCUT_05
+        assert ident.scenario_arm_hash(
+            {"strategy.call_delta_range": [0.1, 0.2]}, None
+        ) == self.LEGACY_TIGHTER_ARM_HASH
+
+    def test_the_default_haircut_still_folds_to_the_omitted_hash(self):
+        """The precedent the new fold copies: a spelled-out default and an
+        omitted one are ONE arm."""
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, ident.DEFAULT_FILL_HAIRCUT
+        ) == self.LEGACY_ARM_HASH_NO_HAIRCUT
+
+    def test_the_canonical_json_of_a_legacy_spec_is_a_literal(self):
+        """Byte-level, not key-level: a new key added to the payload with a
+        `null` value passes a `"x" not in canonical` check and still moves
+        every stored key."""
+        assert json.dumps(
+            ident.canonical_spec(LEGACY_SPEC), sort_keys=True
+        ) == self.LEGACY_CANONICAL_JSON
 
     def test_the_constant_is_the_same_string_in_all_three_copies(self):
         """It is spelled in three stdlib/engine modules that cannot import each
