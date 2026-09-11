@@ -1194,7 +1194,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-116: the replay fills rolls at the haircut-from-mid price, not at the placed limits
 
 **Scope:** shared (backtest engine)
-**Status:** Plan drafted 2026-09-11 (`docs/plans/fc-116.md`, Draft rev 1 — two plan reviews next). Operator decisions 2026-09-11: proceed; `limit` is the default fill mode (the wheel re-baseline is the point); the planner's Q2 (named `ENGINE_VERSION` bump) taken as the technical corollary.
+**Status:** Draft rev 2 — confirmation next (`docs/plans/fc-116.md`; rev 1 reviewed by two adversarial plan reviews 2026-09-11 — options-trader and engine/identity personas — the union addressed in rev 2 §Amendments). Operator decisions 2026-09-11: proceed; `limit` is the default fill mode (the wheel re-baseline is the point); the planner's Q2 (named `ENGINE_VERSION` bump) taken as the technical corollary.
 **Size estimate:** S–M
 
 **Problem:** `BacktestBroker` fills every order at the haircut price from mid (the engine's single fill model), while the live roller is credit-only at the PLACED limits (BTC at the ask, STO at the bid or mid−$0.05). The FC-100 hand-off required the replay to mirror that, but a fill-model change on the roll path alters every wheel replay's numbers and breaks the "wheel golden byte-identical" contract Phase C is bound by. Phase C therefore kept the haircut fills and labels the bias: replay roll credits biased UP vs live (haircut fills), counts/credits biased DOWN vs live (22-DTE lake vs a 28-DTE need). Two opposing biases on one metric is the honest interim, not the answer.
