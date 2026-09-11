@@ -263,3 +263,15 @@ class TestTheBatteryPolicy:
         for it — the lake-degraded policy's rule, and the same trap."""
         f = self._filter()
         assert "jsonPayload.reason" not in f
+
+
+MAX_DOCUMENTATION_CHARS = 4000  # the Monitoring API refuses longer runbooks ("must not be more than 4000 characters")
+
+
+@pytest.mark.parametrize("policy_path", sorted(POLICY_DIR.glob("*.json")), ids=lambda p: p.name)
+def test_the_runbook_fits_the_monitoring_api_cap(policy_path):
+    """`gcloud alpha monitoring policies create` refused the covered-call roll policy on
+    2026-09-11 with a 4000-character cap on documentation.content; the operator hit it
+    at the console. Every policy is checked so a runbook edit cannot recur it."""
+    content = (json.loads(policy_path.read_text()).get("documentation") or {}).get("content", "")
+    assert len(content) <= MAX_DOCUMENTATION_CHARS, f"{policy_path.name}: {len(content)} chars"
