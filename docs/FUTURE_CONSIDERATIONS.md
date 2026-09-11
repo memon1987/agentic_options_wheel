@@ -1206,12 +1206,12 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
 
 **Scope:** shared
-**Status:** Filed 2026-09-11 (operator decision: "wheel and covered call should have the same underlying mechanisms"); queued behind FC-116
+**Status:** Plan drafted 2026-09-11 (`docs/plans/fc-117.md`, Draft rev 1 — two plan reviews next); queued behind FC-116 for the build. Operator decision 2026-09-11: same mechanisms for both strategies.
 **Size estimate:** S–M
 
 **Problem:** `main.py --command battery` submits the wheel's standing set only (base config, one sweep per live wheel symbol, trailing year, 90-day holdout) — Phase C left it wheel-only by choice. The covered-call profile therefore has no weekly trend series: its results exist only when someone submits a sim by hand.
 
-**Proposal:** the battery composes a second standing set from `config/covered_call.yaml`'s symbols with `strategy: covered_call` (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (each CC cell is a ~4 s replay, so ≈ +2 min); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
+**Proposal:** the battery composes a second standing set over the SAME universe as the wheel's (the covered-call profile has no `stocks:` list — its live universe is holdings-derived — so "same mechanisms" means the wheel's 14 symbols measured under `strategy: covered_call`) (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (each CC cell is a ~4 s replay, so ≈ +2 min); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
 
 **Links:** FC-096 Phase B (`docs/plans/fc-096-b.md` battery), Phase C (`docs/plans/fc-096-c.md` — "battery stays wheel-only by choice"), FC-116.
 
