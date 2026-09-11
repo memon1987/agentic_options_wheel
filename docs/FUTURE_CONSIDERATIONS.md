@@ -1206,14 +1206,45 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
 
 **Scope:** shared
-**Status:** Plan drafted 2026-09-11 (`docs/plans/fc-117.md`, Draft rev 1 — two plan reviews next); queued behind FC-116 for the build. Operator decision 2026-09-11: same mechanisms for both strategies.
+**Status:** Draft rev 2 — confirmation next (`docs/plans/fc-117.md`; rev 1 reviewed by two adversarial plan reviews 2026-09-11, the union addressed in rev 2 §Amendments; FC-118/FC-119 filed from them); queued behind FC-116 for the build. Operator decision 2026-09-11: same mechanisms for both strategies.
 **Size estimate:** S–M
 
 **Problem:** `main.py --command battery` submits the wheel's standing set only (base config, one sweep per live wheel symbol, trailing year, 90-day holdout) — Phase C left it wheel-only by choice. The covered-call profile therefore has no weekly trend series: its results exist only when someone submits a sim by hand.
 
 **Proposal:** the battery composes a second standing set over the SAME universe as the wheel's (the covered-call profile has no `stocks:` list — its live universe is holdings-derived — so "same mechanisms" means the wheel's 14 symbols measured under `strategy: covered_call`) (same window shape, same dedup, `submitted_via='battery'`), within the existing wall cap (each CC cell is a ~4 s replay, so ≈ +2 min); pins may carry either strategy; the trend query and the console's battery view segment by `strategy`. Decide whether the CC set runs on the same Saturday execution (simplest) or its own. Tests: the composed set contains both strategies, the CC specs canonicalise with `strategy` present, wheel rows unchanged, wall-cap arithmetic.
 
-**Links:** FC-096 Phase B (`docs/plans/fc-096-b.md` battery), Phase C (`docs/plans/fc-096-c.md` — "battery stays wheel-only by choice"), FC-116.
+**Links:** FC-096 Phase B (`docs/plans/fc-096-b.md` battery), Phase C (`docs/plans/fc-096-c.md` — "battery stays wheel-only by choice"), FC-116, FC-118, FC-119.
+
+### FC-118: the covered-call headline `premium_yield_on_lot` as a `scenario_runs` column
+
+**Scope:** covered_call (a shared table)
+**Status:** Filed 2026-09-11 from the FC-117 plan review (quant reviewer Q1); deferred out of FC-117 by program-owner decision — no `scenario_runs` schema change there.
+**Size estimate:** S
+**Owner:** zeshan
+
+**Problem:** a covered-call row's `annualized_return` is the synthetic lot's EQUITY return (price move + net premium; `src/backtesting/scenarios/report.py` `SYNTHETIC_LOT_BIAS`). The number a covered-call programme is managed to — `premium_yield_on_lot`, annualized net premium over the time-weighted lot value — exists only in the cell artifact (`docs/bigquery/scenario_runs.md` §`strategy`). Once FC-117 gives the CC profile a weekly series, the documented trend query trends the equity return and the headline needs an artifact read per cell.
+
+**Open questions:**
+- Column (NULL on wheel rows) vs a `strategy_metrics_json` bag for every CC-only number (`capital_base`, coverage split, `roll_skips`)? The bag avoids one `ALTER TABLE` per future strategy metric.
+- Backfill the existing CC rows from their artifacts, or leave NULL before the change (the `strategy_id` precedent left history NULL)?
+
+**Links:** FC-117 (`docs/plans/fc-117.md` DD-3, §Amendments Q1), FC-096 Phase C.
+
+### FC-119: committed-table refresh cadence — dividend `until` and the earnings horizon fail-open
+
+**Scope:** shared (backtesting engine data)
+**Status:** Filed 2026-09-11 from the FC-117 plan review (quant reviewer Q6); program-owner decision (v).
+**Size estimate:** S (a re-fetch + a cadence rule; M if automated)
+**Owner:** zeshan
+
+**Problem:** two frozen snapshots in `src/backtesting/data/` drift behind the rolling battery windows. `dividend_history.json` has `until = 2026-07-18`, so every trailing-year window ending after that is `window_exceeds_table` (`dividends.py`) — dividends after 07-18 are missing from BOTH legs, and the covered-call benchmark (the lot held) is dividend-inclusive (`metrics/fitness.py`). `earnings_dates.json` was generated 2026-08-03; AMD and PFE (08-04) and NVDA (08-26) are already past their last known date, and the replay's earnings gate FAILS OPEN past a symbol's horizon (`engine/historical_earnings.py`) — the replay trades across earnings the live FC-013 gate would block. Both conditions are stamped only in the cell artifact's `data_quality` (`earnings_symbols_past_horizon`, `window_exceeds_table`), never on a row, so the bias grows weekly with nothing in `scenario_runs` to show it. A refresh moves `src/**` and therefore the engine identity (every stored key re-replays once) — which is a reason to schedule it, not to skip it.
+
+**Open questions:**
+- Cadence: refresh both tables on a fixed rhythm (monthly, with the `monthly-performance-review` schedule?) or when the earliest horizon comes within N weeks of `last_settled_day()`?
+- Should the battery (or the runner) REFUSE, or at least flag on the sweep row, a window whose symbols are past horizon, instead of relying on the artifact stamp?
+- Automate the fetch (`tools/backtesting/fetch_dividend_table.py` + the earnings fetcher) in CI, or keep it an operator step with a checklist?
+
+**Links:** FC-117 (`docs/plans/fc-117.md` §Risks, §Rollout step 4), FC-013 (live earnings gate), FC-042 Track C (dividends).
 
 
 ## Completed
