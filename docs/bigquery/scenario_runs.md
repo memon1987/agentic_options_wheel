@@ -230,7 +230,8 @@ the summary row stops adding up.
 | group | columns |
 |---|---|
 | identity | `run_id`, `submitted_at` (partition), `written_at` |
-| arm | `scenario_name`, `scenario_hash`, `config_hash`, `overrides_json`, `fill_haircut` (**NULL = the engine default, 0.25** — stored verbatim, see the artifact section) |
+| arm | `scenario_name`, `scenario_hash`, `config_hash`, `overrides_json`, `fill_haircut` (**NULL = the engine default, 0.25** — stored verbatim, see the artifact section), `roll_fill_mode` (**RESOLVED**, see below) |
+| rolling (FC-116) | `rolls_executed`, `roll_skips` (JSON, reason → count), `itm_rolls`, `otm_roll_outs`, `roll_net_credit`, `itm_roll_credit`, `otm_roll_out_credit`, `failed_roll_btc_debit`, `roll_legs_resting`, `roll_legs_marketable` |
 | cell | `symbol`, `split` (`all` \| `fit` \| `holdout`), `window_start`, `window_end` |
 | verdict | `verdict`, `demote`, `insufficient`, `low_activity`, `measured` |
 | performance | `total_return`, `annualized_return`, `annualized_return_on_collateral`, `benchmark_return`, `excess_return`, `option_pnl`, `stock_pnl_realized`, `stock_pnl_unrealized`, `max_drawdown`, `win_rate`, `assignment_rate` |
@@ -416,7 +417,8 @@ Four things on the object exist so a correct artifact cannot tell a reader
 something false, and all four are worth knowing before querying one:
 
 - **`provenance.fill`** — the fill assumption of the SERIALISED replay, always
-  `{"basis": "mid", "fill_haircut": <the RESOLVED haircut>}`. The row's
+  `{"basis": "mid", "fill_haircut": <the RESOLVED haircut>, "roll_fill_mode":
+  <the RESOLVED mode>}`. The row's
   `bid_fill_return` comes from a SECOND replay at the bid that deliberately gets
   no artifact; without this stamp, comparing the two would be comparing two
   different runs.
@@ -430,6 +432,24 @@ something false, and all four are worth knowing before querying one:
   replay ran at must coalesce it. The sweep API's `forecast` block does exactly
   that and additionally serves `fill.is_engine_default`, so a reader can tell a
   declared 0.25 from a defaulted one.
+
+  **`roll_fill_mode` (FC-116) takes the OPPOSITE posture, on purpose.** The
+  haircut above describes ENTRY legs and the covered-call monitor leg only;
+  ROLL legs have their own rule, and the two produce materially different roll
+  credits. That column stores the **RESOLVED** value (`limit` or `haircut`),
+  never NULL from FC-116 on — precisely so it does not need a second
+  `_resolved_haircut` to disambiguate. A **NULL there therefore means exactly
+  one thing: the row was written by an engine before
+  `fc-116-roll-limit-fills`**, which filled roll legs at
+  `mid ∓ fill_haircut × half-spread`. Read it as `haircut`, never as `limit` —
+  the latter would claim a legacy row's roll credit was measured against the
+  limits the live roller places, which is the whole thing FC-116 changed. The
+  sweep API's `forecast.fill` block resolves it that way for you.
+
+  **Rows either side of that boundary are non-comparable on any roll-bearing
+  row**, and they share `scenario_hash` and `config_hash` by design — so any
+  trend series over roll credits must partition on `engine_version` or
+  `roll_fill_mode`. The weekly trend query under *Useful queries* does.
 - **`provenance.masked_reach`** — this ARM's DTE reach and the chain cutoff it
   implies (`max_dte + UNIVERSE_DTE_BUFFER`, carried alongside as `dte_buffer` so
   a reader never has to know the constant's current value), never the sweep-wide
@@ -662,7 +682,12 @@ ORDER BY submitted_at DESC;
 -- `window_end` MOVES week to week because pins and the standing set are both
 -- rolling; a series whose window_end never changed would be one measurement
 -- repeated, which is the defect rolling pins exist to prevent.
-SELECT r.symbol, s.window_end, r.split, r.annualized_return
+-- PARTITION ON `engine_version` (or `roll_fill_mode`): rows written before
+-- `fc-116-roll-limit-fills` filled ROLL legs at the haircut price and are NOT
+-- comparable on any roll-bearing row. Old and new rows share `scenario_hash`
+-- and `config_hash` by design, so nothing else in this query separates them.
+SELECT r.symbol, s.window_end, r.split, r.annualized_return,
+       s.engine_version, r.roll_fill_mode
 FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` s
 JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r
   USING (run_id)

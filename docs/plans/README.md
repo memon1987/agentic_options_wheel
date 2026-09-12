@@ -111,3 +111,7 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-084.md](fc-084.md) — FC-084 — Serialize builds per trigger; pin the smoke test to a build-owned revision; promote with `--to-latest`, status: Done
 - [fc-091.md](fc-091.md) — FC-091 — chain lake merge-on-put, status: Done
 
+_Plans added since that regeneration are appended below rather than re-sorted into it, so the list above stays comparable with the 2026-08-28 snapshot._
+
+- [fc-116.md](fc-116.md) — FC-116 — the replay fills roll legs at the placed limits, capped by the modeled book, with a deliberate wheel re-baseline (`roll_fill_mode`, default `limit`; `ENGINE_VERSION = fc-116-roll-limit-fills`), status: Executing
+
