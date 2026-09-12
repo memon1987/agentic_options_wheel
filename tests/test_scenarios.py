@@ -1052,25 +1052,30 @@ class TestKeysTheReplayCannotReach:
     It was the one allowlisted key the build could not demonstrate moved a
     replay, and it was kept on the reading that "unproven is not dead". A
     reviewer settled it by instrumenting the roller: the knob governs the THIRD
-    and later strike rungs, and rung 1 always fills here — the adapter fills
-    immediately at the broker's haircut price rather than resting a limit that
-    can go unfilled — so over 37 rolls x 7 arms, rung >= 3 was reached 0 times.
-    Live in production, where a real limit can miss; inert in a replay.
+    and later strike rungs, and rung >= 3 was reached 0 times over 37 rolls x 7
+    arms. Live in production, where a real limit can miss; inert in a replay.
     """
 
     def test_fallback_strike_attempts_is_refused(self, sweep_config):
         with pytest.raises(OverrideError) as exc:
             apply_overrides(sweep_config, {"rolling.fallback_strike_attempts": 5})
         message = str(exc.value)
-        # FC-116 made the OLD wording ("unreachable in a replay", "rung 1
-        # always fills") technically false: a leg whose limit lands outside the
-        # modeled book now expires, so a later rung IS reachable in principle.
-        # It still binds 0 times on lake/model-built chains, where every rung-1
-        # limit lies inside the book by construction — so the key stays
-        # refused, on the honest reason.
-        assert "reachable in principle, still inert in practice" in message
-        assert "no rung-1 limit can land outside" in message
-        assert "rung >= 3 was reached 0 times" in message
+        # FC-116 replaced the MECHANISM the old wording named ("the adapter
+        # fills immediately at the broker's haircut price"), so the reason had
+        # to be re-derived. The replacement is STRUCTURAL, not a new
+        # measurement: the rung-1 limit comes from the same snapshot the
+        # adapter fills against, and the book is quantised to cents first, so
+        # the limit is marketable (base mode) or strictly inside the spread
+        # (imminence mode) either way. No leg expires, so no later rung is
+        # asked for.
+        assert "inert in a replay" in message
+        assert "quantised" in message
+        assert "INVERTED quote" in message
+        # E2: the refusal must NOT claim a post-FC-116 rung measurement. None
+        # was taken, and the pre-FC-116 count is not evidence for the new
+        # mechanism.
+        assert "37 rolls" not in message
+        assert "instrumented" not in message.lower()
 
     def test_the_other_roller_knobs_are_still_allowed(self, sweep_config):
         """The refusal is about this one rung counter, not about the roller."""

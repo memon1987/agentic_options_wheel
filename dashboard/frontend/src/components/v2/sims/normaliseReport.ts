@@ -296,17 +296,29 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
   }
   if (rows.length === 0) return null;
 
-  // The arms' overrides and haircuts, off the spec — `shape_results` does not
-  // repeat them, and the provenance table is worth more with them than without.
+  // The arms' overrides, haircuts and roll fill modes, off the spec — the
+  // provenance table is worth more with them than without.
+  //
+  // FC-116 E1: `scenario_roll_fill_modes` is built HERE as well as served by
+  // `shape_results`, and unlike the haircut it is RESOLVED rather than
+  // declared — an absent or null `roll_fill_mode` on an arm means `limit`, the
+  // engine's default, which is what actually ran. Leaving it unset (the bug
+  // this fixes) made the SweepResults haircut-arm flag dead, made the
+  // provenance footer print "not declared - engine default limit" for an arm
+  // that DID declare `haircut`, and left `compareAlignment`'s last fallback
+  // permanently on `limit` — three readers all quietly saying "limit" about a
+  // haircut arm.
   const specScenarios = Array.isArray(spec.scenarios) ? spec.scenarios : [];
   const overrides: Record<string, Record<string, unknown>> = {};
   const haircuts: Record<string, number | null> = {};
+  const rollFillModes: Record<string, string> = {};
   for (const arm of specScenarios) {
     if (!isRecord(arm)) continue;
     const name = str(arm.name);
     if (!name) continue;
     overrides[name] = isRecord(arm.overrides) ? arm.overrides : {};
     haircuts[name] = num(arm.fill_haircut);
+    rollFillModes[name] = str(arm.roll_fill_mode) || 'limit';
   }
 
   return {
@@ -320,6 +332,7 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
     scenario_config_hashes: hashMap(payload.scenario_config_hashes),
     scenario_overrides: overrides,
     scenario_fill_haircuts: haircuts,
+    scenario_roll_fill_modes: rollFillModes,
     in_sample_only: payload.in_sample_only === true,
     min_days_in_position: num(payload.min_days_in_position) ?? 0.25,
     timing: {

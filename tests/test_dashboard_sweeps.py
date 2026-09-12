@@ -171,6 +171,10 @@ class TestTheReportProseIsNotAFork:
         # scenario_roll_fill_modes`, the dashboard off the persisted
         # `spec_json` arms, resolving an absent key to `limit`).
         "ROLL_FILL_RULE",
+        # FC-116 E3/T2. The clause retired from `ROLL_REACH_BIAS`, restored as
+        # its own constant for the rows it is still true of — every run written
+        # by an engine before `fc-116-roll-limit-fills`.
+        "ROLL_FILL_LEGACY",
         # M1 (review round 1): the substitution's two KEYS and its two
         # replacements. The keys are titles taken from SWEEP_BIASES, so a drift
         # in either copy breaks the swap silently — matching on a title that no
@@ -1427,6 +1431,10 @@ def _sample_sweep() -> SweepResult:
             days_in_position_fraction=frac, decision_days=180,
             cycles_completed=3, cycles_open=0, puts_sold=12, calls_sold=5,
             error=err, replay_seconds=1.1,
+            # FC-116 E3/T2 — a cell written by THIS engine carries the
+            # resolved mode. Without it these rows look pre-FC-116 to
+            # `shape_results`, which is the whole point of the new branch.
+            roll_fill_mode="limit",
         )
 
     rows = []

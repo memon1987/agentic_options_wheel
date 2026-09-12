@@ -81,6 +81,7 @@ from .broker import (
     FILL_RULE_LIMIT_MARKETABLE,
     FILL_RULE_LIMIT_RESTING,
     ROLL_FILL_MODE_LIMIT,
+    ROLL_FILL_MODES,
     BacktestBroker,
 )
 from .clock import SimClock
@@ -523,12 +524,20 @@ class SimulationResult:
     roll_net_credit: float = 0.0
     itm_roll_credit: float = 0.0
     otm_roll_out_credit: float = 0.0
-    #: Post-fee cash paid on the BTC leg of a roll that did NOT complete
-    #: (`stc_failed_naked_exposure`, `partial_naked_exposure`,
-    #: `stc_disposition_unknown`). Real money that contributes 0 to
-    #: `roll_net_credit`. Separate, not folded in, so the identity
-    #: `roll_net_credit == sum(roll_records.net_credit)` stays exact. 0 on
-    #: every model-built chain, where no roll leg can expire.
+    #: Post-fee cash paid on the BTC leg of a roll that did NOT complete, i.e.
+    #: a `buy_to_close` with NO `sell_call_open` after it — the roller's
+    #: `stc_failed_naked_exposure` / `stc_disposition_unknown` outcomes. Real
+    #: money that contributes 0 to `roll_net_credit`. Separate, not folded in,
+    #: so the identity `roll_net_credit == sum(roll_records.net_credit)` stays
+    #: exact. 0 on every model-built chain, where no roll leg can expire.
+    #:
+    #: NOT captured: `partial_naked_exposure`, where the STO fills for FEWER
+    #: contracts than the BTC closed. A `sell_call_open` event IS written, so
+    #: positional pairing sees a completed pair and the residual BTC cash on
+    #: the uncovered contracts is not counted here. Accepted as a known gap
+    #: rather than papered over: capturing it needs per-contract pairing, and
+    #: a partial fill cannot occur at all in the replay (the adapter fills a
+    #: leg whole or `expired`).
     failed_roll_btc_debit: float = 0.0
     #: Roll legs by how they filled (FC-116 D1c). `resting` legs are the ones
     #: that rest on the model's ONE approximation — a limit inside the modeled
@@ -612,10 +621,18 @@ class Simulator:
         self.starting_cash = starting_cash
         self.max_dte = max_dte
         self.fill_haircut = fill_haircut
-        # FC-116 — how ROLL legs fill. The constructor DEFAULT is the single
-        # source of the honest mode: `evaluate._simulator` (the screen /
-        # `backtest_runs` path) deliberately passes nothing, so the screen and
-        # a scenario replay cannot drift apart on the fill rule.
+        # FC-116 — how ROLL legs fill. Validated here (E5) rather than
+        # degraded downstream: the adapter's pricing branch is `!= "limit"`, so
+        # an unrecognised spelling such as `"LIMIT"` would hash as a distinct
+        # sweep arm, run as haircut, and persist a mode label that contradicts
+        # the model it ran under. `evaluate._simulator` threads the screen
+        # path's `DEFAULT_ROLL_FILL_MODE` explicitly, so the screen's mode is
+        # pinned by a test rather than inherited silently.
+        if roll_fill_mode not in ROLL_FILL_MODES:
+            raise ValueError(
+                f"roll_fill_mode must be one of {list(ROLL_FILL_MODES)}, "
+                f"got {roll_fill_mode!r}"
+            )
         self.roll_fill_mode = roll_fill_mode
         self.fees_per_contract = fees_per_contract
         # Warm-up history, kept after FC-068 for a different reason than it was
@@ -1293,6 +1310,13 @@ class Simulator:
         `buy_to_close` followed by a `sell_call_open` before the next
         `buy_to_close` is a completed roll, and a `buy_to_close` with no such
         follower is an orphan BTC.
+
+        The one outcome positional pairing does NOT see is
+        `partial_naked_exposure`: the STO fills for fewer contracts than the
+        BTC closed, so a `sell_call_open` IS written and the pair looks
+        complete. See `SimulationResult.failed_roll_btc_debit` — a known gap,
+        unreachable in a replay because the adapter fills a leg whole or
+        `expired`.
         """
         pending_btc: Optional[Any] = None
         for ev in events:

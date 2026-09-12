@@ -43,15 +43,16 @@ BID_FILL_HAIRCUT = 1.0
 # indistinguishable from one produced under a different fill model.
 DEFAULT_FILL_HAIRCUT = 0.25
 
-# FC-116 — how ROLL legs fill. Named here for the same reason the haircut is,
-# and duplicated from `identity.DEFAULT_ROLL_FILL_MODE` / `broker`'s copy for
-# the reason that module documents (stdlib-only, flat-copied into an image with
-# no engine). Pinned equal by a test.
+# FC-116 — how ROLL legs fill on the screen / `backtest_runs` path. Named here
+# for the same reason the haircut is, and duplicated from
+# `identity.DEFAULT_ROLL_FILL_MODE` / `broker`'s copy for the reason that module
+# documents (stdlib-only, flat-copied into an image with no engine). Pinned
+# equal by a test.
 #
-# NOT threaded through `_simulator` below, deliberately: the screen /
-# `backtest_runs` path takes the `Simulator` constructor's default, so there is
-# exactly ONE place the honest mode is decided and the screen cannot silently
-# stay on the haircut while sweeps move.
+# THREADED through `_simulator` below rather than left as dead documentation:
+# the screen path then states its mode at the call site, a test can pin it, and
+# the four copies stay pinned equal to each other. It is the `Simulator`
+# constructor default too, so this is a declaration, not a divergence.
 DEFAULT_ROLL_FILL_MODE = "limit"
 
 
@@ -179,10 +180,19 @@ def _simulator(
     starting_cash: float, fill_haircut: float, max_dte: int,
     dividends: Optional[DividendSchedule] = None,
 ) -> Simulator:
+    """The ONE constructor call the screen / `backtest_runs` path makes.
+
+    `roll_fill_mode` is passed EXPLICITLY (FC-116). It equals the `Simulator`
+    default, so this changes no behaviour — it makes the screen path's fill
+    rule a stated fact at the call site that a test can pin, instead of an
+    inherited default that a later constructor edit could move without any
+    screen-path test noticing.
+    """
     return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte, fill_haircut=fill_haircut,
         dividend_schedule=dividends,
+        roll_fill_mode=DEFAULT_ROLL_FILL_MODE,
     )
 
 

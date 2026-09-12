@@ -54,9 +54,11 @@ FILL_RULE_LIMIT_RESTING = "limit_resting"
 # DEFAULT. `identity.DEFAULT_ROLL_FILL_MODE` and
 # `evaluate.DEFAULT_ROLL_FILL_MODE` are the other two copies (the former is
 # stdlib-only and flat-copied into the dashboard image, which imports no
-# engine; the latter is the screen path's). Duplicated for exactly the reason
-# `WHEEL_STRATEGY` is, and pinned equal by a test — the adapter cannot import
-# `scenarios.identity` without a circular import through
+# engine; the latter is the screen path's, threaded into `_simulator` so that
+# path's mode is stated and pinned). The dashboard backend imports the
+# `identity` copy rather than keeping a fourth (E4). Duplicated for exactly the
+# reason `WHEEL_STRATEGY` is, and pinned equal by a test — the adapter cannot
+# import `scenarios.identity` without a circular import through
 # `scenarios/__init__` -> runner -> simulator -> adapter.
 ROLL_FILL_MODE_LIMIT = "limit"
 ROLL_FILL_MODE_HAIRCUT = "haircut"

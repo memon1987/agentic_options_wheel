@@ -956,6 +956,15 @@ def run_sweep(
                         config_hash=result.scenario_config_hashes[scenario.name],
                         scenario_hash=result.scenario_hashes[scenario.name],
                         error=message,
+                        # FC-116 T3 — the RESOLVED mode, on error rows too.
+                        # This cell ran no replay, but it is a cell of a
+                        # post-FC-116 run and NULL in this column means
+                        # something else entirely ("written before the column
+                        # existed", i.e. the haircut model). Leaving it null
+                        # would file every errored cell of an honest run under
+                        # the legacy fill rule.
+                        roll_fill_mode=result.scenario_roll_fill_modes.get(
+                            scenario.name, DEFAULT_ROLL_FILL_MODE),
                     ))
                 continue
             result.materialise_seconds[key] = round(time.perf_counter() - t0, 3)
@@ -1336,6 +1345,11 @@ def _replay_one(
             split=split, config_hash=cfg_hash, scenario_hash=scenario_hash,
             error=message,
             replay_seconds=round(time.perf_counter() - t0, 3),
+            # FC-116 T3 — as on the materialisation-failure rows above: the
+            # resolved mode, so a NULL in this column keeps its ONE meaning
+            # ("written before FC-116") rather than also meaning "this cell
+            # raised".
+            roll_fill_mode=roll_fill_mode,
         )
 
 

@@ -672,7 +672,7 @@ pre-split engine.
 | `risk.profit_taking.*`, the stop-loss switches | `/monitor`-only; the replay's day loop never runs the monitor, so every arm would return an identical row — which reads as "this knob does not matter" |
 | `strategy.{put,call}_limit_spread_fraction` | the replay does not honour ENTRY limit prices — `BacktestAlpacaClient.place_option_order` *records* an entry leg's `limit_price` and fills at `mid − fill_haircut × half-spread` regardless. **Measured**: a `put_limit_spread_fraction: 0.0` arm came back byte-identical to base on all six symbols over a year. Vary `fill_haircut` on the scenario instead. (FC-116 made ROLL legs fill at their placed limits; entry legs deliberately still do not, because that measurement is what this refusal rests on. For roll legs, vary `roll_fill_mode` on the scenario.) |
 | `universe.min_open_interest` | the engine has no OI data — `get_options_chain` hardcodes `open_interest: 0` — so any floor ≥ 1 rejects **every** call, and the arm reads as "this threshold kills the call leg" rather than "the engine cannot see the number". (`universe.max_spread_pct` *is* allowed: its input is a documented model with a measured error, not an absent field) |
-| `rolling.fallback_strike_attempts` | governs strike rungs that remain unreached. Since FC-116 a roll leg whose limit lands outside the modeled book *does* expire, so a later rung is no longer unreachable by construction — but on lake/model-built chains no rung-1 limit *can* land outside (a base-mode BTC limit is `round(ask, 2) ≥ ask − 0.005 > bid`; an imminence one is `mid + 0.05 > bid`; the STO mirrors both), so rung ≥ 3 still came up **0 times over a re-instrumented 37 rolls × 7 arms**. Live in production, inert here |
+| `rolling.fallback_strike_attempts` | governs strike rungs the replay does not reach. A later rung is asked for only when an earlier one fails to fill, and a rung-1 limit is derived from the *same* day snapshot the adapter then fills it against, with the book quantised to cents first — so a base-mode limit sits **at** the far quote (`round(ask, 2) == ask_c`, `round(bid, 2) == bid_c`) and an imminence-mode one strictly inside it (`mid ± $0.05` against a half-spread floored at $0.02). Rung 1 therefore always fills, and rung ≥ 2 is reachable only on an *inverted* quote, which no lake or model chain produces. Live in production, where the book moves between quote and fill; inert here |
 | `stocks.symbols` | the universe is run *scope*: pass `--symbols`. A candidate symbol is a cold materialisation |
 | `alpaca.*`, `strategy_id`, `bigquery_dataset` | not strategy parameters |
 | `earnings.enabled` / `rolling.enabled` **when `EARNINGS_ENABLED` / `ROLLER_ENABLED` is exported** | the env var wins over the yaml key (FC-013 DD-7, FC-078 DD-7), so the arm would be silently identical to base and the sweep would report two arms as tied |
@@ -854,17 +854,24 @@ rung ≥ 3 was reached **0 times** over 37 rolls × 7 arms.
 
 **FC-116 changed the mechanism but not the answer, and the wording had to move with it.**
 The old reason was "rung 1 always fills in a replay, because the adapter fills immediately
-at the broker's haircut price rather than resting a limit that can go unfilled". That is
-now false: a roll leg whose limit lands outside the modeled book expires, and the ladder
-advances. What keeps the knob inert is narrower and worth stating exactly — on a
-lake/model-built chain no rung-1 limit *can* land outside the book. A base-mode BTC limit
-is `round(ask, 2) ≥ ask − 0.005 > bid` (the modeled spread is at least $0.04), an
-imminence-mode one is `mid + $0.05 > bid`, and the STO mirrors both. Re-instrumented after
-the change, rung ≥ 3 is still reached 0 times. It is live in production, where a real limit
-can miss against a real book; it is inert here. The general lesson is in the allowlist's
-own docstring: *unproven* is a reason to go and measure, not a reason to ship the key —
-and a refusal's REASON has to be re-measured when the mechanism under it moves, or the key
-stays refused for something that is no longer true.
+at the broker's haircut price rather than resting a limit that can go unfilled" — true of
+the mechanism FC-116 replaced. The replacement reason is **structural, and is not a
+re-measurement**: the roller derives its rung-1 limit from the *same* day snapshot the
+adapter then fills it against, and the adapter quantises that book to cents before
+comparing. A base-mode buy-to-close is placed at `round(ask, 2)`, which **is** `ask_c`, so
+it is marketable; the sell-to-open at `round(bid, 2)` is `bid_c`, likewise. An
+imminence-mode leg is placed at `mid ± $0.05` against a half-spread floored at $0.02, so
+it lies strictly inside `[bid_c, ask_c]`. Every rung-1 leg therefore fills, no leg
+expires, and the ladder is never advanced — rung ≥ 2 is reachable only through an
+*inverted* quote (`bid > ask`), which the lake cannot produce and the chain model does not
+generate. That argument holds for every chain of that shape, which is stronger than any
+count over one window would be, and **no post-FC-116 rung instrumentation was run**: the
+37 × 7 figure above belongs to the pre-FC-116 mechanism and is not restated as evidence
+for this one. It is live in production, where the book moves between the quote and the
+fill; it is inert here. The general lesson is in the allowlist's own docstring: *unproven*
+is a reason to go and measure, not a reason to ship the key — and a refusal's REASON has
+to be re-derived when the mechanism under it moves, or the key stays refused for something
+that is no longer true.
 
 Single warm pass over one symbol-year, before and after the row-conversion rewrite (D5):
 

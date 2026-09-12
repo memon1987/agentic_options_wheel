@@ -365,6 +365,25 @@ ROLL_FILL_RULE = (
         "of the fill rule."),
 )
 
+ROLL_FILL_LEGACY = (
+    "This run PREDATES FC-116: its roll legs filled at the haircut price, so "
+    "roll credits are biased UP", (
+        "The engine that produced these numbers filled every order — roll legs "
+        "included — at `mid -/+ fill_haircut x half-spread`, ignoring the limit "
+        "the roller placed. The live roller places its buy-to-close at the old "
+        "contract's ASK and its sell-to-open at the candidate's BID, so a "
+        "modelled roll here captured MORE credit than the same roll would have "
+        "live, on BOTH legs. The bias is not measured, so it is named rather "
+        "than netted into a number that would look like an estimate."
+        "\n\nRuns at or after `fc-116-roll-limit-fills` fill roll legs at the "
+        "placed limits instead, and carry a different footer. Roll credits and "
+        "roll counts from this run are therefore NOT comparable with a "
+        "post-FC-116 run's: partition any trend series over roll credits on "
+        "`engine_version` (or on the row's `roll_fill_mode`, which is NULL "
+        "exactly for rows like these) before reading a level shift as a "
+        "behaviour change."),
+)
+
 CC_ROLL_SPLIT_NOTE = (
     "Rolls are split into ITM defences and OTM roll-outs, and only the first "
     "is defence", (

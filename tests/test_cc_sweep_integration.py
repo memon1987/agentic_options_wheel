@@ -571,17 +571,32 @@ class TestTheScreenPathAgreesWithTheSweepPath:
         assert legs(screen) == legs(sweep)
         assert screen.roll_fill_mode == sweep.roll_fill_mode == "limit"
 
-    def test_evaluate_does_not_pass_the_mode_explicitly(self):
-        """Structural, and the point of T13: the constructor DEFAULT is the
-        single source. An explicit value here would be a second one."""
+    def test_evaluate_states_the_mode_at_its_one_call_site(self):
+        """T13, as amended by review: the screen path THREADS the mode.
+
+        `evaluate.DEFAULT_ROLL_FILL_MODE` was declared and then never used,
+        which is the worst of both worlds — a constant a reader takes for the
+        screen path's setting while the screen path actually inherited the
+        `Simulator` constructor default, with no test on either. Passing it
+        explicitly changes no behaviour (the two are pinned equal below) and
+        makes the screen path's fill rule a stated fact a test can hold.
+        """
         import inspect
 
         from src.backtesting import evaluate
+        from src.backtesting.engine.broker import ROLL_FILL_MODE_LIMIT
+        from src.backtesting.engine.simulator import Simulator
 
         source = inspect.getsource(evaluate._simulator)
-        assert "roll_fill_mode" not in source, (
-            "`evaluate._simulator` must take the Simulator's default — a second "
-            "spelling of the honest mode is a second thing to keep in sync")
+        assert "roll_fill_mode=DEFAULT_ROLL_FILL_MODE" in source, (
+            "`evaluate._simulator` must state the screen path's roll fill "
+            "mode; a silently inherited default is a mode no test pins")
+        # ... and the value it states is the same one everything else uses, so
+        # stating it cannot become a second spelling.
+        assert evaluate.DEFAULT_ROLL_FILL_MODE == ROLL_FILL_MODE_LIMIT
+        assert (inspect.signature(Simulator.__init__)
+                .parameters["roll_fill_mode"].default
+                == evaluate.DEFAULT_ROLL_FILL_MODE)
 
     def test_the_screen_data_quality_block_carries_the_credit(self):
         from datetime import date

@@ -43,6 +43,7 @@ from .broker import (
     FILL_RULE_LIMIT_RESTING,
     ROLL_FILL_MODE_HAIRCUT,
     ROLL_FILL_MODE_LIMIT,
+    ROLL_FILL_MODES,
     BacktestBroker,
 )
 
@@ -101,7 +102,20 @@ class BacktestAlpacaClient:
                 against the day's modeled book capped by the placed limit;
                 ``"haircut"`` is the pre-FC-116 regression arm and ignores the
                 intent entirely.
+
+        Raises:
+            ValueError: `roll_fill_mode` is not one of `ROLL_FILL_MODES`
+                (E5). Validated rather than degraded: the pricing branch below
+                is `!= "limit"`, so an unrecognised spelling such as `"LIMIT"`
+                would hash as a distinct sweep arm, silently RUN as haircut,
+                and persist `roll_fill_mode="LIMIT"` on the row — an arm whose
+                stored label contradicts the model it ran under.
         """
+        if roll_fill_mode not in ROLL_FILL_MODES:
+            raise ValueError(
+                f"roll_fill_mode must be one of {list(ROLL_FILL_MODES)}, "
+                f"got {roll_fill_mode!r}"
+            )
         self._broker = broker
         self._chains = chains
         self._stock_bars = stock_bars
@@ -394,15 +408,21 @@ class BacktestAlpacaClient:
         `roll_fill_mode="limit"`) fill AT THE PLACED LIMIT, capped by the book,
         or not at all — FC-116 D1:
 
-            buy   limit >= ask      -> fills `ask`   (marketable; Alpaca fills
-                                                      at the best offer, never
-                                                      at a worse limit)
-            buy   bid <= limit < ask-> fills `limit` (resting inside the spread)
-            buy   limit <  bid      -> `expired`, filled_qty 0
-            sell  limit <= bid      -> fills `bid`
-            sell  bid < limit <= ask-> fills `limit`
-            sell  limit >  ask      -> `expired`, filled_qty 0
-            either limit_price None -> far quote (a market order under intent)
+            buy   limit >= ask_c      -> fills `ask_c` (marketable; Alpaca
+                                                        fills at the best
+                                                        offer, never at a
+                                                        worse limit)
+            buy   bid_c <= limit < ask_c -> fills `limit` (resting inside)
+            buy   limit <  bid_c      -> `expired`, filled_qty 0
+            sell  limit <= bid_c      -> fills `bid_c`
+            sell  bid_c < limit <= ask_c -> fills `limit`
+            sell  limit >  ask_c      -> `expired`, filled_qty 0
+            either limit_price None   -> far quote (a market order under intent)
+
+        where `bid_c`/`ask_c` are the modeled book QUANTISED TO CENTS. The
+        roller places cent-rounded limits; comparing them against an unrounded
+        model book would tag a marketable leg `limit_resting` roughly half the
+        time (T1).
 
         Why: the live `CallRoller` is credit-only AT ITS PLACED LIMITS (base
         mode BTC at `round(ask, 2)` / STO at `round(bid, 2)`; imminence mode
@@ -532,11 +552,22 @@ class BacktestAlpacaClient:
         exactly as it was before FC-116 and stamps `fill_rule: "haircut"`
         itself.
 
-        Under roll intent the returned price is `min(limit, ask)` on a buy and
-        `max(limit, bid)` on a sell — the book caps the limit in the direction
-        that favours the book, never the order. A limit on the WRONG side of
-        the book (below the bid on a buy, above the ask on a sell) does not
-        fill at all.
+        Under roll intent the returned price is `min(limit, ask_c)` on a buy
+        and `max(limit, bid_c)` on a sell — the book caps the limit in the
+        direction that favours the book, never the order. A limit on the WRONG
+        side of the book (below the bid on a buy, above the ask on a sell) does
+        not fill at all.
+
+        **The book is quantised to cents first** (T1). The live `CallRoller`
+        places `round(ask, 2)` / `round(bid, 2)` / `round(mid ± 0.05, 2)`,
+        while a modeled chain's bid/ask carry full float precision. Comparing a
+        cent-rounded limit against an unrounded book mis-tags roughly half of
+        all base-mode legs: a BTC at `round(ask, 2) = 1.48` against an
+        `ask = 1.4815` is `limit < ask`, so it would be called `limit_resting`
+        and would fill 0.15 c inside a book it is in fact marketable against.
+        Real exchanges quote in cents, so rounding the book — not the limit —
+        is the faithful model, and the resting tag then means what it says:
+        the limit is strictly inside the quantised spread.
         """
         if self._order_intent != ROLL_INTENT:
             return None, None, False
@@ -548,26 +579,26 @@ class BacktestAlpacaClient:
                 "fill_rule": FILL_RULE_HAIRCUT, "limit_price": limit_price,
             }, False
 
-        bid, ask = float(quote.bid), float(quote.ask)
+        bid_c, ask_c = round(float(quote.bid), 2), round(float(quote.ask), 2)
         if limit_price is None:
             # A market order under roll intent: crosses to the far quote.
-            far = ask if side == "buy" else bid
+            far = ask_c if side == "buy" else bid_c
             return far, {
                 "fill_rule": FILL_RULE_LIMIT_MARKETABLE, "limit_price": None,
             }, False
 
         limit = float(limit_price)
         if side == "buy":
-            if limit >= ask:
-                fill, rule = ask, FILL_RULE_LIMIT_MARKETABLE
-            elif limit >= bid:
+            if limit >= ask_c:
+                fill, rule = ask_c, FILL_RULE_LIMIT_MARKETABLE
+            elif limit >= bid_c:
                 fill, rule = limit, FILL_RULE_LIMIT_RESTING
             else:
                 return None, None, True
         else:
-            if limit <= bid:
-                fill, rule = bid, FILL_RULE_LIMIT_MARKETABLE
-            elif limit <= ask:
+            if limit <= bid_c:
+                fill, rule = bid_c, FILL_RULE_LIMIT_MARKETABLE
+            elif limit <= ask_c:
                 fill, rule = limit, FILL_RULE_LIMIT_RESTING
             else:
                 return None, None, True

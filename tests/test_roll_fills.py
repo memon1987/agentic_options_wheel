@@ -27,12 +27,16 @@ each of which was unreachable before this PR and each of which fails silently:
    returns it, so a fold that took every failed reason would double it.
 
 The chains here are HAND-BUILT, deliberately. On a lake/model-built chain no
-rung-1 roll leg can expire — a base-mode BTC limit is `round(ask, 2) >=
-ask - 0.005 > bid` and an imminence one is `mid + 0.05 > bid`, with the STO
-mirroring both — so the expiry branch, the post-placement terminals and rungs
->= 2 are simply unreachable there. That is a fact about the model, not evidence
-that live rolls always fill, and it is why these paths need a book built by
-hand to exercise them at all.
+rung-1 roll leg can expire: the roller prices its limit off the SAME snapshot
+the adapter then fills it against, and the adapter quantises that book to cents
+first (T1), so a base-mode BTC limit is exactly `ask_c` and a base-mode STO
+limit exactly `bid_c` — both marketable — while an imminence limit (`mid +/-
+0.05` against a half-spread floored at 0.02) lies strictly inside the spread.
+The expiry branch, the post-placement terminals and rungs >= 2 are therefore
+unreachable there, and the books below carry limits the roller could not have
+derived from them. That is a fact about the model, not evidence that live rolls
+always fill, and it is why these paths need a book built by hand to exercise
+them at all.
 """
 
 from __future__ import annotations
@@ -216,68 +220,69 @@ class TestABtcThatNeverFills:
         assert merged == {'btc_timeout_canceled': 1}
 
 
-class TestALadderThatExhaustsAfterTheBtcFills:
-    def test_shares_are_left_uncovered_and_the_debit_is_real(self, roller_for):
-        """(b) BTC fills, rung 1's STO limit is above the ask so it expires,
-        and there is no fallback.
+class TestAnStoLimitOutsideTheBookExpires:
+    """(b) The expensive failure: the BTC fills, no new call is written.
 
-        This is the expensive failure: money left the account to close the old
-        call and no new call was written. The roller reports
-        `stc_failed_naked_exposure`; the shares are genuinely uncovered in the
-        sim exactly as they would be live, and the next day's scan re-covers
-        them through the ENTRY gates (never through the roll path, which
-        bypasses the delta band, the DTE ceiling and the premium floor).
+    Live, this is `stc_failed_naked_exposure` — money left the account to close
+    the old call and the shares are genuinely uncovered until the next day's
+    scan re-covers them through the ENTRY gates (never through the roll path,
+    which bypasses the delta band, the DTE ceiling and the premium floor).
 
-        A base-mode STO limit IS the bid, so on any well-formed book it is at
-        or inside the offer and cannot expire — which is exactly the D1 claim
-        that no rung-1 leg expires on a model-built chain. Reaching this branch
-        at all therefore needs a book where `bid > ask`, built here on purpose.
-        `min_credit` is set so the invariant floor lands exactly ON rung 1's
-        price, which suppresses rung 2 (`_rungs` yields it only when the floor
-        is strictly below) and leaves a one-rung ladder to exhaust.
-        """
+    It is exercised at the ADAPTER here rather than through `execute_roll`,
+    because the class below shows the roller cannot produce such a limit on a
+    single-snapshot chain. The branch still has to be right: it is the one the
+    live roller's disposition code is written against.
+    """
+
+    def test_the_order_expires_and_moves_no_money(self):
         broker = _covered_broker()
+        # The old call is closed first, exactly as a roll's BTC leg would.
         client = _client(broker, [
             _q(OLD, 100.0, bid=2.00, ask=2.20, expiration=EXP_OLD),
-            # bid 2.596 rounds UP to a 2.60 limit, which is above BOTH
-            # sides of this (inverted) book — the only shape in which a
-            # base-mode sell-to-open can fail to fill at all.
-            _q(NEW, 102.0, bid=2.596, ask=2.55),
+            _q(NEW, 102.0, bid=2.40, ask=2.45),
         ])
-        roller = roller_for(client, min_credit=0.40)
         with _frozen(), client.order_intent("roll"):
-            result = roller.execute_roll(
-                _opportunity(btc_limit=2.20, stc_limit=2.60, min_credit=0.40))
+            btc = client.place_option_order(OLD, 1, "buy", limit_price=2.20)
+            assert btc["status"] == "filled"
+            ledger_after_btc = len(broker.ledger)
+            # 2.60 is above BOTH quantised sides of the candidate's book.
+            sto = client.place_option_order(NEW, 1, "sell", limit_price=2.60)
 
-        assert result['success'] is False
-        assert result['reason'] == 'stc_failed_naked_exposure'
-        assert result['reason'] in _POST_PLACEMENT_ROLL_FAILURES
-
-        closes = [e for e in broker.ledger if e.kind == "buy_to_close"]
-        assert len(closes) == 1, "the BTC leg must have filled"
-        assert closes[0].price == pytest.approx(2.20), "at the ask"
+        assert sto["success"] is True, (
+            "live Alpaca ACCEPTS this order — the roller's own terminal "
+            "dispositions are what must run, not a placement rejection")
+        assert sto["status"] == "expired"
+        assert client.get_order_by_id(sto["order_id"])["filled_qty"] == 0
+        assert len(broker.ledger) == ledger_after_btc, "an unfilled leg moved money"
         assert broker.uncovered_shares("XYZ") == 100, (
             "the shares are uncovered — the sim must not paper over it")
-        # `failed_roll_btc_debit` is exactly this, post-fee.
-        assert -closes[0].cash_delta == pytest.approx(
+        # `failed_roll_btc_debit` is exactly the BTC leg's cash, post-fee.
+        closes = [e for e in broker.ledger if e.kind == "buy_to_close"]
+        assert closes[-1].price == pytest.approx(2.20), "at the quantised ask"
+        assert -closes[-1].cash_delta == pytest.approx(
             2.20 * 100 + broker.fees_per_contract)
 
+    def test_the_reason_is_in_the_post_placement_allowlist(self):
+        """It is a LIVE outcome even though the replay cannot reach it, so it
+        must still be folded into `roll_skips` rather than dropped."""
+        assert 'stc_failed_naked_exposure' in _POST_PLACEMENT_ROLL_FAILURES
 
-class TestRungTwoIsReachable:
-    def test_a_better_than_limit_btc_fill_opens_the_floor_rung(self, roller_for):
-        """(c) `_rungs` yields rung 2 at `round(btc_fill + min_credit, 2)` only
-        when the BTC filled BETTER than its limit — otherwise the floor is at or
-        above rung 1 and the ladder has one rung.
 
-        Here the BTC limit is 2.25 and the ask is 2.20, so the fill is 2.20
-        (book-capped) — five cents better than the limit, which is what opens
-        the floor rung at `round(2.20 + 0.05, 2) = 2.25`. Rung 1 at the bid
-        expires against a deliberately inverted book (see the test above for
-        why that is the only way to expire a base-mode STO), and rung 2 gets
-        filled. Before FC-116 this rung was unreachable at all: rung 1 always
-        filled, which is what the `fallback_strike_attempts` refusal used to
-        say.
-        """
+class TestTheLadderHasExactlyOneReachableRung:
+    """(c) Why `rolling.fallback_strike_attempts` stays refused (E2).
+
+    The claim is STRUCTURAL, not a measurement: the roller re-derives rung 1's
+    sell-to-open limit from the SAME quote the adapter then fills it against
+    (`_stc_limit_from_quote` -> `round(bid, 2)`), and the adapter quantises the
+    book to cents before comparing (T1), so the limit IS `bid_c` and is always
+    marketable. A later rung is asked for only when an earlier one fails to
+    fill, so rung >= 2 is never placed and the knob cannot move a replay.
+
+    The book below is INVERTED (`bid > ask`) on purpose: even that does not
+    expire the leg, which is the strongest form of the claim.
+    """
+
+    def test_rung_one_fills_even_on_an_inverted_book(self, roller_for):
         broker = _covered_broker()
         client = _client(broker, [
             _q(OLD, 100.0, bid=2.00, ask=2.20, expiration=EXP_OLD),
@@ -285,30 +290,39 @@ class TestRungTwoIsReachable:
         ])
         roller = roller_for(client)
         with _frozen(), client.order_intent("roll"):
+            # A deliberately STALE 2.60 limit from selection: the roller
+            # discards it and re-prices off the quote before placing.
             result = roller.execute_roll(
                 _opportunity(btc_limit=2.25, stc_limit=2.60))
 
         assert result['success'] is True, result
+        sells = [o for o in client.get_orders() if o["side"] == "sell"]
+        assert len(sells) == 1, (
+            "rung 2 was placed, so rung 1 did not fill — the refusal reason "
+            f"for fallback_strike_attempts is no longer true: "
+            f"{[(o['limit_price'], o['status']) for o in sells]}")
+        assert sells[0]["status"] == "filled"
+        assert sells[0]["limit_price"] == pytest.approx(2.60), (
+            "round(bid=2.596, 2) — the re-derived limit, not the stale 2.60 "
+            "that happens to equal it")
+        assert sells[0]["filled_avg_price"] == pytest.approx(2.60), (
+            "a sell limit at the quantised bid is marketable and fills there")
+
         closes = [e for e in broker.ledger if e.kind == "buy_to_close"]
         assert closes[-1].price == pytest.approx(2.20), (
-            "the BTC is book-capped at the ask, BETTER than its 2.25 limit — "
-            "that is what makes the floor rung cheaper than rung 1")
-
-        sells = [o for o in client.get_orders() if o["side"] == "sell"]
-        assert len(sells) == 2, (
-            f"rung 2 was never placed: {[(o['limit_price'], o['status']) for o in sells]}")
-        assert sells[0]["status"] == "expired"
-        assert sells[0]["limit_price"] == pytest.approx(2.60)
-        assert sells[1]["status"] == "filled"
-        assert sells[1]["limit_price"] == pytest.approx(2.25), (
-            "rung 2 is priced at the invariant FLOOR, btc_fill + min_credit")
-
+            "the BTC is book-capped at the quantised ask, BETTER than its "
+            "2.25 limit — the book caps in the order's favour, never against")
         opens = [e for e in broker.ledger if e.kind == "sell_call_open"
                  and e.symbol == NEW]
         assert len(opens) == 1, "exactly one STO may ever fill"
-        # The invariant holds on the ACTUAL fills, which is the whole point of
-        # re-pricing rung 2 off `btc_filled_price` rather than off the limit.
         assert opens[0].price - closes[-1].price >= 0.05 - 1e-9
+
+    def test_a_base_mode_sto_limit_is_the_quantised_bid_by_construction(self):
+        """The one line the whole refusal rests on, pinned directly."""
+        for bid, ask in ((2.4815, 2.55), (0.031, 0.049), (12.3349, 12.99)):
+            limit = CallRoller._stc_limit_from_quote(bid, ask, False)
+            assert limit == round(bid, 2), (bid, ask)
+            assert limit <= round(bid, 2), "marketable against the quantised bid"
 
 
 class TestCreditGoneIsCountedExactlyOnce:

@@ -23,11 +23,11 @@ not do what it says*:
   deliberately still do not (FC-072 measured them against the haircut).
 * ``universe.min_open_interest`` reads a field the engine hardcodes to ``0``, so
   any floor rejects every call — a deterministic wipe-out dressed as a finding.
-* ``rolling.fallback_strike_attempts`` governs rungs that remain unreached: a
-  rung whose limit lands outside the book CAN now expire (FC-116), but on
-  lake/model-built chains every rung-1 limit lies inside the book by
-  construction, so rung >= 3 still comes up 0 times (re-instrumented, 37 rolls
-  x 7 arms). Live in production, inert here.
+* ``rolling.fallback_strike_attempts`` governs rungs the replay does not reach:
+  a rung-1 limit is derived from the SAME day's snapshot the adapter then fills
+  against, so on any un-crossed book it lies inside ``[bid, ask]`` and fills.
+  No rung-1 leg expires, so no later rung is asked for. Live in production,
+  where the book moves between quote and fill; inert here.
 
 All four were on the plan's allowlist and were moved here by measurement, not by
 reading: **selection-only is necessary but not sufficient**. A key also has to be
@@ -231,17 +231,20 @@ REJECTED_OVERRIDES: Dict[str, str] = {
         "a documented model with a measured error, not an absent field."
     ),
     "rolling.fallback_strike_attempts": (
-        "reachable in principle, still inert in practice. The knob decides how "
-        "many FURTHER strikes the roller tries after the first two rungs. Since "
-        "FC-116 a roll leg whose limit lands outside the modeled book DOES "
-        "expire, so a later rung is no longer unreachable by construction — but "
-        "on lake/model-built chains no rung-1 limit can land outside: a "
-        "base-mode BTC limit is `round(ask, 2) >= ask - 0.005 > bid` and an "
-        "imminence-mode one is `mid + 0.05 > bid`, with the STO mirroring both. "
-        "Re-instrumented over 37 rolls x 7 arms, rung >= 3 was reached 0 times, "
-        "so every arm still returns the base row. It is live in production, "
-        "where a real limit can miss against a real book; it is inert here. "
-        "Unproven rather than impossible — measure before allowing it."
+        "inert in a replay. The knob decides how many FURTHER strikes the "
+        "roller tries after the first two rungs, and a later rung is asked for "
+        "only when an earlier one fails to fill. Structurally, that cannot "
+        "happen here: the roller derives its rung-1 limit from the SAME day "
+        "snapshot the adapter then fills it against, and the book is quantised "
+        "to cents before the comparison, so a base-mode limit sits AT the far "
+        "quote (`round(ask, 2) == ask_c` on the buy-to-close, `round(bid, 2) "
+        "== bid_c` on the sell-to-open) and an imminence-mode limit sits "
+        "strictly inside it (`mid +/- 0.05`, against a half-spread floored at "
+        "0.02). Either way the leg fills, so rung 1 never expires and rung >= "
+        "2 is reachable only on an INVERTED quote, which no lake or model "
+        "chain produces. It is live in production, where the book moves "
+        "between the quote and the fill; it is inert here. Measure before "
+        "allowing it."
     ),
     "strategy.opportunity_max_age_minutes": (
         "the replay hands opportunities from scan to execute in memory; there is "

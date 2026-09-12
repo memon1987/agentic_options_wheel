@@ -1212,6 +1212,29 @@ def _roll_legs(result):
     ]
 
 
+def _chains(closes, exps, days):
+    """The SAME modeled book the replay filled against.
+
+    T1/E6: the reconciliation below reads `bid`, `ask` and `mark` from here and
+    computes the half-spread itself. Recovering `hs` from the gap between the
+    haircut fill and the limit fill — which is what the first cut did — is
+    circular: it assumes the closed form in order to test it, and would pass
+    against any fill rule whatsoever.
+    """
+    return _simulator("XYZ", closes, exps, days).materialise().chains
+
+
+def _quote_for(chains, leg):
+    """The `ChainQuote` a roll leg was priced and filled against."""
+    snapshot = chains["XYZ"][leg.event_date]
+    for quote in list(snapshot.calls) + list(snapshot.puts):
+        if quote.symbol == leg.symbol:
+            return quote
+    raise AssertionError(
+        f"no {leg.symbol} quote on {leg.event_date} — the chains here are not "
+        f"the chains the replay filled against")
+
+
 class TestTheRollFillRuleOnTheGoldenWindow:
     """T5. Each leg's price IS the rule, and the credit delta IS the closed
     form — per leg, by ledger TAG.
@@ -1227,28 +1250,56 @@ class TestTheRollFillRuleOnTheGoldenWindow:
                           = 0.25*hs - 0.05 per share (EITHER sign; UP whenever
                             hs > $0.20, which is most of a GOOGL-priced chain)
 
-    Asserted to within a cent per share per leg, not exactly: every roller limit
-    is `round(*, 2)` while the modeled quotes are not rounded, so a base-mode
-    BTC limit lands within +/-$0.005 of the ask and can fall either side of it.
+    Asserted to within HALF A CENT per share per leg, not exactly: every roller
+    limit is `round(*, 2)` while the modeled quote is not, so an imminence
+    limit lands within +/-$0.005 of `mid +/- 0.05`. The BOOK, by contrast, is
+    quantised to cents by the adapter before the comparison (T1), so a
+    marketable leg's fill is an EXACT equality against `round(quote, 2)` — a
+    base-mode BTC limit is `round(ask, 2)`, which is `ask_c` exactly, and the
+    old unrounded comparison mis-tagged about half of those as `limit_resting`.
     """
 
     def test_every_roll_leg_fills_at_the_rule_price(self, dip_then_recovering):
+        """The rule, read off the CHAIN QUOTE rather than off the haircut twin.
+
+        `min(limit, ask_c)` on a buy and `max(limit, bid_c)` on a sell, with
+        `bid_c`/`ask_c` the book quantised to cents, and the TAG derived from
+        the same comparison. Deriving the expected price from the other arm's
+        fill would only prove the two arms are consistent with each other.
+        """
         days, closes, exps = dip_then_recovering
         _hc, lim = _both_modes(closes, exps, days)
+        chains = _chains(closes, exps, days)
         legs = _roll_legs(lim)
         assert legs, "the golden window executed no roll leg"
 
+        tags = set()
         for leg in legs:
             limit = leg.detail["limit_price"]
+            quote = _quote_for(chains, leg)
+            bid_c, ask_c = round(quote.bid, 2), round(quote.ask, 2)
             if leg.kind == "buy_to_close":
-                # A BTC fills at min(limit, ask); `ask` is recoverable from the
-                # tag, since a marketable leg filled AT the ask.
-                assert leg.price <= limit + 1e-9, (
-                    f"a buy filled ABOVE its limit: {leg.price} > {limit}")
+                expected = min(limit, ask_c)
+                expected_tag = ("limit_marketable" if limit >= ask_c
+                                else "limit_resting")
             else:
-                assert leg.price >= limit - 1e-9, (
-                    f"a sell filled BELOW its limit: {leg.price} < {limit}")
-            assert leg.detail["fill_rule"] in ("limit_marketable", "limit_resting")
+                expected = max(limit, bid_c)
+                expected_tag = ("limit_marketable" if limit <= bid_c
+                                else "limit_resting")
+            assert leg.price == pytest.approx(expected, abs=1e-9), (
+                f"{leg.symbol} {leg.kind} on {leg.event_date}: filled "
+                f"{leg.price} against limit {limit} and book "
+                f"[{bid_c}, {ask_c}]")
+            assert leg.detail["fill_rule"] == expected_tag, (
+                f"{leg.symbol} {leg.kind} on {leg.event_date}: tagged "
+                f"{leg.detail['fill_rule']} with limit {limit} against book "
+                f"[{bid_c}, {ask_c}] — the pre-T1 bug tagged a marketable leg "
+                f"`limit_resting` by comparing against an UNROUNDED book")
+            tags.add(expected_tag)
+
+        assert "limit_marketable" in tags, (
+            "no leg was marketable, which on a base-mode window means the "
+            "book is not being quantised before the comparison (T1)")
 
     def test_the_counts_and_strikes_do_not_move(self, dip_then_recovering):
         """A count change is a FINDING, not a re-baseline.
@@ -1272,12 +1323,20 @@ class TestTheRollFillRuleOnTheGoldenWindow:
     def test_the_credit_delta_is_the_per_tag_closed_form(self, dip_then_recovering):
         """The number this whole PR exists to move, reconciled leg by leg.
 
-        `hs` is recovered from the HAIRCUT leg and its `limit` twin rather than
-        assumed: a haircut buy fills at `mark + 0.25*hs` and a marketable limit
-        buy fills at `ask = mark + hs`, so the observed gap IS `0.75*hs`.
+        E6: `hs` is computed INDEPENDENTLY, from the chain quote the leg filled
+        against (`ask - mark` on a buy, `mark - bid` on a sell — the same two
+        quantities `BacktestBroker.buy_fill`/`sell_fill` take a quarter of).
+        The first cut recovered `hs` from the gap between the haircut fill and
+        the limit fill, which is the closed form rearranged: it would have
+        passed against any fill rule at all, including the mis-tagging bug T1
+        fixes.
+
+            limit_marketable -> -0.75 * hs   per share (always DOWN for credit)
+            limit_resting    -> 0.25*hs - 0.05 per share (either sign)
         """
         days, closes, exps = dip_then_recovering
         hc, lim = _both_modes(closes, exps, days)
+        chains = _chains(closes, exps, days)
         hc_legs, lim_legs = _roll_legs(hc), _roll_legs(lim)
         assert len(hc_legs) == len(lim_legs), "the leg SEQUENCE moved"
 
@@ -1287,13 +1346,25 @@ class TestTheRollFillRuleOnTheGoldenWindow:
             # Credit convention: a sell adds, a buy subtracts.
             sign = 1.0 if new.kind == "sell_call_open" else -1.0
             per_share = sign * (new.price - old.price)
+
+            quote = _quote_for(chains, new)
+            hs = (quote.mark - quote.bid if new.kind == "sell_call_open"
+                  else quote.ask - quote.mark)
             if new.detail["fill_rule"] == "limit_marketable":
+                expected = -0.75 * hs
                 assert per_share < 1e-9, (
                     f"a marketable leg must give up credit versus the haircut "
                     f"fill, never gain it: {per_share:+.4f} on {new.symbol}")
             else:
-                # `limit_resting`: either sign, bounded by the pad.
-                assert abs(per_share) < 1.0, per_share
+                expected = 0.25 * hs - 0.05
+            # Half a cent: the roller's limit is `round(*, 2)` and the
+            # quantised book is `round(quote, 2)`, so each side of the
+            # comparison can sit up to $0.005 from the unrounded model value.
+            assert per_share == pytest.approx(expected, abs=0.0051), (
+                f"{new.symbol} {new.kind} on {new.event_date} tagged "
+                f"{new.detail['fill_rule']}: moved {per_share:+.4f}/share, "
+                f"closed form says {expected:+.4f} (hs={hs:.4f} from the "
+                f"quote, not from the haircut twin)")
 
         # And the aggregate reconciles to the sum of the legs it came from.
         total = sum(
