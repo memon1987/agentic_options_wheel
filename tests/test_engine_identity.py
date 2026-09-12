@@ -480,6 +480,49 @@ class TestTheEngineVersionIsNotAFork:
         assert pre(EI.ENGINE_VERSION) is False
         assert pre("") is False, "an unknown era is not a claim either way"
 
+    def test_this_version_is_in_the_post_fc112_set(self):
+        """**E1, review round 1 — the reach boundary's half of the same pin.**
+
+        `spec_max_dte` reads the wheel's materialisation floor off the engine
+        that wrote the run, so `POST_FC112_ENGINE_VERSIONS` is append-only for
+        exactly the reason `POST_FC116_ENGINE_VERSIONS` is. A release that
+        bumps `ENGINE_VERSION` and forgets this set would serve its own wheel
+        runs `effective_max_dte: 7` and drop the `DTE_REACH_BIAS` caveat from
+        runs that earned it — silently, in a footer nobody re-reads. It fails
+        here instead.
+
+        The two sets are deliberately separate objects: the boundaries answer
+        different questions (how roll legs FILLED vs how far the ladder
+        REACHED) and a future engine could move one without the other.
+        """
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+        assert EI.ENGINE_VERSION in S.POST_FC112_ENGINE_VERSIONS
+        assert "fc-112-wheel-roll-reach" in S.POST_FC112_ENGINE_VERSIONS, (
+            "the release the set is named for must stay in it")
+        assert "fc-116-roll-limit-fills" not in S.POST_FC112_ENGINE_VERSIONS, (
+            "FC-116 predates the wheel's reach widening; if it were in the set "
+            "every row of the 09-12 battery would be served a 21-DTE reach it "
+            "never had")
+
+    def test_the_wheel_reach_floor_follows_the_engine_not_the_spec(self):
+        """E1, the behaviour the set exists for. The same wheel spec, read
+        against each era, must yield the reach that era's roller actually
+        had."""
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+
+        spec = {"scenarios": [], "symbols": ["AAPL"]}
+        assert S.spec_max_dte(spec, engine_version=EI.ENGINE_VERSION) == 21
+        assert S.spec_max_dte(
+            spec, engine_version="fc-116-roll-limit-fills") == 7
+        assert S.spec_max_dte(spec, engine_version="fc-069-scanner-rewire") == 7
+        assert S.spec_max_dte(spec, engine_version=None) == 7, (
+            "declining to assert is the posture for a run this image cannot "
+            "identify")
+
 
 # ==========================================================================
 # (3) The key migration

@@ -166,6 +166,11 @@ class TestTheReportProseIsNotAFork:
         # `spec_json.strategy`).
         "SYNTHETIC_LOT_BIAS", "MODEL_SPREAD_BIAS", "ROLL_REACH_BIAS",
         "CC_ROLL_SPLIT_NOTE", "MONITOR_LEG_NOTE",
+        # FC-112 review round 1 (T2/E2). The WHEEL's own roll-reach footer.
+        # `ROLL_REACH_BIAS` is emitted on covered-call runs only, so its wheel
+        # paragraph was addressed to a reader who could never see it; this is
+        # the copy wheel readers get, on both sides, on every wheel run.
+        "WHEEL_ROLL_REACH_NOTE",
         # FC-116. Same posture again: the WORDS are pinned here, emission is
         # derived on each side (the CLI off `SweepResult.
         # scenario_roll_fill_modes`, the dashboard off the persisted
@@ -1539,6 +1544,13 @@ def shaped_and_engine():
         engine_version=ENGINE_VERSION)
     sweep_row = {
         "run_id": "rid", "status": "done", "in_sample_only": False,
+        # FC-112 E1. A real `sweep_runs` row is stamped at insert, and since
+        # E1 the wheel's materialisation floor is read off that stamp — the
+        # engine side of this fixture reports `effective_max_dte=21`, which is
+        # true only of a post-FC-112 engine. Omitting it here would have the
+        # dashboard side derive 7 and the footers disagree on a fixture
+        # difference rather than on a code one.
+        "engine_version": ENGINE_VERSION,
         "spec_json": json.dumps({
             "symbols": ["AAPL", "NVDA", "UNH"],
             "scenarios": [{"name": "tighter"}, {"name": "wider"}],
@@ -2513,23 +2525,123 @@ class TestTheDteReachCaveatIsNotAFork:
         assert set(overrides.DTE_OVERRIDE_KEYS) <= set(ALLOWED_OVERRIDES)
 
 
-class TestSpecMaxDte:
-    """**FC-112 moved the wheel's floor from 7 to `WHEEL_BASE_REACH` (21).**
-
-    Both strategy floors now sit at `MAX_SWEEPABLE_DTE`, and every DTE override
-    is validated at or below that same cap — so on TODAY's constants no arm can
-    raise `spec_max_dte` above its floor, and the function is (for the moment) a
-    constant. That is a fact about the two profiles' current knobs, not a
-    licence to delete the arm scan: either floor can be retuned down, and an
-    arm-scan that had quietly stopped being exercised would come back wrong.
-    So the arm cases below are asserted against a LOWERED floor, and the
-    floor-is-the-floor cases against the real one.
+class TestTheWheelRollReachNoteSaysBothThings:
+    """T2/E2 + T1, review round 1. The two facts a WHEEL reader was never
+    shown, asserted on the SERVED footer rather than on the constant — the
+    constant being right is `TestTheReportProseIsNotAFork`'s job; being
+    *delivered to a wheel reader* is this one's.
     """
 
-    def test_a_spec_with_no_dte_arms_sits_at_the_floor(self):
-        assert S.spec_max_dte({"scenarios": [
-            {"name": "a", "overrides": {"strategy.min_put_premium": 0.3}}]}) \
-            == S.WHEEL_BASE_REACH == 21
+    def _titles_and_detail(self, engine_version):
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done", "in_sample_only": True,
+            "engine_version": engine_version,
+            "spec_json": json.dumps({"symbols": ["AAPL"], "scenarios": []}),
+        }, [])
+        detail = next(b["detail"] for b in shaped["known_biases"]
+                      if b["title"] == T.WHEEL_ROLL_REACH_NOTE[0])
+        return [b["title"] for b in shaped["known_biases"]], detail
+
+    @pytest.mark.parametrize("version", [
+        "fc-112-wheel-roll-reach", "fc-116-roll-limit-fills", None])
+    def test_every_wheel_run_carries_it_at_either_reach(self, version):
+        titles, _ = self._titles_and_detail(version)
+        assert T.WHEEL_ROLL_REACH_NOTE[0] in titles
+
+    def test_it_states_the_chained_roll_residual_not_zero_residual(self):
+        """T1. The claim it replaces — "the wheel has NO residual roll-reach
+        truncation" — was false for every roll after the first."""
+        _, detail = self._titles_and_detail(S.ENGINE_VERSION)
+        assert "FIRST roll of a chain" in detail
+        assert "29-36 days" in detail
+        assert "FEWER and SHORTER replacements" in detail
+        assert "biases AGAINST it" in detail
+
+    def test_it_states_the_version_boundary(self):
+        """T2/E2. The sentence lived in `ROLL_REACH_BIAS`, which a wheel reader
+        never sees."""
+        _, detail = self._titles_and_detail(S.ENGINE_VERSION)
+        assert "fc-112-wheel-roll-reach" in detail
+        assert "NOT comparable" in detail
+
+    def test_a_covered_call_run_does_not_get_the_wheel_copy(self):
+        """The CC reader keeps `ROLL_REACH_BIAS`; two copies of the same
+        argument in one footer is how footers stop being read."""
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done", "in_sample_only": True,
+            "engine_version": S.ENGINE_VERSION,
+            "spec_json": json.dumps({"symbols": ["AAPL"], "scenarios": [],
+                                     "strategy": "covered_call"}),
+        }, [])
+        titles = [b["title"] for b in shaped["known_biases"]]
+        assert T.WHEEL_ROLL_REACH_NOTE[0] not in titles
+        assert T.ROLL_REACH_BIAS[0] in titles
+
+    def test_the_dte_caveat_points_at_the_credit_screen_not_the_earlier_gate(
+            self):
+        """T3. A thin long-dated print is one the roller CAN see and cannot
+        make a credit out of, so it fails the credit screen
+        (`call_roller.py:415`) and lands in `no_credit_candidate`;
+        `no_suitable_replacement` is the earlier horizon/strike/delta gate, and
+        a reader sent to it would count the wrong thing."""
+        detail = T.DTE_REACH_BIAS[1]
+        assert "`roll_skips.no_credit_candidate`" in detail
+        assert "`no_suitable_replacement` is the earlier gate" in detail
+
+
+class TestSpecMaxDte:
+    """**FC-112 moved the wheel's floor from 7 to `WHEEL_BASE_REACH` (21) — for
+    runs written by a post-FC-112 ENGINE only (E1, review round 1).**
+
+    On a post-FC-112 engine both strategy floors sit at `MAX_SWEEPABLE_DTE`, and
+    every DTE override is validated at or below that same cap — so on TODAY's
+    constants no arm can raise `spec_max_dte` above that floor, and for those
+    runs the function is (for the moment) a constant. That is a fact about the
+    two profiles' current knobs, not a licence to delete the arm scan: either
+    floor can be retuned down, and an arm-scan that had quietly stopped being
+    exercised would come back wrong. The arm cases below therefore run on the
+    PRE-FC-112 floor (7), which is not a contrivance — it is what every stored
+    wheel row in BigQuery is served today — and the floor-is-the-floor cases
+    run on both.
+    """
+
+    def test_a_post_fc112_spec_with_no_dte_arms_sits_at_the_wheel_floor(self):
+        assert S.spec_max_dte(
+            {"scenarios": [{"name": "a",
+                            "overrides": {"strategy.min_put_premium": 0.3}}]},
+            engine_version=S.ENGINE_VERSION) == S.WHEEL_BASE_REACH == 21
+
+    @pytest.mark.parametrize("version", [
+        "fc-116-roll-limit-fills", "fc-069-scanner-rewire", "", None,
+        "fc-999-some-image-this-one-never-heard-of",
+    ])
+    def test_a_wheel_run_from_any_other_engine_sits_at_the_threshold(
+            self, version):
+        """**E1, review round 1.** The floor is a property of the ENGINE that
+        replayed the run, not of the spec. `fc-116-roll-limit-fills` and
+        `fc-069-scanner-rewire` wrote every stored wheel row there is — the
+        09-05 and 09-12 batteries, the GOOGL pin's 09-12 point — and their
+        roller chose replacements from a ladder cut off at 8 days. Serving
+        those rows `effective_max_dte: 21` would attach the thin-print caveat
+        to data their roller never saw.
+
+        An absent or unrecognised version reads the same way, deliberately:
+        `_ran_post_fc112` declines to assert. The only way to meet an
+        unrecognised version is deploy skew (a dashboard image older than the
+        Job), which `test_this_version_is_in_the_post_fc112_set` prevents from
+        becoming permanent and a redeploy clears.
+        """
+        assert S.spec_max_dte({"scenarios": []}, engine_version=version) \
+            == S.DTE_REACH_BIAS_THRESHOLD == 7
+
+    def test_the_covered_call_floor_is_not_engine_gated(self):
+        """That profile has reached its roll horizon since the release that
+        first replayed it (FC-096 Phase C), so there is no pre-era CC row to
+        protect and no gate to write."""
+        for version in (S.ENGINE_VERSION, "fc-069-scanner-rewire", None):
+            assert S.spec_max_dte(
+                {"scenarios": [], "strategy": "covered_call"},
+                engine_version=version) == S.CC_BASE_REACH == 21
 
     def test_the_wheel_floor_is_not_the_caveat_threshold(self):
         """FC-112. They were equal by coincidence and are now different
@@ -2542,29 +2654,30 @@ class TestSpecMaxDte:
 
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
-    def test_either_leg_raises_it(self, key, monkeypatch):
-        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
+    def test_either_leg_raises_it(self, key):
+        """On a PRE-FC-112 engine, where the floor is 7 and an arm can still
+        out-reach it. Post-FC-112 both floors sit at `MAX_SWEEPABLE_DTE` and no
+        arm can — see the class docstring."""
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {key: 14}}]}) == 14
 
-    def test_the_maximum_wins(self, monkeypatch):
-        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
+    def test_the_maximum_wins(self):
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {"strategy.put_target_dte": 3}},
             {"name": "b", "overrides": {"strategy.call_target_dte": 21}},
         ]}) == 21
 
-    def test_a_shorter_arm_never_lowers_it(self, monkeypatch):
+    def test_a_shorter_arm_never_lowers_it(self):
         """Below the floor the answer is the floor: a DTE-3 arm does not narrow
         the materialisation the rest of the run was built on."""
-        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {"strategy.put_target_dte": 3}}]}) == 7
-        # And on the real floor, likewise — a short arm cannot pull a wheel run
-        # back off its roller's ladder.
-        monkeypatch.undo()
-        assert S.spec_max_dte({"scenarios": [
-            {"name": "a", "overrides": {"strategy.put_target_dte": 3}}]}) == 21
+        # And on a post-FC-112 engine's floor, likewise — a short arm cannot
+        # pull a wheel run back off its roller's ladder.
+        assert S.spec_max_dte(
+            {"scenarios": [{"name": "a",
+                            "overrides": {"strategy.put_target_dte": 3}}]},
+            engine_version=S.ENGINE_VERSION) == 21
 
     @pytest.mark.parametrize("spec", [
         {}, {"scenarios": None}, {"scenarios": []}, {"scenarios": ["not-a-dict"]},
@@ -2578,21 +2691,23 @@ class TestSpecMaxDte:
         """A `submitted` run has no cells and a run from before this field
         existed has no DTE keys; neither may 500 the results page, and neither
         may invent a reach the run did not have."""
-        assert S.spec_max_dte(spec) == S.WHEEL_BASE_REACH == 21
+        assert S.spec_max_dte(spec, engine_version=S.ENGINE_VERSION) \
+            == S.WHEEL_BASE_REACH == 21
+        assert S.spec_max_dte(spec) == S.DTE_REACH_BIAS_THRESHOLD == 7
 
 
 class TestTheFooterIsPerRun:
-    def _shaped(self, overrides):
+    def _shaped(self, overrides, engine_version=ENGINE_VERSION):
         return S.shape_results({
             "run_id": "r", "status": "done", "in_sample_only": True,
+            "engine_version": engine_version,
             "spec_json": json.dumps({
                 "symbols": ["AAPL"],
                 "scenarios": [{"name": "x", "overrides": overrides}],
             }),
         }, [])
 
-    def test_a_run_below_the_threshold_carries_the_ordinary_footer_only(
-            self, monkeypatch):
+    def test_a_run_below_the_threshold_carries_the_ordinary_footer_only(self):
         """FC-116 — plus `ROLL_FILL_RULE`, which every POST-FC-116 run carries.
 
         It is not conditional on reach, strategy or arm: the roll fill rule is
@@ -2602,23 +2717,29 @@ class TestTheFooterIsPerRun:
         see `TestTheFooterFollowsTheEngineThatWroteTheRun`). The rest of the
         footer is unchanged, which is what the equality below still says.
 
-        **FC-112: the floor is monkeypatched down to reach this branch at all.**
-        Since the wheel's materialisation floor became its roll horizon, no real
-        wheel spec sits at or below `DTE_REACH_BIAS_THRESHOLD` — the
-        caveat-absent branch is live code (a CC profile retune, or a future
-        lower floor) that no production spec exercises today. Asserting it on a
-        patched floor keeps it covered; deleting it would leave the emission
-        conditional itself untested in the negative direction, and a footer that
-        fires unconditionally is a footer nobody can trust to mean anything.
+        **FC-112 E1: the run this branch describes is a REAL one — every wheel
+        sweep already in BigQuery.** `fc-116-roll-limit-fills` reached 7 on the
+        wheel and filled roll legs at their placed limits, so it earns
+        `ROLL_FILL_RULE` and not `DTE_REACH_BIAS`. Before E1 the dashboard
+        served these rows 21 and the thin-print caveat, describing a ladder
+        their roller never had.
         """
-        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
-        shaped = self._shaped({"strategy.min_put_premium": 0.3})
+        shaped = self._shaped({"strategy.min_put_premium": 0.3},
+                              engine_version="fc-116-roll-limit-fills")
         assert shaped["effective_max_dte"] == 7
         titles = [b["title"] for b in shaped["known_biases"]]
         assert T.DTE_REACH_BIAS[0] not in titles
         assert shaped["known_biases"] == [
             {"title": t, "detail": d} for t, d in T.SWEEP_BIASES
-        ] + [{"title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}]
+        ] + [
+            # T2/E2: the wheel's roll-reach footer is UNCONDITIONAL on a wheel
+            # run. This row is precisely the one whose reader needs the version
+            # boundary — its roll numbers are not comparable with post-FC-112
+            # ones and it carries no other footer that says so.
+            {"title": T.WHEEL_ROLL_REACH_NOTE[0],
+             "detail": T.WHEEL_ROLL_REACH_NOTE[1]},
+            {"title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]},
+        ]
 
     def test_every_wheel_run_now_carries_the_reach_caveat(self):
         """FC-112, the live half of the pair above — and the consequence D-2
@@ -2634,7 +2755,8 @@ class TestTheFooterIsPerRun:
         assert shaped["effective_max_dte"] == 21
         titles = [b["title"] for b in shaped["known_biases"]]
         assert T.DTE_REACH_BIAS[0] in titles
-        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
+        assert T.WHEEL_ROLL_REACH_NOTE[0] in titles
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 3
         detail = next(b["detail"] for b in shaped["known_biases"]
                       if b["title"] == T.DTE_REACH_BIAS[0])
         assert "caps every ENTRY at 7" in detail, (
@@ -2643,10 +2765,12 @@ class TestTheFooterIsPerRun:
 
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
-    def test_a_long_dte_run_gains_the_caveat_and_nothing_else(
-            self, key, monkeypatch):
-        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
-        shaped = self._shaped({key: 14})
+    def test_a_long_dte_run_gains_the_caveat_and_nothing_else(self, key):
+        """On a PRE-FC-112 engine, where the arm is what carries the run past
+        the threshold rather than the floor — the arm scan is still live code
+        and this is what exercises it."""
+        shaped = self._shaped({key: 14},
+                              engine_version="fc-116-roll-limit-fills")
         assert shaped["effective_max_dte"] == 14
         title, detail = T.DTE_REACH_BIAS
         titles = [b["title"] for b in shaped["known_biases"]]
@@ -2654,7 +2778,7 @@ class TestTheFooterIsPerRun:
         # `ROLL_FILL_RULE` is appended last, after the reach caveat.
         assert shaped["known_biases"][-1] == {
             "title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}
-        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 3
 
     def test_a_haircut_only_spec_still_gets_the_rule(self):
         """T2. The old gate emitted the footer only if some arm resolved to
@@ -2688,7 +2812,8 @@ class TestTheFooterIsPerRun:
         # the engine side describing a run the dashboard side cannot produce.
         sweep.effective_max_dte = 21
         rendered = json.loads(engine_report.render_json(sweep))
-        shaped = self._shaped({"strategy.put_target_dte": 14})
+        shaped = self._shaped({"strategy.put_target_dte": 14},
+                              engine_version=ENGINE_VERSION)
         assert shaped["known_biases"] == rendered["known_biases"]
         assert shaped["effective_max_dte"] == rendered["effective_max_dte"] == 21
 

@@ -186,8 +186,15 @@ failure mode: it cannot flatter a symbol into looking tradeable.
    - `engine_version = 'fc-112-wheel-roll-reach'` (FC-112 PR-1, **2026-09-12**) widens
      the WHEEL replay's materialisation from 7 DTE to its roll horizon —
      `call_target_dte` 7 + `rolling.max_extension_days` 14 = 21, which is
-     `MAX_SWEEPABLE_DTE` exactly, so the wheel has **no residual reach truncation**
-     after it (unlike the covered-call profile's 28-wanted-vs-21-available). Before it,
+     `MAX_SWEEPABLE_DTE` exactly. That covers the **first roll of a chain and no
+     more**: a call already rolled OUT is held at ~15-22 DTE, so its own next horizon
+     is `old_expiry + 14` = 29-36 days against the same 21-DTE ladder, and every
+     subsequent chained roll is truncated exactly as the covered-call profile's is —
+     fewer and shorter replacements, falling on the arm that rolls more. (An earlier
+     draft of this line claimed "no residual reach truncation"; that is true of the
+     first roll only. `report.WHEEL_ROLL_REACH_NOTE` is the reader-facing statement,
+     and a cheap tell in the data is a roll record whose replacement DTE sits AT the
+     cutoff.) Before it,
      the wheel's daily credit-only roller chose replacements from a ladder cut off at
      8 calendar days while its live twin searched to `old_expiry + 14`; the replay
      therefore suppressed OTM roll-OUTS specifically — the roll that
@@ -1010,10 +1017,12 @@ a roll MORE than the live roller's own limits would — is **gone as of FC-116**
 roll legs now fill at the placed limit against the day's modeled book, so a
 replayed roll captures the credit the live credit invariant was computed on and
 never more. Two opposing unmeasured biases on one metric was the honest interim,
-not the answer, and FC-112 reads exactly that metric. The WHEEL carries the same
-reach truncation (7 + 14 against a 7-DTE materialisation), unfixed here because
-widening it would move every stored wheel number for a *different* reason —
-FC-112 owns it.
+not the answer, and FC-112 reads exactly that metric. **The WHEEL's own reach was
+widened by FC-112** (`engine_version = 'fc-112-wheel-roll-reach'`, §5 above): its
+materialisation moved from 7 DTE to its roll horizon, 7 + 14 = 21. What remains on
+the wheel is the same residual the covered-call profile has, one roll later — a
+chained roll wants `old_expiry + 14` = 29-36 days and the ladder stops at 21 — so
+neither profile is free of it.
 
 **The spread gate is SUSPENDED** on model-built chains: the modelled
 half-spread is >= 5% of mark for an OTM contract, so the profile's

@@ -129,32 +129,34 @@ SWEEP_BIASES = [('Every arm is measured by the same biased engine, so DIFFERENCE
 # WORDS.
 DTE_REACH_BIAS_THRESHOLD = 7
 
-DTE_REACH_BIAS = ('Arms reaching past 7 DTE are measured on THINNER data, and the thinness '
- 'biases selection rather than merely adding noise',
- 'These are not extrapolated prices: a 14- or 21-DTE quote here is a real '
- "print of a real contract, with implied vol solved from that contract's own "
- 'daily trade bar. The problem is WHICH contracts survive. Longer-dated '
- 'contracts trade thinly, and the chain builder drops any contract with no '
- 'trade that day — so a hole in the ladder is indistinguishable from a strike '
- 'that never existed, and the strategy picks from whatever happened to trade '
- 'rather than from the real ladder. That biases SELECTION; it is not a wider '
- 'error bar around the same choice. Two further limits ride along: the spread '
- 'model (FC-051) was measured on short-dated OTM puts only and is unvalidated '
- 'at these tenors, and the premium shortfalls quoted above were measured at 7 '
- "DTE. Read a long-DTE arm's RANK against other long-DTE arms; a "
- 'long-versus-short comparison carries this on top of every bias listed '
- 'here.\n'
+DTE_REACH_BIAS = ('Arms reaching past 7 DTE are measured on THINNER data, and the thinness biases '
+ 'selection rather than merely adding noise',
+ 'These are not extrapolated prices: a 14- or 21-DTE quote here is a real print of a '
+ "real contract, with implied vol solved from that contract's own daily trade bar. The "
+ 'problem is WHICH contracts survive. Longer-dated contracts trade thinly, and the '
+ 'chain builder drops any contract with no trade that day — so a hole in the ladder is '
+ 'indistinguishable from a strike that never existed, and the strategy picks from '
+ 'whatever happened to trade rather than from the real ladder. That biases SELECTION; '
+ 'it is not a wider error bar around the same choice. Two further limits ride along: '
+ 'the spread model (FC-051) was measured on short-dated OTM puts only and is '
+ 'unvalidated at these tenors, and the premium shortfalls quoted above were measured '
+ "at 7 DTE. Read a long-DTE arm's RANK against other long-DTE arms; a "
+ 'long-versus-short comparison carries this on top of every bias listed here.\n'
  '\n'
- 'WHICH LEG reaches past 7 is not the same question on both strategies, and '
- "this caveat fires on the run's materialisation reach rather than on its "
- 'entries. On a WHEEL run with no DTE arm (since FC-112) the reach is 21 '
- "because the ROLLER's replacement search needs it — `call_target_dte` 7 + "
- '`rolling.max_extension_days` 14 — while the scanner still caps every ENTRY '
- "at 7. So the thinness above bites the wheel's roll candidates, not its put "
- 'or call entries: read it against `otm_roll_outs`, `roll_net_credit` and '
- '`roll_skips.no_suitable_replacement`, not against `puts_sold`. A wheel arm '
- 'that overrides a DTE key reaches past 7 on entries too, and then the caveat '
- 'applies to both.')
+ 'WHICH LEG reaches past 7 is not the same question on both strategies, and this '
+ "caveat fires on the run's materialisation reach rather than on its entries. On a "
+ "WHEEL run with no DTE arm (since FC-112) the reach is 21 because the ROLLER's "
+ 'replacement search needs it — `call_target_dte` 7 + `rolling.max_extension_days` 14 '
+ '— while the scanner still caps every ENTRY at 7. So the thinness above bites the '
+ "wheel's roll candidates, not its put or call entries: read it against "
+ '`otm_roll_outs`, `roll_net_credit` and `roll_skips.no_credit_candidate`, not against '
+ '`puts_sold` — a thin long-dated print is one the roller CAN see and cannot make a '
+ 'credit out of, so it fails the credit screen and lands in that counter; '
+ '`no_suitable_replacement` is the earlier gate, where nothing passed the '
+ 'horizon/strike/delta filter at all. A wheel arm that overrides a DTE key reaches '
+ 'past 7 on entries too, and then the caveat applies to both. `WHEEL_ROLL_REACH_NOTE` '
+ "carries the rest of the wheel's roll-reach story: what the 21 does NOT cover, and "
+ 'the version boundary.')
 
 # FC-096 Phase E PR-1. DASHBOARD-ONLY prose — see the module docstring. The
 # forecast panel refuses to render on a blank caveat, so this constant is
@@ -259,17 +261,55 @@ ROLL_REACH_BIAS = ('Covered-call ROLL candidates are truncated at 21 DTE, so rol
  'when an ITM move is most likely to need defending. Direction: FEWER candidates, '
  'never more. Roll counts and captured credits are FLOORS, not estimates. \n'
  '\n'
- "The WHEEL's horizon (7 + 14 = 21) is fully materialised since FC-112, so the wheel "
- 'has NO residual roll-reach truncation — 21 is both what its roller wants and what '
- 'the lake stores. Its roll candidates past 7 DTE carry the thin-print caveat instead '
- '(`DTE_REACH_BIAS`); its ENTRIES are still capped at 7 by the scanner. Wheel roll '
- 'counts and credits written before `fc-112-wheel-roll-reach` were measured on a 7-DTE '
- 'ladder and are NOT comparable with later ones. \n'
+ 'The WHEEL carries the SAME truncation, one roll later. Its FIRST roll is fully '
+ 'materialised since FC-112 — a call entered at 7 DTE has a horizon of at most 21, '
+ 'which is what the replay builds — but a call already rolled OUT is held at roughly '
+ '15-22 DTE, so ITS next horizon is `old_expiry + 14` = 29-36 days against the same '
+ '21-DTE ladder. Every chained roll after the first therefore chooses from a truncated '
+ 'set, in this same direction. Wheel ENTRIES are still capped at 7 by the scanner, and '
+ 'wheel roll candidates past 7 DTE carry the thin-print caveat as well '
+ '(`DTE_REACH_BIAS`). Wheel readers get this in their own footer '
+ '(`WHEEL_ROLL_REACH_NOTE`), which is also where the `fc-112-wheel-roll-reach` version '
+ 'boundary is stated. \n'
  '\n'
  'Read `roll_skips` beside the roll counts before concluding anything about roller '
  'activity: a credit-only roller declining 40 evaluations and a roller that could not '
  'price a single one both report the same `rolls_executed`, and only the skip reasons '
  'separate them.')
+
+# FC-112, review round 1 (T2/E2). The WHEEL's own roll-reach footer — the
+# wheel half of ROLL_REACH_BIAS, which is emitted on covered-call runs only and
+# so was addressed to a reader who could never see it. Emitted on EVERY wheel
+# run on both sides, at both reaches: a pre-FC-112 row earns no DTE_REACH_BIAS
+# and is exactly the row whose reader most needs the boundary sentence.
+WHEEL_ROLL_REACH_NOTE = ('Wheel ROLL candidates are truncated after the FIRST roll of a chain, and wheel roll '
+ 'numbers are NOT comparable across the `fc-112-wheel-roll-reach` boundary',
+ "Since `fc-112-wheel-roll-reach` a wheel window materialises to the ROLLER's horizon "
+ '— `call_target_dte` 7 + `rolling.max_extension_days` 14 = 21 — instead of to the '
+ "scanner's 7. That is the whole horizon for the FIRST roll of a chain: a call entered "
+ 'at 7 DTE has at most 8 days to run and cannot want a replacement past 21. It is not '
+ 'the whole horizon for any roll after that one. A call that has ALREADY been rolled '
+ 'out is held at roughly 15-22 DTE, so ITS next horizon is `old_expiry + 14` = 29-36 '
+ 'days, against a ladder that stops at `MAX_SWEEPABLE_DTE` = 21 (the lake stores '
+ '`universe_dte = 22`). So every chained roll past the first chooses from a truncated '
+ "candidate set, exactly as the covered-call profile's rolls do, and in the same "
+ 'direction: FEWER and SHORTER replacements, never more. Roll counts and captured '
+ 'credits on an arm that chains rolls are FLOORS, not estimates.\n'
+ '\n'
+ 'WHICH ARM it costs: the one that rolls MORE. A lower `rolling.itm_trigger_ratio` '
+ 'authorises OTM roll-OUTS, and roll-outs are the rolls that chain — so the truncation '
+ 'lands on the arm doing the thing under test and biases AGAINST it, rather than '
+ 'cancelling between arms. A cheap tell in the data before reading any roll contrast: '
+ 'on a roll record, a replacement whose DTE sits AT the cutoff is a search that hit '
+ 'the edge, not one that chose. Count those.\n'
+ '\n'
+ 'THE VERSION BOUNDARY. Wheel roll counts and credits written before `engine_version = '
+ "'fc-112-wheel-roll-reach'` were measured on a ladder cut off at 8 days, where the "
+ 'roller could not reach an OTM roll-out at all; they are NOT comparable with later '
+ 'ones. Because an executed roll changes the position, the non-comparability is not '
+ 'confined to the roll columns — `puts_sold`, `calls_sold`, `cycles_completed`, '
+ '`option_pnl` and the returns move too on any window that rolls. Partition a wheel '
+ 'trend on `engine_version` before reading across that boundary.')
 
 ROLL_FILL_RULE = ("Roll legs fill at the placed limit against the day's modeled book, or not at all",
  'The live roller is credit-only AT ITS PLACED LIMITS, so the replay prices roll legs '

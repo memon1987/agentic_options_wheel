@@ -1927,6 +1927,67 @@ class TestTheDteReachFooter:
         assert engine_report.DTE_REACH_BIAS_THRESHOLD == 7
 
 
+class TestTheWheelRollReachNoteReachesWheelReaders:
+    """T2/E2 + T1, review round 1, on the ENGINE side.
+
+    `ROLL_REACH_BIAS` is appended only when `strategy != "wheel"`, so its wheel
+    paragraph — the chained-roll residual and the `fc-112-wheel-roll-reach`
+    version boundary — was prose no `sweep.md` for a wheel run could contain.
+    `WHEEL_ROLL_REACH_NOTE` is the copy a wheel reader gets, and unlike
+    `DTE_REACH_BIAS` it is NOT conditional on reach: a run replayed at 7 is
+    precisely the run whose numbers sit on the wrong side of the boundary.
+    """
+
+    def _result(self, reach):
+        result = _hand_built_holdout()
+        result.effective_max_dte = reach
+        return result
+
+    @pytest.mark.parametrize("reach", [7, 21])
+    def test_a_wheel_run_carries_it_at_either_reach(self, reach):
+        from src.backtesting.scenarios import report as engine_report
+
+        title, detail = engine_report.WHEEL_ROLL_REACH_NOTE
+        result = self._result(reach)
+        assert title in render_markdown(result)
+        assert {"title": title, "detail": detail} in json.loads(
+            render_json(result))["known_biases"]
+
+    def test_it_carries_both_facts_the_wheel_reader_was_missing(self):
+        from src.backtesting.scenarios import report as engine_report
+
+        detail = engine_report.WHEEL_ROLL_REACH_NOTE[1]
+        # T1 — the residual, which the retired claim said did not exist.
+        assert "FIRST roll of a chain" in detail
+        assert "29-36 days" in detail
+        assert "FEWER and SHORTER replacements" in detail
+        # T2/E2 — the boundary, and that it is not confined to roll columns.
+        assert "fc-112-wheel-roll-reach" in detail
+        assert "NOT comparable" in detail
+        assert "cycles_completed" in detail
+
+    def test_the_retired_claim_is_gone_from_every_footer(self):
+        """T1. "The wheel has NO residual roll-reach truncation" was false for
+        every roll after the first; a grep-style pin so it cannot come back by
+        copy-paste into either constant."""
+        from src.backtesting.scenarios import report as engine_report
+
+        for name in ("ROLL_REACH_BIAS", "WHEEL_ROLL_REACH_NOTE",
+                     "DTE_REACH_BIAS"):
+            detail = getattr(engine_report, name)[1]
+            assert "NO residual" not in detail, name
+            assert "no residual" not in detail, name
+
+    def test_a_covered_call_run_keeps_the_cc_copy_and_not_this_one(self):
+        from src.backtesting.scenarios import report as engine_report
+
+        result = self._result(21)
+        result.strategy = "covered_call"
+        titles = [t for t, _ in engine_report.sweep_biases(result)]
+        assert engine_report.WHEEL_ROLL_REACH_NOTE[0] not in titles
+        assert engine_report.ROLL_REACH_BIAS[0] in titles
+
+
 class TestTheSweepHeaderSurfacesEarningsGaps:
     """FC-096 A4. The FC-013 gate answers "clear" for a symbol it has no row
     for, which is exactly what a freshly-onboarded candidate looks like — so

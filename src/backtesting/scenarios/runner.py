@@ -562,8 +562,17 @@ def roll_horizon_reach(config) -> int:
     the truncation instead of the trigger is the failure FC-112's D-2 signs off
     against, so the re-baseline happens BEFORE the study rather than never.
 
-    Unlike the covered-call profile's 28-vs-21, the wheel has NO residual
-    truncation after this: 7 + 14 = 21 = ``MAX_SWEEPABLE_DTE`` exactly.
+    **The wheel's residual is not zero — it is one roll later** (FC-112 review
+    round 1, T1; the first cut claimed "no residual truncation" here). 7 + 14 =
+    21 = ``MAX_SWEEPABLE_DTE`` exactly, which covers the FIRST roll of a chain:
+    a call entered at ``call_target_dte`` has at most 8 days to run and cannot
+    want a replacement past 21. A call that has already been rolled OUT is held
+    at roughly 15-22 DTE, so ITS horizon is ``old_expiry + 14`` = 29-36 days
+    against the same 21-DTE ladder — and this function returns 21 for it too,
+    because the lake has nothing further to give. Every chained roll past the
+    first is therefore truncated exactly as the covered-call profile's are, in
+    the same direction (fewer and shorter replacements), and on the arm that
+    rolls MORE. ``report.WHEEL_ROLL_REACH_NOTE`` states it to the reader.
 
     Entries do not move. The reach is a MATERIALISATION bound, and the entry
     path caps its own candidates at ``*_target_dte`` inside the scanner

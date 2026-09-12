@@ -375,8 +375,16 @@ class TestTheRollHorizonReach:
         # `Found while planning` 4 — `spec_max_dte`'s wheel floor is a dashboard
         # constant, and a PR that moved only the engine would leave the two
         # footers disagreeing about whether the reach caveat had been earned.
-        assert (S.spec_max_dte({"scenarios": []})
+        # E1 (review round 1): the wheel floor is ENGINE-gated, so the
+        # comparison must name the engine whose `effective_max_dte` it is being
+        # compared against. `Config()` here is THIS image's wheel profile, so
+        # `S.ENGINE_VERSION` is the right era; a bare call would correctly
+        # answer 7, which is what every row written before this release had.
+        assert (S.spec_max_dte({"scenarios": []},
+                               engine_version=S.ENGINE_VERSION)
                 == effective_max_dte(Config(), []) == 21), "the wheel's floor"
+        assert S.spec_max_dte({"scenarios": []}) == 7, (
+            "and a run this image cannot place gets the pre-FC-112 answer")
 
     def test_the_pinned_wheel_base_reach_matches_the_profile(self):
         """FC-112 T-6, the constant half — the `CC_BASE_REACH` treatment."""
