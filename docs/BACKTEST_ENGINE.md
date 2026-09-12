@@ -170,10 +170,13 @@ failure mode: it cannot flatter a symbol into looking tradeable.
      ROLL legs are priced, on both strategies. Before it, every order — entry and roll
      alike — filled at `mid ∓ fill_haircut × half-spread` and the strategy's
      `limit_price` was recorded and ignored. After it, a roll leg fills at the limit the
-     live `CallRoller` would have placed, capped by the day's modeled book: a
-     buy-to-close at or through the ask fills AT the ask, a sell-to-open at or through
-     the bid fills at the bid, one resting inside the spread fills at its limit, and one
-     outside the book does not fill at all. **Rows before and after are non-comparable on
+     live `CallRoller` would have placed, capped by the day's modeled book **quantised
+     to cents**: a buy-to-close at or through the ask fills AT the ask, a sell-to-open at
+     or through the bid fills at the bid, one resting inside the spread fills at its
+     limit, and one outside the book does not fill at all. (The quantisation matters —
+     the roller places `round(·, 2)` limits, so comparing them against an unrounded model
+     book would tag about half of all base-mode legs `limit_resting` and fill them
+     fractionally inside the book.) **Rows before and after are non-comparable on
      every roll-bearing row** — roll credits, and anything derived from them. Nothing
      else moves: entry legs and the covered-call monitor leg keep the haircut model
      (FC-072, FC-086). Rows also gained eleven roll columns; a NULL `roll_fill_mode` on

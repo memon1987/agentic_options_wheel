@@ -1235,6 +1235,27 @@ def _quote_for(chains, leg):
         f"the chains the replay filled against")
 
 
+class TestTheRollFillModeIsValidatedAtConstruction:
+    """E5, on the simulator side.
+
+    The adapter refuses it too, but the simulator is where a sweep arm's
+    resolved mode arrives, and it is the one that must fail BEFORE a three
+    minute materialisation — not after, with a row already labelled wrong.
+    """
+
+    @pytest.mark.parametrize("bad", ["LIMIT", "Haircut", "mid", "", None])
+    def test_an_unrecognised_mode_raises(self, bad, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        with pytest.raises(ValueError, match="roll_fill_mode"):
+            _simulator("XYZ", closes, exps, days, roll_fill_mode=bad)
+
+    @pytest.mark.parametrize("good", ["limit", "haircut"])
+    def test_both_real_modes_are_accepted(self, good, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        sim = _simulator("XYZ", closes, exps, days, roll_fill_mode=good)
+        assert sim.roll_fill_mode == good
+
+
 class TestTheRollFillRuleOnTheGoldenWindow:
     """T5. Each leg's price IS the rule, and the credit delta IS the closed
     form — per leg, by ledger TAG.

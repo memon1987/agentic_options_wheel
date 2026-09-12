@@ -477,6 +477,31 @@ def _open_short_call(broker):
                              mark=0.80, bid=0.70, opened=D1)
 
 
+class TestTheRollFillModeIsValidated:
+    """E5. An unrecognised spelling used to DEGRADE to haircut, silently.
+
+    The pricing branch is `!= "limit"`, so `"LIMIT"` hashed as its own sweep
+    arm, ran the pre-FC-116 model, and persisted `roll_fill_mode="LIMIT"` on
+    the row — an arm whose stored label contradicts the model it ran under, and
+    a `/sims` footer that would describe the wrong rule for it.
+    """
+
+    @pytest.mark.parametrize("bad", ["LIMIT", "Haircut", "mid", "", None])
+    def test_the_adapter_refuses_it(self, bad):
+        with pytest.raises(ValueError, match="roll_fill_mode"):
+            BacktestAlpacaClient(
+                BacktestBroker(starting_cash=1.0), chains={}, stock_bars={},
+                roll_fill_mode=bad,
+            )
+
+    @pytest.mark.parametrize("good", ["limit", "haircut"])
+    def test_both_real_modes_are_accepted(self, good):
+        BacktestAlpacaClient(
+            BacktestBroker(starting_cash=1.0), chains={}, stock_bars={},
+            roll_fill_mode=good,
+        )
+
+
 class TestRollLegsFillAtTheirLimits:
     """T1. Every row of the D1 table, on a synthetic book.
 
@@ -521,6 +546,48 @@ class TestRollLegsFillAtTheirLimits:
         assert event.detail["limit_price"] == pytest.approx(limit)
         assert broker.cash == pytest.approx(
             cash_before - expect_fill * 100 - broker.fees_per_contract)
+
+    @pytest.mark.parametrize("side,bid,ask,limit,expect_fill", [
+        # The live bug (T1): a base-mode BTC is placed at `round(ask, 2)`, and
+        # against an UNROUNDED ask of 1.4815 that limit of 1.48 is "inside the
+        # spread" — so the leg was tagged `limit_resting` and filled 0.15 c
+        # better than the book, contaminating `roll_legs_resting` on roughly
+        # half of all base-mode legs. Quantised, 1.48 IS the ask.
+        ("buy", 1.3395, 1.4815, 1.48, 1.48),
+        # A quote that rounds DOWN is marketable too: ask 1.4749 -> 1.47.
+        ("buy", 1.3395, 1.4749, 1.47, 1.47),
+        # And the mirror on the sell side: `round(bid, 2)` IS `bid_c`.
+        ("sell", 4.9936, 5.5264, 4.99, 4.99),
+        ("sell", 4.9851, 5.5264, 4.99, 4.99),
+    ])
+    def test_the_book_is_quantised_to_cents_before_the_comparison(
+            self, side, bid, ask, limit, expect_fill):
+        """Real exchanges quote in cents; a modeled chain does not.
+
+        Rounding the BOOK (not the limit) is the faithful model, and it is what
+        makes `limit_resting` mean what the footer says it means — a limit
+        strictly inside the quantised spread, resting on the one-snapshot
+        assumption — rather than "the model book carried a third decimal".
+        """
+        broker = BacktestBroker(starting_cash=50_000.0)
+        broker.deposit_shares("XYZ", 100, 95.0, D1, premise="test cover")
+        q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+                   mark=(bid + ask) / 2, bid=bid, ask=ask, delta=0.20)
+        client = BacktestAlpacaClient(
+            broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+            stock_bars={"XYZ": _bars((D1, 100.0))},
+        )
+        if side == "buy":
+            _open_short_call(broker)
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, side, limit_price=limit)
+        assert res["status"] == "filled"
+        event = broker.ledger[-1]
+        assert event.price == pytest.approx(expect_fill)
+        assert event.detail["fill_rule"] == "limit_marketable", (
+            "the roller's own limit against the book it was derived from is "
+            "marketable by construction — tagging it `limit_resting` is the "
+            "T1 bug")
 
     def test_a_btc_below_the_bid_expires_and_moves_nothing(self, rolling):
         broker, client = rolling
