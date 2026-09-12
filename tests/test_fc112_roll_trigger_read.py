@@ -813,6 +813,26 @@ class TestT14VerdictBlockProvenance:
                 READ.tool_provenance(str(stray))
         assert not hasattr(READ, "SHA_UNAVAILABLE")
 
+    def test_main_refuses_with_code_4_and_prints_no_verdict(self,
+                                                            monkeypatch,
+                                                            capsys):
+        """Q-4 / D-3 at the ENTRY POINT. `tool_provenance` raising is only
+        half the contract; the other half is that `main` turns that into exit
+        4 with nothing on stdout, so a caller redirecting stdout to a record
+        file cannot capture a verdict from a run that could not name its rule.
+        The refusal must also happen BEFORE the BigQuery import, so this test
+        needs no GCP client."""
+        def refuse(path=None):
+            raise READ.ProvenanceError(
+                "the tool file is MODIFIED relative to its commit (fixture)")
+
+        monkeypatch.setattr(READ, "tool_provenance", refuse)
+        rc = READ.main(["--run-id", "run_decision"])
+        assert rc == 4
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "REFUSING TO RUN" in captured.err
+
     def test_the_full_report_carries_the_rule_and_the_verdict(self):
         analysis = READ.analyse(cells_for(KEEP_DELTAS))
         report = READ.render_report(
@@ -1006,6 +1026,37 @@ class TestRaPartialOutcomes:
         assert analysis.verdict.label == "PARTIAL-SAME-SIGN"
         assert analysis.verdict.resolves_to == "1.00"
         assert "crossed MIN_EFFECT_PP" in analysis.verdict.reasons[0]
+
+    def test_a_crossed_partial_with_an_opposing_read_gets_its_own_label(self):
+        """Confirmation residual (PR-2). `limit`/`haircut` cross -2.0 pp but
+        miss the sign count (N- = 4), so NOTHING passes and the conflict
+        branch never runs — yet `noimm` is +0.3 pp on 7/7 and so OPPOSES the
+        crossed direction. Resolution is the default (R-a: no read passed, so
+        there is no conflict to park on 0.98), but the label must not be
+        PARTIAL-SAME-SIGN: the reads did not agree in sign."""
+        cells = cells_for({"limit": -2.0, "haircut": -2.0, "noimm": +0.3})
+        flipped = []
+        for c in cells:
+            # Three of seven symbols positive in the two CROSSING reads ->
+            # N- = 4 < 6, nothing passes, medians still -2.0 pp.
+            if (c.scenario_name in ("t100", "t100_haircut")
+                    and c.split == "fit" and c.symbol in SYMBOLS[:3]):
+                flipped.append(cell(c.scenario_name, c.symbol, "fit",
+                                    annualized_return=BASE_ANN + 0.02,
+                                    total_return=BASE_ANN + 0.02,
+                                    option_pnl=c.option_pnl))
+            else:
+                flipped.append(c)
+        analysis = READ.analyse(flipped)
+        assert analysis.reads["limit"].n_neg == 4
+        assert analysis.reads["limit"].median == pytest.approx(-2.0)
+        assert analysis.reads["haircut"].n_neg == 4
+        assert analysis.reads["noimm"].n_pos == 7
+        assert analysis.reads["noimm"].median == pytest.approx(0.3)
+        assert analysis.verdict.label == "PARTIAL-CROSSED-OPPOSED"
+        assert analysis.verdict.resolves_to == "1.00"
+        assert "noimm points the other way" in analysis.verdict.reasons[0]
+        assert "haircut,limit crossed" in analysis.verdict.reasons[0]
 
     def test_mixed_null_keeps_its_literal_definition(self):
         v = verdict_for(cells_for({"limit": -0.1, "haircut": -0.1,

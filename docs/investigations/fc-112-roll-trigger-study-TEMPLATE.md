@@ -68,13 +68,15 @@ interchangeable:
 | **MOVE** | the mirror passes in every read, and the holdout does not refute (R-b) | 1.00 |
 | **KEEP-REFUSED-OPTION-LEG** | a full KEEP, refused **only** because the effect is not in the option leg (R-d) | 1.00 |
 | **PARTIAL-SAME-SIGN** | some reads pass (or cross `MIN_EFFECT_PP`), the rest agree in sign but stay under threshold (R-a) | 1.00 |
+| **PARTIAL-CROSSED-OPPOSED** | nothing passes, a read crosses `MIN_EFFECT_PP` without its sign count, and another read points the other way (R-a) — same resolution as PARTIAL-SAME-SIGN; the label exists because the reads did **not** agree in sign | 1.00 |
 | **MIXED-NULL** | **no** read crosses **either** threshold anywhere, and no sign conflict (R-a, literal) | 1.00 |
 | **MIXED-CONFLICT** | a read passes while another has the **opposite median sign** (any size) or an opposite sign count at `MIN_SIGN_COUNT[M]`; the holdout refutes at `comparable >= 4` (KEEP **or** MOVE); an informative OOS refutes; the primary `limit` median flips sign across the monitor points | 0.98 stays **+ operator review** |
 | **VOID(reason)** | any structural check below | file it; do not read further |
 
-Never describe a `PARTIAL-SAME-SIGN` or a `KEEP-REFUSED-OPTION-LEG` as "no
-measurable difference" — both measured one, and only MIXED-NULL is the claim
-that nothing did.
+Never describe a `PARTIAL-SAME-SIGN`, a `PARTIAL-CROSSED-OPPOSED` or a
+`KEEP-REFUSED-OPTION-LEG` as "no measurable difference" — all three measured
+one, and only MIXED-NULL is the claim that nothing did. And never describe a
+`PARTIAL-CROSSED-OPPOSED` as same-signed: name the opposing read.
 
 ### 2a. The null base rate of this rule (DD-1, computed 2026-09-12)
 
@@ -229,7 +231,8 @@ the tool printed `VACUOUS (n windows)`, fewer than two windows were read and
 ## 9. What follows
 
 - **KEEP** → FC-078 amendment recording the measured reason; close FC-112.
-- **MOVE / MIXED-NULL / PARTIAL-SAME-SIGN / KEEP-REFUSED-OPTION-LEG** → open
+- **MOVE / MIXED-NULL / PARTIAL-SAME-SIGN / PARTIAL-CROSSED-OPPOSED /
+  KEEP-REFUSED-OPTION-LEG** → open
   the config-flip FC (its own PR, `Config` census
   test inverted to "no key differs", alert-twin check, FC-078 amendment).
   **Nothing in `config/`, `src/strategy/` or `deploy/` moves in FC-112.**

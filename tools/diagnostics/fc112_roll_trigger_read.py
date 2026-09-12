@@ -1189,7 +1189,13 @@ def apply_rule(reads: Dict[str, ReadSummary],
       sign count at `MIN_SIGN_COUNT[M]`) is MIXED-CONFLICT. Some reads passing
       with the others same-signed but under threshold is NOT MIXED-NULL: it
       resolves to the default under its own label, `PARTIAL-SAME-SIGN`, so the
-      record can never call a partial result "no measurable difference".
+      record can never call a partial result "no measurable difference". A
+      partial in which a read CROSSED `MIN_EFFECT_PP` without meeting its sign
+      count — which never reaches the conflict branch, since nothing passes —
+      while another read points the opposite way resolves to the default too,
+      under `PARTIAL-CROSSED-OPPOSED`: same resolution, a label that does not
+      assert the sign agreement the reads did not show, with the opposing
+      reads named in the reason.
       MIXED-NULL keeps DD-1's literal definition — NO read crosses EITHER
       threshold anywhere, and no sign conflict.
     * **R-d, the option leg.** `opt_read` must be computed on the same symbols
@@ -1281,10 +1287,15 @@ def apply_rule(reads: Dict[str, ReadSummary],
             return Verdict("MIXED-CONFLICT", "0.98", (holdout_reason,))
         return Verdict("MOVE", "1.00", ())
 
-    # R-a. Everything that reaches here is SAME-SIGNED (the conflict branch
-    # above has returned) and resolves to the default — but only a read where
-    # NOTHING crossed either threshold anywhere is MIXED-NULL, because
-    # "no measurable difference" is a claim and a partial result is not it.
+    # R-a. Everything that reaches here resolves to the default, and only a
+    # read where NOTHING crossed either threshold anywhere is MIXED-NULL,
+    # because "no measurable difference" is a claim and a partial result is
+    # not it. The two partials differ in what they may assert about SIGN: a
+    # `passing` partial IS same-signed (a passing read beside an opposing one
+    # returned MIXED-CONFLICT above), but a read that merely CROSSED without
+    # meeting its sign count never reaches that branch, so an opposing read
+    # can still be standing here. Same resolution, separate label — the record
+    # must not claim an agreement the reads did not show.
     passing = sorted(n for n in reads if keeps[n] or moves[n])
     crossed = sorted(n for n, s in reads.items()
                      if _crosses(s, +1) or _crosses(s, -1))
@@ -1294,6 +1305,17 @@ def apply_rule(reads: Dict[str, ReadSummary],
             ("partial_same_sign:" + ",".join(passing) + " passed the full rule;"
              " the other reads agree in sign but stay under threshold",))
     if crossed:
+        crossed_signs = [sign for sign in (-1, +1)
+                         if any(_crosses(reads[n], sign) for n in crossed)]
+        opposing = sorted({n for n, s in reads.items()
+                           for sign in crossed_signs if _opposes(s, sign)})
+        if opposing:
+            return Verdict(
+                "PARTIAL-CROSSED-OPPOSED", DEFAULT_RESOLUTION,
+                ("partial_crossed_opposed:" + ",".join(crossed) + " crossed "
+                 "MIN_EFFECT_PP without meeting its sign count, while "
+                 + ",".join(opposing) + " points the other way (opposite "
+                 "median sign, or an opposite sign count at MIN_SIGN_COUNT)",))
         return Verdict(
             "PARTIAL-SAME-SIGN", DEFAULT_RESOLUTION,
             ("partial_same_sign:" + ",".join(crossed) + " crossed "
