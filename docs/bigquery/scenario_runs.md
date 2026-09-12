@@ -787,9 +787,22 @@ and DD-1's four non-deciding metrics to the SELECT, and its own
   `pin_id IS NULL`.
 * **Follow `deduplicated_to`, and check the target.** A `deduplicated` sweep
   writes no cell rows of its own. The realistic collision is a one-shot
-  submitted at the coming Saturday's window, which the pin's first point then
-  dedups INTO (the cell key carries no `pin_id` and no `submitted_via`) — so
-  submit one-shots Mon–Thu, never Saturday morning UTC.
+  submitted at the coming Saturday's window whose body is **byte-identical** to
+  the pin's canonical spec, which the pin's first point then dedups INTO (the
+  cell key carries no `pin_id` and no `submitted_via`) — so submit one-shots
+  Mon–Thu, never Saturday morning UTC. `sweep_key` hashes the **whole**
+  canonical spec (`identity.py:492`), so a one-shot that adds an arm has a
+  different key and cannot collide.
+* **Select by run id on the SOURCE, never the resolved one.** `resolved` holds
+  both rows of a deduped pair — the `deduplicated` row pointing at the target
+  and the target's own row — so `IFNULL(t.run_id, l.run_id) IN UNNEST(@run_ids)`
+  matches both and returns every cell TWICE. Project `l.run_id AS
+  source_run_id` and filter on that.
+* **`(symbol, split, scenario_name)` is not unique across pins.** Two pins in
+  one read both carry the implicit `base` arm, so every shared symbol has two
+  `base` rows. Put `run_id` in the `ORDER BY` and compare the duplicates before
+  indexing: identical is expected, differing means the pins are not asking the
+  same base question.
 
 ```sql
 WITH latest AS (
@@ -802,13 +815,17 @@ WITH latest AS (
     WHERE submitted_at >= @since) WHERE rn = 1),
 resolved AS (  -- follow deduplicated_to once; the target must be done
   SELECT l.pin_id, l.window_end, l.submitted_via,
+         l.run_id AS source_run_id, l.window_start, l.holdout_start,
+         SAFE_CAST(JSON_VALUE(l.spec_json, '$.starting_cash') AS FLOAT64) AS spec_starting_cash,
          IFNULL(t.run_id, l.run_id) AS run_id, IFNULL(t.status, l.status) AS status,
          IFNULL(t.engine_version, l.engine_version) AS engine_version,
          IFNULL(t.engine_identity, l.engine_identity) AS engine_identity
   FROM latest l LEFT JOIN latest t ON t.run_id = l.deduplicated_to AND l.status = 'deduplicated'
   WHERE IFNULL(JSON_VALUE(l.spec_json, '$.strategy'), 'wheel') = 'wheel')
 SELECT s.pin_id, s.window_end, s.engine_version, s.engine_identity,
-       r.symbol, r.split, r.scenario_name, r.verdict, r.annualized_return,
+       s.window_start, s.holdout_start, s.spec_starting_cash, s.source_run_id,
+       r.symbol, r.split, r.scenario_name, r.verdict, r.measured, r.error,
+       r.annualized_return,
        r.option_pnl, r.stock_pnl_realized, r.stock_pnl_unrealized,
        r.rolls_executed, r.itm_rolls, r.otm_roll_outs, r.roll_net_credit,
        r.itm_roll_credit, r.otm_roll_out_credit, r.failed_roll_btc_debit,
@@ -817,8 +834,9 @@ FROM resolved s
 JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r USING (run_id)
 WHERE s.status = 'done'
   AND s.pin_id IN UNNEST(@pin_ids)     -- or: s.pin_id IS NULL AND s.submitted_via = 'battery'
+                                       -- or: s.source_run_id IN UNNEST(@run_ids)
   AND s.window_end = @window_end
-ORDER BY r.symbol, r.split, r.scenario_name;
+ORDER BY r.symbol, r.split, r.scenario_name, run_id;
 ```
 
 `engine_version` and `engine_identity` must be **single-valued** across every

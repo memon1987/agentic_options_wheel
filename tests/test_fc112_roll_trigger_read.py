@@ -17,12 +17,29 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from datetime import date
-from typing import Any, Dict, List, Optional, Sequence
+import contextlib
+import dataclasses
+import math
+import os
+import subprocess
+from datetime import date, timedelta
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import pytest
 
 from tools.diagnostics import fc112_roll_trigger_read as READ
+
+@contextlib.contextmanager
+def _env(values: Dict[str, str]) -> Iterator[None]:
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
 
 SYMBOLS = ["AAPL", "AMD", "AMZN", "GOOGL", "IWM", "NVDA", "UNH"]
 BASE_ANN = 0.06
@@ -210,10 +227,12 @@ class TestT10TheRuleBranches:
                           opt_delta_pp=-0.05)
         analysis = READ.analyse(cells)
         assert analysis.reads["limit"].n_neg == 7
-        assert analysis.verdict.label == "MIXED-NULL"
+        # R-d: its OWN label, never MIXED-NULL — "no measurable difference" is
+        # a claim, and this read measured a difference it would not locate.
+        assert analysis.verdict.label == "KEEP-REFUSED-OPTION-LEG"
         assert analysis.verdict.resolves_to == "1.00"
-        assert analysis.verdict.reasons == (
-            "keep_refused_option_leg_not_located",)
+        assert analysis.verdict.reasons[0].startswith(
+            "keep_refused_option_leg_not_located")
 
     def test_five_measured_symbols_is_a_void_not_a_thinner_read(self):
         """M < 6 has no entry in MIN_SIGN_COUNT; inventing one is inventing a
@@ -363,7 +382,7 @@ class TestT11StructuralChecks:
 STATUS_RANK = {"submitted": 0, "running": 1, "deduplicated": 2, "failed": 3,
                "done": 4}
 CELL_COLUMNS = (
-    "symbol", "split", "scenario_name", "verdict", "measured",
+    "symbol", "split", "scenario_name", "verdict", "measured", "error",
     "annualized_return", "total_return", "option_pnl", "stock_pnl_realized",
     "stock_pnl_unrealized", "rolls_executed", "itm_rolls", "otm_roll_outs",
     "roll_net_credit", "itm_roll_credit", "otm_roll_out_credit",
@@ -415,6 +434,10 @@ class FakeBigQuery:
                 "pin_id": row.get("pin_id"),
                 "window_end": row.get("window_end"),
                 "submitted_via": row.get("submitted_via"),
+                "window_start": row.get("window_start"),
+                "holdout_start": row.get("holdout_start"),
+                "spec_starting_cash": json.loads(
+                    row.get("spec_json") or "{}").get("starting_cash"),
                 "resolved_run_id": (target or row)["run_id"],
                 "resolved_status": (target or row).get("status"),
                 "engine_version": (target or row).get("engine_version"),
@@ -434,9 +457,11 @@ class FakeBigQuery:
             if row.get("submitted_via") != "battery":
                 return False
         elif "run_id IN UNNEST(@run_ids)" in sql:
-            key = ("resolved_run_id" if "scenario_runs" in sql
-                   else "source_run_id")
-            if row.get(key) not in params.get("run_ids", []):
+            # D-4: BOTH queries select on the SOURCE run id. Selecting the cell
+            # query on the RESOLVED id returns a deduped pair twice.
+            assert "source_run_id IN UNNEST(@run_ids)" in sql or (
+                "scenario_runs" not in sql)
+            if row.get("source_run_id") not in params.get("run_ids", []):
                 return False
         if "window_end = @window_end" in sql:
             if str(row.get("window_end")) != str(params.get("window_end")):
@@ -450,7 +475,7 @@ class FakeBigQuery:
             params[p.name] = getattr(p, "value", None) or getattr(
                 p, "values", None)
         resolved = self._resolved()
-        if "source_run_id" in sql:                      # the sweep projection
+        if "scenario_runs" not in sql:                  # the sweep projection
             return _FakeJob([r for r in resolved
                              if self._matches(r, sql, params)])
         rows = []
@@ -464,6 +489,10 @@ class FakeBigQuery:
                     continue
                 row = {"pin_id": sweep["pin_id"],
                        "window_end": sweep["window_end"],
+                       "window_start": sweep["window_start"],
+                       "holdout_start": sweep["holdout_start"],
+                       "spec_starting_cash": sweep["spec_starting_cash"],
+                       "source_run_id": sweep["source_run_id"],
                        "engine_version": sweep["engine_version"],
                        "engine_identity": sweep["engine_identity"],
                        "submitted_via": sweep["submitted_via"],
@@ -672,14 +701,16 @@ class TestT13HoldoutParity:
         from src.backtesting.scenarios.report import sign_agreement
         from src.backtesting.scenarios.runner import ScenarioResult, SweepResult
 
-        # AAA and BBB agree (t100 worse in both windows); CCC flips (worse in
-        # fit, better in the holdout); DDD never completed a cycle in the
+        # AAPL and AMD agree (t100 worse in both windows); AMZN flips (worse
+        # in fit, better in the holdout); GOOGL never completed a cycle in the
         # holdout and is comparable in NEITHER numerator nor denominator.
+        # Real STUDY_SYMBOLS: the deciding holdout line is restricted to them
+        # (R-e), so a fixture on invented tickers would measure nothing.
         plan = {
-            "AAA": (0.10, 0.08, 0.10, 0.08),
-            "BBB": (0.10, 0.07, 0.12, 0.09),
-            "CCC": (0.10, 0.08, 0.10, 0.12),
-            "DDD": (0.10, 0.08, 0.10, None),
+            "AAPL": (0.10, 0.08, 0.10, 0.08),
+            "AMD": (0.10, 0.07, 0.12, 0.09),
+            "AMZN": (0.10, 0.08, 0.10, 0.12),
+            "GOOGL": (0.10, 0.08, 0.10, None),
         }
         rows, cells = [], []
         for symbol, (bf, tf, bh, th) in plan.items():
@@ -720,22 +751,74 @@ class TestT13HoldoutParity:
 # --------------------------------------------------------------------------- #
 class TestT14VerdictBlockProvenance:
     def test_the_block_prints_the_three_constants_and_a_40_hex_sha(self):
-        block = "\n".join(READ.render_provenance("a" * 40))
+        block = "\n".join(READ.render_provenance(
+            READ.Provenance(head="a" * 40, blob="c" * 40, path="t.py")))
         assert "TIE_BREAK       : move" in block
         assert "MIN_EFFECT_PP   : 0.5" in block
         assert "MIN_SIGN_COUNT  : {6: 5, 7: 6}" in block
         assert re.search(r"\b[0-9a-f]{40}\b", block)
+        # Q-4 / D-3: the blob names the exact BYTES of the rule; HEAD only
+        # names a tree that a reader has to trust contained them.
+        assert "c" * 40 in block
+        assert "tool blob" in block
 
-    def test_the_real_commit_sha_reaches_the_block(self):
-        sha = READ.tool_commit_sha()
-        if sha == READ.SHA_UNAVAILABLE:
-            pytest.skip("no git checkout to read a SHA from")
-        assert re.fullmatch(r"[0-9a-f]{40}", sha)
-        assert sha in "\n".join(READ.render_provenance())
+    def test_the_real_commit_sha_and_blob_reach_the_block(self):
+        try:
+            provenance = READ.tool_provenance()
+        except READ.ProvenanceError as exc:
+            # The ONLY tolerated cause is a checkout with this file open for
+            # editing; CI runs on a clean tree, where this is the assertion.
+            # Every other cause (no git, no checkout) is exercised
+            # deterministically by the two tests below.
+            assert "MODIFIED" in str(exc), exc
+            pytest.skip("the tool file is dirty in this working tree")
+        assert re.fullmatch(r"[0-9a-f]{40}", provenance.head)
+        assert re.fullmatch(r"[0-9a-f]{40}", provenance.blob)
+        assert provenance.path.endswith("fc112_roll_trigger_read.py")
+        block = "\n".join(READ.render_provenance())
+        assert provenance.head in block and provenance.blob in block
+
+    def test_a_dirty_tool_file_refuses_to_produce_a_verdict(self, tmp_path):
+        """Q-4 / D-3. A verdict whose SHA names bytes that are not the ones
+        that ran is not pre-registered — it is a number with a citation to
+        something else. There is deliberately no `SHA_UNAVAILABLE` fallback."""
+        repo = tmp_path / "repo"
+        (repo / "tools").mkdir(parents=True)
+        target = repo / "tools" / "fc112_roll_trigger_read.py"
+        target.write_text("# committed\n", encoding="utf-8")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        for argv in (["init", "-q"], ["add", "-A"],
+                     ["commit", "-qm", "x", "--no-gpg-sign"]):
+            subprocess.run(["git", "-C", str(repo), *argv], check=True,
+                           env=env, capture_output=True)
+        clean = READ.tool_provenance(str(target))
+        assert re.fullmatch(r"[0-9a-f]{40}", clean.blob)
+        assert clean.path == "tools/fc112_roll_trigger_read.py"
+
+        target.write_text("# EDITED AFTER THE COMMIT\n", encoding="utf-8")
+        with pytest.raises(READ.ProvenanceError) as excinfo:
+            READ.tool_provenance(str(target))
+        assert "MODIFIED" in str(excinfo.value)
+
+    def test_git_being_unavailable_refuses_rather_than_degrading(self,
+                                                                tmp_path):
+        """No `SHA_UNAVAILABLE` verdicts: a run outside a checkout REFUSES."""
+        stray = tmp_path / "not_a_repo" / "tool.py"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("# x\n", encoding="utf-8")
+        env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(tmp_path)}
+        with pytest.raises(READ.ProvenanceError):
+            with _env(env):
+                READ.tool_provenance(str(stray))
+        assert not hasattr(READ, "SHA_UNAVAILABLE")
 
     def test_the_full_report_carries_the_rule_and_the_verdict(self):
         analysis = READ.analyse(cells_for(KEEP_DELTAS))
-        report = READ.render_report(analysis, ["fixture"], sha="b" * 40)
+        report = READ.render_report(
+            analysis, ["fixture"],
+            provenance=READ.Provenance(head="b" * 40, blob="d" * 40,
+                                       path="t.py"))
         assert "b" * 40 in report
         assert "MIN_SIGN_COUNT  : {6: 5, 7: 6}" in report
         assert report.rstrip().endswith("=" * 78)
@@ -846,3 +929,633 @@ class TestTheArtifactTables:
             {"paired_events": rows, "resting_by_kind": {}, "missing": []}))
         assert "230.00 -> 235.00" in rendered
         assert "call_assignment 2026-03-20" in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1 (PR-2): the two adversarial reviews' required fixes, and the
+# PROGRAM OWNER's rule clarifications R-a .. R-e (plan §Amendments rev 4).
+#
+# Every test below names the finding it closes. They are the contract for the
+# clarifications: the rule was ambiguous, the ambiguity was closed by ruling
+# rather than by whoever read the code last, and these pin the ruling.
+# --------------------------------------------------------------------------- #
+class TestRaPartialOutcomes:
+    """R-a / Q-2. A partial result is never reported as 'no difference'."""
+
+    def test_a_keep_against_an_opposite_median_of_any_size_is_a_conflict(self):
+        """The widened test. Under rev 3 a +0.1 pp median did not 'cross the
+        opposite threshold' and the read resolved to the DEFAULT in silence —
+        two reads of the same trades disagreeing about DIRECTION went to 1.00
+        without an operator ever seeing the disagreement."""
+        deltas = {"limit": -2.0, "haircut": -2.0, "noimm": +0.1}
+        v = verdict_for(cells_for(deltas))
+        assert v.label == "MIXED-CONFLICT"
+        assert v.resolves_to == "0.98"
+        assert any("noimm points the other way" in r for r in v.reasons)
+
+    def test_an_opposite_sign_count_alone_is_a_conflict(self):
+        """`MIN_SIGN_COUNT[7]` symbols pointing the other way is a conflict
+        even when their median sits inside +/- MIN_EFFECT_PP."""
+        cells = cells_for({"limit": -2.0, "haircut": -2.0, "noimm": 0.0})
+        # Six of seven `noimm` symbols positive, median 0.05 pp — far under
+        # MIN_EFFECT_PP, but the sign count is the rule's own bar.
+        patched = []
+        for c in cells:
+            if c.scenario_name == "t100_noimm":
+                bump = +0.05 if c.symbol != SYMBOLS[0] else -0.05
+                patched.append(cell("t100_noimm", c.symbol, c.split,
+                                    annualized_return=BASE_ANN + bump / 100.0))
+            else:
+                patched.append(c)
+        analysis = READ.analyse(patched)
+        assert analysis.reads["noimm"].n_pos == 6
+        assert abs(analysis.reads["noimm"].median) < READ.MIN_EFFECT_PP
+        assert analysis.verdict.label == "MIXED-CONFLICT"
+
+    def test_a_same_signed_partial_is_its_own_label_not_mixed_null(self):
+        """`limit` and `haircut` pass; `noimm` agrees in sign but sits under
+        threshold. That is NOT 'no measurable difference'."""
+        v = verdict_for(cells_for({"limit": -2.0, "haircut": -2.0,
+                                   "noimm": -0.2}))
+        assert v.label == "PARTIAL-SAME-SIGN"
+        assert v.resolves_to == "1.00"
+        assert v.reasons[0].startswith("partial_same_sign:haircut,limit")
+
+    def test_a_crossing_read_that_misses_its_sign_count_is_also_partial(self):
+        """Crossed MIN_EFFECT_PP, failed the sign count: not MIXED-NULL
+        either, because MIXED-NULL is 'no read crosses EITHER threshold'.
+
+        Rev 3 labelled this MIXED-NULL with a `partial:` reason string buried
+        inside it, so a record generated from the label alone would have said
+        "no measurable difference" about a read whose median was -2 pp."""
+        cells = cells_for({"limit": -2.0, "haircut": -2.0, "noimm": -2.0})
+        t100_arms = {arm for _n, _b, arm in READ.READS}
+        flipped = []
+        for c in cells:
+            # Three of seven symbols positive in EVERY read -> N- = 4 < 6 and
+            # nothing passes, but every median is still -2.0 pp.
+            if (c.scenario_name in t100_arms and c.split == "fit"
+                    and c.symbol in SYMBOLS[:3]):
+                flipped.append(cell(c.scenario_name, c.symbol, "fit",
+                                    annualized_return=BASE_ANN + 0.02))
+            else:
+                flipped.append(c)
+        analysis = READ.analyse(flipped)
+        assert analysis.reads["limit"].n_neg == 4
+        assert analysis.reads["limit"].median == pytest.approx(-2.0)
+        assert analysis.verdict.label == "PARTIAL-SAME-SIGN"
+        assert analysis.verdict.resolves_to == "1.00"
+        assert "crossed MIN_EFFECT_PP" in analysis.verdict.reasons[0]
+
+    def test_mixed_null_keeps_its_literal_definition(self):
+        v = verdict_for(cells_for({"limit": -0.1, "haircut": -0.1,
+                                   "noimm": -0.1}))
+        assert v.label == "MIXED-NULL"
+        assert v.reasons == ("no_read_crosses_either_threshold",)
+
+
+class TestRbHoldoutRefutesAMove:
+    """R-b / Q-3. DD-1's 'any of' row does not say 'only for a KEEP'."""
+
+    def test_a_refuting_holdout_blocks_a_move_too(self):
+        move = {"limit": +2.0, "haircut": +2.0, "noimm": +2.0}
+        four = SYMBOLS[:4]
+        cells = cells_for(move, holdout_symbols=four,
+                          holdout_delta_pp={s: -2.0 for s in four[:3]})
+        analysis = READ.analyse(cells)
+        assert analysis.holdout.comparable == 4
+        assert analysis.holdout.agreeing == 1
+        assert analysis.verdict.label == "MIXED-CONFLICT"
+        assert analysis.verdict.resolves_to == "0.98"
+
+    def test_an_uninformative_holdout_still_lets_a_move_through(self):
+        move = {"limit": +2.0, "haircut": +2.0, "noimm": +2.0}
+        three = SYMBOLS[:3]
+        cells = cells_for(move, holdout_symbols=three,
+                          holdout_delta_pp={s: -2.0 for s in three})
+        analysis = READ.analyse(cells)
+        assert not analysis.holdout.informative
+        assert analysis.verdict.label == "MOVE"
+
+
+class TestRcOutOfSample:
+    """R-c / Q-9 / D-9. The OOS read is a KEEP condition, so it carries a
+    floor of its own and the structural burden that goes with the power to
+    refute."""
+
+    def _oos(self, delta: float, symbols=tuple(SYMBOLS[:5]), **kw):
+        return cells_for({"limit": delta, "haircut": delta, "noimm": delta},
+                         symbols=symbols, holdout_symbols=(), **kw)
+
+    def test_an_oos_read_under_the_floor_cannot_refute(self):
+        """Three symbols is two symbols' noise with a median printed on it."""
+        keep = cells_for(KEEP_DELTAS)
+        analysis = READ.analyse(keep, oos_cells=self._oos(
+            +2.0, symbols=tuple(SYMBOLS[:3])))
+        assert analysis.oos.m == 3 < READ.OOS_MIN_M
+        assert analysis.verdict.label == "KEEP"
+        rendered = "\n".join(READ.render_holdout_and_oos(analysis))
+        assert "UNINFORMATIVE" in rendered and "cannot refute" in rendered
+
+    def test_an_oos_read_at_the_floor_refutes(self):
+        keep = cells_for(KEEP_DELTAS)
+        analysis = READ.analyse(keep, oos_cells=self._oos(
+            +2.0, symbols=tuple(SYMBOLS[:4])))
+        assert analysis.oos.m == READ.OOS_MIN_M
+        assert analysis.verdict.label == "MIXED-CONFLICT"
+        assert any("oos_refutes" in r for r in analysis.verdict.reasons)
+
+    def test_the_oos_rows_carry_the_structural_checks_themselves(self):
+        """An OOS arm that did not carry the 1.00 override would 'agree' with
+        base for free and refute nothing — or, worse, agree so exactly that it
+        looks like confirmation."""
+        keep = cells_for(KEEP_DELTAS)
+        placebo = []
+        for c in self._oos(0.0):
+            if c.scenario_name in READ.T100_ARMS:
+                # Byte-identical to base on every column the study reads: the
+                # override never reached the engine.
+                placebo.append(cell(c.scenario_name, c.symbol, c.split,
+                                    rolls_executed=2, itm_rolls=2,
+                                    otm_roll_outs=0))
+            else:
+                placebo.append(c)
+        analysis = READ.analyse(keep, oos_cells=placebo)
+        assert "oos_placebo_gate" in _void_names(analysis.verdict)
+
+    def test_an_oos_replayed_by_another_engine_voids_the_read(self):
+        keep = cells_for(KEEP_DELTAS)
+        stale = [cell(c.scenario_name, c.symbol, c.split,
+                      annualized_return=c.annualized_return,
+                      engine_version="fc-116-roll-limit-fills")
+                 for c in self._oos(+2.0)]
+        analysis = READ.analyse(keep, oos_cells=stale)
+        assert "oos_engine_version_equals_the_decision_read" in _void_names(
+            analysis.verdict)
+
+    def test_an_oos_row_that_predates_fc116_voids_the_read(self):
+        keep = cells_for(KEEP_DELTAS)
+        legacy = [cell(c.scenario_name, c.symbol, c.split,
+                       annualized_return=c.annualized_return,
+                       roll_fill_mode=None)
+                  for c in self._oos(+2.0)]
+        analysis = READ.analyse(keep, oos_cells=legacy)
+        assert "oos_no_pre_fc116_rows" in _void_names(analysis.verdict)
+
+
+class TestRdTheOptionLeg:
+    """R-d / Q-5 / Q-6. Condition 2 is a contrast, so it needs the same
+    symbols, and refusing on it is not the same statement as measuring
+    nothing."""
+
+    def test_an_option_leg_on_fewer_symbols_is_a_void(self):
+        """A NULL `option_pnl` on one symbol silently shrinks the option-leg
+        contrast to six symbols while `limit` stays at seven — condition 2 is
+        then evaluated on a different portfolio from the one that passed
+        condition 1, and the mismatch never surfaces."""
+        cells = []
+        for c in cells_for(KEEP_DELTAS):
+            if c.scenario_name == "t100" and c.symbol == "UNH" \
+                    and c.split == "fit":
+                cells.append(cell("t100", "UNH", "fit",
+                                  annualized_return=c.annualized_return,
+                                  option_pnl=None))
+            else:
+                cells.append(c)
+        analysis = READ.analyse(cells)
+        assert analysis.reads["limit"].m == 7
+        assert analysis.opt_read.m == 6
+        assert analysis.verdict.is_void
+        assert any("option_leg_m_mismatch" in r
+                   for r in analysis.verdict.reasons)
+
+    def test_a_keep_refused_on_the_option_leg_AND_the_holdout_is_a_conflict(
+            self):
+        """Consistency with the KEEP branch: the holdout's refutation is a
+        statement about the whole read, and it outranks 'we would not have
+        located it anyway'."""
+        four = SYMBOLS[:4]
+        cells = cells_for(KEEP_DELTAS, opt_delta_pp=-0.05,
+                          holdout_symbols=four,
+                          holdout_delta_pp={s: +2.0 for s in four[:3]})
+        analysis = READ.analyse(cells)
+        assert analysis.holdout.refutes
+        assert analysis.verdict.label == "MIXED-CONFLICT"
+        assert analysis.verdict.resolves_to == "0.98"
+
+
+class TestReStudySymbols:
+    """R-e / D-2. Which symbols may enter `M` is part of the frozen rule."""
+
+    def test_the_frozen_universe_is_the_seven_measuring_wheel_symbols(self):
+        assert READ.STUDY_SYMBOLS == frozenset(
+            {"AAPL", "AMD", "AMZN", "GOOGL", "IWM", "NVDA", "UNH"})
+        assert READ.MIN_SIGN_COUNT == {7: 6, 6: 5}
+
+    def test_an_extra_symbol_cannot_join_the_deciding_read(self):
+        """The one-shot may carry all fourteen (DD-5). An eighth symbol in
+        `M` would move the sign count the read is judged against — 7 needs 6
+        of 7, and an unregistered M = 8 has no entry at all."""
+        cells = cells_for(KEEP_DELTAS, symbols=tuple(SYMBOLS) + ("PFE",))
+        analysis = READ.analyse(cells)
+        assert analysis.reads["limit"].m == 7
+        assert "PFE" not in dict(analysis.reads["limit"].deltas)
+        assert analysis.off_study == ("PFE",)
+        assert analysis.verdict.label == "KEEP"
+
+    def test_a_read_of_only_off_study_symbols_is_a_void(self):
+        cells = cells_for(KEEP_DELTAS, symbols=("PFE", "F", "KMI", "VZ"),
+                          holdout_symbols=())
+        v = verdict_for(cells)
+        assert v.is_void
+        assert any("insufficient_measured" in r for r in v.reasons)
+
+
+class TestQ1DuplicateCellKeys:
+    """Q-1. BOTH pins carry the implicit `base` arm, so every symbol they
+    share has two `base` rows in one read — and `index_cells` is last-wins."""
+
+    def _two_pins(self, second_base_kw: Dict[str, Any]) -> List[READ.Cell]:
+        cells = list(cells_for(KEEP_DELTAS))
+        for symbol in SYMBOLS:
+            cells.append(cell(READ.BASE_ARM, symbol, pin_id="pin_control",
+                              run_id="run_control", **second_base_kw))
+        return cells
+
+    def test_identical_duplicates_pass_and_are_deduped_for_the_tables(self):
+        cells = self._two_pins({})
+        assert len(READ.duplicate_key_groups(cells)) == len(SYMBOLS)
+        analysis = READ.analyse(cells)
+        assert analysis.verdict.label == "KEEP"
+        # The economics tables must not print GOOGL's roll counts twice.
+        rendered = "\n".join(READ.render_economics(cells))
+        once = "\n".join(READ.render_economics(cells_for(KEEP_DELTAS)))
+        # Three tables, so three rows per cell either way — and exactly the
+        # same count with the second pin's duplicate `base` rows present.
+        assert rendered.count("| base | fit | GOOGL |") == once.count(
+            "| base | fit | GOOGL |") == 3
+
+    def test_duplicates_that_disagree_void_the_read(self):
+        """Which of the two 'wins' would otherwise be decided by whatever
+        order BigQuery happened to return, silently, inside every delta."""
+        cells = self._two_pins({"annualized_return": BASE_ANN + 0.01})
+        analysis = READ.analyse(cells)
+        assert analysis.verdict.is_void
+        assert "duplicate_cell_keys_differ" in _void_names(analysis.verdict)
+
+    def test_the_cell_query_orders_by_run_id_so_last_wins_is_at_least_stable(
+            self):
+        sql = READ._cell_sql(DATASET, "TRUE")
+        assert sql.rstrip().endswith(
+            "ORDER BY r.symbol, r.split, r.scenario_name, run_id")
+
+
+class TestD1DedupScoping:
+    """D-1. `resolve_dedup` must see only the windows this read reads."""
+
+    def _rows(self):
+        return [
+            {"source_run_id": "old", "source_status": "deduplicated",
+             "resolved_run_id": "gone", "resolved_status": "failed",
+             "deduplicated_to": "gone", "window_end": "2026-06-20",
+             "pin_id": "pin_decision"},
+            {"source_run_id": "now", "source_status": "done",
+             "resolved_run_id": "now", "resolved_status": "done",
+             "deduplicated_to": None, "window_end": "2026-09-19",
+             "pin_id": "pin_decision"},
+        ]
+
+    def test_unscoped_every_later_read_of_the_pin_is_voided_for_ever(self):
+        """The trap this fix closes: a rolling pin accumulates a point every
+        Saturday, `--since` reaches back 400 days, and a single broken point
+        from three months ago cannot be deleted."""
+        _mapping, voids = READ.resolve_dedup(self._rows())
+        assert voids and "dedup_target_not_done" in voids[0]
+
+    def test_scoped_to_the_windows_actually_read_the_current_point_stands(self):
+        scoped = READ.scope_sweeps(self._rows(), ["2026-09-19"])
+        assert [r["source_run_id"] for r in scoped] == ["now"]
+        _mapping, voids = READ.resolve_dedup(scoped)
+        assert voids == []
+
+    def test_the_monitor_windows_are_in_scope_too(self):
+        scoped = READ.scope_sweeps(self._rows(),
+                                   ["2026-09-19", "2026-06-20"])
+        assert len(scoped) == 2
+        assert READ.resolve_dedup(scoped)[1]
+
+    def test_a_date_valued_window_end_scopes_the_same_as_a_string(self):
+        rows = [dict(self._rows()[1], window_end=date(2026, 9, 19))]
+        assert len(READ.scope_sweeps(rows, ["2026-09-19"])) == 1
+
+    def test_each_sweep_row_read_is_reported_with_its_status(self):
+        lines = READ.sweep_status_lines(self._rows())
+        assert any("old [deduplicated] -> gone [failed]" in ln for ln in lines)
+        assert any("now [done]" in ln for ln in lines)
+
+
+class TestD4RunIdSelection:
+    """D-4. `--run-id` must select on the SOURCE run id."""
+
+    def test_a_run_id_whose_sweep_deduped_returns_each_cell_exactly_once(self):
+        """`resolved` holds BOTH rows — the `deduplicated` source pointing at
+        the target AND the target's own row. Selecting on the resolved id
+        matches both and returns every cell twice; `M` is unchanged (the index
+        is by key) but every economics table doubles and a reader counts the
+        rolls twice."""
+        client = FakeBigQuery(
+            [sweep_row("target", "done", "2026-09-17T10:00:00Z",
+                       submitted_via="sim-service"),
+             sweep_row("source", "deduplicated", "2026-09-19T08:30:00Z",
+                       pin_id="pin_decision", deduplicated_to="target")],
+            [raw_cell("target", "base", "AAPL"),
+             raw_cell("target", "t100", "AAPL")])
+        cells = READ.fetch_cells(client, DATASET, READ.SELECT_RUN_IDS,
+                                 _since_params(run_ids=["source"]))
+        assert len(cells) == 2
+        assert sorted(c.scenario_name for c in cells) == ["base", "t100"]
+        assert {c.source_run_id for c in cells} == {"source"}
+        assert {c.run_id for c in cells} == {"target"}
+        assert READ.duplicate_key_groups(cells) == {}
+
+    def test_the_cell_query_binds_the_source_run_id_and_the_sweep_query_l(self):
+        cell_sql = READ._cell_sql(DATASET, READ.bind(
+            READ.SELECT_RUN_IDS, "s", "s.source_run_id"))
+        sweep_sql = READ._sweep_sql(DATASET, READ.bind(
+            READ.SELECT_RUN_IDS, "l", "l.run_id"))
+        assert "s.source_run_id IN UNNEST(@run_ids)" in cell_sql
+        assert "l.run_id IN UNNEST(@run_ids)" in sweep_sql
+        assert "s.run_id IN UNNEST(@run_ids)" not in cell_sql
+
+
+class TestD5D6D7ReportedLines:
+    def test_an_errored_cell_voids_rather_than_shrinking_m_in_silence(self):
+        """D-5. An errored cell is not `measured`, so it falls out of every
+        contrast on its own — and the read comes back M = 6, judged against
+        `MIN_SIGN_COUNT[6] = 5`, with nobody told a symbol failed to replay."""
+        cells = []
+        for c in cells_for(KEEP_DELTAS):
+            if c.scenario_name == "t100" and c.symbol == "UNH":
+                cells.append(cell("t100", c.symbol, c.split, measured=False,
+                                  verdict="error", error="provider 503"))
+            else:
+                cells.append(c)
+        analysis = READ.analyse(cells)
+        assert analysis.reads["limit"].m == 6
+        assert analysis.verdict.is_void
+        assert "errored_cells" in _void_names(analysis.verdict)
+        # ...and the rows stay in the reported tables.
+        rendered = "\n".join(READ.render_economics(cells))
+        assert "| t100 | fit | UNH |" in rendered and "ERR" in rendered
+
+    def test_the_secondary_holdout_line_keeps_the_insufficient_symbols(self):
+        """D-6. The primary line drops every cell the engine did not call
+        `measured`, which on the 09-11 wheel leaves three. This one drops only
+        cells that ERRORED, so AMZN and GOOGL still contribute a sign."""
+        keep = {"limit": -2.0, "haircut": -2.0, "noimm": -2.0}
+        # The real 09-11 shape: three symbols measure in the holdout, and
+        # AMZN and GOOGL rolled but never completed a cycle there.
+        cells = list(cells_for(keep, holdout_symbols=("AAPL", "IWM", "NVDA")))
+        for symbol in ("AMZN", "GOOGL"):
+            for arm, total in ((READ.BASE_ARM, 0.04), ("t100", 0.02)):
+                cells.append(cell(arm, symbol, "holdout", measured=False,
+                                  verdict="insufficient", rolls_executed=7,
+                                  annualized_return=None, total_return=total))
+        analysis = READ.analyse(cells)
+        assert analysis.holdout.comparable == 3          # measured-only
+        secondary = analysis.holdout_total_return
+        assert (secondary.agreeing, secondary.comparable) == (2, 5)
+        rendered = "\n".join(READ.render_holdout_and_oos(analysis))
+        assert "SECONDARY (reported, NEVER deciding)" in rendered
+        assert "NON-ERRORED holdout cells 2/5" in rendered
+
+    def test_the_holdout_exclusions_are_computed_not_remembered(self):
+        keep = {"limit": -2.0, "haircut": -2.0, "noimm": -2.0}
+        cells = list(cells_for(keep, holdout_symbols=("AAPL", "IWM", "NVDA")))
+        cells.append(cell("t100", "AMZN", "holdout", measured=False,
+                          verdict="insufficient", rolls_executed=7))
+        cells.append(cell(READ.BASE_ARM, "AMZN", "holdout"))
+        analysis = READ.analyse(cells)
+        assert any(line.startswith("AMZN:") and "insufficient" in line
+                   and "rolls 7" in line
+                   for line in analysis.holdout_exclusions)
+        rendered = "\n".join(READ.render_holdout_and_oos(analysis))
+        assert "excluded from the holdout line" in rendered
+        # The remembered sentence is gone: nothing in the tool names a symbol.
+        source = inspect.getsource(READ)
+        assert "AMZN and GOOGL rolled seven" not in source
+
+    def test_one_monitor_window_is_vacuous_not_a_no_flip_claim(self):
+        """D-7. `sign flip = False` over ONE window is a claim about
+        fragility made from a single point."""
+        analysis = READ.analyse(cells_for(KEEP_DELTAS),
+                                monitor_medians=[-2.0])
+        assert analysis.monitor_windows == 1
+        report = READ.render_report(
+            analysis, ["fixture"],
+            provenance=READ.Provenance("a" * 40, "b" * 40, "t.py"))
+        assert "VACUOUS (1 window)" in report
+        assert "sign flip = False" not in report
+
+    def test_two_monitor_windows_make_the_claim(self):
+        analysis = READ.analyse(cells_for(KEEP_DELTAS),
+                                monitor_medians=[-2.0, -1.9])
+        report = READ.render_report(
+            analysis, ["fixture"],
+            provenance=READ.Provenance("a" * 40, "b" * 40, "t.py"))
+        assert "median sign flip = False (over 2 windows)" in report
+
+
+class TestD8TheSqlStructure:
+    """D-8. Three properties of the emitted SQL that a selection bug hides in,
+    asserted on the TEXT because the fake client cannot prove them."""
+
+    def test_status_done_is_filtered_only_after_the_dedup_pointer_is_followed(
+            self):
+        """`s.status = 'done'` inside `latest` would drop a `deduplicated`
+        row before its pointer was ever read, and the pin would contribute
+        nothing — silently, which is the one failure this study cannot
+        absorb."""
+        for sql in (READ._cell_sql(DATASET, "TRUE"),
+                    READ._sweep_sql(DATASET, "TRUE")):
+            resolved_at = sql.index("resolved AS")
+            if "status = 'done'" in sql:
+                assert sql.index("status = 'done'") > resolved_at
+
+    def test_the_pointer_join_only_follows_a_deduplicated_row(self):
+        """Without `AND l.status = 'deduplicated'` a stale `deduplicated_to`
+        on a row that later completed would redirect a finished run's cells to
+        somebody else's."""
+        for sql in (READ._cell_sql(DATASET, "TRUE"),
+                    READ._sweep_sql(DATASET, "TRUE")):
+            assert ("LEFT JOIN latest t ON t.run_id = l.deduplicated_to "
+                    "AND l.status = 'deduplicated'") in sql
+
+    def test_the_window_predicate_is_never_on_the_runs_row(self):
+        sql = READ._cell_sql(DATASET, READ.bind(
+            READ.SELECT_PINS + READ.WINDOW_CLAUSE, "s", "s.source_run_id"))
+        assert "s.window_end = @window_end" in sql
+        assert "r.window_end" not in sql
+
+    def test_the_error_column_is_selected(self):
+        assert "r.error" in READ._cell_sql(DATASET, "TRUE")
+
+
+class TestQ8ThePairedEventTable:
+    """Q-8. The table is what the verdict MEANS in trades, so a row that
+    reports the wrong trade is worse than no table."""
+
+    def test_a_call_that_closed_before_the_day_is_not_the_held_call(self):
+        """Taking the last `sell_call_open` at or before `day` finds a
+        contract even when the t100 arm was FLAT that day — and then reports
+        an assignment from weeks earlier as the un-rolled call's outcome."""
+        base = _artifact(
+            [{"day": "2026-04-20", "underlying": "AAPL", "success": True,
+              "roll_kind": "otm_roll_out", "net_credit": 90.0,
+              "old_strike": 230.0, "new_strike": 235.0, "itm_ratio": 0.985}],
+            [])
+        t100 = _artifact([], [
+            _leg("2026-03-02", "AAPL", "sell_call_open", "limit_marketable",
+                 "AAPL260320C00230000"),
+            _leg("2026-03-20", "AAPL", "call_assignment", "haircut",
+                 "AAPL260320C00230000")])
+        rows = READ.paired_events(base, t100)
+        assert len(rows) == 1
+        assert rows[0]["t100_contract"] == ""
+        assert rows[0]["t100_outcome"].startswith("NOT HELD on the day")
+        assert "call_assignment 2026-03-20" in rows[0]["t100_outcome"]
+
+    def test_a_buy_to_close_that_is_a_roll_leg_is_not_bought_back(self):
+        """Every roll closes the held call, so the terminal scan finds a
+        `buy_to_close`. Reporting that as 'bought back' says the t100 arm gave
+        up the position when it in fact rolled it forward."""
+        base = _artifact(
+            [{"day": "2026-03-09", "underlying": "AAPL", "success": True,
+              "roll_kind": "otm_roll_out", "net_credit": 87.0,
+              "old_strike": 230.0, "new_strike": 235.0, "itm_ratio": 0.987}],
+            [])
+        t100 = _artifact(
+            [{"day": "2026-03-16", "underlying": "AAPL", "success": True,
+              "roll_kind": "itm_defence", "net_credit": 41.0}],
+            [_leg("2026-03-02", "AAPL", "sell_call_open", "limit_marketable",
+                  "AAPL260320C00230000"),
+             _leg("2026-03-16", "AAPL", "buy_to_close", "limit_resting",
+                  "AAPL260320C00230000")])
+        rows = READ.paired_events(base, t100)
+        assert rows[0]["t100_outcome"] == "rolled (itm_defence) — NOT bought back"
+        assert rows[0]["t100_outcome_day"] == "2026-03-16"
+
+    def test_a_same_day_t100_roll_is_labelled_not_implied_away(self):
+        """At 1.00 the trigger cannot fire BELOW the strike — but it fires AT
+        or above it, so a day base rolled OTM can be a day t100 executed an
+        `itm_defence`. The pairing premise does not hold for that row."""
+        base = _artifact(
+            [{"day": "2026-03-09", "underlying": "AAPL", "success": True,
+              "roll_kind": "otm_roll_out", "net_credit": 87.0,
+              "old_strike": 230.0, "new_strike": 235.0, "itm_ratio": 0.987}],
+            [])
+        t100 = _artifact(
+            [{"day": "2026-03-09", "underlying": "AAPL", "success": True,
+              "roll_kind": "itm_defence", "net_credit": 12.0}],
+            [_leg("2026-03-02", "AAPL", "sell_call_open", "limit_marketable",
+                  "AAPL260320C00230000")])
+        rows = READ.paired_events(base, t100)
+        assert rows[0]["t100_same_day_roll"] == "itm_defence"
+        rendered = "\n".join(READ.render_artifacts(
+            {"paired_events": rows, "resting_by_kind": {}, "missing": []}))
+        assert "YES: itm_defence" in rendered
+        assert "t100 executed a roll of its own" in rendered
+
+    def test_the_ledger_key_is_date_and_event_date_is_only_a_fallback(self):
+        """`artifact._ledger_rows` serialises `LedgerEvent.event_date` under
+        the key `date` — DD-6 was right and PR-2 deviation 6 was wrong."""
+        assert READ._ev_date({"date": "2026-03-09"}) == "2026-03-09"
+        assert READ._ev_date({"event_date": "2026-03-09"}) == "2026-03-09"
+        assert READ._ev_date({"date": "2026-03-09",
+                              "event_date": "2020-01-01"}) == "2026-03-09"
+
+
+class TestTheRideAlongLows:
+    def test_a_nan_delta_is_treated_as_the_null_it_is(self):
+        """`nan > 0` and `nan < 0` are BOTH False, so a NaN would count
+        towards `M` while landing in neither sign bucket — lowering the bar it
+        is judged against without ever appearing in it."""
+        assert READ.finite(float("nan")) is None
+        assert READ.finite(float("inf")) is None
+        assert READ.finite(None) is None
+        assert READ.finite(3) == 3.0
+        cells = []
+        for c in cells_for(KEEP_DELTAS):
+            if c.scenario_name == "t100" and c.symbol == "UNH" \
+                    and c.split == "fit":
+                cells.append(cell("t100", "UNH", "fit",
+                                  annualized_return=float("nan")))
+            else:
+                cells.append(c)
+        analysis = READ.analyse(cells)
+        assert analysis.reads["limit"].m == 6
+        assert all(math.isfinite(v) for v in analysis.reads["limit"].values)
+
+    def test_a_zero_median_is_not_a_third_sign_for_the_monitor(self):
+        assert READ.monitor_sign_flip([-2.0, 0.0, -1.8]) is False
+        assert READ.monitor_sign_flip([-2.0, +1.8]) is True
+        assert READ.monitor_sign_flip([-2.0, float("nan")]) is False
+        assert READ.monitor_sign_flip([-2.0]) is False
+
+    def _at(self, delta_ann: float) -> List[READ.Cell]:
+        """Cells whose every per-symbol delta is EXACTLY `delta_ann * 100` pp."""
+        out: List[READ.Cell] = []
+        for name, base_arm, arm in READ.READS:
+            for symbol in SYMBOLS:
+                out.append(cell(base_arm, symbol, annualized_return=0.0,
+                                option_pnl=0.0))
+                out.append(cell(
+                    arm, symbol, annualized_return=delta_ann,
+                    option_pnl=(-1000.0 if name == READ.PRIMARY_READ else 0.0)))
+        return out
+
+    def test_a_median_of_exactly_minus_half_a_point_keeps(self):
+        """`MIN_EFFECT_PP` is inclusive: DD-1 says `median <= -MIN_EFFECT_PP`.
+        Built to land on -0.5000 exactly rather than near it."""
+        analysis = READ.analyse(self._at(-0.005))
+        assert analysis.reads["limit"].median == -0.5
+        assert repr(analysis.reads["limit"].median) == "-0.5"
+        assert analysis.verdict.label == "KEEP"
+
+    def test_a_median_just_inside_the_boundary_does_not(self):
+        analysis = READ.analyse(self._at(-0.0049))
+        assert analysis.reads["limit"].median > -0.5
+        assert analysis.verdict.label == "MIXED-NULL"
+
+    def test_a_window_shape_the_constants_do_not_describe_voids(self):
+        """`delta_opt_pp` annualises by 365 / FIT_WINDOW_DAYS and divides by
+        STARTING_CASH. A 364-day pin rescales condition 2 in silence."""
+        hold = date(2026, 6, 22)
+        exact = (hold - timedelta(days=READ.FIT_WINDOW_DAYS)).isoformat()
+        short = (hold - timedelta(days=READ.FIT_WINDOW_DAYS - 1)).isoformat()
+        base = cells_for(KEEP_DELTAS)
+
+        def shaped(**kw):
+            return [dataclasses.replace(c, holdout_start=hold.isoformat(), **kw)
+                    for c in base]
+
+        assert READ.analyse(shaped(window_start=exact,
+                                   spec_starting_cash=100_000.0)
+                            ).verdict.label == "KEEP"
+        assert "frozen_constants_match_the_spec" in _void_names(
+            READ.analyse(shaped(window_start=short)).verdict)
+        assert "frozen_constants_match_the_spec" in _void_names(
+            READ.analyse(shaped(window_start=exact,
+                                spec_starting_cash=250_000.0)).verdict)
+
+    def test_the_machine_summary_carries_the_selection_and_the_blob(self):
+        analysis = READ.analyse(cells_for(KEEP_DELTAS))
+        payload = READ.summary_json(
+            analysis, READ.Provenance("a" * 40, "b" * 40, "t.py"),
+            ["dataset x", "pins p1, p2"])
+        assert payload["selection"] == ["dataset x", "pins p1, p2"]
+        assert payload["tool_blob"] == "b" * 40
+        assert payload["constants"]["STUDY_SYMBOLS"] == sorted(
+            READ.STUDY_SYMBOLS)
+        assert payload["monitor_windows"] == 0
+        assert json.dumps(payload, default=str)

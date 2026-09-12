@@ -35,8 +35,20 @@ covered-call profile?
 TIE_BREAK       = "move"          # default outcome: 1.00
 MIN_EFFECT_PP   = 0.5             # pp of annualised return on $100,000
 MIN_SIGN_COUNT  = {7: 6, 6: 5}    # M < 6 -> VOID(insufficient_measured)
+STUDY_SYMBOLS   = AAPL, AMD, AMZN, GOOGL, IWM, NVDA, UNH
+OOS_MIN_M       = 4               # below it the OOS read cannot refute
 tool commit     = <sha>
+tool blob       = <blob>          # `git cat-file -p <blob>` IS the rule
 ```
+
+**Provenance confirmation (paste it, every time).** The tool refuses to run
+from a modified working tree, so a verdict block that exists at all already
+carries this — but the record must state it:
+
+> Read at tool commit `<sha>`, blob `<blob>`, working tree clean for
+> `tools/diagnostics/fc112_roll_trigger_read.py`; `<sha>` is an ancestor of
+> `main` (`git merge-base --is-ancestor <sha> origin/main`), so the rule quoted
+> here is the rule that merged before any `t100` cell was replayed.
 
 KEEP (0.98 stays) requires **all** of:
 
@@ -47,9 +59,22 @@ KEEP (0.98 stays) requires **all** of:
 3. The holdout does not refute (only informative at `comparable >= 4`).
 4. The out-of-sample read (DD-10), where it exists, does not refute.
 
-Everything else: **MOVE** (the mirror in every read) → 1.00 · **MIXED-NULL** →
-1.00 · **MIXED-CONFLICT** → 0.98 stays, plus operator review · **VOID(reason)**
-→ file it and do not read further.
+Everything else, with the program owner's rule clarifications of 2026-09-12
+(plan §Amendments rev 4) written out, because the labels are not
+interchangeable:
+
+| verdict | when | resolves to |
+|---|---|---|
+| **MOVE** | the mirror passes in every read, and the holdout does not refute (R-b) | 1.00 |
+| **KEEP-REFUSED-OPTION-LEG** | a full KEEP, refused **only** because the effect is not in the option leg (R-d) | 1.00 |
+| **PARTIAL-SAME-SIGN** | some reads pass (or cross `MIN_EFFECT_PP`), the rest agree in sign but stay under threshold (R-a) | 1.00 |
+| **MIXED-NULL** | **no** read crosses **either** threshold anywhere, and no sign conflict (R-a, literal) | 1.00 |
+| **MIXED-CONFLICT** | a read passes while another has the **opposite median sign** (any size) or an opposite sign count at `MIN_SIGN_COUNT[M]`; the holdout refutes at `comparable >= 4` (KEEP **or** MOVE); an informative OOS refutes; the primary `limit` median flips sign across the monitor points | 0.98 stays **+ operator review** |
+| **VOID(reason)** | any structural check below | file it; do not read further |
+
+Never describe a `PARTIAL-SAME-SIGN` or a `KEEP-REFUSED-OPTION-LEG` as "no
+measurable difference" — both measured one, and only MIXED-NULL is the claim
+that nothing did.
 
 ### 2a. The null base rate of this rule (DD-1, computed 2026-09-12)
 
@@ -94,9 +119,17 @@ Every one, pass or fail. **Any FAIL is a VOID: file it and stop.**
 | `no_pre_fc116_rows` | `<...>` |
 | `rolls_executed_equals_itm_plus_otm` | `<...>` |
 | `engine_version_uniform` / `engine_identity_uniform` | `<...>` |
+| `duplicate_cell_keys_differ` | `<...>` — two pins both carry `base`; identical duplicates pass and are deduped, differing ones VOID |
+| `errored_cells` | `<...>` — an errored cell would shrink `M` in silence |
+| `frozen_constants_match_the_spec` | `<...>` — the sweep's own fit split is 275d on $100,000 |
 | `placebo_gate` | `<...>` |
 | `pin_base_equals_standing_base` | `<...>` |
+| `oos_*` (only with `--oos-run-id`) | `<...>` — the OOS rows carry the placebo gate, `no_pre_fc116_rows`, `t100` OTM = 0, and engine equality **with the decision read** |
 | `M >= 6` | `<...>` |
+| `option_leg_m_mismatch` | `<...>` — the option-leg contrast must rest on the same symbols as `limit` |
+| `missing_read` | `<...>` — all three of `limit` / `haircut` / `noimm` present |
+| `unregistered_M` | `<...>` — `M` has an entry in `MIN_SIGN_COUNT` |
+| `dedup_target_not_done` | `<...>` — raised by `resolve_dedup`, scoped to the windows read |
 
 ## 5. The three reads
 
@@ -122,13 +155,22 @@ One table per read: per-symbol `delta ann` (pp), then `N+ / N- / N0`,
 ### 5b. Holdout (condition 3)
 
 `<agreeing/comparable>`. If `comparable < 4`, say so and say it does not block.
-Say either way that AMZN and GOOGL rolled seven times each in the 09-11 holdout
-and are `insufficient`, so they carry no number to take a sign from.
+Copy the tool's **"excluded from the holdout line, and why"** lines verbatim —
+it computes them from the rows read, per symbol. Do **not** quote a remembered
+pair; the 09-11 answer (AMZN and GOOGL, `insufficient` after seven rolls each)
+is not guaranteed to be this window's.
+
+Then the **secondary** line, reported and never deciding: `total_return` sign
+agreement over all **non-errored** holdout cells — `<agreeing/comparable>`. It
+keeps the symbols the engine called `insufficient`, so it is wider and weaker
+than the primary line, and it is stated so a reader can see whether the primary
+line's small `comparable` is hiding a pattern.
 
 ### 5c. Out-of-sample (condition 4)
 
 `<median, M>`, or: no OOS instrument — **the record is labelled single-window
-and condition 4 is vacuous.**
+and condition 4 is vacuous.** If `M < OOS_MIN_M` (4), the OOS read is
+**uninformative**: state the median, and state that it did not decide.
 
 ## 6. Reported but non-deciding
 
@@ -180,12 +222,15 @@ $0.20); the `noimm` read is what bounds it.
 
 Fragility monitor (DD-4 — four overlapping Saturdays are ONE read with the
 edges moved, **not** out-of-sample): `<the four points, and whether the verdict
-class reproduced on each>`. Any primary `limit` sign flip → MIXED-CONFLICT.
+class reproduced on each>`. Any primary `limit` sign flip → MIXED-CONFLICT. If
+the tool printed `VACUOUS (n windows)`, fewer than two windows were read and
+**no** fragility claim may be made — not even "no flip".
 
 ## 9. What follows
 
 - **KEEP** → FC-078 amendment recording the measured reason; close FC-112.
-- **MOVE / MIXED-NULL** → open the config-flip FC (its own PR, `Config` census
+- **MOVE / MIXED-NULL / PARTIAL-SAME-SIGN / KEEP-REFUSED-OPTION-LEG** → open
+  the config-flip FC (its own PR, `Config` census
   test inverted to "no key differs", alert-twin check, FC-078 amendment).
   **Nothing in `config/`, `src/strategy/` or `deploy/` moves in FC-112.**
 - **MIXED-CONFLICT** → operator review with the data; no config change.
