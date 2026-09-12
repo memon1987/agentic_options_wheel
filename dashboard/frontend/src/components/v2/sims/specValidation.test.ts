@@ -184,7 +184,7 @@ describe('validateSpec — arms', () => {
   it('refuses an arm with nothing in it — it would duplicate base', () => {
     const v = validateSpec(good({ scenarios: [{ name: 'empty', overrides: {} }] }));
     expect(v.valid).toBe(false);
-    expect(messages(v)).toMatch(/no overrides and no fill_haircut/);
+    expect(messages(v)).toMatch(/no overrides, no fill_haircut and no roll_fill_mode/);
   });
 
   it('refuses a rejected override key WITH THE RUNNER’S OWN REASON', () => {
@@ -290,5 +290,75 @@ describe('buildSpec', () => {
     expect(spec.holdout_start).toBe(HOLDOUT);
     expect(spec.starting_cash).toBe(100_000);
     expect(spec.run_sensitivity).toBe(true);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// FC-116 T9/T14 — the console can submit the roll fill mode at all
+//
+// `parseScenariosJson` REBUILDS every arm field by field, so before FC-116 any
+// key it did not know was silently DROPPED: a `roll_fill_mode` typed into the
+// console would have vanished between the textarea and the request, the run
+// would have come back on the default, and nothing anywhere would have said the
+// request was ignored. That is the regression this block exists for.
+// --------------------------------------------------------------------------- //
+describe('roll_fill_mode survives the arm rebuild (FC-116)', () => {
+  it('carries the key through instead of dropping it', () => {
+    const { scenarios, error } = parseScenariosJson(
+      JSON.stringify([{ name: 'haircut_fills', roll_fill_mode: 'haircut' }]),
+    );
+    expect(error).toBeNull();
+    expect(scenarios).toEqual([
+      { name: 'haircut_fills', overrides: {}, roll_fill_mode: 'haircut' },
+    ]);
+  });
+
+  it('keeps an explicit "limit" rather than folding it away here', () => {
+    // The FOLD is `scenario_arm_hash`'s job, server-side: both spellings key
+    // identically, and the stored spec still records what was asked for.
+    const { scenarios } = parseScenariosJson(
+      JSON.stringify([{ name: 'honest', roll_fill_mode: 'limit' }]),
+    );
+    expect(scenarios![0].roll_fill_mode).toBe('limit');
+  });
+
+  it('leaves the key absent when the arm does not set it', () => {
+    const { scenarios } = parseScenariosJson(
+      JSON.stringify([{ name: 'tighter', overrides: { 'strategy.min_call_premium': 0.5 } }]),
+    );
+    expect('roll_fill_mode' in scenarios![0]).toBe(false);
+  });
+
+  it('refuses a mode that is neither limit nor haircut', () => {
+    const { scenarios, error } = parseScenariosJson(
+      JSON.stringify([{ name: 'nonsense', roll_fill_mode: 'mid' }]),
+    );
+    expect(scenarios).toBeNull();
+    expect(error).toMatch(/"limit" or "haircut"/);
+  });
+
+  it('a mode-only arm is NOT a duplicate of base', () => {
+    // The regression arm of the whole before/after IS `{name, roll_fill_mode}`
+    // with no overrides. Refusing it would refuse the comparison.
+    const v = validateSpec(
+      good({ scenarios: [{ name: 'haircut_fills', overrides: {}, roll_fill_mode: 'haircut' }] }),
+    );
+    expect(v.valid).toBe(true);
+  });
+
+  it('buildSpec carries it into the request body', () => {
+    const spec = buildSpec({
+      symbols: ['AAPL'],
+      start: START,
+      end: END,
+      holdoutEnabled: false,
+      holdoutStart: HOLDOUT,
+      startingCash: undefined,
+      runSensitivity: false,
+      scenarios: [
+        { name: 'haircut_fills', overrides: {}, roll_fill_mode: 'haircut' },
+      ] as SweepScenarioSpec[],
+    });
+    expect(spec.scenarios[0].roll_fill_mode).toBe('haircut');
   });
 });

@@ -318,6 +318,14 @@ export function overridesDiff(
 export interface EffectiveFill {
   basis: string | null;
   haircut: number | null;
+  /**
+   * FC-116 — how ROLL legs were priced. Part of the ALIGNMENT KEY, not
+   * decoration: before this field a `haircut` arm and a `limit` arm with the
+   * same `fill_haircut` reported the fill row as ALIGNED, and an operator
+   * would have read the whole roll-credit gap between them as a config effect.
+   * `null` when no side has loaded.
+   */
+  rollFillMode: string | null;
   /** Where the reading came from — `declared` is not `measured`. */
   source: string;
 }
@@ -341,6 +349,7 @@ export function effectiveFill(side: CompareSide): EffectiveFill {
     return {
       basis: stamped.basis ?? null,
       haircut: finite(stamped.fill_haircut),
+      rollFillMode: stamped.roll_fill_mode ?? 'haircut',
       source: 'stamped on the cell artifact',
     };
   }
@@ -351,17 +360,36 @@ export function effectiveFill(side: CompareSide): EffectiveFill {
     return {
       basis: served.basis ?? null,
       haircut: finite(served.fill_haircut),
+      rollFillMode: served.roll_fill_mode ?? 'haircut',
       source: served.is_engine_default === true ? 'served by the forecast (engine default)' : 'served by the forecast',
     };
   }
+  // The spec's DECLARED mode, resolved the way the engine resolves it: an arm
+  // that named none ran `limit`. `undefined` (no report at all) stays null.
+  const declaredMode = side.report?.scenario_roll_fill_modes?.[side.ref.scenario] ?? null;
   const declared = side.report?.scenario_fill_haircuts?.[side.ref.scenario];
-  if (declared === undefined) return { basis: null, haircut: null, source: 'not known' };
-  if (declared === null) return { basis: null, haircut: null, source: 'declared: engine default' };
-  return { basis: null, haircut: declared, source: 'declared on the spec' };
+  if (declared === undefined) {
+    return { basis: null, haircut: null, rollFillMode: declaredMode, source: 'not known' };
+  }
+  if (declared === null) {
+    return {
+      basis: null,
+      haircut: null,
+      rollFillMode: declaredMode ?? 'limit',
+      source: 'declared: engine default',
+    };
+  }
+  return {
+    basis: null,
+    haircut: declared,
+    rollFillMode: declaredMode ?? 'limit',
+    source: 'declared on the spec',
+  };
 }
 
 const fillText = (fill: EffectiveFill): string =>
-  `${fill.basis ?? '—'} · haircut ${fill.haircut === null ? 'engine default' : fill.haircut} · ${fill.source}`;
+  `${fill.basis ?? '—'} · haircut ${fill.haircut === null ? 'engine default' : fill.haircut}` +
+  ` · rolls ${fill.rollFillMode ?? '—'} · ${fill.source}`;
 
 // --------------------------------------------------------------------------- //
 // The matrix
@@ -688,7 +716,13 @@ export function alignCells(
   // --- fill haircut ---------------------------------------------------------- //
   const fillA = effectiveFill(a);
   const fillB = effectiveFill(b);
-  const fillAligned = fillA.basis === fillB.basis && fillA.haircut === fillB.haircut;
+  // FC-116 — the roll fill mode joins the key. Two cells with the same basis
+  // and haircut but different roll rules are NOT the same fill assumption, and
+  // calling them aligned hides exactly the difference this comparison is for.
+  const fillAligned =
+    fillA.basis === fillB.basis &&
+    fillA.haircut === fillB.haircut &&
+    fillA.rollFillMode === fillB.rollFillMode;
   rows.push({
     id: 'fill_haircut',
     label: 'Fill',

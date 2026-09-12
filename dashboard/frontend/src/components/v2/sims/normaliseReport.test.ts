@@ -259,6 +259,12 @@ describe('the forecast is coerced, not cast (review round 1, F9)', () => {
       basis: 'mid',
       fill_haircut: 0.25,
       is_engine_default: true,
+      // FC-116. This fixture predates `fc-116-roll-limit-fills`, so it carries
+      // no `roll_fill_mode` — and that absence resolves to `haircut`, which is
+      // what the engine that produced it actually did. Defaulting to `limit`
+      // here would claim its roll credits were measured against the placed
+      // limits.
+      roll_fill_mode: 'haircut',
     });
     expect(base.portfolio.net_option_pnl!.annual_low).toBeCloseTo(5932.5668389, 6);
     expect(base.portfolio.included).toEqual(['GOOGL']);
@@ -305,7 +311,12 @@ describe('the forecast is coerced, not cast (review round 1, F9)', () => {
     expect(forecast.capital_base).toBeNull();
     expect(forecast.days).toEqual({ fit: null, holdout: null });
     const cell = forecast.by_scenario.base.symbols.GOOGL;
-    expect(cell.fill).toEqual({ basis: null, fill_haircut: null });
+    expect(cell.fill).toEqual({
+      basis: null,
+      fill_haircut: null,
+      // A poisoned/absent value is still the legacy reading, never `limit`.
+      roll_fill_mode: 'haircut',
+    });
     expect(cell.capital_base).toBeNull();
     expect(cell.net_option_pnl.annual_low).toBeNull();
     // `total_pnl: null` still yields the all-null shape the panel can render,

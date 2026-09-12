@@ -566,6 +566,11 @@ export interface SweepReport {
   scenario_hashes?: Record<string, string>;
   scenario_overrides?: Record<string, Record<string, unknown>>;
   scenario_fill_haircuts?: Record<string, number | null>;
+  /**
+   * FC-116 — arm name -> RESOLVED roll fill mode. The alignment matrix reads it
+   * as the last fallback, after the artifact's stamp and the forecast's.
+   */
+  scenario_roll_fill_modes?: Record<string, string>;
   in_sample_only: boolean;
   min_days_in_position: number;
   timing?: {
@@ -662,6 +667,12 @@ export interface SweepPreset {
   overrides: Record<string, unknown>;
   /** A preset may vary the fill assumption instead of a config key. */
   fill_haircut?: number;
+  /**
+   * FC-116 — how ROLL legs fill. Absent means `'limit'`: each leg is priced at
+   * the limit the live roller would have placed, capped by the day's modeled
+   * book. `'haircut'` is the pre-FC-116 regression arm.
+   */
+  roll_fill_mode?: 'limit' | 'haircut';
 }
 
 /** `GET /api/v2/sweeps/allowlist` — the same allowlist the runner enforces. */
@@ -688,6 +699,8 @@ export interface SweepScenarioSpec {
   name: string;
   overrides: Record<string, unknown>;
   fill_haircut?: number;
+  /** FC-116 — see `SweepPreset.roll_fill_mode`. Absent means `'limit'`. */
+  roll_fill_mode?: 'limit' | 'haircut';
 }
 
 /** The `POST /api/v2/sweeps` body (plan D2). */
@@ -906,7 +919,16 @@ export interface SimArtifactProvenance {
   config_hash: string | null;
   scenario_hash: string | null;
   starting_cash: number | null;
-  fill: { basis: string | null; fill_haircut: number | null } | null;
+  fill: {
+    basis: string | null;
+    fill_haircut: number | null;
+    /**
+     * FC-116 — how ROLL legs were priced. An artifact written before
+     * `fc-116-roll-limit-fills` has no such key; the parser resolves that
+     * absence to `'haircut'`, which is what that engine did.
+     */
+    roll_fill_mode?: string;
+  } | null;
   masked_reach: Record<string, number> | null;
   /**
    * PR-1 stamp: THE denominator every ratio on this cell uses.
@@ -1005,7 +1027,13 @@ export interface SimForecastBasis {
 }
 
 export interface SimForecastSymbol {
-  fill: { basis: string | null; fill_haircut: number | null; is_engine_default?: boolean };
+  fill: {
+    basis: string | null;
+    fill_haircut: number | null;
+    is_engine_default?: boolean;
+    /** FC-116 — `'limit'` | `'haircut'`; a pre-FC-116 row resolves to `'haircut'`. */
+    roll_fill_mode?: string;
+  };
   days: { fit: number | null; holdout: number | null };
   capital_base: number | null;
   net_option_pnl: SimForecastBasis;

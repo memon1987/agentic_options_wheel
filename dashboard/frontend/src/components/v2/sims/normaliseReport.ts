@@ -87,6 +87,11 @@ function forecastSymbol(raw: unknown): SimForecastSymbol | null {
       ...(typeof fill.is_engine_default === 'boolean'
         ? { is_engine_default: fill.is_engine_default }
         : {}),
+      // FC-116 — the same rebuild hazard as `normaliseArtifact`. The server
+      // already resolves a legacy NULL to `'haircut'`; this default covers a
+      // response from a backend older than that.
+      roll_fill_mode:
+        typeof fill.roll_fill_mode === 'string' ? fill.roll_fill_mode : 'haircut',
     },
     days: { fit: num(days.fit), holdout: num(days.holdout) },
     capital_base: num(raw.capital_base),

@@ -160,10 +160,29 @@ export function parseScenariosJson(text: string): ScenarioParse {
     if (haircut !== undefined && typeof haircut !== 'number') {
       return { scenarios: null, error: `Arm "${obj.name}": "fill_haircut" must be a number.` };
     }
+    // FC-116. This rebuild is why the key has to be named here: an arm is
+    // reconstructed field by field, so ANY key this function does not know is
+    // silently DROPPED before submission — a `roll_fill_mode` typed into the
+    // console would simply vanish, and the run would come back on the default
+    // with nothing to say it had ignored the request.
+    const rollFillMode = obj.roll_fill_mode;
+    if (
+      rollFillMode !== undefined &&
+      rollFillMode !== 'limit' &&
+      rollFillMode !== 'haircut'
+    ) {
+      return {
+        scenarios: null,
+        error: `Arm "${obj.name}": "roll_fill_mode" must be "limit" or "haircut".`,
+      };
+    }
     out.push({
       name: obj.name,
       overrides: (overrides as Record<string, unknown>) ?? {},
       ...(haircut === undefined ? {} : { fill_haircut: haircut }),
+      ...(rollFillMode === undefined
+        ? {}
+        : { roll_fill_mode: rollFillMode as 'limit' | 'haircut' }),
     });
   }
   return { scenarios: out, error: null };
@@ -300,10 +319,18 @@ export function validateSpec(args: ValidateArgs): SpecValidation {
       }
       seen.add(arm.name);
       const keys = Object.keys(arm.overrides ?? {});
-      if (keys.length === 0 && arm.fill_haircut === undefined) {
+      // FC-116 — `roll_fill_mode` joins this check. A `{name, roll_fill_mode:
+      // "haircut"}` arm is the regression arm and is NOT a duplicate of base;
+      // without this clause the console would refuse the one arm the whole
+      // before/after comparison exists to run.
+      if (
+        keys.length === 0 &&
+        arm.fill_haircut === undefined &&
+        arm.roll_fill_mode === undefined
+      ) {
         issues.push({
           field: 'scenarios',
-          message: `"${arm.name}" has no overrides and no fill_haircut — it would be a duplicate of base.`,
+          message: `"${arm.name}" has no overrides, no fill_haircut and no roll_fill_mode — it would be a duplicate of base.`,
         });
       }
       for (const key of keys) {

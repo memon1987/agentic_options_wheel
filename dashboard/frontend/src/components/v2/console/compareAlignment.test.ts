@@ -328,6 +328,65 @@ describe('the withheld rows, one synthetic field each', () => {
     expect(row.a).toContain('bid');
   });
 
+  // -- FC-116 T14 --------------------------------------------------------- //
+  // Before the mode joined the alignment key, these two cells reported the
+  // fill row as ALIGNED: same basis, same haircut. An operator would then have
+  // read the entire roll-credit gap between a `haircut` arm and a `limit` arm
+  // as an effect of the config under test. It is the opposite — it is the one
+  // difference that is NOT the config.
+  it('a haircut arm and a limit arm are NOT aligned on the fill row', () => {
+    const stamp = (mode: string) =>
+      ({
+        provenance: { fill: { basis: 'mid', fill_haircut: 0.25, roll_fill_mode: mode } },
+      }) as unknown as SimArtifact;
+    const a = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: stamp('limit'),
+    });
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: stamp('haircut'),
+    });
+    const alignment = alignCells(a, b);
+    expect(outcome(alignment, 'fill_haircut')).toBe('noted');
+    const row = alignment.rows.find((r) => r.id === 'fill_haircut')!;
+    expect(row.a).toContain('rolls limit');
+    expect(row.b).toContain('rolls haircut');
+  });
+
+  it('two cells on the same mode stay aligned', () => {
+    const stamp = () =>
+      ({
+        provenance: { fill: { basis: 'mid', fill_haircut: 0.25, roll_fill_mode: 'limit' } },
+      }) as unknown as SimArtifact;
+    const a = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: stamp(),
+    });
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: stamp(),
+    });
+    expect(outcome(alignCells(a, b), 'fill_haircut')).toBe('aligned');
+  });
+
+  it('an artifact with no stamp reads haircut, not limit', () => {
+    // A cell stored before `fc-116-roll-limit-fills`. Reading its absence as
+    // `limit` would claim its roll credit was measured against the placed
+    // limits, and would ALIGN it with a genuinely-limit cell.
+    const legacy = {
+      provenance: { fill: { basis: 'mid', fill_haircut: 0.25 } },
+    } as unknown as SimArtifact;
+    const modern = {
+      provenance: { fill: { basis: 'mid', fill_haircut: 0.25, roll_fill_mode: 'limit' } },
+    } as unknown as SimArtifact;
+    const a = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: legacy,
+    });
+    const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {
+      artifact: modern,
+    });
+    const alignment = alignCells(a, b);
+    expect(outcome(alignment, 'fill_haircut')).toBe('noted');
+    expect(alignment.rows.find((r) => r.id === 'fill_haircut')!.a).toContain('rolls haircut');
+  });
+
   it('an in-sample side is noted, and it is enough that ONE side is', () => {
     const a = base();
     const b = side(shaped13cc, { scenario: 'base', symbol: 'GOOGL', split: 'fit' }, {

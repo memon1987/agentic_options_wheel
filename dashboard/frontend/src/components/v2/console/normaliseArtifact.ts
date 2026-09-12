@@ -236,7 +236,18 @@ function artifactProvenance(raw: Record<string, unknown>): SimArtifactProvenance
     scenario_hash: strOrNull(raw.scenario_hash),
     starting_cash: numOrNull(raw.starting_cash),
     fill: fill
-      ? { basis: strOrNull(fill.basis), fill_haircut: numOrNull(fill.fill_haircut) }
+      ? {
+          basis: strOrNull(fill.basis),
+          fill_haircut: numOrNull(fill.fill_haircut),
+          // FC-116. This object is REBUILT field by field, so a key not named
+          // here is dropped on the floor. An artifact written before
+          // `fc-116-roll-limit-fills` carries no `roll_fill_mode`, and that
+          // absence means `haircut` — the engine that wrote it filled roll legs
+          // at `mid -/+ fill_haircut x half-spread`. Defaulting to `limit`
+          // would claim its roll credit was measured against the placed limits.
+          roll_fill_mode:
+            typeof fill.roll_fill_mode === 'string' ? fill.roll_fill_mode : 'haircut',
+        }
       : null,
     masked_reach: numberMap(raw.masked_reach),
   };

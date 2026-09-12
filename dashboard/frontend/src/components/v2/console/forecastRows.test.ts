@@ -106,7 +106,13 @@ describe('forecastRows — the served run', () => {
 
   it('carries the fill stamp, including the engine-default flag', () => {
     const view = forecastRows(forecast, 'base', 'GOOGL', 90);
-    expect(view.symbol!.fill).toEqual({ basis: 'mid', fill_haircut: 0.25, is_engine_default: true });
+    expect(view.symbol!.fill).toEqual({
+      basis: 'mid',
+      fill_haircut: 0.25,
+      is_engine_default: true,
+      // FC-116 — a pre-FC-116 fixture resolves to `haircut`, not `limit`.
+      roll_fill_mode: 'haircut',
+    });
     expect(view.symbol!.capitalBase).toBe(100000);
   });
 });

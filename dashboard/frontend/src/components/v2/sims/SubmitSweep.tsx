@@ -73,6 +73,9 @@ export default function SubmitSweep({
   const [startingCash, setStartingCash] = useState('');
   const [runSensitivity, setRunSensitivity] = useState(false);
   const [fillHaircut, setFillHaircut] = useState('');
+  // FC-116. Blank = the engine default `limit`, which is the HONEST rule;
+  // `haircut` is the pre-FC-116 regression arm and has to be asked for.
+  const [rollFillMode, setRollFillMode] = useState('');
   const [scenariosText, setScenariosText] = useState('[]');
   const [submitting, setSubmitting] = useState(false);
   const [outcome, setOutcome] = useState<SubmitOutcome | null>(null);
@@ -101,10 +104,20 @@ export default function SubmitSweep({
   // Applying it here stamps it onto every declared arm.
   const haircutValue = fillHaircut.trim() === '' ? undefined : Number(fillHaircut);
   const scenarios: SweepScenarioSpec[] = useMemo(() => {
-    const base = parsed.scenarios ?? [];
-    if (haircutValue === undefined) return base;
-    return base.map((s) => ({ ...s, fill_haircut: s.fill_haircut ?? haircutValue }));
-  }, [parsed.scenarios, haircutValue]);
+    let base = parsed.scenarios ?? [];
+    if (haircutValue !== undefined) {
+      base = base.map((s) => ({ ...s, fill_haircut: s.fill_haircut ?? haircutValue }));
+    }
+    // Same posture as the haircut: stamped onto every declared arm that does
+    // not already set its own, so a per-arm value in the JSON always wins.
+    if (rollFillMode !== '') {
+      base = base.map((s) => ({
+        ...s,
+        roll_fill_mode: s.roll_fill_mode ?? (rollFillMode as 'limit' | 'haircut'),
+      }));
+    }
+    return base;
+  }, [parsed.scenarios, haircutValue, rollFillMode]);
 
   const cashValue = startingCash.trim() === '' ? undefined : Number(startingCash);
 
@@ -353,7 +366,7 @@ export default function SubmitSweep({
       </div>
 
       {/* --- fill + sensitivity + cash --- */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-300" htmlFor="sweep-haircut">
             Fill haircut
@@ -375,6 +388,26 @@ export default function SubmitSweep({
           {haircutBad && (
             <p className="text-xs text-red-300 mt-1">Fill haircut must be between 0 and 1.</p>
           )}
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-300" htmlFor="sweep-roll-fill">
+            Roll fills
+          </label>
+          <select
+            id="sweep-roll-fill"
+            value={rollFillMode}
+            onChange={(e) => setRollFillMode(e.target.value)}
+            className="mt-1 w-full bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-sm text-gray-200"
+          >
+            <option value="">engine default (limit)</option>
+            <option value="limit">limit</option>
+            <option value="haircut">haircut (pre-FC-116)</option>
+          </select>
+          <p className="text-xs text-gray-500 mt-1">
+            <code>limit</code> prices each roll leg at the limit the live roller would have
+            placed, capped by the day&rsquo;s modeled book. <code>haircut</code> is the old
+            model &mdash; run it as a second arm to see the difference, not on its own.
+          </p>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-300" htmlFor="sweep-cash">

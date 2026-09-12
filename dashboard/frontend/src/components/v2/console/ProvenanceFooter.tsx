@@ -176,6 +176,14 @@ export default function ProvenanceFooter({
           }
           title="What the SPEC declared for this arm. `null` or absent does not mean 'no haircut': it means the arm declared none and the engine applied its own default, which the cell block below shows as the replay actually used it."
         />
+        <Row
+          label="roll_fill_mode"
+          value={
+            report.scenario_roll_fill_modes?.[scenario] ??
+            'not declared — engine default `limit` (see cell)'
+          }
+          title="FC-116. How ROLL legs were priced. `limit` fills each leg at the limit the live roller would have placed, capped by the day's modeled book; `haircut` is the pre-FC-116 model and is NOT comparable with a `limit` arm on any roll-bearing number. An arm that declared none ran `limit`."
+        />
         <Row label="scenario_hash" value={report.scenario_hashes?.[scenario] ?? DASH} />
         <Row
           label="config_hash"
@@ -218,8 +226,8 @@ export default function ProvenanceFooter({
               label="fill"
               value={`${artifact.provenance.fill?.basis ?? DASH} · haircut ${
                 artifact.provenance.fill?.fill_haircut ?? DASH
-              }`}
-              title="This artifact is the MID replay. The row's `bid_fill_return` is a SECOND replay with no artifact of its own — the ledger shown here is not that one."
+              } · rolls ${artifact.provenance.fill?.roll_fill_mode ?? 'haircut'}`}
+              title="This artifact is the MID replay. The row's `bid_fill_return` is a SECOND replay with no artifact of its own — the ledger shown here is not that one. `rolls` is FC-116's roll-leg rule as the replay ACTUALLY ran it; an artifact stored before that PR carries no stamp and reads `haircut`, which is what its engine did."
             />
             <Row
               label="masked reach"
