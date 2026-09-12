@@ -1446,3 +1446,121 @@ class _Logger:
 
     def error(self, *a, **k):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T11 — the eleven roll columns, and the NULL that means something
+# --------------------------------------------------------------------------- #
+ROLL_COLUMNS = {
+    "rolls_executed": "INT64",
+    "roll_skips": "STRING",
+    "itm_rolls": "INT64",
+    "otm_roll_outs": "INT64",
+    "roll_net_credit": "FLOAT64",
+    "itm_roll_credit": "FLOAT64",
+    "otm_roll_out_credit": "FLOAT64",
+    "failed_roll_btc_debit": "FLOAT64",
+    "roll_legs_resting": "INT64",
+    "roll_legs_marketable": "INT64",
+    "roll_fill_mode": "STRING",
+}
+
+
+class TestTheRollColumnsAreAdditiveAndNullable:
+    """FC-116 D6 (decision iv). NONE of these was a column before — not even
+    `rolls_executed`, `roll_skips`, `itm_rolls` or `otm_roll_outs`, which have
+    been on `ScenarioResult` since FC-096 Phase C and reached a reader only
+    through the report and the cell artifact. FC-112 has to read them PER ROW.
+    """
+
+    def test_all_eleven_are_declared_with_the_right_types(self):
+        pytest.importorskip("google.cloud.bigquery")
+        by_name = {f.name: f for f in store._runs_schema()}
+        for name, want in ROLL_COLUMNS.items():
+            assert name in by_name, f"{name} is not a scenario_runs column"
+            assert store._canonical_type(by_name[name].field_type) == want, name
+            assert (by_name[name].mode or "NULLABLE").upper() == "NULLABLE", (
+                f"{name} must be NULLABLE — the additive reconcile can only "
+                f"add a nullable column to a live table, and every row written "
+                f"before this PR has no value for it")
+
+    def test_a_table_missing_every_one_of_them_reconciles(self):
+        """The migration, such as it is: `_ensure_table` adds them all on the
+        first write after deploy. A column missed from the reconcile is a
+        column that silently stays absent and reads NULL forever."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._runs_schema()
+        legacy = [f for f in declared if f.name not in ROLL_COLUMNS]
+        assert len(legacy) == len(declared) - len(ROLL_COLUMNS)
+
+        writer = TestBigQueryLegacyTypeNames.writer_over(None, legacy)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        writer._ensure_table(ref, store.RUNS_TABLE, declared,
+                             partition_field="submitted_at", clustering=None)
+
+    def test_a_null_mode_means_pre_fc116_not_unknown(self):
+        """The posture chosen deliberately AGAINST `fill_haircut`'s.
+
+        `fill_haircut` is stored VERBATIM, so a NULL there means "the arm
+        declared none" and the dashboard had to grow `_resolved_haircut` to
+        tell that from a real value. Here the RESOLVED value is stored, so a
+        NULL has exactly one meaning — written by an engine before
+        `fc-116-roll-limit-fills` — and reading it as `limit` would claim every
+        legacy row's roll credit was measured against the placed limits.
+        """
+        import sys
+        from pathlib import Path
+
+        backend = str(Path("dashboard/backend").resolve())
+        if backend not in sys.path:
+            sys.path.insert(0, backend)
+        from services import sweeps as dash
+
+        assert dash._resolved_roll_fill_mode({}) == "haircut"
+        assert dash._resolved_roll_fill_mode({"roll_fill_mode": None}) == "haircut"
+        assert dash._resolved_roll_fill_mode({"roll_fill_mode": "limit"}) == "limit"
+        assert dash._resolved_roll_fill_mode(None) == "haircut"
+
+
+class TestTheRollFieldsRoundTripOntoARow:
+    def _row(self, **cell_kw):
+        from src.backtesting.scenarios.runner import ScenarioResult, SweepResult
+
+        cell = ScenarioResult(
+            scenario="a", symbol="XYZ", start=date(2024, 6, 3),
+            end=date(2024, 6, 28), split="all", config_hash="cfg",
+            scenario_hash="arm", verdict="fit", **cell_kw)
+        result = SweepResult(rows=[cell], scenarios=["a"])
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-11T00:00:00+00:00",
+            engine_version="fc-116-roll-limit-fills")
+        return rows[0]
+
+    def test_every_roll_field_reaches_the_row(self):
+        row = self._row(
+            rolls_executed=3, itm_rolls=2, otm_roll_outs=1,
+            roll_skips={"no_credit_candidate": 4, "btc_timeout_canceled": 1},
+            roll_net_credit=412.5, itm_roll_credit=300.0,
+            otm_roll_out_credit=112.5, failed_roll_btc_debit=0.0,
+            roll_legs_resting=2, roll_legs_marketable=4,
+            roll_fill_mode="limit",
+        )
+        assert row["rolls_executed"] == 3
+        assert row["itm_rolls"] == 2 and row["otm_roll_outs"] == 1
+        assert row["roll_net_credit"] == 412.5
+        assert row["itm_roll_credit"] + row["otm_roll_out_credit"] == 412.5
+        assert row["roll_legs_resting"] == 2
+        assert row["roll_legs_marketable"] == 4
+        assert row["roll_fill_mode"] == "limit"
+
+    def test_roll_skips_round_trips_through_json(self):
+        """A STRING column, because the reason set is open and a RECORD would
+        need a schema change every time the roller learns a new one."""
+        skips = {"no_credit_candidate": 4, "btc_timeout_canceled": 1}
+        row = self._row(roll_skips=skips)
+        assert json.loads(row["roll_skips"]) == skips
+
+    def test_an_empty_skip_dict_is_null_not_an_empty_string(self):
+        assert self._row(roll_skips={})["roll_skips"] is None
+        assert self._row()["roll_skips"] is None

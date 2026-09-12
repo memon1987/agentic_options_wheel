@@ -998,3 +998,92 @@ class TestTheRollSplit:
         unknown = S._stamp_roll_record(base, day=date(2024, 6, 3), close=None)
         assert unknown["roll_kind"] is None
         assert unknown["itm_ratio"] is None
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T7 — the fill rule is SHARED, not per-strategy
+#
+# The wheel and the covered-call profile run the same `CallRoller` through the
+# same adapter. A rule that behaved differently on one of them would be a
+# second, undocumented fill model — and the footer that describes it
+# (`ROLL_FILL_RULE`, emitted on both strategies) would be false on one.
+# --------------------------------------------------------------------------- #
+class TestTheRollFillRuleIsProfileBlind:
+    def test_the_same_per_leg_rule_holds_on_the_covered_call_profile(self):
+        days, closes, exps = _rally_window()
+        lim = _cc_simulator("XYZ", closes, exps, days,
+                            roll_fill_mode="limit").run()
+        legs = [e for e in lim.broker.ledger
+                if e.kind in ("buy_to_close", "sell_call_open")
+                and (e.detail or {}).get("limit_price") is not None]
+        assert legs, "the covered-call rally executed no roll leg"
+        for leg in legs:
+            limit = leg.detail["limit_price"]
+            if leg.kind == "buy_to_close":
+                assert leg.price <= limit + 1e-9
+            else:
+                assert leg.price >= limit - 1e-9
+            assert leg.detail["fill_rule"] in ("limit_marketable", "limit_resting")
+
+    def test_the_per_tag_delta_law_holds_on_the_covered_call_profile(self):
+        """Same law, same direction, on the other profile: a marketable leg
+        gives up credit versus the haircut fill and never gains it."""
+        days, closes, exps = _rally_window()
+        hc = _cc_simulator("XYZ", closes, exps, days,
+                           roll_fill_mode="haircut").run()
+        lim = _cc_simulator("XYZ", closes, exps, days,
+                            roll_fill_mode="limit").run()
+
+        assert hc.rolls_executed == lim.rolls_executed > 0
+        hc_legs = [e for e in hc.broker.ledger
+                   if e.kind in ("buy_to_close", "sell_call_open")
+                   and (e.detail or {}).get("limit_price") is not None]
+        lim_legs = [e for e in lim.broker.ledger
+                    if e.kind in ("buy_to_close", "sell_call_open")
+                    and (e.detail or {}).get("limit_price") is not None]
+        assert len(hc_legs) == len(lim_legs)
+        for old, new in zip(hc_legs, lim_legs):
+            assert (old.kind, old.symbol) == (new.kind, new.symbol)
+            sign = 1.0 if new.kind == "sell_call_open" else -1.0
+            per_share = sign * (new.price - old.price)
+            if new.detail["fill_rule"] == "limit_marketable":
+                assert per_share < 1e-9, (
+                    f"{new.symbol}: a marketable leg gained credit — the rule "
+                    f"is inverted on this profile")
+
+    def test_the_counters_reconcile_on_the_covered_call_profile(self):
+        days, closes, exps = _rally_window()
+        lim = _cc_simulator("XYZ", closes, exps, days,
+                            roll_fill_mode="limit").run()
+        assert (lim.roll_legs_resting + lim.roll_legs_marketable
+                == 2 * lim.rolls_executed)
+        assert lim.failed_roll_btc_debit == 0.0
+        assert lim.roll_net_credit == pytest.approx(
+            round(sum(r["net_credit"] for r in lim.roll_records), 2))
+
+    def test_the_fill_path_reads_no_strategy_id(self):
+        """Structural, and deliberately crude.
+
+        The cheapest way for a profile-conditional fill rule to appear is a
+        `if strategy == ...` inside the adapter's pricing or the broker's
+        ledger. Neither module has any business knowing which strategy is
+        replaying — that is the simulator's concept — so the absence is
+        asserted directly rather than inferred from two passing profiles.
+        """
+        import re
+        from pathlib import Path
+
+        for path in ("src/backtesting/engine/alpaca_adapter.py",
+                     "src/backtesting/engine/broker.py"):
+            source = Path(path).read_text()
+            # Comments and docstrings may legitimately mention a strategy; CODE
+            # may not branch on one.
+            code = "\n".join(
+                line for line in source.splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            for token in ("strategy_id", "covered_call", "WHEEL_STRATEGY"):
+                assert not re.search(rf"\b{token}\b\s*[=!<>]", code), (
+                    f"{path} branches on {token!r} — the fill rule must be the "
+                    f"same on both profiles, and the shared footer that "
+                    f"describes it would be false on one of them")

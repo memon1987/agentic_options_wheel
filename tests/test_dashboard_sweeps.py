@@ -4585,3 +4585,163 @@ class TestTheForecastSuppressesTotalPnlWithoutACapitalBase:
                                       "scenarios": [{"name": "tighter"}]})},
             _fit_holdout())
         assert shaped["forecast"]["capital_base"] == S.DEFAULT_STARTING_CASH
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T10 — the footer says the right thing, on both strategies
+#
+# Prose is not decoration here. `ROLL_REACH_BIAS` used to claim the fill model
+# biased roll credits UP; that clause is now FALSE, and a footer that keeps a
+# retired caveat is worse than one that never had it — a reader discounts a
+# number in the wrong direction and has no way to know.
+# --------------------------------------------------------------------------- #
+class TestTheRollFillRuleProse:
+    def test_the_retired_clause_is_gone_from_ROLL_REACH_BIAS(self):
+        title, detail = engine_report.ROLL_REACH_BIAS
+        assert "credits UP" not in title
+        assert "OPPOSITE direction" not in detail
+        assert "haircut price from the mark" not in detail
+        # What must SURVIVE: the reach truncation is still real and is still
+        # the reason roll counts and credits are floors.
+        assert "21 DTE" in title and "biased DOWN" in title
+        assert "FLOORS, not estimates" in detail
+        assert "roll_skips" in detail
+
+    def test_the_new_rule_states_the_model_width_and_the_direction(self):
+        """Roll credits now pay the FULL modeled spread on both legs, and the
+        model measures ~2.46x wider than the real book — so the honest fill
+        rule makes replayed roll credits AND counts biased DOWN versus live.
+        Saying the first without the second would read as a correction rather
+        than a new bias."""
+        _title, detail = engine_report.ROLL_FILL_RULE
+        assert "2.46" in detail
+        assert "biased DOWN" in detail
+        assert "MORE credit" in detail, (
+            "the residual cuts BOTH ways — an imminence roll on a chain with "
+            "hs > $0.20 carries more credit under this rule, not less")
+
+    def test_the_half_spread_is_never_quoted_as_the_bare_base_term(self):
+        """`hs = max(0.02, (0.05 + 0.10*|1 - K/S| [+0.05 if mark < 0.50]) *
+        mark)`. "5% of mark" is the BASE TERM ONLY; the OTM and cheap-contract
+        widenings are part of `hs`. A footer that quotes the base term as if it
+        were the spread understates the residual it is trying to disclose."""
+        _title, detail = engine_report.ROLL_FILL_RULE
+        for idx in range(len(detail)):
+            if detail.startswith("5% of mark", idx):
+                window = detail[idx:idx + 120]
+                assert "widened" in window, (
+                    f"'5% of mark' appears without 'widened': ...{window}...")
+
+    def test_the_two_things_a_zero_does_not_mean_are_stated(self):
+        _title, detail = engine_report.ROLL_FILL_RULE
+        assert "roll_skips" in detail
+        assert "upper bound on live ATTEMPTS" in detail
+
+
+class TestTheRollFillRuleIsEmittedOnBothStrategies:
+    def _result(self, strategy, modes):
+        from src.backtesting.scenarios.runner import SweepResult
+
+        return SweepResult(
+            scenarios=list(modes), strategy=strategy,
+            scenario_roll_fill_modes=dict(modes),
+        )
+
+    def test_a_wheel_sweep_carries_it(self):
+        biases = engine_report.sweep_biases(
+            self._result("wheel", {"base": "limit"}))
+        assert engine_report.ROLL_FILL_RULE[0] in [t for t, _d in biases]
+
+    def test_a_covered_call_sweep_carries_it(self):
+        biases = engine_report.sweep_biases(
+            self._result("covered_call", {"base": "limit"}))
+        titles = [t for t, _d in biases]
+        assert engine_report.ROLL_FILL_RULE[0] in titles
+        # ...alongside the CC-only lines, not instead of them.
+        assert engine_report.ROLL_REACH_BIAS[0] in titles
+
+    def test_a_mixed_sweep_names_its_haircut_arms(self):
+        """The arm field exists so a before/after is ONE submission. A reader
+        of that table must be told which column is the old model."""
+        biases = engine_report.sweep_biases(self._result(
+            "wheel", {"base": "limit", "haircut_fills": "haircut"}))
+        detail = dict(biases)[engine_report.ROLL_FILL_RULE[0]]
+        assert "`haircut_fills`" in detail
+        assert "NOT comparable" in detail
+
+    def test_an_all_haircut_sweep_does_not_claim_the_honest_rule(self):
+        biases = engine_report.sweep_biases(self._result(
+            "wheel", {"old_model": "haircut"}))
+        assert engine_report.ROLL_FILL_RULE[0] not in [t for t, _d in biases]
+
+    def test_the_two_sides_build_the_same_trailing_sentence(self):
+        """The dashboard copy takes the arm NAMES rather than its own result
+        object precisely so this comparison is possible. Both sides derive
+        EMISSION their own way (the CLI off `SweepResult`, the dashboard off
+        the persisted spec) — it is the WORDS that must not fork."""
+        from services import sweeps as dash
+
+        for legacy in ([], ["a"], ["a", "b"]):
+            assert (engine_report.roll_fill_rule_for(legacy)
+                    == dash._roll_fill_rule_for(legacy)), legacy
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T9 — the API validator, the third of three that must agree
+#
+# The CLI (`main.scenarios_from_spec`), this one, and the console
+# (`specValidation.parseScenariosJson`) all have to accept the same arm. A key
+# one takes and another refuses is a spec that runs from the terminal and 400s
+# from the console — or worse, one the console silently DROPS before sending.
+# --------------------------------------------------------------------------- #
+class TestTheApiAcceptsTheRollFillMode:
+    def test_both_values_survive_normalisation(self):
+        for mode in ("limit", "haircut"):
+            normalised = S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_mode": mode}]))
+            assert normalised["scenarios"][0]["roll_fill_mode"] == mode
+
+    def test_an_omitted_mode_normalises_to_none(self):
+        """Not to `"limit"`. The RUNNER resolves it, and the stored spec must
+        record what the submitter asked for — `scenario_arm_hash` folds the two
+        spellings to the same key anyway."""
+        normalised = S.validate_spec(spec())
+        assert normalised["scenarios"][0]["roll_fill_mode"] is None
+
+    def test_an_unknown_mode_is_refused_with_the_value_in_the_message(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_mode": "mid"}]))
+        assert "roll_fill_mode" in str(exc.value)
+        assert "'mid'" in str(exc.value)
+
+    def test_the_key_is_in_the_known_field_set(self):
+        """`SCENARIO_FIELDS` is the unknown-field guard. Adding the key without
+        adding it here would make every arm that carries it a hard 400."""
+        assert "roll_fill_mode" in S.SCENARIO_FIELDS
+
+    def test_a_misspelled_neighbour_is_still_refused(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_modes": "haircut"}]))
+        assert "unknown field" in str(exc.value)
+
+    def test_a_mode_only_arm_keys_differently_from_base(self):
+        """The whole point of the arm field: a before/after in ONE submission.
+        If the regression arm keyed the same as base it would dedup into it.
+        """
+        from src.backtesting.scenarios.identity import scenario_arm_hash
+
+        normalised = S.validate_spec(spec(scenarios=[
+            {"name": "haircut_fills", "overrides": {},
+             "roll_fill_mode": "haircut"}]))
+        arm = normalised["scenarios"][0]
+        assert scenario_arm_hash(arm["overrides"], arm["fill_haircut"],
+                                 arm["roll_fill_mode"]) != \
+            scenario_arm_hash({}, None)
+
+    def test_the_reserved_base_name_is_still_refused_with_a_mode(self):
+        with pytest.raises(S.SweepValidationError):
+            S.validate_spec(spec(scenarios=[
+                {"name": "base", "overrides": {},
+                 "roll_fill_mode": "haircut"}]))

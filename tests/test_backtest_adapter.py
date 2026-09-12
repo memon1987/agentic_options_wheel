@@ -441,3 +441,292 @@ class TestExecuteTimeRequoteStaysOfflineFC072:
         blob_priced = sell_limit_price(opportunity["bid"], opportunity["ask"],
                                        1.00, 0.10, "XYZ")
         assert live_priced.limit_price == blob_priced.limit_price
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 — roll legs fill at their placed limits, capped by the book
+#
+# The live `CallRoller` is credit-only AT ITS PLACED LIMITS, and its credit
+# invariant is tested on exactly those limits. Before FC-116 the adapter
+# RECORDED `limit_price` and filled everything at `mid -/+ haircut x
+# half-spread`, so a replayed roll booked credit the live roller never sees.
+# --------------------------------------------------------------------------- #
+ROLL_CALL = "XYZ240607C00105000"
+
+
+@pytest.fixture
+def rolling():
+    """A covered position and a book of bid 0.70 / ask 0.90 (mark 0.80).
+
+    100 shares so an STO has cover and a BTC has something to close.
+    """
+    broker = BacktestBroker(starting_cash=50_000.0)
+    broker.deposit_shares("XYZ", 100, 95.0, D1, premise="test cover")
+    q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+               mark=0.80, bid=0.70, ask=0.90, delta=0.20)
+    client = BacktestAlpacaClient(
+        broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+        stock_bars={"XYZ": _bars((D1, 100.0))},
+    )
+    return broker, client
+
+
+def _open_short_call(broker):
+    """One short call to close, opened OUTSIDE the roll window."""
+    broker.sell_call_to_open(ROLL_CALL, "XYZ", 105.0, EXP, 1,
+                             mark=0.80, bid=0.70, opened=D1)
+
+
+class TestRollLegsFillAtTheirLimits:
+    """T1. Every row of the D1 table, on a synthetic book.
+
+    Catches: an inverted comparison; a fill AT the limit when the limit is
+    through the book (which would overpay the replay and make FC-088's tick
+    snapping strictly worse); cash moving on a leg that never filled; an
+    `expired` masking a rejection that live Alpaca would have raised at
+    placement.
+    """
+
+    # -- buys (BTC) ------------------------------------------------------- #
+    @pytest.mark.parametrize("limit,expect_fill,expect_rule", [
+        # at the ask -> marketable, fills AT THE BOOK
+        (0.90, 0.90, "limit_marketable"),
+        # THROUGH the ask -> still the ask. Alpaca fills at the best offer and
+        # never at a worse limit; paying 0.95 here would manufacture a cost the
+        # live roller would not have paid.
+        (0.95, 0.90, "limit_marketable"),
+        # inside the spread -> rests, assumed touched, fills at the LIMIT
+        (0.80, 0.80, "limit_resting"),
+        # at the bid is still inside the book (a buy at the bid can be hit)
+        (0.70, 0.70, "limit_resting"),
+    ])
+    def test_a_btc_fills_at_min_of_limit_and_ask(
+            self, rolling, limit, expect_fill, expect_rule):
+        broker, client = rolling
+        _open_short_call(broker)
+        cash_before = broker.cash
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "buy", limit_price=limit)
+        assert res["success"] is True
+        assert res["status"] == "filled"
+        order = client.get_order_by_id(res["order_id"])
+        assert order["filled_avg_price"] == pytest.approx(expect_fill)
+        assert order["limit_price"] == pytest.approx(limit)
+        # The LEDGER is the proof, not the order record: a fill price the
+        # broker did not actually charge is not a fill.
+        event = broker.ledger[-1]
+        assert event.kind == "buy_to_close"
+        assert event.price == pytest.approx(expect_fill)
+        assert event.detail["fill_rule"] == expect_rule
+        assert event.detail["limit_price"] == pytest.approx(limit)
+        assert broker.cash == pytest.approx(
+            cash_before - expect_fill * 100 - broker.fees_per_contract)
+
+    def test_a_btc_below_the_bid_expires_and_moves_nothing(self, rolling):
+        broker, client = rolling
+        _open_short_call(broker)
+        cash_before, ledger_before = broker.cash, len(broker.ledger)
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "buy", limit_price=0.65)
+        assert res["success"] is True, (
+            "live Alpaca ACCEPTS this order and lets it time out — the roller's "
+            "own ladder and dispositions are what must run, and they key off "
+            "`status`, not off `success: False`")
+        assert res["status"] == "expired"
+        order = client.get_order_by_id(res["order_id"])
+        assert order["filled_qty"] == 0
+        assert order["filled_avg_price"] is None
+        assert order["expired_at"] is not None and order["filled_at"] is None
+        # Nothing moved. Not the cash, not the position, not the ledger.
+        assert broker.cash == pytest.approx(cash_before)
+        assert len(broker.ledger) == ledger_before
+        assert ROLL_CALL in broker.options
+
+    # -- sells (STO) ------------------------------------------------------ #
+    @pytest.mark.parametrize("limit,expect_fill,expect_rule", [
+        (0.70, 0.70, "limit_marketable"),   # at the bid
+        (0.65, 0.70, "limit_marketable"),   # THROUGH the bid -> still the bid
+        (0.80, 0.80, "limit_resting"),      # inside
+        (0.90, 0.90, "limit_resting"),      # at the ask
+    ])
+    def test_an_sto_fills_at_max_of_limit_and_bid(
+            self, rolling, limit, expect_fill, expect_rule):
+        broker, client = rolling
+        cash_before = broker.cash
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "sell", limit_price=limit)
+        assert res["status"] == "filled"
+        event = broker.ledger[-1]
+        assert event.kind == "sell_call_open"
+        assert event.price == pytest.approx(expect_fill)
+        assert event.detail["fill_rule"] == expect_rule
+        assert event.detail["limit_price"] == pytest.approx(limit)
+        assert broker.cash == pytest.approx(
+            cash_before + expect_fill * 100 - broker.fees_per_contract)
+
+    def test_an_sto_above_the_ask_expires_and_moves_nothing(self, rolling):
+        broker, client = rolling
+        cash_before, ledger_before = broker.cash, len(broker.ledger)
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.95)
+        assert res["status"] == "expired"
+        assert broker.cash == pytest.approx(cash_before)
+        assert len(broker.ledger) == ledger_before
+        assert broker.options == {}, "an unfilled STO must open no position"
+
+    # -- degenerate and precedence cases ---------------------------------- #
+    def test_a_market_order_under_roll_intent_crosses_to_the_far_quote(self, rolling):
+        broker, client = rolling
+        _open_short_call(broker)
+        with _at(D1), client.order_intent("roll"):
+            client.place_option_order(ROLL_CALL, 1, "buy", limit_price=None)
+        assert broker.ledger[-1].price == pytest.approx(0.90)
+        assert broker.ledger[-1].detail["fill_rule"] == "limit_marketable"
+        assert broker.ledger[-1].detail["limit_price"] is None
+
+    def test_fees_are_charged_once_per_filled_contract(self, rolling):
+        broker, client = rolling
+        broker.deposit_shares("XYZ", 100, 95.0, D1, premise="more cover")
+        cash_before = broker.cash
+        with _at(D1), client.order_intent("roll"):
+            client.place_option_order(ROLL_CALL, 2, "sell", limit_price=0.70)
+        assert broker.cash == pytest.approx(
+            cash_before + 0.70 * 200 - 2 * broker.fees_per_contract)
+
+    def test_no_position_outranks_expired(self, rolling):
+        """E7 precedence. Live Alpaca REJECTS a close of a position you do not
+        hold, at placement — so the roller must see `btc_rejected`, never a
+        timeout it would then try to cancel and settle."""
+        _, client = rolling
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "buy", limit_price=0.65)
+        assert res["success"] is False
+        assert res["error_type"] == "no_position"
+
+    def test_insufficient_shares_outranks_expired(self):
+        """The STO mirror of the precedence rule: live rejects an uncovered
+        sell-to-open at placement, so the roller must see `stc_rejected`."""
+        broker = BacktestBroker(starting_cash=50_000.0)  # no shares at all
+        q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+                   mark=0.80, bid=0.70, ask=0.90, delta=0.20)
+        client = BacktestAlpacaClient(
+            broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+            stock_bars={"XYZ": _bars((D1, 100.0))},
+        )
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.95)
+        assert res["success"] is False
+        assert res["error_type"] == "insufficient_shares"
+
+    def test_insufficient_cash_quotes_the_RULE_price(self):
+        """The message and the ledger must agree about what this leg costs.
+
+        Under the haircut model the quoted cost was `mid + 0.25 x half-spread`;
+        a roll leg actually pays the ask, which is MORE — so the old message
+        would have understated the shortfall it was reporting.
+        """
+        broker = BacktestBroker(starting_cash=100.0)
+        broker.deposit_shares("XYZ", 100, 95.0, D1, premise="cover")
+        q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+                   mark=0.80, bid=0.70, ask=0.90, delta=0.20)
+        client = BacktestAlpacaClient(
+            broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+            stock_bars={"XYZ": _bars((D1, 100.0))},
+        )
+        broker.sell_call_to_open(ROLL_CALL, "XYZ", 105.0, EXP, 1,
+                                 mark=0.80, bid=0.70, opened=D1)
+        broker.cash = 50.0  # cannot cover 0.90 * 100
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, "buy", limit_price=0.95)
+        assert res["error_type"] == "insufficient_cash"
+        assert "$90.00" in res["error_message"], (
+            f"the cost must be quoted at the ask (the RULE price), not at the "
+            f"haircut price: {res['error_message']}")
+
+
+class TestTheRuleIsScopedToRollIntent:
+    """T2. The rule must not leak onto entry legs or the CC monitor leg.
+
+    FC-072 measured ENTRY fills against the haircut model — that measurement is
+    why `strategy.*_limit_spread_fraction` is refused as a sweep key — so an
+    entry leg that started filling at its limit would silently invalidate it.
+    """
+
+    def test_without_intent_the_haircut_price_is_unchanged(self, rolling):
+        broker, client = rolling
+        with _at(D1):
+            client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.70)
+        # mark 0.80, bid 0.70, haircut 0.25 -> 0.80 - 0.25*0.10 = 0.775
+        assert broker.ledger[-1].price == pytest.approx(0.775)
+        assert broker.ledger[-1].detail["fill_rule"] == "haircut"
+        assert "limit_price" not in broker.ledger[-1].detail, (
+            "a non-roll leg carries no limit_price — the number is not "
+            "meaningful there, and stamping it would invite a reader to "
+            "compare a fill against a limit that was never enforced")
+
+    def test_haircut_mode_ignores_the_intent_entirely(self, rolling):
+        broker, _client = rolling
+        q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+                   mark=0.80, bid=0.70, ask=0.90, delta=0.20)
+        client = BacktestAlpacaClient(
+            broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+            stock_bars={"XYZ": _bars((D1, 100.0))},
+            roll_fill_mode="haircut",
+        )
+        with _at(D1), client.order_intent("roll"):
+            client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.70)
+        assert broker.ledger[-1].price == pytest.approx(0.775), (
+            "the regression arm must reproduce the pre-FC-116 number exactly")
+        assert broker.ledger[-1].detail["fill_rule"] == "haircut"
+        assert broker.ledger[-1].detail["limit_price"] == pytest.approx(0.70), (
+            "a haircut-mode ROLL leg still records its limit, so a haircut "
+            "ledger stays comparable leg-for-leg against a limit one")
+
+    def test_the_intent_does_not_survive_the_context(self, rolling):
+        broker, client = rolling
+        with _at(D1):
+            with client.order_intent("roll"):
+                pass
+            client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.70)
+        assert broker.ledger[-1].detail["fill_rule"] == "haircut"
+
+    def test_the_intent_is_released_even_when_the_body_raises(self, rolling):
+        broker, client = rolling
+        with _at(D1):
+            with pytest.raises(RuntimeError):
+                with client.order_intent("roll"):
+                    raise RuntimeError("the roller blew up")
+            client.place_option_order(ROLL_CALL, 1, "sell", limit_price=0.70)
+        assert broker.ledger[-1].detail["fill_rule"] == "haircut", (
+            "a leaked intent would silently re-price tomorrow's ENTRY legs")
+
+
+class TestTheAdapterOnlyEverReturnsTerminalStatuses:
+    """T4. The invariant that keeps a replay from sleeping 120 s per leg.
+
+    `CallRoller._poll_order_fill` returns on its first `get_order_by_id` read
+    only while the status is in `_TERMINAL_ORDER_STATUSES`; anything else makes
+    it `time.sleep`. And note what does NOT pin this: `cancel_order` raising
+    `UnsupportedBacktestCall` proves nothing, because `_safe_cancel` swallows
+    every exception — a reached cancel would quietly return False and settle.
+    The guard is this assertion plus the `time.sleep` raise in
+    `tests/test_roll_fills.py`.
+    """
+
+    @pytest.mark.parametrize("side,limit", [
+        ("buy", 0.95), ("buy", 0.90), ("buy", 0.80), ("buy", 0.65), ("buy", None),
+        ("sell", 0.65), ("sell", 0.70), ("sell", 0.80), ("sell", 0.95), ("sell", None),
+    ])
+    def test_every_roll_leg_outcome_is_filled_or_expired(self, rolling, side, limit):
+        broker, client = rolling
+        _open_short_call(broker)
+        broker.deposit_shares("XYZ", 100, 95.0, D1, premise="cover for the STO")
+        with _at(D1), client.order_intent("roll"):
+            res = client.place_option_order(ROLL_CALL, 1, side, limit_price=limit)
+        assert res["success"] is True
+        assert res["status"] in ("filled", "expired"), res["status"]
+
+    def test_cancel_order_is_still_a_tripwire(self, rolling):
+        _, client = rolling
+        with pytest.raises(UnsupportedBacktestCall):
+            client.cancel_order("bt-000001")

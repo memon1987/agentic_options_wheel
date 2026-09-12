@@ -407,3 +407,201 @@ class TestTheEntryPointsReachConfigHashWithoutRaising:
         # The put leg falls back rather than raising, which is what the reach
         # derivation depends on.
         assert config_target_dte(cc, "put") > 0
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T12/T13 — FC-112 readiness, on the WHEEL
+#
+# FC-112 compares `rolling.itm_trigger_ratio` in {0.98, 1.00} across the
+# wheel's standing set. It reads, per row: `rolls_executed`, the ITM/OTM split,
+# and the roll CREDIT split the same way. Before this PR:
+#   * the split was `None` on every wheel row (gated to covered-call rows) and
+#     printed only in the covered-call table;
+#   * no roll-credit aggregate existed ANYWHERE — not on the result, the
+#     report, the artifact or the row.
+# FC-112 would have arrived to find the number it needs gated off.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def wheel_roll_sweep():
+    """A real WHEEL sweep over the one scripted window that executes a roll."""
+    from tests.test_backtest_simulator import dip_then_recovering_window
+
+    days, closes, expirations = dip_then_recovering_window()
+    provider = ScriptedProvider("XYZ", closes, expirations)
+    artifacts = []
+    result = run_sweep(
+        Config(),
+        [Scenario(name="trigger_100",
+                  overrides={"rolling.itm_trigger_ratio": 1.00})],
+        ["XYZ"], days[0], days[-1],
+        starting_cash=50_000.0,
+        chain_store=_NoChainStore(),
+        bar_provider=provider,
+        artifact_sink=artifacts.append,
+        run_id="wheelroll0000001",
+        engine_identity="testidentity",
+        git_commit="deadbeef",
+    )
+    return result, artifacts
+
+
+class TestFC112CanReadWhatItNeeds:
+    def test_a_wheel_row_carries_the_split_it_used_to_gate_off(self, wheel_roll_sweep):
+        result, _artifacts = wheel_roll_sweep
+        rolled = [r for r in result.rows if (r.rolls_executed or 0) > 0]
+        assert rolled, "the wheel sweep executed no roll — the fixture is wrong"
+        for row in rolled:
+            assert row.itm_rolls is not None, (
+                "the ITM/OTM split is `None` on this wheel row — that gating is "
+                "exactly what FC-112 would have arrived to find")
+            assert row.otm_roll_outs is not None
+            assert row.rolls_executed == row.itm_rolls + row.otm_roll_outs
+
+    def test_a_wheel_row_carries_the_roll_credit_and_its_split(self, wheel_roll_sweep):
+        result, _artifacts = wheel_roll_sweep
+        for row in [r for r in result.rows if (r.rolls_executed or 0) > 0]:
+            assert row.roll_net_credit is not None
+            assert row.itm_roll_credit is not None
+            assert row.otm_roll_out_credit is not None
+            assert row.roll_net_credit == pytest.approx(
+                row.itm_roll_credit + row.otm_roll_out_credit)
+
+    def test_a_wheel_row_carries_the_residual_counters_and_the_mode(
+            self, wheel_roll_sweep):
+        """`roll_legs_resting` is how a reader DISCOUNTS a row: it is the count
+        of legs that rest on the model's one assumption."""
+        result, _artifacts = wheel_roll_sweep
+        for row in [r for r in result.rows if (r.rolls_executed or 0) > 0]:
+            assert row.roll_legs_resting is not None
+            assert row.roll_legs_marketable is not None
+            assert (row.roll_legs_resting + row.roll_legs_marketable
+                    == 2 * row.rolls_executed)
+            assert row.failed_roll_btc_debit == 0.0
+            assert row.roll_fill_mode == "limit", (
+                "every arm of this sweep omitted the field, so every row must "
+                "have RESOLVED to the honest default — a NULL here is the "
+                "ambiguity the resolved-value posture exists to avoid")
+
+    def test_roll_skips_is_on_the_wheel_row_too(self, wheel_roll_sweep):
+        """A credit-only roller declining 40 evaluations and a roller that
+        could not price a single one report the same `rolls_executed`."""
+        result, _artifacts = wheel_roll_sweep
+        assert any(r.roll_skips for r in result.rows)
+
+    def test_the_wheel_markdown_prints_the_roll_credit_column(self, wheel_roll_sweep):
+        from src.backtesting.scenarios.report import render_markdown
+
+        result, _artifacts = wheel_roll_sweep
+        markdown = render_markdown(result)
+        assert "### Roll activity and credit" in markdown, (
+            "the split and the credit were printed only in the COVERED-CALL "
+            "table; FC-112's question is about the wheel")
+        assert "rolls itm/otm · credit" in markdown
+        assert "resting/mktable" in markdown
+
+    def test_the_wheel_markdown_carries_the_new_footer(self, wheel_roll_sweep):
+        from src.backtesting.scenarios.report import (
+            ROLL_FILL_RULE, render_markdown,
+        )
+
+        result, _artifacts = wheel_roll_sweep
+        markdown = render_markdown(result)
+        assert ROLL_FILL_RULE[0] in markdown
+        assert "roll fills" in markdown, "the scenario table must print the mode"
+
+    def test_the_cell_artifact_counters_reconcile(self, wheel_roll_sweep):
+        result, artifacts = wheel_roll_sweep
+        rolled = [a for a in artifacts if a["counters"]["rolls_executed"]]
+        assert rolled, "no artifact recorded a roll"
+        for artifact in rolled:
+            counters = artifact["counters"]
+            assert counters["roll_net_credit"] == pytest.approx(
+                round(sum(r["net_credit"] for r in artifact["roll_records"]), 2))
+            assert counters["roll_net_credit"] == pytest.approx(
+                counters["itm_roll_credit"] + counters["otm_roll_out_credit"])
+            assert (counters["roll_legs_resting"]
+                    + counters["roll_legs_marketable"]
+                    == 2 * counters["rolls_executed"])
+            assert artifact["provenance"]["fill"]["roll_fill_mode"] == "limit"
+
+
+class TestTheScreenPathAgreesWithTheSweepPath:
+    """T13. `evaluate._simulator` builds a `Simulator` for the screen /
+    `backtest_runs` path and passes NO `roll_fill_mode`, taking the constructor
+    default. That is the design: one source for the honest mode, so the screen
+    cannot silently stay on the haircut while sweeps move.
+
+    *Catches:* someone adding an explicit `roll_fill_mode=` to one of the two
+    call sites and not the other.
+    """
+
+    def test_both_entry_points_produce_the_same_roll_leg_fills(self):
+        from src.backtesting.data.chain_builder import ChainBuilder
+        from src.backtesting.evaluate import _simulator as screen_simulator
+        from src.backtesting.scenarios.runner import _simulator as sweep_simulator
+        from tests.test_backtest_simulator import dip_then_recovering_window
+
+        days, closes, expirations = dip_then_recovering_window()
+
+        def legs(result):
+            return [
+                (e.kind, e.event_date, e.symbol, round(e.price, 6),
+                 e.detail["fill_rule"], e.detail["limit_price"])
+                for e in result.broker.ledger
+                if e.kind in ("buy_to_close", "sell_call_open")
+                and (e.detail or {}).get("limit_price") is not None
+            ]
+
+        provider = ScriptedProvider("XYZ", closes, expirations)
+        screen = screen_simulator(
+            "XYZ", days[0], days[-1], Config(), provider,
+            ChainBuilder(provider, risk_free_rate=0.04),
+            starting_cash=50_000.0, fill_haircut=0.25, max_dte=7,
+        ).run()
+
+        provider2 = ScriptedProvider("XYZ", closes, expirations)
+        sweep = sweep_simulator(
+            Config(), provider2, ChainBuilder(provider2, risk_free_rate=0.04),
+            "XYZ", days[0], days[-1],
+            starting_cash=50_000.0, max_dte=7, fill_haircut=0.25,
+            dividends=None,
+        ).run()
+
+        assert legs(screen), "the screen path executed no roll leg"
+        assert legs(screen) == legs(sweep)
+        assert screen.roll_fill_mode == sweep.roll_fill_mode == "limit"
+
+    def test_evaluate_does_not_pass_the_mode_explicitly(self):
+        """Structural, and the point of T13: the constructor DEFAULT is the
+        single source. An explicit value here would be a second one."""
+        import inspect
+
+        from src.backtesting import evaluate
+
+        source = inspect.getsource(evaluate._simulator)
+        assert "roll_fill_mode" not in source, (
+            "`evaluate._simulator` must take the Simulator's default — a second "
+            "spelling of the honest mode is a second thing to keep in sync")
+
+    def test_the_screen_data_quality_block_carries_the_credit(self):
+        from datetime import date
+
+        from src.backtesting.evaluate import _data_quality
+        from src.backtesting.engine.simulator import SimulationResult
+
+        result = SimulationResult(
+            symbols=["XYZ"], start=date(2024, 6, 3), end=date(2024, 6, 28),
+            starting_cash=50_000.0, daily=[], broker=_EmptyBroker(),
+            roll_net_credit=412.5, itm_roll_credit=300.0,
+            otm_roll_out_credit=112.5, roll_legs_resting=1,
+            roll_legs_marketable=3, roll_fill_mode="limit",
+        )
+        block = _data_quality(result, [])
+        assert block["roll_net_credit"] == 412.5
+        assert block["roll_fill_mode"] == "limit"
+        assert block["roll_legs_resting"] == 1
+
+
+class _EmptyBroker:
+    ledger: list = []
+    cash = 50_000.0
