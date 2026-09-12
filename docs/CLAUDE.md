@@ -738,7 +738,12 @@ deltas for the same kind of reason.
     `fc-116-roll-limit-fills` filled roll legs at the haircut price rather than
     at the limits the live roller places, and old and new rows share
     `scenario_hash` and `config_hash` by design, so nothing else separates
-    them. A NULL `roll_fill_mode` means "before that boundary".
+    them. A NULL `roll_fill_mode` means "before that boundary". **A second,
+    WHEEL-ONLY boundary sits at `fc-112-wheel-roll-reach`** (FC-112 PR-1):
+    before it the wheel's roller replayed on a 7-DTE ladder instead of its
+    21-DTE roll horizon, so wheel roll counts, credits and — on any window that
+    rolled — the returns step there too. `roll_fill_mode` does not separate
+    that one; only `engine_version` does.
   - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
   - Google Cloud Storage: `gs://options-wheel-chain-lake/chains/v1/` — the
     **chain lake** (FC-060 Layer 1): the point-in-time option chains the
@@ -958,11 +963,17 @@ scheduler needed no change. Four properties are worth knowing:
   invalidates dedup; the version is what makes the boundary *queryable* after
   the fact — FC-048 did not bump, and the docs still call that boundary
   "timestamp-only" as the regret. The most recent one is
-  `fc-116-roll-limit-fills`: rows before it filled ROLL legs at the haircut
-  price, so they are **not comparable on any roll-bearing row**, and any trend
-  series over roll credits must partition on `engine_version` (or on the
-  `scenario_runs.roll_fill_mode` column, where NULL means "before that
-  boundary").
+  `fc-112-wheel-roll-reach` (FC-112 PR-1, 2026-09-12): the WHEEL replay's
+  materialisation moved from 7 DTE to its roll horizon (7 + 14 = 21), so its
+  roller finally sees the ladder the live roller searches. Wheel rows before
+  and after are **not comparable on any roll-bearing row**, and on a window
+  that rolled the divergence reaches the returns as well (an executed roll
+  changes the position the rest of the window trades from). Covered-call rows
+  are byte-unchanged. Before it, `fc-116-roll-limit-fills`: rows before THAT
+  filled ROLL legs at the haircut price, and a NULL
+  `scenario_runs.roll_fill_mode` means "before that boundary" — note it does
+  NOT separate the FC-112 one, where both eras are `limit`. Any trend series
+  over roll credits partitions on `engine_version`.
 - **The exit boundary is structural.** The backfill branch exits with the
   backfill's code and nothing can move it: the battery's return value is
   discarded and every way it can fail — a crash, or a `SystemExit` from its own

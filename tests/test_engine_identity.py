@@ -447,6 +447,39 @@ class TestTheEngineVersionIsNotAFork:
         import services.sweeps as S
         assert S.ENGINE_VERSION == EI.ENGINE_VERSION
 
+    def test_this_version_is_in_the_post_fc116_set(self):
+        """FC-112. `_ran_pre_fc116` decides the fill-rule footer for a sweep
+        with no cells to speak for it, and it used to reason "any version but
+        mine is older". FC-112's own bump falsified that: a rowless
+        `fc-116-roll-limit-fills` sweep would have been served the LEGACY
+        footer, claiming its roll credits were filled at the haircut price when
+        they were filled at the placed limits.
+
+        The set is append-only and this is the test that makes it so — a bump
+        that forgets to add itself fails here rather than in a footer nobody
+        re-reads.
+        """
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+        assert EI.ENGINE_VERSION in S.POST_FC116_ENGINE_VERSIONS
+        assert "fc-116-roll-limit-fills" in S.POST_FC116_ENGINE_VERSIONS, (
+            "the release the set is named for must stay in it")
+
+    def test_a_rowless_sweep_from_each_era_gets_the_right_footer(self):
+        """FC-112, the behaviour the set exists for — asserted, not assumed."""
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+
+        def pre(version):
+            return S._ran_pre_fc116({"engine_version": version}, [])
+
+        assert pre("fc-069-scanner-rewire") is True
+        assert pre("fc-116-roll-limit-fills") is False
+        assert pre(EI.ENGINE_VERSION) is False
+        assert pre("") is False, "an unknown era is not a claim either way"
+
 
 # ==========================================================================
 # (3) The key migration

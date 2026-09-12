@@ -463,6 +463,18 @@ something false, and all four are worth knowing before querying one:
   row**, and they share `scenario_hash` and `config_hash` by design — so any
   trend series over roll credits must partition on `engine_version` or
   `roll_fill_mode`. The weekly trend query under *Useful queries* does.
+
+  **A SECOND boundary, on the wheel only: `fc-112-wheel-roll-reach`** (FC-112
+  PR-1, 2026-09-12). It widened the wheel replay's materialisation from 7 DTE
+  to its roll horizon (7 + 14 = 21), so a wheel roller written before it chose
+  replacements from a ladder cut off at 8 calendar days while its live twin
+  searched to `old_expiry + 14`. Wheel rows either side are non-comparable on
+  every roll-bearing row — and, on any window that actually rolled, on
+  `puts_sold`, `calls_sold`, `cycles_completed`, `option_pnl` and the returns
+  as well, because a roll that executes changes the position the rest of the
+  window trades from. `roll_fill_mode` does NOT separate this one (both eras
+  are `limit`): partition on `engine_version`. Covered-call rows are unaffected
+  — that profile already reached 21.
 - **`provenance.masked_reach`** — this ARM's DTE reach and the chain cutoff it
   implies (`max_dte + UNIVERSE_DTE_BUFFER`, carried alongside as `dte_buffer` so
   a reader never has to know the constant's current value), never the sweep-wide
@@ -711,6 +723,10 @@ ORDER BY submitted_at DESC;
 -- `fc-116-roll-limit-fills` filled ROLL legs at the haircut price and are NOT
 -- comparable on any roll-bearing row. Old and new rows share `scenario_hash`
 -- and `config_hash` by design, so nothing else in this query separates them.
+-- `engine_version` ALSO carries a WHEEL-ONLY boundary that `roll_fill_mode`
+-- does not: rows before `fc-112-wheel-roll-reach` replayed the wheel's roller
+-- on a 7-DTE ladder instead of its 21-DTE roll horizon, so wheel roll counts,
+-- credits AND (on any window that rolled) the returns step at it too.
 -- `r.roll_fill_mode` is a POST-FC-116 column: the writer adds it to the live
 -- table on the first `ScenarioRunWriter` construction of an FC-116-or-later
 -- build (`persist.py:636-644`), so until that run this query fails with an

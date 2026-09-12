@@ -2298,3 +2298,215 @@ class TestTheThresholdTracksTheLiveConfig:
             f"were measured at the old target — re-argue the wording, then move "
             f"the constant (and its dashboard copy)."
         )
+
+
+# --------------------------------------------------------------------------- #
+# FC-112 PR-1 (DD-2) — the wheel's roll reach becomes its roll horizon.
+#
+# T-2 and T-3 both route through `run_sweep` / `_replay_one` DELIBERATELY.
+# `tests/test_backtest_simulator._simulator` hardcodes `max_dte=7`, so a test
+# built on it can never observe a widened ladder and would pass vacuously
+# whichever way the engine behaved (plan §Tests, T-3).
+# --------------------------------------------------------------------------- #
+def _roll_ladder_window():
+    """The `dip_then_recovering` price path with a ladder that reaches 21 DTE.
+
+    `dip_then_recovering_window` lists expirations only INSIDE its own window,
+    so the last few decision days have no Friday more than a week out and the
+    widened reach would have nothing to find — a fixture that cannot fail is
+    worse than no fixture. Fridays run 40 days past the window end here, which
+    is the "expirations every Friday for >= 3 weeks past each decision day" the
+    plan requires.
+    """
+    from .test_backtest_simulator import dip_then_recovering_window
+
+    days, closes, _inside_only = dip_then_recovering_window()
+    expirations, day = [], days[0]
+    while day <= days[-1] + timedelta(days=40):
+        if day.weekday() == 4:
+            expirations.append(day)
+        day += timedelta(days=1)
+    return days, _MultiSymbolProvider(
+        {"AAA": ScriptedProvider("AAA", closes, expirations)})
+
+
+def _occ_expiry(symbol: str, underlying: str = "AAA") -> date:
+    offset = len(underlying)
+    return datetime.strptime(symbol[offset:offset + 6], "%y%m%d").date()
+
+
+class TestTheWheelsRollReachIsTheRollHorizon:
+    """FC-112 PR-1, T-2 and T-3, on one scripted window through `run_sweep`.
+
+    The re-baseline's whole claim is a pair: the ROLLER sees the 8-to-21-DTE
+    ladder it sees live, and NOTHING ELSE moves — entries in particular. Both
+    halves are asserted here, because either one alone is consistent with a
+    wrong change (a reach that widened entries would satisfy T-3; a reach
+    masked straight back to 7 in `_replay_one` would satisfy T-2).
+    """
+
+    @staticmethod
+    def _sweep(tmp_path, name, *, reach, trigger=None, sink=None):
+        """One wheel sweep. `reach=7` replays the PRE-FC-112 wheel.
+
+        Forced by patching `roll_horizon_reach` to 0 — byte-for-byte the branch
+        FC-112 deleted — rather than by narrowing `rolling.max_extension_days`,
+        which would ALSO change the roller's own search bound and stop the two
+        runs from differing in exactly one thing.
+        """
+        from src.backtesting.scenarios import runner as runner_module
+
+        days, provider = _roll_ladder_window()
+        config = Config()
+        config._config["stocks"]["symbols"] = ["AAA"]
+        if trigger is not None:
+            config._config["rolling"]["itm_trigger_ratio"] = trigger
+
+        kw = {} if sink is None else {"artifact_sink": sink}
+
+        def go():
+            return run_sweep(
+                config, [], ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+                chain_store=ChainStore(str(tmp_path / name)),
+                bar_provider=provider, quiet_logs=True, **kw)
+
+        if reach != 7:
+            return go()
+        with patch.object(runner_module, "roll_horizon_reach", lambda _c: 0):
+            return go()
+
+    @staticmethod
+    def _legs(artifact):
+        """`(entries, roll_legs)`, each `(date, kind, symbol, calendar_dte)`.
+
+        A roll leg is the one carrying a `limit_price`: the roller places
+        limits, the entry path does not (FC-116).
+        """
+        entries, rolls = [], []
+        for event in artifact["ledger"]:
+            symbol = event.get("symbol") or ""
+            if len(symbol) < 15:          # a stock leg, not an option
+                continue
+            day = datetime.strptime(event["date"], "%Y-%m-%d").date()
+            record = (event["date"], event["kind"], symbol,
+                      (_occ_expiry(symbol) - day).days)
+            if (event.get("detail") or {}).get("limit_price") is None:
+                entries.append(record)
+            else:
+                rolls.append(record)
+        return entries, rolls
+
+    # -- T-3 ------------------------------------------------------------- #
+    def test_the_roller_reaches_past_8_dte_and_only_the_roller_does(
+            self, tmp_path):
+        """T-3. The ladder is not merely materialised — it is USED.
+
+        At reach 7 the chain is cut off at `max_dte + 1` = 8 calendar days, so
+        every replacement the roller can name expires within 8 days of the
+        decision. At 21 it can extend to `old_expiry + max_extension_days`
+        exactly as the live roller does. Asserting the STORED replacement's own
+        expiry (off its OCC symbol) rather than the reach variable is what
+        catches the failure the plan names: a reach materialised at 21 and then
+        masked back to 7 inside `_replay_one` would report 21 and roll at 8.
+        """
+        narrow_seen, wide_seen = [], []
+        narrow = self._sweep(tmp_path, "t3_narrow", reach=7,
+                             sink=narrow_seen.append)
+        wide = self._sweep(tmp_path, "t3_wide", reach=21, sink=wide_seen.append)
+
+        assert narrow.effective_max_dte == 7 and wide.effective_max_dte == 21
+        _, narrow_rolls = self._legs(narrow_seen[0])
+        wide_entries, wide_rolls = self._legs(wide_seen[0])
+        assert narrow_rolls and wide_rolls, "the window executed no roll"
+
+        assert max(leg[-1] for leg in narrow_rolls) <= 8, (
+            "a 7-reach wheel replay cannot name a replacement past the 8-day "
+            "chain cutoff — if it did, this fixture is not measuring the reach")
+        assert max(leg[-1] for leg in wide_rolls) > 8, (
+            "the widened ladder was materialised and then not used: every "
+            "replacement still expires inside the old 8-day cutoff, which is "
+            "the mask-back-to-7 regression in `_replay_one`")
+        # ...and the widening is the ROLLER's alone.
+        assert max(leg[-1] for leg in wide_entries) <= 8
+
+    def test_the_roll_counts_move_in_the_direction_the_plan_predicts(
+            self, tmp_path):
+        """T-3's second half, and the reason the study needed PR-1.
+
+        At 0.98 the roll the trigger uniquely authorises is an OTM roll-OUT,
+        which has to sell tenor it does not have on a 7-DTE ladder. So the
+        widened reach must convert roll-outs the narrow replay could not price
+        into executed ones — measured here, not assumed.
+        """
+        narrow = self._sweep(tmp_path, "t3b_narrow", reach=7).rows[0]
+        wide = self._sweep(tmp_path, "t3b_wide", reach=21).rows[0]
+
+        assert narrow.rolls_executed and wide.rolls_executed
+        assert wide.otm_roll_outs > narrow.otm_roll_outs, (
+            f"OTM roll-outs did not rise on the wider ladder "
+            f"({narrow.otm_roll_outs} -> {wide.otm_roll_outs}); the truncation "
+            f"that suppressed the behaviour FC-112 measures is still in place")
+        assert wide.roll_net_credit > narrow.roll_net_credit
+        assert (wide.rolls_executed
+                == wide.itm_rolls + wide.otm_roll_outs), "the split must partition"
+
+    # -- T-2 ------------------------------------------------------------- #
+    def test_entries_are_capped_by_the_scanner_not_by_the_reach(self, tmp_path):
+        """T-2, the direct form. Every ENTRY leg respects its own DTE target.
+
+        The bound is `target + 1` CALENDAR days, not `target`: the scanner's
+        own `dte` is `(expiry - now).days` on a `now` that carries a time of
+        day, so an 8-calendar-day contract scores 7 and is legitimately sold.
+        Pinning `<= target` would fail on correct code; pinning `<= reach`
+        would pass on the broken code this exists to catch.
+        """
+        seen = []
+        result = self._sweep(tmp_path, "t2a", reach=21, sink=seen.append)
+        assert result.effective_max_dte == 21
+        entries, rolls = self._legs(seen[0])
+        assert entries and rolls, "nothing to invariance-check"
+
+        config = Config()
+        caps = {"sell_put_open": config.put_target_dte + 1,
+                "sell_call_open": config.call_target_dte + 1}
+        checked = 0
+        for day, kind, symbol, dte in entries:
+            cap = caps.get(kind)
+            if cap is None:            # assignments, expiries — not entries
+                continue
+            checked += 1
+            assert dte <= cap, (
+                f"{kind} {symbol} on {day} is {dte} calendar days out, past "
+                f"the scanner's {cap}-day cap — the reach leaked into entry "
+                f"selection, which would re-baseline far more than the roller")
+        assert checked >= 2, "no entry legs were actually checked"
+
+    def test_a_window_with_no_executed_roll_is_byte_identical_at_both_reaches(
+            self, tmp_path):
+        """T-2, the paired form — the strongest statement PR-1 can make.
+
+        Same price path, same live roller, `itm_trigger_ratio` raised to 1.20
+        so it evaluates every day and fires on none. If the reach touched
+        anything but the roller's candidate set, these two rows would differ.
+
+        The roller must still be LIVE and EVALUATING, or this is a comparison
+        of two runs with no roller in them and it would pass against any reach
+        whatsoever — so `rolls_evaluated` is asserted non-zero and
+        `rolls_executed` zero, on both.
+        """
+        def row(name, reach):
+            result = self._sweep(tmp_path, name, reach=reach, trigger=1.20)
+            payload = result.rows[0].as_dict()
+            payload.pop("replay_seconds", None)     # wall-clock noise
+            return result.rows[0], payload
+
+        narrow_row, narrow = row("t2b_narrow", 7)
+        wide_row, wide = row("t2b_wide", 21)
+
+        for tag, r in (("narrow", narrow_row), ("wide", wide_row)):
+            assert r.rolls_evaluated, f"{tag}: the roller never looked"
+            assert r.rolls_executed == 0, f"{tag}: the roller fired"
+            assert r.puts_sold and r.calls_sold, f"{tag}: nothing was sold"
+
+        assert wide == narrow, {
+            k: (narrow[k], wide[k]) for k in narrow if narrow[k] != wide[k]}

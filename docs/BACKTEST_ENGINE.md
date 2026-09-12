@@ -183,6 +183,26 @@ failure mode: it cannot flatter a symbol into looking tradeable.
      a `scenario_runs` row means "written before this boundary", i.e. the haircut model.
      Query `engine_version` or `roll_fill_mode`, not the date.
 
+   - `engine_version = 'fc-112-wheel-roll-reach'` (FC-112 PR-1, **2026-09-12**) widens
+     the WHEEL replay's materialisation from 7 DTE to its roll horizon —
+     `call_target_dte` 7 + `rolling.max_extension_days` 14 = 21, which is
+     `MAX_SWEEPABLE_DTE` exactly, so the wheel has **no residual reach truncation**
+     after it (unlike the covered-call profile's 28-wanted-vs-21-available). Before it,
+     the wheel's daily credit-only roller chose replacements from a ladder cut off at
+     8 calendar days while its live twin searched to `old_expiry + 14`; the replay
+     therefore suppressed OTM roll-OUTS specifically — the roll that
+     `rolling.itm_trigger_ratio: 0.98` uniquely authorises and that needs tenor to sell
+     into — and `no_credit_candidate` dominated the wheel's `roll_skips`. **Wheel rows
+     before and after are non-comparable on every roll-bearing row**, and the knock-on
+     is wider than FC-116's: a roll that executes changes the position, so `puts_sold`,
+     `calls_sold`, `cycles_completed`, `option_pnl` and the returns move too on any
+     window that rolls. Covered-call rows are byte-unchanged (that profile already
+     reached 21). Entries did not move on either profile — the scanner caps them at
+     `*_target_dte` independently of the reach, pinned by
+     `TestTheWheelsRollReachIsTheRollHorizon` in `tests/test_scenarios.py`. One
+     consequence for readers: every wheel run now carries the `DTE_REACH_BIAS` footer,
+     which applies to its **roll candidates only**.
+
    Do not compare across any of these boundaries. Old rows are never mutated —
    provenance is `engine_version` + `timestamp` + `config_hash`.
 6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2
