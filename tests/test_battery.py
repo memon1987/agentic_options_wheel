@@ -216,6 +216,30 @@ def wired(monkeypatch):
     return writer
 
 
+# The wheel standing set, frozen. Captured with
+# `json.dumps(battery_standing_specs(_config(), today=date(2026, 9, 5)),
+# sort_keys=True)` on `main` at 1745f00 — BEFORE any FC-117 source change —
+# and pasted verbatim. FC-117 composes a second standing set out of the same
+# builder; DD-5 makes the wheel half a BYTE contract, because a moved field,
+# a reordered symbol or a changed window would re-key every wheel row and put
+# a step in the project's baseline trend series that no market move explains.
+_FROZEN_WHEEL_STANDING_SET_2026_09_05 = (
+    '[{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AAPL"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["MSFT"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["GOOGL"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AMZN"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["NVDA"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AMD"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["QQQ"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["SPY"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["IWM"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["UNH"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["F"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["PFE"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["KMI"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["VZ"]}]'
+)
+
 # ==========================================================================
 # The standing set
 # ==========================================================================
@@ -282,6 +306,25 @@ class TestTheStandingSet:
             "weekly point a comparison against something else"
         )
         assert spec["run_sensitivity"] is False
+
+    def test_the_wheel_half_is_byte_identical_to_the_pre_fc_117_set(self):
+        """DD-5 (FC-117): the wheel standing set is a BYTE contract.
+
+        FC-117 composes a covered-call standing set out of the same builder.
+        The refactor that makes that possible must not move a single byte of
+        the wheel half: the wheel series is this project's baseline, and a
+        changed field, a reordered symbol or a changed window would re-key
+        every wheel row and step the series for a reason no market move
+        explains.
+
+        If the wheel's universe or window shape ever changes on purpose, this
+        literal is REGENERATED from the new code and the change is argued in
+        the PR — it is never edited field by field to make a red test green.
+        """
+        assert json.dumps(
+            cli.battery_standing_specs(_config(), today=date(2026, 9, 5)),
+            sort_keys=True,
+        ) == _FROZEN_WHEEL_STANDING_SET_2026_09_05
 
 
 # ==========================================================================
