@@ -320,8 +320,9 @@ class TestTheRollHorizonReach:
         deleted rather than kept beside the new one: two tests claiming
         opposite reaches is how a revert goes unnoticed.
 
-        7 + 14 = 21 = `MAX_SWEEPABLE_DTE`, so the wheel has no residual
-        truncation — the covered-call profile's 28-vs-21 gap has no wheel twin.
+        7 + 14 = 21 = `MAX_SWEEPABLE_DTE`, so the wheel's FIRST roll is fully
+        materialised; chained rolls (horizon old_expiry + 14 = 29–36 d) are still
+        truncated at the lake's 22 — see WHEEL_ROLL_REACH_NOTE.
         """
         from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
 
