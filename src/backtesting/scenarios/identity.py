@@ -266,6 +266,20 @@ DEFAULT_STARTING_CASH = 100_000.0
 # the runner substitutes this exact value for ``None``.
 DEFAULT_FILL_HAIRCUT = 0.25
 
+# FC-116 D2 — how ROLL legs fill. ``"limit"`` (the default) fills each leg at
+# the placed limit capped by the day's modeled book, which is what the live
+# `CallRoller`'s credit invariant is computed on; ``"haircut"`` is the
+# pre-FC-116 regression arm. Duplicated in `engine.broker` and `evaluate` for
+# the same reason `DEFAULT_FILL_HAIRCUT` is — this module is stdlib-only and
+# flat-copied into the dashboard image, which ships no engine — and pinned
+# equal by a test.
+#
+# The DEFAULT is the honest mode on purpose: every existing spec, standing pin
+# and battery arm gets it with no edit, and the dishonest mode is the one you
+# must ask for. See `scenario_arm_hash` for why that costs no stored key.
+DEFAULT_ROLL_FILL_MODE = "limit"
+ROLL_FILL_MODES = (DEFAULT_ROLL_FILL_MODE, "haircut")
+
 # Spec fields that describe HOW to run rather than WHAT to measure, and are
 # therefore excluded from the identity. ``force`` is an operator's instruction to
 # skip the dedup lookup; including it in the key would make a forced re-run
@@ -311,9 +325,11 @@ def _canonical_number(value: Any) -> Any:
 
 
 def scenario_arm_hash(
-    overrides: Optional[Mapping[str, Any]], fill_haircut: Optional[float]
+    overrides: Optional[Mapping[str, Any]],
+    fill_haircut: Optional[float],
+    roll_fill_mode: Optional[str] = None,
 ) -> str:
-    """Identity of one arm: its effective overrides plus its fill haircut.
+    """Identity of one arm: its overrides, its fill haircut, its roll fill mode.
 
     Two normalisations, both because the same arm can be *spelled* two ways:
 
@@ -327,20 +343,35 @@ def scenario_arm_hash(
     ``default=str`` is load-bearing rather than defensive: an override value may
     be any YAML/JSON scalar or list, and a date arriving from a hand-written spec
     must hash rather than raise.
+
+    **FC-116 E1 — `roll_fill_mode` is added CONDITIONALLY, never as a `null`.**
+    The two keys above are a FIXED dict that always writes
+    ``"fill_haircut": null`` for the default. Copying that shape for the new
+    key would change the payload bytes of EVERY arm ever hashed, and with them
+    every ``scenario_hash``, ``sweep_key`` and standing pin in the store — a
+    silent, total dedup miss. So the default (`"limit"`, and `None` meaning
+    "unspecified") is spelled by ABSENCE, exactly as a `"wheel"` strategy is in
+    ``canonical_spec``; only an explicit `"haircut"` appears. A literal legacy
+    arm hash is pinned in ``tests/test_cc_spec_and_stamps.py`` so this cannot
+    regress unnoticed.
+
+    This costs nothing in stored keys even though the engine changed:
+    ``sweep_key`` mixes in ``engine_identity`` (the content hash of ``src/**``),
+    which FC-116 moves anyway. Old rows stay readable and are told apart by the
+    bumped ``engine_version``, not by the key.
     """
     if fill_haircut is not None and float(fill_haircut) == DEFAULT_FILL_HAIRCUT:
         fill_haircut = None
-    payload = json.dumps(
-        {
-            "overrides": {
-                k: _canonical_number(overrides[k]) for k in sorted(overrides or {})
-            },
-            "fill_haircut": (None if fill_haircut is None
-                             else _canonical_number(fill_haircut)),
+    body: Dict[str, Any] = {
+        "overrides": {
+            k: _canonical_number(overrides[k]) for k in sorted(overrides or {})
         },
-        sort_keys=True,
-        default=str,
-    )
+        "fill_haircut": (None if fill_haircut is None
+                         else _canonical_number(fill_haircut)),
+    }
+    if roll_fill_mode is not None and str(roll_fill_mode) != DEFAULT_ROLL_FILL_MODE:
+        body["roll_fill_mode"] = str(roll_fill_mode)
+    payload = json.dumps(body, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -350,6 +381,10 @@ def _is_implicit_base(entry: Mapping[str, Any]) -> bool:
         str(entry.get("name")) == BASE_SCENARIO_NAME
         and not (entry.get("overrides") or {})
         and entry.get("fill_haircut") is None
+        # FC-116 — a `base` that names a roll fill mode is NOT the implicit
+        # base; folding it away would silently drop the mode. (The runner and
+        # both validators refuse such a base outright, same as a haircut.)
+        and entry.get("roll_fill_mode") in (None, DEFAULT_ROLL_FILL_MODE)
     )
 
 
@@ -370,7 +405,8 @@ def canonical_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
         {
             "name": str(entry.get("name")),
             "hash": scenario_arm_hash(
-                entry.get("overrides") or {}, entry.get("fill_haircut")
+                entry.get("overrides") or {}, entry.get("fill_haircut"),
+                entry.get("roll_fill_mode"),
             ),
         }
         for entry in (spec.get("scenarios") or [])

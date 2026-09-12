@@ -24,13 +24,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 
 logger = structlog.get_logger(__name__)
 
 ITM_THRESHOLD = 0.01  # OCC auto-exercise: in the money by >= 1 cent
+
+# FC-116 D1c — how a fill was priced, stamped on EVERY `buy_to_close` and
+# `sell_call_open` ledger event so a stored artifact answers "what did this leg
+# pay, versus the limit it was placed at?" without re-running the replay.
+#
+#   haircut          mid -/+ fill_haircut * half-spread (the pre-FC-116 model;
+#                    still every entry leg, the CC monitor leg, and every roll
+#                    leg under `roll_fill_mode: haircut`)
+#   limit_marketable the placed limit was at or through the far quote, so the
+#                    leg filled AT THE BOOK (ask on a buy, bid on a sell)
+#   limit_resting    the placed limit rested inside the modeled spread and is
+#                    assumed touched within the leg's window — this tag is the
+#                    measurable form of the model's ONE residual (`hs - 0.05`
+#                    per share on an imminence-mode leg), so a row whose roll
+#                    credit is mostly resting legs is the row to distrust first
+FILL_RULE_HAIRCUT = "haircut"
+FILL_RULE_LIMIT_MARKETABLE = "limit_marketable"
+FILL_RULE_LIMIT_RESTING = "limit_resting"
+
+# FC-116 D2 — the engine-side spelling of the arm field's two values, and its
+# DEFAULT. `identity.DEFAULT_ROLL_FILL_MODE` and
+# `evaluate.DEFAULT_ROLL_FILL_MODE` are the other two copies (the former is
+# stdlib-only and flat-copied into the dashboard image, which imports no
+# engine; the latter is the screen path's). Duplicated for exactly the reason
+# `WHEEL_STRATEGY` is, and pinned equal by a test — the adapter cannot import
+# `scenarios.identity` without a circular import through
+# `scenarios/__init__` -> runner -> simulator -> adapter.
+ROLL_FILL_MODE_LIMIT = "limit"
+ROLL_FILL_MODE_HAIRCUT = "haircut"
+ROLL_FILL_MODES = (ROLL_FILL_MODE_LIMIT, ROLL_FILL_MODE_HAIRCUT)
+
+
+def _fill_detail(
+    fill_detail: Optional[Dict[str, Any]], **base: Any
+) -> Dict[str, Any]:
+    """Ledger `detail` for a priced leg: the caller's keys plus the fill rule.
+
+    `fill_rule` is on EVERY such event, defaulting to `haircut`, so a reader
+    never has to infer the pricing model from the absence of a key.
+    """
+    detail: Dict[str, Any] = {"fill_rule": FILL_RULE_HAIRCUT}
+    detail.update(base)
+    if fill_detail:
+        detail.update(fill_detail)
+    return detail
 
 
 @dataclass
@@ -186,6 +231,8 @@ class BacktestBroker:
         mark: float,
         bid: float,
         opened: date,
+        fill: Optional[float] = None,
+        fill_detail: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         """Sell-to-open a covered call. Returns fill/share, or None if there are
         not enough UNPLEDGED shares to cover it.
@@ -194,10 +241,19 @@ class BacktestBroker:
         short call are spoken for. Ignoring that let the wheel write a second
         call against the same 100 shares — a naked call in a cash account, which
         the live broker rejects outright.
+
+        FC-116 D1c — ``fill``/``fill_detail`` are the explicit-fill entry point.
+        ``fill=None`` (every pre-FC-116 caller) keeps the haircut price, so this
+        method is byte-identical for them. A float is used AS the fill and
+        nothing else changes: fees, the cover check, ``_add_option`` and
+        ``_record`` are untouched. The broker deliberately stays a pure ledger —
+        it does not know what an order INTENT is; the adapter, which is the only
+        party holding the placed limit and the intent, computes the price and
+        the ``fill_rule`` tag and hands both down.
         """
         if self.uncovered_shares(underlying) < 100 * contracts:
             return None
-        fill = self.sell_fill(mark, bid)
+        fill = self.sell_fill(mark, bid) if fill is None else float(fill)
         premium = fill * 100 * contracts
         fees = self.fees_per_contract * contracts
         self.cash += premium - fees
@@ -207,6 +263,7 @@ class BacktestBroker:
         self._record(
             "sell_call_open", underlying, symbol, contracts=contracts, price=fill,
             cash_delta=premium - fees, fees=fees, event_date=opened,
+            detail=_fill_detail(fill_detail),
         )
         return fill
 
@@ -220,6 +277,8 @@ class BacktestBroker:
         mark: float,
         ask: float,
         close_date: date,
+        fill: Optional[float] = None,
+        fill_detail: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         """Buy-to-close ``contracts`` of a short option.
 
@@ -235,11 +294,18 @@ class BacktestBroker:
 
         Collateral released by this close is counted as available, since the two
         settle together; only a genuine shortfall rejects.
+
+        FC-116 D1c — ``fill``/``fill_detail`` as on ``sell_call_to_open``:
+        ``None`` keeps the haircut price (byte-identical for every pre-FC-116
+        caller); a float IS the fill. The cash check below runs against the
+        supplied price, which is the point — a roll's BTC at the ask costs more
+        than the same leg at mid + 0.25·half-spread, and the sim must reject it
+        for the same reason the live cash account would.
         """
         pos = self.options.get(symbol)
         if pos is None or contracts > pos.contracts:
             return None
-        fill = self.buy_fill(mark, ask)
+        fill = self.buy_fill(mark, ask) if fill is None else float(fill)
         cost = fill * 100 * contracts
         fees = self.fees_per_contract * contracts
 
@@ -263,7 +329,7 @@ class BacktestBroker:
         self._record(
             "buy_to_close", pos.underlying, symbol, contracts=contracts, price=fill,
             cash_delta=-(cost + fees), fees=fees, event_date=close_date,
-            detail={"collateral_released": released},
+            detail=_fill_detail(fill_detail, collateral_released=released),
         )
         return fill
 

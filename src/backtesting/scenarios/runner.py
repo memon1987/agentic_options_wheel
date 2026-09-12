@@ -165,11 +165,18 @@ class Scenario:
     the headline value lives on ``evaluate.DEFAULT_FILL_HAIRCUT`` and
     ``config_hash`` hashes the *module* value, so two scenarios differing only in
     haircut would carry the same hash and be indistinguishable in any record.
+
+    ``roll_fill_mode`` (FC-116) is arm-level for the same reason and for one
+    more: a haircut-vs-limit before/after is then ONE submission, not two
+    sweeps whose only difference is invisible in the identity. ``None`` and
+    ``"limit"`` are the same arm — the honest mode is the default, so every
+    existing spec, pin and battery arm gets it with no edit.
     """
 
     name: str
     overrides: Dict[str, Any] = field(default_factory=dict)
     fill_haircut: Optional[float] = None
+    roll_fill_mode: Optional[str] = None
 
     def scenario_hash(self) -> str:
         """Identity of this ARM: its effective overrides plus its fill haircut.
@@ -192,7 +199,9 @@ class Scenario:
         anything, and a second implementation would be a second definition of
         "the same arm".
         """
-        return scenario_arm_hash(self.overrides, self.fill_haircut)
+        return scenario_arm_hash(
+            self.overrides, self.fill_haircut, self.roll_fill_mode,
+        )
 
 
 @dataclass
@@ -1018,13 +1027,15 @@ def _with_base_first(scenarios: Sequence[Scenario]) -> List[Scenario]:
     existing = next((s for s in ordered if s.name == BASE_SCENARIO_NAME), None)
     if existing is None:
         return [Scenario(BASE_SCENARIO_NAME, {})] + ordered
-    if existing.overrides or existing.fill_haircut is not None:
+    if (existing.overrides or existing.fill_haircut is not None
+            or existing.roll_fill_mode is not None):
         raise ValueError(
-            f"the scenario named {BASE_SCENARIO_NAME!r} must carry no overrides "
-            f"and no fill_haircut — it is the comparator every other row is read "
-            f"against. Got overrides={existing.overrides!r}, "
-            f"fill_haircut={existing.fill_haircut!r}. Rename it, and the implicit "
-            f"{BASE_SCENARIO_NAME!r} arm will be added back."
+            f"the scenario named {BASE_SCENARIO_NAME!r} must carry no overrides, "
+            f"no fill_haircut and no roll_fill_mode — it is the comparator every "
+            f"other row is read against. Got overrides={existing.overrides!r}, "
+            f"fill_haircut={existing.fill_haircut!r}, "
+            f"roll_fill_mode={existing.roll_fill_mode!r}. Rename it, and the "
+            f"implicit {BASE_SCENARIO_NAME!r} arm will be added back."
         )
     ordered.remove(existing)
     return [existing] + ordered
@@ -1045,13 +1056,13 @@ def _check_unique_names(scenarios: Sequence[Scenario]) -> None:
 def _simulator(
     config, provider, builder, symbol: str, start: date, end: date,
     *, starting_cash: float, max_dte: int, fill_haircut: float, dividends,
-    synthetic_lots=None,
+    synthetic_lots=None, roll_fill_mode: str = DEFAULT_ROLL_FILL_MODE,
 ) -> Simulator:
     return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte,
         fill_haircut=fill_haircut, dividend_schedule=dividends,
-        synthetic_lots=synthetic_lots,
+        synthetic_lots=synthetic_lots, roll_fill_mode=roll_fill_mode,
     )
 
 
@@ -1167,6 +1178,14 @@ def _replay_one(
         DEFAULT_FILL_HAIRCUT if scenario.fill_haircut is None
         else scenario.fill_haircut
     )
+    # FC-116 — `None` resolves to the honest mode. The RESOLVED value is what
+    # gets stored on the row, deliberately unlike `fill_haircut` (stored
+    # verbatim, which forced the dashboard to grow `_resolved_haircut` to
+    # disambiguate a NULL).
+    roll_fill_mode = (
+        DEFAULT_ROLL_FILL_MODE if scenario.roll_fill_mode is None
+        else str(scenario.roll_fill_mode)
+    )
     t0 = time.perf_counter()
     try:
         bars = materialised.stock_bars.get(symbol, [])
@@ -1180,7 +1199,7 @@ def _replay_one(
             config, provider, builder, symbol, w_start, w_end,
             starting_cash=starting_cash, max_dte=max_dte,
             fill_haircut=haircut, dividends=dividends,
-            synthetic_lots=synthetic_lots,
+            synthetic_lots=synthetic_lots, roll_fill_mode=roll_fill_mode,
         ).replay(view)
         # FC-096 A4. The single-symbol report surfaces this; a sweep did not, so
         # a candidate sweep said nothing at all about a symbol its earnings gate
@@ -1201,6 +1220,10 @@ def _replay_one(
                 # programme against a flat account and report the whole
                 # difference as fill sensitivity.
                 synthetic_lots=synthetic_lots,
+                # ...and the SAME roll fill rule: the bid pass measures ENTRY
+                # fill sensitivity, and swapping the roll rule underneath it
+                # would fold a second change into that one number.
+                roll_fill_mode=roll_fill_mode,
             ).replay(view)
             bid_report = _score(symbol, bid_result, bars, starting_cash, dividends)
             sensitivity = {
