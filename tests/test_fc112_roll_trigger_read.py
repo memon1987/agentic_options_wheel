@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shutil
 import contextlib
 import dataclasses
 import math
@@ -762,6 +763,9 @@ class TestT14VerdictBlockProvenance:
         assert "c" * 40 in block
         assert "tool blob" in block
 
+    @pytest.mark.skipif(shutil.which("git") is None,
+                        reason="needs the git binary (the CI image has none; the "
+                               "no-git refusal is pinned by the patched-raise test)")
     def test_the_real_commit_sha_and_blob_reach_the_block(self):
         try:
             provenance = READ.tool_provenance()
@@ -778,6 +782,9 @@ class TestT14VerdictBlockProvenance:
         block = "\n".join(READ.render_provenance())
         assert provenance.head in block and provenance.blob in block
 
+    @pytest.mark.skipif(shutil.which("git") is None,
+                        reason="needs the git binary (the CI image has none; the "
+                               "no-git refusal is pinned by the patched-raise test)")
     def test_a_dirty_tool_file_refuses_to_produce_a_verdict(self, tmp_path):
         """Q-4 / D-3. A verdict whose SHA names bytes that are not the ones
         that ran is not pre-registered — it is a number with a citation to
