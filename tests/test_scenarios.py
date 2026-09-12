@@ -1050,10 +1050,12 @@ class TestKeysTheReplayCannotReach:
     """Q1. `rolling.fallback_strike_attempts` joins the refused list.
 
     It was the one allowlisted key the build could not demonstrate moved a
-    replay, and it was kept on the reading that "unproven is not dead". A
-    reviewer settled it by instrumenting the roller: the knob governs the THIRD
-    and later strike rungs, and rung >= 3 was reached 0 times over 37 rolls x 7
-    arms. Live in production, where a real limit can miss; inert in a replay.
+    replay, and it was kept on the reading that "unproven is not dead". The
+    knob governs the THIRD and later strike rungs, which a replay does not
+    reach — for the STRUCTURAL reason the assertions below pin, not for a rung
+    count (the pre-FC-116 count that once stood here measured the mechanism
+    FC-116 replaced, so it is gone rather than re-labelled). Live in
+    production, where a real limit can miss; inert in a replay.
     """
 
     def test_fallback_strike_attempts_is_refused(self, sweep_config):

@@ -256,6 +256,37 @@ const hashMap = (raw: unknown): Record<string, string> => {
   return out;
 };
 
+/** The two roll fill modes the engine will ever persist (FC-116 D2). */
+const ROLL_FILL_MODES = ['limit', 'haircut'];
+
+/**
+ * The RESOLVED roll fill mode per arm as SERVED by `shape_results`, or null.
+ *
+ * FC-116 confirmation: the spec-derived map below cannot tell "declared limit"
+ * from "ran before the field existed" — both read as an absent
+ * `roll_fill_mode`, and the spec-derived fallback resolves both to `limit`.
+ * The backend CAN tell them apart, because it reads the resolved column off
+ * the stored cells and maps a legacy NULL to `haircut`, so its map wins
+ * whenever it is there and well formed.
+ *
+ * Rejected WHOLE rather than per-entry when any value is not one of the two
+ * modes: a served map the SPA does not recognise means the two sides disagree
+ * about the field, and half-trusting it would print a mode nothing ran under.
+ * A missing ARM is different — the served map is filled from the same spec on
+ * the backend, so a gap is topped up rather than treated as corruption.
+ */
+const servedRollFillModes = (raw: unknown): Record<string, string> | null => {
+  if (!isRecord(raw)) return null;
+  const entries = Object.entries(raw);
+  if (entries.length === 0) return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of entries) {
+    if (typeof v !== 'string' || !ROLL_FILL_MODES.includes(v)) return null;
+    out[k] = v;
+  }
+  return out;
+};
+
 /**
  * Reshape a `shape_results` payload.
  *
@@ -308,6 +339,13 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
   // that DID declare `haircut`, and left `compareAlignment`'s last fallback
   // permanently on `limit` — three readers all quietly saying "limit" about a
   // haircut arm.
+  //
+  // The spec-derived map below is the FALLBACK, not the answer: a PRE-FC-116
+  // run declares nothing on any arm, so resolving off the spec alone calls
+  // every legacy arm `limit` while the footer's own provenance line says
+  // ROLL_FILL_LEGACY. `shape_results` reads the resolved column off the stored
+  // cells and maps a legacy NULL to `haircut`, so its map is preferred
+  // wherever it is present and well formed.
   const specScenarios = Array.isArray(spec.scenarios) ? spec.scenarios : [];
   const overrides: Record<string, Record<string, unknown>> = {};
   const haircuts: Record<string, number | null> = {};
@@ -320,6 +358,12 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
     haircuts[name] = num(arm.fill_haircut);
     rollFillModes[name] = str(arm.roll_fill_mode) || 'limit';
   }
+  // The served map wins where it exists (see `servedRollFillModes`); the
+  // spec-derived values above only fill arms it does not mention.
+  const served = servedRollFillModes(payload.scenario_roll_fill_modes);
+  const resolvedRollFillModes = served
+    ? { ...rollFillModes, ...served }
+    : rollFillModes;
 
   return {
     scenarios,
@@ -332,7 +376,7 @@ export function normaliseReport(payload: unknown, sweep: SweepRow | null): Sweep
     scenario_config_hashes: hashMap(payload.scenario_config_hashes),
     scenario_overrides: overrides,
     scenario_fill_haircuts: haircuts,
-    scenario_roll_fill_modes: rollFillModes,
+    scenario_roll_fill_modes: resolvedRollFillModes,
     in_sample_only: payload.in_sample_only === true,
     min_days_in_position: num(payload.min_days_in_position) ?? 0.25,
     timing: {

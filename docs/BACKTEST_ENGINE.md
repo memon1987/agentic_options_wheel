@@ -851,9 +851,8 @@ of magnitude inside it.
 move at least one row at an extreme value over AAPL+NVDA × one year.
 
 `rolling.fallback_strike_attempts` was the twentieth, was carried as *unproven* on the
-reading that "did not bind" is not "cannot bind", and is **refused**. A reviewer settled
-it by instrumenting the roller: the knob governs the third and later strike rungs, and
-rung ≥ 3 was reached **0 times** over 37 rolls × 7 arms.
+reading that "did not bind" is not "cannot bind", and is **refused**: the knob governs the
+third and later strike rungs, which a replay does not reach.
 
 **FC-116 changed the mechanism but not the answer, and the wording had to move with it.**
 The old reason was "rung 1 always fills in a replay, because the adapter fills immediately
@@ -868,9 +867,9 @@ it lies strictly inside `[bid_c, ask_c]`. Every rung-1 leg therefore fills, no l
 expires, and the ladder is never advanced — rung ≥ 2 is reachable only through an
 *inverted* quote (`bid > ask`), which the lake cannot produce and the chain model does not
 generate. That argument holds for every chain of that shape, which is stronger than any
-count over one window would be, and **no post-FC-116 rung instrumentation was run**: the
-37 × 7 figure above belongs to the pre-FC-116 mechanism and is not restated as evidence
-for this one. It is live in production, where the book moves between the quote and the
+count over one window would be, and **no rung instrumentation backs the current refusal**:
+the count that once stood above was taken against the mechanism FC-116 replaced, so it is
+not restated as evidence for this one and has been removed rather than re-labelled. It is live in production, where the book moves between the quote and the
 fill; it is inert here. The general lesson is in the allowlist's own docstring: *unproven*
 is a reason to go and measure, not a reason to ship the key — and a refusal's REASON has
 to be re-derived when the mechanism under it moves, or the key stays refused for something

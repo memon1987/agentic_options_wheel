@@ -72,8 +72,9 @@ from services.sweep_report_text import (
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
         DEFAULT_FILL_HAIRCUT, DEFAULT_ROLL_FILL_MODE, DEFAULT_STARTING_CASH,
-        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODES, SCENARIO_NAME_RE, STRATEGIES,
-        WHEEL_STRATEGY, canonical_spec, sweep_key, validate_scenario_name,
+        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODE_HAIRCUT, ROLL_FILL_MODES,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from src.backtesting.scenarios.overrides import (
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -82,8 +83,9 @@ try:  # repo / test environment
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
         DEFAULT_FILL_HAIRCUT, DEFAULT_ROLL_FILL_MODE, DEFAULT_STARTING_CASH,
-        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODES, SCENARIO_NAME_RE, STRATEGIES,
-        WHEEL_STRATEGY, canonical_spec, sweep_key, validate_scenario_name,
+        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODE_HAIRCUT, ROLL_FILL_MODES,
+        SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
+        sweep_key, validate_scenario_name,
     )
     from scenario_overrides import (  # type: ignore
         ALLOWED_OVERRIDES, DTE_OVERRIDE_KEYS, REJECTED_OVERRIDES, OverrideError,
@@ -2084,7 +2086,7 @@ def _resolved_roll_fill_mode(row: Optional[Dict[str, Any]]) -> str:
     legacy row's roll credit was measured against the placed limits.
     """
     raw = (row or {}).get("roll_fill_mode")
-    return str(raw) if raw else "haircut"
+    return str(raw) if raw else ROLL_FILL_MODE_HAIRCUT
 
 
 def _basis_block(fit_per_day: Optional[float],

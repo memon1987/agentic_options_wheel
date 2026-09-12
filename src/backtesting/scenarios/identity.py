@@ -280,6 +280,16 @@ DEFAULT_FILL_HAIRCUT = 0.25
 DEFAULT_ROLL_FILL_MODE = "limit"
 ROLL_FILL_MODES = (DEFAULT_ROLL_FILL_MODE, "haircut")
 
+# The NON-default mode, named because the dashboard has one site that must
+# produce it from nothing: a stored cell with a NULL `roll_fill_mode` is a
+# pre-FC-116 row, and pre-FC-116 is `haircut`. That legacy fallback is the only
+# place in either codebase where the string is CONSTRUCTED rather than read
+# back, so it gets a name rather than a bare literal the module's own fork test
+# would otherwise have to whitelist. `engine.broker` spells it the same way for
+# the same circular-import reason as `ROLL_FILL_MODE_LIMIT`; pinned equal, and
+# pinned as a member of `ROLL_FILL_MODES`, by a test.
+ROLL_FILL_MODE_HAIRCUT = "haircut"
+
 # Spec fields that describe HOW to run rather than WHAT to measure, and are
 # therefore excluded from the identity. ``force`` is an operator's instruction to
 # skip the dedup lookup; including it in the key would make a forced re-run

@@ -295,22 +295,34 @@ class TestTheRollFillModeEnumIsNotAFork:
 
         assert S.ROLL_FILL_MODES is ident.ROLL_FILL_MODES
         assert S.DEFAULT_ROLL_FILL_MODE is ident.DEFAULT_ROLL_FILL_MODE
+        assert S.ROLL_FILL_MODE_HAIRCUT is ident.ROLL_FILL_MODE_HAIRCUT
 
     def test_no_bare_mode_literal_survives_in_the_module(self):
         """The literals at the validator and the footer are gone too — a
         re-introduced `"limit"` string is how the import gets quietly bypassed
-        one call site at a time."""
+        one call site at a time.
+
+        `"haircut"` is scanned for the same reason and was the survivor: the
+        legacy-NULL fallback in `_resolved_roll_fill_mode` CONSTRUCTS the mode
+        rather than reading one back, so it is the one site that can drift
+        away from the enum without any import breaking. It now spells
+        `ROLL_FILL_MODE_HAIRCUT`.
+        """
         source = Path(S.__file__).read_text()
-        # Docstrings and comments legitimately SAY "limit"; code must not.
+        # Docstrings and comments legitimately SAY "limit" / "haircut" (an
+        # ast.Constant for a docstring is the WHOLE string, so it never equals
+        # either mode); code must not.
         tree = ast.parse(source)
         literals = [
             node for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and node.value in ("limit",)
+            if isinstance(node, ast.Constant)
+            and node.value in ("limit", "haircut")
         ]
         assert not literals, (
             "bare roll-fill-mode literals at lines "
             f"{sorted(n.lineno for n in literals)} — use "
-            "DEFAULT_ROLL_FILL_MODE / ROLL_FILL_MODES")
+            "DEFAULT_ROLL_FILL_MODE / ROLL_FILL_MODE_HAIRCUT / "
+            "ROLL_FILL_MODES")
 
 
 class TestTheEngineIdentityIsReadNeverComputed:

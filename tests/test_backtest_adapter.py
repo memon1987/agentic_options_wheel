@@ -711,6 +711,95 @@ class TestRollLegsFillAtTheirLimits:
             f"haircut price: {res['error_message']}")
 
 
+def _rolling_book(*, hs: float, mode: str, side: str, mid: float = 0.80):
+    """A fresh broker + client whose ROLL_CALL book has half-spread `hs`.
+
+    Covered with 100 shares either way; short one call only for a BTC, because
+    a second STO against the same 100 shares would be rejected for cover before
+    the fill rule ever ran.
+    """
+    broker = BacktestBroker(starting_cash=50_000.0)
+    broker.deposit_shares("XYZ", 100, 95.0, D1, premise="test cover")
+    q = _quote(ROLL_CALL, "call", 105.0, as_of=D1,
+               mark=mid, bid=mid - hs, ask=mid + hs, delta=0.20)
+    client = BacktestAlpacaClient(
+        broker, chains={"XYZ": {D1: _snapshot(D1, calls=[q])}},
+        stock_bars={"XYZ": _bars((D1, 100.0))},
+        roll_fill_mode=mode,
+    )
+    if side == "buy":
+        _open_short_call(broker)
+    return broker, client
+
+
+def _roll_leg_event(side: str, hs: float, mode: str, limit: float):
+    """Place one roll leg under `mode` and return the LEDGER event it made."""
+    broker, client = _rolling_book(hs=hs, mode=mode, side=side)
+    with _at(D1), client.order_intent("roll"):
+        res = client.place_option_order(ROLL_CALL, 1, side, limit_price=limit)
+    assert res["status"] == "filled", f"{side} {mode} hs={hs} did not fill"
+    return broker.ledger[-1]
+
+
+class TestTheRestingResidualMatchesItsClosedForm:
+    """The ONE approximation, priced.
+
+    `place_option_order`'s docstring, the `roll_legs_resting` counter and the
+    footer all quote the same number for a resting leg's error versus the
+    haircut model — `0.25 x hs - 0.05` per share on an imminence-mode leg — and
+    NOTHING asserted it. Both golden windows come back with `roll_legs_resting`
+    at 0 (every roll leg on them is base-mode and marketable), so the arithmetic
+    behind the claim was unreachable from any existing test: a sign error, a
+    dropped factor, or a haircut applied to the full spread instead of the half
+    would all have shipped green.
+
+    Two half-spreads, because the residual CHANGES SIGN across them and the
+    direction is the part a reader acts on:
+
+      hs = 0.30 -> +$0.025/share: the limit model is KINDER to the account than
+                   the haircut model. A row whose roll credit is mostly resting
+                   legs on a wide chain is optimistic.
+      hs = 0.10 -> -$0.025/share: on a tight chain it is HARSHER — the 5c
+                   offset is further from mid than a quarter of the half-spread.
+
+    Signed, throughout, as the limit model's benefit TO THE ACCOUNT: a buy pays
+    less, a sell receives more.
+    """
+
+    @pytest.mark.parametrize("hs,residual", [
+        (0.30, +0.025),   # wide chain: 0.25*0.30 - 0.05
+        (0.10, -0.025),   # tight chain: 0.25*0.10 - 0.05
+    ])
+    @pytest.mark.parametrize("side", ["buy", "sell"])
+    def test_an_imminence_leg_resting_five_cents_off_mid(self, side, hs, residual):
+        mid = 0.80
+        # Exactly where `CallRoller` puts an imminence-mode leg: `mid -/+ 0.05`,
+        # cent-rounded. Strictly inside `[bid_c, ask_c]` at both half-spreads,
+        # so it rests rather than crossing.
+        limit = round(mid + 0.05, 2) if side == "buy" else round(mid - 0.05, 2)
+
+        rested = _roll_leg_event(side, hs, "limit", limit)
+        assert rested.detail["fill_rule"] == "limit_resting", (
+            "the closed form is only claimed for a RESTING leg — a marketable "
+            "one fills at the book and has no residual at all")
+        assert rested.price == pytest.approx(limit), (
+            "a resting leg fills at its own limit, not at the book")
+
+        # The comparison arm, from the SAME adapter rather than from arithmetic
+        # restated here: `mid -/+ 0.25 x hs` is what the pre-FC-116 model paid.
+        haircut = _roll_leg_event(side, hs, "haircut", limit)
+        assert haircut.detail["fill_rule"] == "haircut"
+        assert haircut.price == pytest.approx(
+            mid + (0.25 * hs if side == "buy" else -0.25 * hs))
+
+        benefit = (haircut.price - rested.price if side == "buy"
+                   else rested.price - haircut.price)
+        assert benefit == pytest.approx(0.25 * hs - 0.05, abs=0.005), (
+            f"{side} at hs={hs}: residual {benefit:.4f} is not the documented "
+            f"0.25*hs - 0.05 = {0.25 * hs - 0.05:.4f}")
+        assert benefit == pytest.approx(residual, abs=0.005)
+
+
 class TestTheRuleIsScopedToRollIntent:
     """T2. The rule must not leak onto entry legs or the CC monitor leg.
 

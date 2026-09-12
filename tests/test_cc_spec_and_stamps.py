@@ -218,6 +218,15 @@ class TestCanonicalisationByOmission:
                 == bk.ROLL_FILL_MODE_LIMIT
                 == "limit")
         assert ident.ROLL_FILL_MODES == bk.ROLL_FILL_MODES == ("limit", "haircut")
+        # The non-default mode is named in both copies too (the dashboard's
+        # legacy-NULL fallback imports `identity`'s). Pinned as a MEMBER of the
+        # enum as well, because the two are declared independently: a rename of
+        # the tuple's second element that missed this constant would leave the
+        # fallback producing a mode the validator rejects.
+        assert (ident.ROLL_FILL_MODE_HAIRCUT
+                == bk.ROLL_FILL_MODE_HAIRCUT
+                == "haircut")
+        assert ident.ROLL_FILL_MODE_HAIRCUT in ident.ROLL_FILL_MODES
         # The dashboard is NOT a fourth copy — it imports this one. Pinned
         # by identity in `test_dashboard_sweeps.py` (E4), which has the
         # path setup needed to import `services.sweeps`.

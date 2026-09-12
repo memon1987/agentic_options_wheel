@@ -120,6 +120,24 @@ describe('SweepResults — the roll fill mode flag (FC-116 E1)', () => {
     show(reportWithMode('limit'));
     expect(screen.queryAllByText(/rolls: haircut/)).toHaveLength(0);
   });
+
+  it('flags a legacy arm off the SERVED map, which declares nothing', () => {
+    // Confirmation miss: a pre-FC-116 run declares no mode on any arm, so the
+    // spec-derived map called it `limit` and this flag stayed dark — on the
+    // one class of run where it is ALWAYS warranted. `shape_results` resolves
+    // it off the stored cells instead, where a NULL is `haircut`.
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    const report = normaliseReport(
+      {
+        ...shapedHoldout,
+        scenario_roll_fill_modes: { at_the_bid: 'haircut' },
+        spec: { ...spec, scenarios: [{ name: 'at_the_bid', overrides: {} }] },
+      },
+      sweep(),
+    )!;
+    show(report);
+    expect(screen.getAllByText(/rolls: haircut \(pre-FC-116\)/).length).toBeGreaterThan(0);
+  });
 });
 
 describe('SweepResults — the five cell renderings', () => {

@@ -86,6 +86,26 @@ describe('the roll fill mode reaches the footer (FC-116 E1)', () => {
       .parentElement!;
     expect(row.textContent).toContain('limit');
   });
+
+  it('prints the SERVED mode on a legacy run, not the spec-derived `limit`', () => {
+    // The confirmation miss: `shape_results` reads the resolved mode off the
+    // stored cells (a legacy NULL is `haircut`), but `normaliseReport` built
+    // the map off the spec and ignored it — so this row said `limit` on a
+    // pre-FC-116 run whose own provenance line says ROLL_FILL_LEGACY.
+    const report = normaliseSweepDetail({
+      ...shaped13cc,
+      scenario_roll_fill_modes: { legacy: 'haircut' },
+      spec: {
+        ...(shaped13cc as Record<string, unknown>).spec as object,
+        scenarios: [{ name: 'legacy', overrides: {} }],
+      },
+    } as unknown as Parameters<typeof normaliseSweepDetail>[0])!.results!;
+    show({ report, scenario: 'legacy' });
+    const row = within(screen.getByTestId('provenance-footer')).getByText('roll_fill_mode')
+      .parentElement!;
+    expect(row.textContent).toContain('haircut');
+    expect(row.textContent).not.toContain('not declared');
+  });
 });
 
 describe('the run block', () => {
