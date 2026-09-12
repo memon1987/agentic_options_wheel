@@ -405,7 +405,8 @@ class TestTheCoveredCallStandingSet:
             assert "strategy" not in canonical_spec(w)
             assert key(c) != key(w)
 
-    def test_the_backfill_universe_covers_the_covered_call_set(self):
+    def test_the_backfill_universe_covers_the_covered_call_set(
+            self, monkeypatch):
         """DD-4, the structural guard.
 
         The battery rides the backfill's execution precisely so that it
@@ -414,7 +415,14 @@ class TestTheCoveredCallStandingSet:
         row every Saturday until somebody widened the lake by hand. Both lists
         are drawn from the same process config today; this fails the day an
         edit lets them diverge.
+
+        `BACKFILL_SYMBOLS` is cleared because `backfill_symbols` prefers it
+        over the config (`main.py:522`): with that variable set in the shell,
+        this guard would compare the CC set against whatever the operator last
+        exported and pass or fail for a reason that has nothing to do with the
+        repo. The ambient-environment class, again.
         """
+        monkeypatch.delenv('BACKFILL_SYMBOLS', raising=False)
         args = Namespace(symbols=None)
         covered = set(cli.backfill_symbols(args, _config()))
         wanted = {sym for spec in cli.battery_covered_call_specs(_config())
@@ -548,7 +556,7 @@ class TestTheCoveredCallStandingSet:
         assert payload["oversized_labels"] == []
 
     def test_every_cc_row_is_stamped_battery_and_replayed_under_the_profile(
-            self, wired):
+            self, wired, monkeypatch):
         """Through the REAL `run_sweep_cmd`, not the entry point alone.
 
         This drives `resolve_replay_config` -> `Config('config/covered_call.yaml')`
@@ -559,8 +567,22 @@ class TestTheCoveredCallStandingSet:
         be the wheel's.
         """
         from src.utils.config import Config
+        import src.backtesting.scenarios as scenarios_pkg
+
+        replayed = []
+        monkeypatch.setattr(
+            scenarios_pkg, "run_sweep",
+            lambda *a, **k: replayed.append(a[0]) or clean_sweep())
 
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        # The hash below proves the row was STAMPED with the covered-call
+        # profile; this proves the object the replay actually ran on IS that
+        # profile. A build that snapshotted the CC config for the row and then
+        # handed `run_sweep` the wheel's would pass the hash assertion alone.
+        n = len(_config().stock_symbols)
+        assert [c.strategy_id for c in replayed[n:2 * n]] == ['covered_call'] * n
+        assert [c.strategy_id for c in replayed[:n]] == ['wheel'] * n
 
         cc_rows = [r for r in wired.statuses
                    if r["spec_json"]

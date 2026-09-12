@@ -901,12 +901,19 @@ Observability of the split: `battery_started` carries `standing_wheel` /
 `measured_wheel` / `measured_cc` (the un-suffixed fields stay totals). Item
 labels are `standing:<SYMBOL>`, `standing:cc:<SYMBOL>` and `pin:<pin_id>`.
 **`measured_*` count completed SUBMISSIONS, not measured cells** — an item
-whose cells all came back `insufficient` is one measured item, so a CC half
-reporting 14 measured with several symbols `insufficient` is the expected
-shape (F, PFE, KMI and VZ sit below the CC `$0.30` call floor), not a bug; the
-per-cell truth is `r.measured` / `r.verdict` in `scenario_runs`. Never "fix" a
-low measured-cell count by trimming the CC list — the `insufficient` rows ARE
-the measurement.
+whose cells all came back unmeasured is still one measured item, so a CC half
+reporting 14 measured with several symbols unmeasured is the expected shape,
+not a bug; the per-cell truth is `r.measured` / `r.verdict` in `scenario_runs`.
+**The premium-floor names land `low_activity`, not `insufficient`.** F, PFE,
+KMI and VZ cannot find a call at the CC `$0.30` floor, so their coverage falls
+under `MIN_COVERED_FRACTION` (30 % of the days the strategy could have written
+one) — that is a `BLOCK:` reason, hence `verdict = 'unfit'` and
+`low_activity = true` (`fitness.py:613-621`, `runner.py:354-356`). CC
+`insufficient` means something else entirely: no synthetic lot was ever
+seeded, the window is shorter than one call tenor, or every day was a
+stand-down the strategy is supposed to take (`fitness.py:588-606`). Never
+"fix" a low measured-cell count by trimming the CC list — those rows ARE the
+measurement.
 
 **The `data-backfill` Job runs at 2 GiB since FC-117** (`cloudbuild.yaml`). The
 composed execution now does 28 materialisations in one container whose tmpfs

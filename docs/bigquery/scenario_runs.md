@@ -217,13 +217,18 @@ average anything that is not `measured`.
 | state | means | why it must never be rendered as a return |
 |---|---|---|
 | `insufficient` | the window contained no completed cycle | rendering it as 0% makes "nothing happened" look like a measured flat result |
-| `low_activity` | a position was held on under `MIN_DAYS_IN_POSITION` (25%) of decision days | the annualised number rests on capital that mostly sat idle; the fewer days deployed, the more one lucky trade is multiplied by 365/days |
+| `low_activity` | **wheel:** a position was held on under `MIN_DAYS_IN_POSITION` (25%) of decision days. **covered call:** a call was open on under `MIN_COVERED_FRACTION` (30%) of the days the strategy could have written one — the denominator excludes below-basis and earnings-span stand-downs, which are the strategy WORKING | the annualised number rests on capital that mostly sat idle; the fewer days deployed, the more one lucky trade is multiplied by 365/days. On a covered-call row the days-in-position test would be inert (the lot is held on essentially every day), so this is the test that fires instead — and it is the state the names below the `$0.30` call floor land in |
 | `error` | the cell was never measured | not implicitly fine |
 | `measured` | carries a number worth ranking | the only state that belongs in a median |
 
 `insufficient` **wins** over `low_activity` (a window with no cycle also has a
 tiny days-in-position fraction). Without that precedence a cell counts twice and
-the summary row stops adding up.
+the summary row stops adding up. A `low_activity` covered-call cell also carries
+`verdict = 'unfit'`: the coverage shortfall is a `BLOCK:` reason, not an
+`INSUFFICIENT:` one (`fitness.py:614-621`). Do not count the premium-floor
+symbols as `insufficient` — `verdict = 'insufficient'` on a covered-call cell
+means a lot was never seeded, the window was shorter than one call tenor, or
+every day was a stand-down.
 
 ### Schema
 
@@ -706,14 +711,28 @@ ORDER BY submitted_at DESC;
 -- `fc-116-roll-limit-fills` filled ROLL legs at the haircut price and are NOT
 -- comparable on any roll-bearing row. Old and new rows share `scenario_hash`
 -- and `config_hash` by design, so nothing else in this query separates them.
+-- `r.roll_fill_mode` is a POST-FC-116 column: the writer adds it to the live
+-- table on the first `ScenarioRunWriter` construction of an FC-116-or-later
+-- build (`persist.py:636-644`), so until that run this query fails with an
+-- unknown-column error, and every row written before it reads NULL. Drop the
+-- column from the SELECT to query an older table.
+-- FOLLOW THE DEDUP. A `deduplicated` sweep writes NO `scenario_runs` rows of
+-- its own (`main.py:2478-2505`) — it points at the run that already measured
+-- that key. Joining on `run_id` alone would silently drop its point from the
+-- series. It is rare but real: a standing item re-anchors weekly and so
+-- normally replays, but a console covered-call sim submitted Saturday morning
+-- UTC at the default window (cash left at the default, yesterday a trading
+-- day) has the same key and, running first, is what the battery's item dedups
+-- INTO.
 SELECT
   IFNULL(JSON_VALUE(s.spec_json, '$.strategy'), 'wheel') AS strategy,
   r.symbol, s.window_end, r.split, r.measured, r.verdict,
   r.annualized_return, s.engine_identity, s.engine_version, r.roll_fill_mode
 FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` s
 JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r
-  USING (run_id)
-WHERE s.submitted_via = 'battery' AND s.status = 'done'
+  ON r.run_id = COALESCE(s.deduplicated_to, s.run_id)
+WHERE s.submitted_via = 'battery'
+  AND s.status IN ('done', 'deduplicated')
   -- AND r.symbol IN ('GOOGL', 'UNH')   -- the live covered-call BOOK is a
   --                                    -- filter over these rows, not a set
 ORDER BY strategy, s.window_end DESC, r.symbol, r.split;
@@ -803,7 +822,11 @@ Reading the table with covered-call rows in it:
   the same `window_end` across symbols, or a long series read for drift), and
   `annualized_return` on such a row is the lot's **equity** return. The
   covered-call headline, `premium_yield_on_lot`, is **artifact-only** — no
-  column here; promoting it is FC-118.
+  column here; promoting it is FC-118. Ignore `spec_json.starting_cash` on
+  these rows (100000, the default): the replay runs on `CC_CASH_FLOAT` plus the
+  lot and never reads the spec's cash, so it is a **dead identity axis** — it
+  still keys the row, which is why the standing set leaves it at the default,
+  but it describes nothing about the measurement.
 * **Do not compare `annualized_return` across strategies.** A wheel row's ratio
   is over `starting_cash`; a covered-call row's is over the synthetic lot. They
   are different denominators describing different premises, which is why the
@@ -814,5 +837,7 @@ Reading the table with covered-call rows in it:
   if a caller omits `strategy` from the spec. That is the second belt behind
   `sweep_key`.
 * `verdict` on a covered-call row uses the covered-call cutoffs:
-  `insufficient` there means "no lot seeded, or a window shorter than one call
-  tenor", NOT "no cycle closed".
+  `insufficient` there means "no lot seeded, a window shorter than one call
+  tenor, or every day a stand-down", NOT "no cycle closed". A symbol that
+  cannot find a call at the profile's `$0.30` floor is **not** `insufficient` —
+  it is `unfit` with `low_activity = true`, on the coverage test above.
