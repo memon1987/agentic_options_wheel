@@ -234,39 +234,80 @@ MODEL_SPREAD_BIAS = ('The bid/ask spread GATE was suspended for this run, becaus
  'so the day real spreads arrive this fails loudly and the gate is restored '
  'deliberately rather than staying off because nobody remembered it was.')
 
-ROLL_REACH_BIAS = ('Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and '
- 'credits are biased DOWN — and the fill model biases credits UP',
+ROLL_REACH_BIAS = ('Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and credits are '
+ 'biased DOWN',
  "The roller's replacement search is bounded by `old_expiry + "
- 'rolling.max_extension_days` and by nothing else. On this profile that is '
- '14 + 14 = 28 DTE of chain for a full candidate set. The replay '
- 'materialises to 21 DTE — the roll horizon, capped at what the lake stores '
- '(`universe_dte = 22`, FC-096 Phase A) — so the top 7 days of that horizon '
- 'are absent from every roll decision. Concretely: a replacement can be '
- 'extended only to about `21 - k` days past the old expiry, where `k` is the '
- 'days the old call still has to run, so the shortfall is largest exactly '
- "when the roller is most useful — early in a freshly-written call's life, "
- 'which is when an ITM move is most likely to need defending. Direction: '
- 'FEWER candidates, never more. Roll counts and captured credits are FLOORS, '
- 'not estimates. \n'
+ 'rolling.max_extension_days` and by nothing else. On this profile that is 14 + 14 = '
+ '28 DTE of chain for a full candidate set. The replay materialises to 21 DTE — the '
+ 'roll horizon, capped at what the lake stores (`universe_dte = 22`, FC-096 Phase A) — '
+ 'so the top 7 days of that horizon are absent from every roll decision. Concretely: a '
+ 'replacement can be extended only to about `21 - k` days past the old expiry, where '
+ '`k` is the days the old call still has to run, so the shortfall is largest exactly '
+ "when the roller is most useful — early in a freshly-written call's life, which is "
+ 'when an ITM move is most likely to need defending. Direction: FEWER candidates, '
+ 'never more. Roll counts and captured credits are FLOORS, not estimates. \n'
  '\n'
- 'In the OPPOSITE direction, and not netted against it: the live roller '
- "places its buy-to-close at the old contract's ASK and its sell-to-open at "
- "the candidate's BID, while this engine fills every order at its haircut "
- 'price from the mark. A modelled roll therefore captures MORE credit than '
- 'the same roll would live, on both legs. Neither bias is measured, so they '
- 'are both named rather than combined into a single number that would look '
- 'like an estimate. \n'
+ 'The WHEEL carries the same truncation, unmeasured and unfixed here: its horizon is 7 '
+ '+ 14 = 21 against a 7-DTE materialisation. Widening it would move every stored wheel '
+ "number at once, so it is left to FC-112 — which already owns the wheel's "
+ 'roll-trigger study — rather than changed as a side effect of a covered-call '
+ 'release. \n'
  '\n'
- 'The WHEEL carries the same truncation, unmeasured and unfixed here: its '
- 'horizon is 7 + 14 = 21 against a 7-DTE materialisation. Widening it would '
- 'move every stored wheel number at once, so it is left to FC-112 — which '
- "already owns the wheel's roll-trigger study — rather than changed as a "
- 'side effect of a covered-call release. \n'
+ 'Read `roll_skips` beside the roll counts before concluding anything about roller '
+ 'activity: a credit-only roller declining 40 evaluations and a roller that could not '
+ 'price a single one both report the same `rolls_executed`, and only the skip reasons '
+ 'separate them.')
+
+ROLL_FILL_RULE = ("Roll legs fill at the placed limit against the day's modeled book, or not at all",
+ 'The live roller is credit-only AT ITS PLACED LIMITS, so the replay prices roll legs '
+ 'the same way. A buy-to-close whose limit is at or through the ask fills AT THE ASK '
+ '(never at a worse limit); a sell-to-open whose limit is at or through the bid fills '
+ 'at the BID. That is base mode. In imminence mode the roller rests both legs at `mid '
+ '+/- $0.05`, and a limit resting inside the modeled spread is ASSUMED to fill at its '
+ "limit within the leg's 120-second window — the replay has one modeled book per "
+ 'decision day and no intraday tape. A limit outside the book does not fill: the order '
+ "expires and the roller's own ladder and terminal dispositions apply, which "
+ '`roll_skips` now carries. Entry legs and the covered-call monitor leg are NOT priced '
+ 'this way; they still fill at the haircut price (FC-072, FC-086).\n'
  '\n'
- 'Read `roll_skips` beside the roll counts before concluding anything about '
- 'roller activity: a credit-only roller declining 40 evaluations and a '
- 'roller that could not price a single one both report the same '
- '`rolls_executed`, and only the skip reasons separate them.')
+ 'Roll credits therefore now pay the FULL modeled spread on both legs — base-mode '
+ '`credit = (mark_new - mark_old) - (hs_new + hs_old)`, where `hs` is the modeled '
+ 'half-spread (5% of mark, widened OTM and for cheap contracts, floor $0.02). The '
+ 'spread model measures ~2.46x WIDER than the real book, so replayed roll credits AND '
+ 'roll counts (a credit invariant tested on wider spreads fails more often) are biased '
+ 'DOWN versus live.\n'
+ '\n'
+ 'The model has exactly ONE residual, and it is measured rather than estimated: an '
+ 'imminence-mode leg rests `hs - $0.05` per share inside the far quote, which is NOT '
+ 'small on a high-mark chain (an `hs` of $0.40-1.00 rests $0.35-0.95 per share per leg '
+ 'on the assumption). It cuts BOTH ways against the old model: an imminence roll on a '
+ 'chain with `hs > $0.20` carries MORE credit under this rule than the haircut model '
+ 'gave it. `roll_legs_resting` on each row counts how many legs rest on the '
+ 'assumption, and every roll-leg ledger event carries `fill_rule` and `limit_price`, '
+ 'so a reader can discount a row rather than guess at it.\n'
+ '\n'
+ 'Two things a zero here does NOT mean. On lake/model-built chains no rung-1 roll leg '
+ 'can expire — every such limit lies inside the book by construction — so a zero in '
+ "`roll_skips`' post-placement terminals is the model, not evidence that live rolls "
+ 'always fill. And the replay attempts every roll the roller wants, whereas live '
+ 'per-position and cycle budgets can truncate a ladder or skip a position entirely; '
+ 'replayed roll counts are an upper bound on live ATTEMPTS, independent of the fill '
+ 'rule.')
+
+ROLL_FILL_LEGACY = ('This run PREDATES FC-116: its roll legs filled at the haircut price, so roll credits '
+ 'are biased UP',
+ 'The engine that produced these numbers filled every order — roll legs included — at `mid '
+ '-/+ fill_haircut x half-spread`, ignoring the limit the roller placed. The live roller '
+ "places its buy-to-close at the old contract's ASK and its sell-to-open at the candidate's "
+ 'BID, so a modelled roll here captured MORE credit than the same roll would have live, on '
+ 'BOTH legs. The bias is not measured, so it is named rather than netted into a number that '
+ 'would look like an estimate.\n'
+ '\n'
+ 'Runs at or after `fc-116-roll-limit-fills` fill roll legs at the placed limits instead, and '
+ 'carry a different footer. Roll credits and roll counts from this run are therefore NOT '
+ "comparable with a post-FC-116 run's: partition any trend series over roll credits on "
+ "`engine_version` (or on the row's `roll_fill_mode`, which is NULL exactly for rows like "
+ 'these) before reading a level shift as a behaviour change.')
 
 CC_ROLL_SPLIT_NOTE = ('Rolls are split into ITM defences and OTM roll-outs, and only the first is '
  'defence',

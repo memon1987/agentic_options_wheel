@@ -1181,3 +1181,316 @@ class TestTheCallLegActuallyRuns:
         )
         # And the replay is not vacuously silent — the live vocabulary is there.
         assert "stage_1_complete" in seen or "stock_rejected_filter" in seen
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T5/T6 — the deliberate re-baseline, on the one scripted window that
+# actually executes a roll.
+#
+# There is no stored numeric golden in this repo. The wheel's golden contract is
+# the INVARIANTS asserted on this window (every roll nets a credit and moves the
+# strike up), the frozen artifact key set, and the byte-stability of every
+# legacy `canonical_spec`. So "re-baseline" here means: prove the roll-leg
+# prices moved by exactly the amount the rule predicts, and prove NOTHING ELSE
+# moved.
+# --------------------------------------------------------------------------- #
+def _both_modes(closes, exps, days):
+    """The same window replayed under `haircut` and under `limit`."""
+    return (
+        _simulator("XYZ", closes, exps, days, roll_fill_mode="haircut").run(),
+        _simulator("XYZ", closes, exps, days, roll_fill_mode="limit").run(),
+    )
+
+
+def _roll_legs(result):
+    """Every roll-intent ledger leg, in order. Roll legs are the ones carrying
+    a `limit_price` — entry legs and the CC monitor leg never do."""
+    return [
+        e for e in result.broker.ledger
+        if e.kind in ("buy_to_close", "sell_call_open")
+        and (e.detail or {}).get("limit_price") is not None
+    ]
+
+
+def _chains(closes, exps, days):
+    """The SAME modeled book the replay filled against.
+
+    T1/E6: the reconciliation below reads `bid`, `ask` and `mark` from here and
+    computes the half-spread itself. Recovering `hs` from the gap between the
+    haircut fill and the limit fill — which is what the first cut did — is
+    circular: it assumes the closed form in order to test it, and would pass
+    against any fill rule whatsoever.
+    """
+    return _simulator("XYZ", closes, exps, days).materialise().chains
+
+
+def _quote_for(chains, leg):
+    """The `ChainQuote` a roll leg was priced and filled against."""
+    snapshot = chains["XYZ"][leg.event_date]
+    for quote in list(snapshot.calls) + list(snapshot.puts):
+        if quote.symbol == leg.symbol:
+            return quote
+    raise AssertionError(
+        f"no {leg.symbol} quote on {leg.event_date} — the chains here are not "
+        f"the chains the replay filled against")
+
+
+class TestTheRollFillModeIsValidatedAtConstruction:
+    """E5, on the simulator side.
+
+    The adapter refuses it too, but the simulator is where a sweep arm's
+    resolved mode arrives, and it is the one that must fail BEFORE a three
+    minute materialisation — not after, with a row already labelled wrong.
+    """
+
+    @pytest.mark.parametrize("bad", ["LIMIT", "Haircut", "mid", "", None])
+    def test_an_unrecognised_mode_raises(self, bad, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        with pytest.raises(ValueError, match="roll_fill_mode"):
+            _simulator("XYZ", closes, exps, days, roll_fill_mode=bad)
+
+    @pytest.mark.parametrize("good", ["limit", "haircut"])
+    def test_both_real_modes_are_accepted(self, good, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        sim = _simulator("XYZ", closes, exps, days, roll_fill_mode=good)
+        assert sim.roll_fill_mode == good
+
+
+class TestTheRollFillRuleOnTheGoldenWindow:
+    """T5. Each leg's price IS the rule, and the credit delta IS the closed
+    form — per leg, by ledger TAG.
+
+    The law is per LEG and not per roll, because a single roll can MIX tags: a
+    deep-ITM high-mark old leg can rest while the cheap rolled-to leg
+    (`hs < $0.05`, so the pad is through the book) is marketable. Stating it per
+    roll per pricing mode would be wrong the first time that happens.
+
+      limit_marketable -> fill moves from `mid -/+ 0.25*hs` to the far quote
+                          = -0.75 * hs per share (always DOWN for credit)
+      limit_resting    -> fill moves to `mid -/+ 0.05`
+                          = 0.25*hs - 0.05 per share (EITHER sign; UP whenever
+                            hs > $0.20, which is most of a GOOGL-priced chain)
+
+    Asserted to within HALF A CENT per share per leg, not exactly: every roller
+    limit is `round(*, 2)` while the modeled quote is not, so an imminence
+    limit lands within +/-$0.005 of `mid +/- 0.05`. The BOOK, by contrast, is
+    quantised to cents by the adapter before the comparison (T1), so a
+    marketable leg's fill is an EXACT equality against `round(quote, 2)` — a
+    base-mode BTC limit is `round(ask, 2)`, which is `ask_c` exactly, and the
+    old unrounded comparison mis-tagged about half of those as `limit_resting`.
+    """
+
+    def test_every_roll_leg_fills_at_the_rule_price(self, dip_then_recovering):
+        """The rule, read off the CHAIN QUOTE rather than off the haircut twin.
+
+        `min(limit, ask_c)` on a buy and `max(limit, bid_c)` on a sell, with
+        `bid_c`/`ask_c` the book quantised to cents, and the TAG derived from
+        the same comparison. Deriving the expected price from the other arm's
+        fill would only prove the two arms are consistent with each other.
+        """
+        days, closes, exps = dip_then_recovering
+        _hc, lim = _both_modes(closes, exps, days)
+        chains = _chains(closes, exps, days)
+        legs = _roll_legs(lim)
+        assert legs, "the golden window executed no roll leg"
+
+        tags = set()
+        for leg in legs:
+            limit = leg.detail["limit_price"]
+            quote = _quote_for(chains, leg)
+            bid_c, ask_c = round(quote.bid, 2), round(quote.ask, 2)
+            if leg.kind == "buy_to_close":
+                expected = min(limit, ask_c)
+                expected_tag = ("limit_marketable" if limit >= ask_c
+                                else "limit_resting")
+            else:
+                expected = max(limit, bid_c)
+                expected_tag = ("limit_marketable" if limit <= bid_c
+                                else "limit_resting")
+            assert leg.price == pytest.approx(expected, abs=1e-9), (
+                f"{leg.symbol} {leg.kind} on {leg.event_date}: filled "
+                f"{leg.price} against limit {limit} and book "
+                f"[{bid_c}, {ask_c}]")
+            assert leg.detail["fill_rule"] == expected_tag, (
+                f"{leg.symbol} {leg.kind} on {leg.event_date}: tagged "
+                f"{leg.detail['fill_rule']} with limit {limit} against book "
+                f"[{bid_c}, {ask_c}] — the pre-T1 bug tagged a marketable leg "
+                f"`limit_resting` by comparing against an UNROUNDED book")
+            tags.add(expected_tag)
+
+        assert "limit_marketable" in tags, (
+            "no leg was marketable, which on a base-mode window means the "
+            "book is not being quantised before the comparison (T1)")
+
+    def test_the_counts_and_strikes_do_not_move(self, dip_then_recovering):
+        """A count change is a FINDING, not a re-baseline.
+
+        On a model-built chain no rung-1 leg can expire, so the same rolls must
+        be taken under both modes — only their prices differ.
+        """
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        assert hc.rolls_executed == lim.rolls_executed > 0
+        assert hc.itm_rolls == lim.itm_rolls
+        assert hc.otm_roll_outs == lim.otm_roll_outs
+        assert (
+            [(r["old_strike"], r["new_strike"], r["day"]) for r in hc.roll_records]
+            == [(r["old_strike"], r["new_strike"], r["day"]) for r in lim.roll_records]
+        )
+        assert hc.roll_skips == lim.roll_skips, (
+            "a roll that skips under one fill rule and not the other is a "
+            "finding — no rung-1 limit can expire on a model-built chain")
+
+    def test_the_credit_delta_is_the_per_tag_closed_form(self, dip_then_recovering):
+        """The number this whole PR exists to move, reconciled leg by leg.
+
+        E6: `hs` is computed INDEPENDENTLY, from the chain quote the leg filled
+        against (`ask - mark` on a buy, `mark - bid` on a sell — the same two
+        quantities `BacktestBroker.buy_fill`/`sell_fill` take a quarter of).
+        The first cut recovered `hs` from the gap between the haircut fill and
+        the limit fill, which is the closed form rearranged: it would have
+        passed against any fill rule at all, including the mis-tagging bug T1
+        fixes.
+
+            limit_marketable -> -0.75 * hs   per share (always DOWN for credit)
+            limit_resting    -> 0.25*hs - 0.05 per share (either sign)
+        """
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        chains = _chains(closes, exps, days)
+        hc_legs, lim_legs = _roll_legs(hc), _roll_legs(lim)
+        assert len(hc_legs) == len(lim_legs), "the leg SEQUENCE moved"
+
+        for old, new in zip(hc_legs, lim_legs):
+            assert (old.kind, old.symbol, old.contracts) == (
+                new.kind, new.symbol, new.contracts)
+            # Credit convention: a sell adds, a buy subtracts.
+            sign = 1.0 if new.kind == "sell_call_open" else -1.0
+            per_share = sign * (new.price - old.price)
+
+            quote = _quote_for(chains, new)
+            hs = (quote.mark - quote.bid if new.kind == "sell_call_open"
+                  else quote.ask - quote.mark)
+            if new.detail["fill_rule"] == "limit_marketable":
+                expected = -0.75 * hs
+                assert per_share < 1e-9, (
+                    f"a marketable leg must give up credit versus the haircut "
+                    f"fill, never gain it: {per_share:+.4f} on {new.symbol}")
+            else:
+                expected = 0.25 * hs - 0.05
+            # Half a cent: the roller's limit is `round(*, 2)` and the
+            # quantised book is `round(quote, 2)`, so each side of the
+            # comparison can sit up to $0.005 from the unrounded model value.
+            assert per_share == pytest.approx(expected, abs=0.0051), (
+                f"{new.symbol} {new.kind} on {new.event_date} tagged "
+                f"{new.detail['fill_rule']}: moved {per_share:+.4f}/share, "
+                f"closed form says {expected:+.4f} (hs={hs:.4f} from the "
+                f"quote, not from the haircut twin)")
+
+        # And the aggregate reconciles to the sum of the legs it came from.
+        total = sum(
+            (1.0 if n.kind == "sell_call_open" else -1.0)
+            * (n.price - o.price) * 100 * n.contracts
+            for o, n in zip(hc_legs, lim_legs)
+        )
+        assert lim.roll_net_credit - hc.roll_net_credit == pytest.approx(
+            total, abs=0.01 * 100 * max(l.contracts for l in lim_legs))
+
+    def test_the_leg_counters_reconcile_to_the_roll_count(self, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        assert (lim.roll_legs_resting + lim.roll_legs_marketable
+                == 2 * lim.rolls_executed), (
+            "every completed roll is exactly two legs, and no leg expired here")
+        assert lim.failed_roll_btc_debit == 0.0, (
+            "no roll leg can expire on a model-built chain, so no BTC can be "
+            "orphaned — a non-zero here is a finding")
+        assert (hc.roll_legs_resting, hc.roll_legs_marketable) == (0, 0), (
+            "the haircut arm tags nothing as a limit fill")
+
+    def test_the_existing_invariants_hold_under_both_modes(self, dip_then_recovering):
+        """The golden contract itself. Under `limit` the fills ARE the limits
+        the live credit invariant was computed on, so it holds by construction
+        — but by construction is not the same as verified."""
+        days, closes, exps = dip_then_recovering
+        for result in _both_modes(closes, exps, days):
+            for record in result.roll_records:
+                assert record["new_strike"] > record["old_strike"], record
+                assert record["net_credit"] >= 0, record
+
+    def test_the_credit_aggregate_reconciles_to_the_records(self, dip_then_recovering):
+        """`roll_net_credit == sum(roll_records.net_credit)`, EXACTLY.
+
+        This is why `failed_roll_btc_debit` is a separate counter rather than
+        folded in: folding it would break this identity, and an FC-112 reader
+        could no longer check the number against the rolls it came from.
+        """
+        days, closes, exps = dip_then_recovering
+        for result in _both_modes(closes, exps, days):
+            assert result.roll_net_credit == pytest.approx(
+                round(sum(r["net_credit"] for r in result.roll_records), 2))
+            assert result.roll_net_credit == pytest.approx(
+                result.itm_roll_credit + result.otm_roll_out_credit)
+
+
+class TestNothingElseMovesOnTheGoldenWindow:
+    """T6. The re-baseline is attributable or it is not a re-baseline.
+
+    One honest caveat, and it is the reason the put-fill count is asserted
+    separately below: a lower roll credit lowers cash, and cash gates the next
+    put's collateral check (`broker.py` `collateral > available_cash`). On a
+    DIFFERENT window a later put could genuinely flip. If a future re-script
+    makes that happen here, the window gets more starting cash — the assertion
+    does not get loosened.
+    """
+
+    def test_only_roll_legs_change_price(self, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        assert len(hc.broker.ledger) == len(lim.broker.ledger)
+
+        moved = []
+        for old, new in zip(hc.broker.ledger, lim.broker.ledger):
+            assert (old.kind, old.event_date, old.symbol, old.contracts) == (
+                new.kind, new.event_date, new.symbol, new.contracts), (
+                f"the event SEQUENCE diverged: {old.kind} -> {new.kind}")
+            if old.price != new.price or old.cash_delta != new.cash_delta:
+                moved.append(new)
+
+        assert moved, "the fill rule changed nothing at all — it is not wired in"
+        for event in moved:
+            assert (event.detail or {}).get("limit_price") is not None, (
+                f"a NON-roll leg changed price: {event.kind} {event.symbol} on "
+                f"{event.event_date}. Entry legs and the monitor leg must keep "
+                f"the haircut model — FC-072 measured them against it.")
+
+    def test_the_put_leg_is_untouched(self, dip_then_recovering):
+        """Cash-gated, so this is the one that could plausibly cascade."""
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        for kind in ("sell_put_open", "put_assignment", "call_assignment",
+                     "expire_worthless", "dividend"):
+            a = [(e.event_date, e.symbol, e.contracts, e.price)
+                 for e in hc.broker.ledger if e.kind == kind]
+            b = [(e.event_date, e.symbol, e.contracts, e.price)
+                 for e in lim.broker.ledger if e.kind == kind]
+            assert a == b, f"{kind} events diverged between fill modes"
+
+    def test_every_priced_leg_carries_a_fill_rule(self, dip_then_recovering):
+        """A reader must never have to infer the pricing model from the ABSENCE
+        of a key."""
+        days, closes, exps = dip_then_recovering
+        _hc, lim = _both_modes(closes, exps, days)
+        for event in lim.broker.ledger:
+            if event.kind in ("buy_to_close", "sell_call_open"):
+                assert event.detail["fill_rule"] in (
+                    "haircut", "limit_marketable", "limit_resting")
+
+    def test_the_resolved_mode_is_on_the_result(self, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        hc, lim = _both_modes(closes, exps, days)
+        assert hc.roll_fill_mode == "haircut"
+        assert lim.roll_fill_mode == "limit"
+        # And the DEFAULT is the honest one, on the constructor — which is what
+        # `evaluate._simulator` (the screen path) relies on.
+        assert _simulator("XYZ", closes, exps, days).roll_fill_mode == "limit"

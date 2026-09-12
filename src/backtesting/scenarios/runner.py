@@ -98,7 +98,7 @@ from ..engine.simulator import (
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
-from .identity import scenario_arm_hash
+from .identity import DEFAULT_ROLL_FILL_MODE, scenario_arm_hash
 from .overrides import (
     DTE_OVERRIDE_KEYS, MAX_SWEEPABLE_DTE, apply_overrides, validate_overrides,
 )
@@ -165,11 +165,18 @@ class Scenario:
     the headline value lives on ``evaluate.DEFAULT_FILL_HAIRCUT`` and
     ``config_hash`` hashes the *module* value, so two scenarios differing only in
     haircut would carry the same hash and be indistinguishable in any record.
+
+    ``roll_fill_mode`` (FC-116) is arm-level for the same reason and for one
+    more: a haircut-vs-limit before/after is then ONE submission, not two
+    sweeps whose only difference is invisible in the identity. ``None`` and
+    ``"limit"`` are the same arm — the honest mode is the default, so every
+    existing spec, pin and battery arm gets it with no edit.
     """
 
     name: str
     overrides: Dict[str, Any] = field(default_factory=dict)
     fill_haircut: Optional[float] = None
+    roll_fill_mode: Optional[str] = None
 
     def scenario_hash(self) -> str:
         """Identity of this ARM: its effective overrides plus its fill haircut.
@@ -192,7 +199,9 @@ class Scenario:
         anything, and a second implementation would be a second definition of
         "the same arm".
         """
-        return scenario_arm_hash(self.overrides, self.fill_haircut)
+        return scenario_arm_hash(
+            self.overrides, self.fill_haircut, self.roll_fill_mode,
+        )
 
 
 @dataclass
@@ -264,12 +273,32 @@ class ScenarioResult:
     coverage_by_reason: Optional[Dict[str, int]] = None
     calls_closed_early: Optional[int] = None
     synthetic_lots_opened: Optional[int] = None
+    #: FC-116 D6 — no longer gated to covered-call rows. FC-112 compares the
+    #: wheel's `rolling.itm_trigger_ratio` 0.98 vs 1.00, and the split IS the
+    #: question: an ITM roll is defence, an OTM roll-out is the roller
+    #: re-writing a call that was never threatened. A `None` here on a wheel
+    #: row is FC-112 arriving to find its number gated off.
     itm_rolls: Optional[int] = None
     otm_roll_outs: Optional[int] = None
-    #: ``call_roll_skipped`` reason -> count (H3). On EVERY measured row, wheel
+    #: ``call_roll_skipped`` reason -> count (H3), MERGED with the six
+    #: post-placement roller failures (FC-116 D5). On EVERY measured row, wheel
     #: included: the roller runs on both profiles, and this is the only thing
     #: that separates "declined 40 credit-only evaluations" from "blind".
     roll_skips: Optional[Dict[str, int]] = None
+    #: FC-116 D6 — the roll CREDIT, pre-fee (the quantity the live credit
+    #: invariant guards and `call_roll_completed` reports), and the same split.
+    roll_net_credit: Optional[float] = None
+    itm_roll_credit: Optional[float] = None
+    otm_roll_out_credit: Optional[float] = None
+    #: Post-fee cash paid on BTC legs of rolls that did not complete.
+    failed_roll_btc_debit: Optional[float] = None
+    #: How many roll legs rested inside the modeled spread (the model's one
+    #: approximation) versus filled at the book. Both 0 under `haircut`.
+    roll_legs_resting: Optional[int] = None
+    roll_legs_marketable: Optional[int] = None
+    #: The RESOLVED mode — `"limit"` or `"haircut"`, never None on a measured
+    #: row. Stored resolved on purpose, unlike `fill_haircut`.
+    roll_fill_mode: Optional[str] = None
     replay_seconds: Optional[float] = None
     error: Optional[str] = None
 
@@ -367,6 +396,10 @@ class SweepResult:
     scenario_hashes: Dict[str, str] = field(default_factory=dict)
     scenario_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     scenario_fill_haircuts: Dict[str, Optional[float]] = field(default_factory=dict)
+    #: FC-116 — arm name -> RESOLVED roll fill mode. The footer needs it to say
+    #: which arms (if any) ran the pre-FC-116 haircut model, so a reader of a
+    #: mixed sweep is never left guessing which column is the honest one.
+    scenario_roll_fill_modes: Dict[str, str] = field(default_factory=dict)
     materialise_seconds: Dict[str, float] = field(default_factory=dict)
     replay_seconds: Dict[str, float] = field(default_factory=dict)
     wall_seconds: float = 0.0
@@ -617,12 +650,29 @@ def _windows(
     ]
 
 
+#: FC-116 D6 — the roll fields a `SimulationResult` hands to the row, the cell
+#: artifact's `counters` and the `scenario_runs` schema. ONE list, because
+#: three call sites naming them separately is how one of them ends up missing a
+#: field and an FC-112 query silently reads a NULL.
+ROLL_METRIC_FIELDS = (
+    "roll_net_credit", "itm_roll_credit", "otm_roll_out_credit",
+    "failed_roll_btc_debit", "roll_legs_resting", "roll_legs_marketable",
+    "roll_fill_mode",
+)
+
+
+def roll_metrics(result) -> Dict[str, Any]:
+    """The D6 roll metrics off a `SimulationResult`, as row kwargs."""
+    return {name: getattr(result, name) for name in ROLL_METRIC_FIELDS}
+
+
 def _row_from_report(
     *, scenario: str, symbol: str, window: Tuple[str, date, date],
     cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
     seconds: float, rolls_evaluated: Optional[int] = None,
     rolls_executed: Optional[int] = None,
     roll_skips: Optional[Dict[str, int]] = None,
+    roll_metrics: Optional[Dict[str, Any]] = None,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
@@ -671,9 +721,14 @@ def _row_from_report(
         calls_closed_early=(None if report.is_wheel else report.calls_closed_early),
         synthetic_lots_opened=(None if report.is_wheel
                                else report.synthetic_lots_opened),
-        itm_rolls=(None if report.is_wheel else report.itm_rolls),
-        otm_roll_outs=(None if report.is_wheel else report.otm_roll_outs),
+        # FC-116 D6 — the `None if report.is_wheel` gating is GONE. It was
+        # right when only the CC table printed the split; FC-112's whole
+        # question is the WHEEL's 0.98-vs-1.00 trigger, and it reads exactly
+        # these two numbers plus the credit split below.
+        itm_rolls=report.itm_rolls,
+        otm_roll_outs=report.otm_roll_outs,
         roll_skips=(dict(roll_skips) if roll_skips else None),
+        **(roll_metrics or {}),
         replay_seconds=round(seconds, 3),
     )
 
@@ -845,6 +900,13 @@ def run_sweep(
         scenario_hashes={s.name: s.scenario_hash() for s in scenarios},
         scenario_overrides={s.name: dict(s.overrides) for s in scenarios},
         scenario_fill_haircuts={s.name: s.fill_haircut for s in scenarios},
+        # RESOLVED, not verbatim: the footer's question is "did this arm fill
+        # rolls honestly?", and `None` is not an answer to it.
+        scenario_roll_fill_modes={
+            s.name: (DEFAULT_ROLL_FILL_MODE if s.roll_fill_mode is None
+                     else str(s.roll_fill_mode))
+            for s in scenarios
+        },
         starting_cash=starting_cash,
         run_sensitivity=run_sensitivity,
         effective_max_dte=max_dte,
@@ -894,6 +956,15 @@ def run_sweep(
                         config_hash=result.scenario_config_hashes[scenario.name],
                         scenario_hash=result.scenario_hashes[scenario.name],
                         error=message,
+                        # FC-116 T3 — the RESOLVED mode, on error rows too.
+                        # This cell ran no replay, but it is a cell of a
+                        # post-FC-116 run and NULL in this column means
+                        # something else entirely ("written before the column
+                        # existed", i.e. the haircut model). Leaving it null
+                        # would file every errored cell of an honest run under
+                        # the legacy fill rule.
+                        roll_fill_mode=result.scenario_roll_fill_modes.get(
+                            scenario.name, DEFAULT_ROLL_FILL_MODE),
                     ))
                 continue
             result.materialise_seconds[key] = round(time.perf_counter() - t0, 3)
@@ -1018,13 +1089,15 @@ def _with_base_first(scenarios: Sequence[Scenario]) -> List[Scenario]:
     existing = next((s for s in ordered if s.name == BASE_SCENARIO_NAME), None)
     if existing is None:
         return [Scenario(BASE_SCENARIO_NAME, {})] + ordered
-    if existing.overrides or existing.fill_haircut is not None:
+    if (existing.overrides or existing.fill_haircut is not None
+            or existing.roll_fill_mode is not None):
         raise ValueError(
-            f"the scenario named {BASE_SCENARIO_NAME!r} must carry no overrides "
-            f"and no fill_haircut — it is the comparator every other row is read "
-            f"against. Got overrides={existing.overrides!r}, "
-            f"fill_haircut={existing.fill_haircut!r}. Rename it, and the implicit "
-            f"{BASE_SCENARIO_NAME!r} arm will be added back."
+            f"the scenario named {BASE_SCENARIO_NAME!r} must carry no overrides, "
+            f"no fill_haircut and no roll_fill_mode — it is the comparator every "
+            f"other row is read against. Got overrides={existing.overrides!r}, "
+            f"fill_haircut={existing.fill_haircut!r}, "
+            f"roll_fill_mode={existing.roll_fill_mode!r}. Rename it, and the "
+            f"implicit {BASE_SCENARIO_NAME!r} arm will be added back."
         )
     ordered.remove(existing)
     return [existing] + ordered
@@ -1045,13 +1118,13 @@ def _check_unique_names(scenarios: Sequence[Scenario]) -> None:
 def _simulator(
     config, provider, builder, symbol: str, start: date, end: date,
     *, starting_cash: float, max_dte: int, fill_haircut: float, dividends,
-    synthetic_lots=None,
+    synthetic_lots=None, roll_fill_mode: str = DEFAULT_ROLL_FILL_MODE,
 ) -> Simulator:
     return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte,
         fill_haircut=fill_haircut, dividend_schedule=dividends,
-        synthetic_lots=synthetic_lots,
+        synthetic_lots=synthetic_lots, roll_fill_mode=roll_fill_mode,
     )
 
 
@@ -1167,6 +1240,14 @@ def _replay_one(
         DEFAULT_FILL_HAIRCUT if scenario.fill_haircut is None
         else scenario.fill_haircut
     )
+    # FC-116 — `None` resolves to the honest mode. The RESOLVED value is what
+    # gets stored on the row, deliberately unlike `fill_haircut` (stored
+    # verbatim, which forced the dashboard to grow `_resolved_haircut` to
+    # disambiguate a NULL).
+    roll_fill_mode = (
+        DEFAULT_ROLL_FILL_MODE if scenario.roll_fill_mode is None
+        else str(scenario.roll_fill_mode)
+    )
     t0 = time.perf_counter()
     try:
         bars = materialised.stock_bars.get(symbol, [])
@@ -1180,7 +1261,7 @@ def _replay_one(
             config, provider, builder, symbol, w_start, w_end,
             starting_cash=starting_cash, max_dte=max_dte,
             fill_haircut=haircut, dividends=dividends,
-            synthetic_lots=synthetic_lots,
+            synthetic_lots=synthetic_lots, roll_fill_mode=roll_fill_mode,
         ).replay(view)
         # FC-096 A4. The single-symbol report surfaces this; a sweep did not, so
         # a candidate sweep said nothing at all about a symbol its earnings gate
@@ -1201,6 +1282,10 @@ def _replay_one(
                 # programme against a flat account and report the whole
                 # difference as fill sensitivity.
                 synthetic_lots=synthetic_lots,
+                # ...and the SAME roll fill rule: the bid pass measures ENTRY
+                # fill sensitivity, and swapping the roll rule underneath it
+                # would fold a second change into that one number.
+                roll_fill_mode=roll_fill_mode,
             ).replay(view)
             bid_report = _score(symbol, bid_result, bars, starting_cash, dividends)
             sensitivity = {
@@ -1220,6 +1305,7 @@ def _replay_one(
             rolls_evaluated=result.rolls_evaluated,
             rolls_executed=result.rolls_executed,
             roll_skips=result.roll_skips,
+            roll_metrics=roll_metrics(result),
         )
         if artifact_sink is not None:
             _emit_artifact(
@@ -1259,6 +1345,11 @@ def _replay_one(
             split=split, config_hash=cfg_hash, scenario_hash=scenario_hash,
             error=message,
             replay_seconds=round(time.perf_counter() - t0, 3),
+            # FC-116 T3 — as on the materialisation-failure rows above: the
+            # resolved mode, so a NULL in this column keeps its ONE meaning
+            # ("written before FC-116") rather than also meaning "this cell
+            # raised".
+            roll_fill_mode=roll_fill_mode,
         )
 
 

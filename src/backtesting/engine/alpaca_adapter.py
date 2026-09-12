@@ -26,8 +26,9 @@ than production and silently inflate the opportunity set.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import pandas as pd
 import structlog
@@ -36,7 +37,20 @@ from ...utils import clock
 from ...utils.option_symbols import parse_option_symbol
 from ..data.chain_builder import ChainSnapshot
 from ..data.provider import StockBar
-from .broker import BacktestBroker
+from .broker import (
+    FILL_RULE_HAIRCUT,
+    FILL_RULE_LIMIT_MARKETABLE,
+    FILL_RULE_LIMIT_RESTING,
+    ROLL_FILL_MODE_HAIRCUT,
+    ROLL_FILL_MODE_LIMIT,
+    ROLL_FILL_MODES,
+    BacktestBroker,
+)
+
+# FC-116 D1b — the adapter sees no order KIND today (only symbol/qty/side/
+# type/limit), so the simulator hands it one for the window in which the live
+# `CallRoller` is the only order placer.
+ROLL_INTENT = "roll"
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +88,7 @@ class BacktestAlpacaClient:
         chains: Dict[str, Dict[date, ChainSnapshot]],
         stock_bars: Dict[str, List[StockBar]],
         options_approved_level: int = 2,
+        roll_fill_mode: str = ROLL_FILL_MODE_LIMIT,
     ) -> None:
         """
         Args:
@@ -83,11 +98,33 @@ class BacktestAlpacaClient:
                 to the simulator's current date, so passing the whole history is
                 safe and lets one dict serve every day of the run.
             options_approved_level: mirrors the live account's approval level.
+            roll_fill_mode: FC-116 — ``"limit"`` (default) fills roll legs
+                against the day's modeled book capped by the placed limit;
+                ``"haircut"`` is the pre-FC-116 regression arm and ignores the
+                intent entirely.
+
+        Raises:
+            ValueError: `roll_fill_mode` is not one of `ROLL_FILL_MODES`
+                (E5). Validated rather than degraded: the pricing branch below
+                is `!= "limit"`, so an unrecognised spelling such as `"LIMIT"`
+                would hash as a distinct sweep arm, silently RUN as haircut,
+                and persist `roll_fill_mode="LIMIT"` on the row — an arm whose
+                stored label contradicts the model it ran under.
         """
+        if roll_fill_mode not in ROLL_FILL_MODES:
+            raise ValueError(
+                f"roll_fill_mode must be one of {list(ROLL_FILL_MODES)}, "
+                f"got {roll_fill_mode!r}"
+            )
         self._broker = broker
         self._chains = chains
         self._stock_bars = stock_bars
         self._options_approved_level = options_approved_level
+        self._roll_fill_mode = roll_fill_mode
+        # Initialised HERE, not lazily: `__getattr__` raises
+        # `UnsupportedBacktestCall` on any missing attribute, so a lazily-set
+        # `_order_intent` would turn the first haircut-mode read into a crash.
+        self._order_intent: Optional[str] = None
 
         self._orders: Dict[str, Dict[str, Any]] = {}
         self._order_seq = 0
@@ -326,6 +363,30 @@ class BacktestAlpacaClient:
     # ------------------------------------------------------------------ #
     # Orders
     # ------------------------------------------------------------------ #
+    @contextmanager
+    def order_intent(self, kind: Optional[str]) -> Iterator[None]:
+        """Declare what the orders placed inside this window ARE (FC-116 D1b).
+
+        The live `AlpacaClient` surface carries no order kind, and the adapter
+        must not grow one — that would be a live API change for a replay
+        concern. The simulator instead wraps the one seat in its day loop where
+        the `CallRoller` is the only order placer:
+
+            with client.order_intent("roll"):
+                rolls = engine.run_rolling_cycle() or {}
+
+        Rejected alternatives: a `kind=` kwarg threaded through `CallRoller`
+        (changes the live surface); inferring "roll" from `side == "buy"` on a
+        call (the CC monitor leg buys to close too, and must stay on the
+        haircut path).
+        """
+        previous = self._order_intent
+        self._order_intent = kind
+        try:
+            yield
+        finally:
+            self._order_intent = previous
+
     def place_option_order(
         self,
         symbol: str,
@@ -334,12 +395,51 @@ class BacktestAlpacaClient:
         order_type: str = "limit",
         limit_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Fill immediately at the broker's haircut price (EOD convention).
+        """Fill against the day's modeled book. Two rules, by order intent.
 
-        The strategy's limit_price is recorded but not enforced: at one decision
-        point per day there is no intraday path along which to decide whether a
-        limit would have been touched. The broker's mid-minus-haircut fill is the
-        documented convention, and Phase 4 reports the bid-fill worst case.
+        **Entry legs and the CC monitor leg** (no intent) fill at the broker's
+        haircut price and the strategy's `limit_price` is recorded but not
+        enforced: at one decision point per day there is no intraday path along
+        which to decide whether a limit would have been touched. FC-072
+        measured entry fills against exactly that convention, which is why
+        `strategy.*_limit_spread_fraction` is refused as a sweep key.
+
+        **Roll legs** (inside `order_intent("roll")`, under the default
+        `roll_fill_mode="limit"`) fill AT THE PLACED LIMIT, capped by the book,
+        or not at all — FC-116 D1:
+
+            buy   limit >= ask_c      -> fills `ask_c` (marketable; Alpaca
+                                                        fills at the best
+                                                        offer, never at a
+                                                        worse limit)
+            buy   bid_c <= limit < ask_c -> fills `limit` (resting inside)
+            buy   limit <  bid_c      -> `expired`, filled_qty 0
+            sell  limit <= bid_c      -> fills `bid_c`
+            sell  bid_c < limit <= ask_c -> fills `limit`
+            sell  limit >  ask_c      -> `expired`, filled_qty 0
+            either limit_price None   -> far quote (a market order under intent)
+
+        where `bid_c`/`ask_c` are the modeled book QUANTISED TO CENTS. The
+        roller places cent-rounded limits; comparing them against an unrounded
+        model book would tag a marketable leg `limit_resting` roughly half the
+        time (T1).
+
+        Why: the live `CallRoller` is credit-only AT ITS PLACED LIMITS (base
+        mode BTC at `round(ask, 2)` / STO at `round(bid, 2)`; imminence mode
+        both legs at `round(mid +/- 0.05, 2)`), and its credit invariant is
+        tested on those limits. Filling at mid would manufacture credit the
+        live roller never sees.
+
+        The ONE approximation: the replay has one modeled book per day and no
+        intraday tape, so a limit resting INSIDE the spread is assumed touched
+        within the leg's 120 s window. That is tagged `limit_resting` on the
+        ledger event and counted per row (`roll_legs_resting`) rather than
+        estimated away — the residual versus the far quote is `hs - 0.05` per
+        share on an imminence-mode leg, which is NOT small on a high-mark
+        chain.
+
+        `roll_fill_mode="haircut"` ignores the intent entirely and is the
+        pre-FC-116 regression arm.
         """
         parsed = parse_option_symbol(symbol)
         underlying = parsed.get("underlying", "")
@@ -355,8 +455,18 @@ class BacktestAlpacaClient:
                 f"No {symbol} bar on {self.today}: contract did not trade.",
             )
 
+        # FC-116 D1 — the rule price and its ledger tag, or `None` to keep the
+        # haircut. Computed BEFORE the broker call so the broker's cash check
+        # and the `insufficient_cash` message both quote the price that would
+        # actually be paid.
+        rule_fill, fill_detail, rule_expired = self._roll_leg_fill(
+            side, limit_price, quote,
+        )
+
         if side == "sell":
             if option_type == "put":
+                # Puts are never roll legs (the roller rolls calls), so this
+                # branch is untouched by FC-116.
                 fill = self._broker.sell_put_to_open(
                     symbol, underlying, strike, expiration, qty,
                     quote.mark, quote.bid, self.today,
@@ -368,11 +478,25 @@ class BacktestAlpacaClient:
                         f"${self._broker.available_cash:,.0f} available.",
                     )
             else:
+                # E7 precedence: the position-level check runs BEFORE the fill
+                # rule. Live Alpaca rejects an uncovered STO at placement, so
+                # the roller must see `stc_rejected`, never `expired`.
+                if self._broker.uncovered_shares(underlying) < 100 * qty:
+                    return self._order_error(
+                        symbol, qty, side, "insufficient_shares",
+                        f"Need {qty * 100} uncovered shares of {underlying}; "
+                        f"hold {self._broker.shares(underlying)}, of which "
+                        f"{self._broker.pledged_shares(underlying)} already back "
+                        f"open calls.",
+                    )
+                if rule_expired:
+                    return self._order_expired(symbol, qty, side, limit_price)
                 fill = self._broker.sell_call_to_open(
                     symbol, underlying, strike, expiration, qty,
                     quote.mark, quote.bid, self.today,
+                    fill=rule_fill, fill_detail=fill_detail,
                 )
-                if fill is None:
+                if fill is None:  # pragma: no cover - pre-checked above
                     return self._order_error(
                         symbol, qty, side, "insufficient_shares",
                         f"Need {qty * 100} uncovered shares of {underlying}; "
@@ -385,18 +509,31 @@ class BacktestAlpacaClient:
             # correctly. buy_to_close returns None for two different causes, and
             # reporting a cash shortfall as "no position" would mislead exactly
             # the rejection analysis this feeds.
+            #
+            # E7 precedence: `no_position` outranks `expired` — live Alpaca
+            # rejects a close of a position you do not hold at placement, so the
+            # roller must see `btc_rejected`, not a timeout. A leg that clears
+            # the position check and whose limit lies outside the book expires;
+            # only a leg that would actually fill can run out of cash, and that
+            # message quotes the RULE price.
             position = self._broker.options.get(symbol)
+            if position is None or qty > position.contracts:
+                return self._order_error(
+                    symbol, qty, side, "no_position",
+                    f"No open short position in {symbol} to close "
+                    f"({qty} contracts requested).",
+                )
+            if rule_expired:
+                return self._order_expired(symbol, qty, side, limit_price)
             fill = self._broker.buy_to_close(
-                symbol, qty, quote.mark, quote.ask, self.today
+                symbol, qty, quote.mark, quote.ask, self.today,
+                fill=rule_fill, fill_detail=fill_detail,
             )
             if fill is None:
-                if position is None or qty > position.contracts:
-                    return self._order_error(
-                        symbol, qty, side, "no_position",
-                        f"No open short position in {symbol} to close "
-                        f"({qty} contracts requested).",
-                    )
-                cost = self._broker.buy_fill(quote.mark, quote.ask) * 100 * qty
+                cost = (
+                    self._broker.buy_fill(quote.mark, quote.ask)
+                    if rule_fill is None else rule_fill
+                ) * 100 * qty
                 return self._order_error(
                     symbol, qty, side, "insufficient_cash",
                     f"Buy-to-close needs ${cost:,.2f} but only "
@@ -406,6 +543,103 @@ class BacktestAlpacaClient:
             raise UnsupportedBacktestCall(f"Unsupported order side: {side!r}")
 
         return self._order_success(symbol, qty, side, limit_price, fill)
+
+    def _roll_leg_fill(self, side, limit_price, quote):
+        """(fill, ledger detail, expired) for one leg — FC-116 D1.
+
+        Returns ``(None, None, False)`` for every leg that is not a roll leg,
+        which keeps the haircut path byte-identical: the broker is then called
+        exactly as it was before FC-116 and stamps `fill_rule: "haircut"`
+        itself.
+
+        Under roll intent the returned price is `min(limit, ask_c)` on a buy
+        and `max(limit, bid_c)` on a sell — the book caps the limit in the
+        direction that favours the book, never the order. A limit on the WRONG
+        side of the book (below the bid on a buy, above the ask on a sell) does
+        not fill at all.
+
+        **The book is quantised to cents first** (T1). The live `CallRoller`
+        places `round(ask, 2)` / `round(bid, 2)` / `round(mid ± 0.05, 2)`,
+        while a modeled chain's bid/ask carry full float precision. Comparing a
+        cent-rounded limit against an unrounded book mis-tags roughly half of
+        all base-mode legs: a BTC at `round(ask, 2) = 1.48` against an
+        `ask = 1.4815` is `limit < ask`, so it would be called `limit_resting`
+        and would fill 0.15 c inside a book it is in fact marketable against.
+        Real exchanges quote in cents, so rounding the book — not the limit —
+        is the faithful model, and the resting tag then means what it says:
+        the limit is strictly inside the quantised spread.
+        """
+        if self._order_intent != ROLL_INTENT:
+            return None, None, False
+        if self._roll_fill_mode != ROLL_FILL_MODE_LIMIT:
+            # The regression arm: price exactly as before, but still say which
+            # limit was placed, so a haircut-mode ledger is comparable leg for
+            # leg against a limit-mode one.
+            return None, {
+                "fill_rule": FILL_RULE_HAIRCUT, "limit_price": limit_price,
+            }, False
+
+        bid_c, ask_c = round(float(quote.bid), 2), round(float(quote.ask), 2)
+        if limit_price is None:
+            # A market order under roll intent: crosses to the far quote.
+            far = ask_c if side == "buy" else bid_c
+            return far, {
+                "fill_rule": FILL_RULE_LIMIT_MARKETABLE, "limit_price": None,
+            }, False
+
+        limit = float(limit_price)
+        if side == "buy":
+            if limit >= ask_c:
+                fill, rule = ask_c, FILL_RULE_LIMIT_MARKETABLE
+            elif limit >= bid_c:
+                fill, rule = limit, FILL_RULE_LIMIT_RESTING
+            else:
+                return None, None, True
+        else:
+            if limit <= bid_c:
+                fill, rule = bid_c, FILL_RULE_LIMIT_MARKETABLE
+            elif limit <= ask_c:
+                fill, rule = limit, FILL_RULE_LIMIT_RESTING
+            else:
+                return None, None, True
+        return fill, {"fill_rule": rule, "limit_price": limit}, False
+
+    def _order_expired(self, symbol, qty, side, limit_price) -> Dict[str, Any]:
+        """A placed order whose limit never touched the book — FC-116 D1.
+
+        `success: True` with a TERMINAL status, deliberately: live Alpaca
+        ACCEPTS this order, and the roller's own post-placement dispositions
+        (`btc_timeout_canceled`, the STO ladder, `stc_failed_naked_exposure`)
+        are what must run. Because `expired` is in
+        `CallRoller._TERMINAL_ORDER_STATUSES`, `_poll_order_fill` returns on
+        its first `get_order_by_id` read with NO `time.sleep` — the replay
+        never waits 120 s per leg — and `_cancel_and_settle` is never reached.
+        """
+        self._order_seq += 1
+        order_id = f"bt-{self._order_seq:06d}"
+        stamp = clock.now().isoformat()
+        record = {
+            "order_id": order_id,
+            "client_order_id": order_id,
+            "symbol": symbol,
+            "qty": int(qty),
+            "filled_qty": 0,
+            "remaining_qty": int(qty),
+            "is_partial_fill": False,
+            "side": side,
+            "status": "expired",
+            "order_type": "limit",
+            "limit_price": limit_price,
+            "filled_avg_price": None,
+            "submitted_at": stamp,
+            "filled_at": None,
+            "expired_at": stamp,
+            "canceled_at": None,
+        }
+        self._orders[order_id] = record
+        return {"success": True, **{k: record[k] for k in (
+            "order_id", "client_order_id", "symbol", "qty", "side",
+            "limit_price", "status", "submitted_at")}}
 
     def _order_success(self, symbol, qty, side, limit_price, fill) -> Dict[str, Any]:
         self._order_seq += 1

@@ -82,7 +82,7 @@ from typing import Dict, List, Optional, Tuple
 # because the two answer different questions: the file hash says "the code
 # changed", this says "the operator declared a new engine generation" — and an
 # operator who bumps it deliberately wants the cache invalidated.
-ENGINE_VERSION = "fc-069-scanner-rewire"
+ENGINE_VERSION = "fc-116-roll-limit-fills"
 
 # Versioned so a future change to the digest recipe (a different separator, a
 # different boundary) is a deliberate, visible invalidation rather than a silent

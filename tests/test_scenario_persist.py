@@ -1446,3 +1446,202 @@ class _Logger:
 
     def error(self, *a, **k):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T11 — the eleven roll columns, and the NULL that means something
+# --------------------------------------------------------------------------- #
+ROLL_COLUMNS = {
+    "rolls_executed": "INT64",
+    "roll_skips": "STRING",
+    "itm_rolls": "INT64",
+    "otm_roll_outs": "INT64",
+    "roll_net_credit": "FLOAT64",
+    "itm_roll_credit": "FLOAT64",
+    "otm_roll_out_credit": "FLOAT64",
+    "failed_roll_btc_debit": "FLOAT64",
+    "roll_legs_resting": "INT64",
+    "roll_legs_marketable": "INT64",
+    "roll_fill_mode": "STRING",
+}
+
+
+class TestTheRollColumnsAreAdditiveAndNullable:
+    """FC-116 D6 (decision iv). NONE of these was a column before — not even
+    `rolls_executed`, `roll_skips`, `itm_rolls` or `otm_roll_outs`, which have
+    been on `ScenarioResult` since FC-096 Phase C and reached a reader only
+    through the report and the cell artifact. FC-112 has to read them PER ROW.
+    """
+
+    def test_all_eleven_are_declared_with_the_right_types(self):
+        pytest.importorskip("google.cloud.bigquery")
+        by_name = {f.name: f for f in store._runs_schema()}
+        for name, want in ROLL_COLUMNS.items():
+            assert name in by_name, f"{name} is not a scenario_runs column"
+            assert store._canonical_type(by_name[name].field_type) == want, name
+            assert (by_name[name].mode or "NULLABLE").upper() == "NULLABLE", (
+                f"{name} must be NULLABLE — the additive reconcile can only "
+                f"add a nullable column to a live table, and every row written "
+                f"before this PR has no value for it")
+
+    def test_a_table_missing_every_one_of_them_reconciles(self):
+        """The migration, such as it is: `_ensure_table` adds them all on the
+        first write after deploy. A column missed from the reconcile is a
+        column that silently stays absent and reads NULL forever."""
+        bigquery = pytest.importorskip("google.cloud.bigquery")
+
+        declared = store._runs_schema()
+        legacy = [f for f in declared if f.name not in ROLL_COLUMNS]
+        assert len(legacy) == len(declared) - len(ROLL_COLUMNS)
+
+        writer = TestBigQueryLegacyTypeNames.writer_over(None, legacy)
+        ref = bigquery.DatasetReference("p", "options_wheel")
+        writer._ensure_table(ref, store.RUNS_TABLE, declared,
+                             partition_field="submitted_at", clustering=None)
+
+    def test_a_null_mode_means_pre_fc116_not_unknown(self):
+        """The posture chosen deliberately AGAINST `fill_haircut`'s.
+
+        `fill_haircut` is stored VERBATIM, so a NULL there means "the arm
+        declared none" and the dashboard had to grow `_resolved_haircut` to
+        tell that from a real value. Here the RESOLVED value is stored, so a
+        NULL has exactly one meaning — written by an engine before
+        `fc-116-roll-limit-fills` — and reading it as `limit` would claim every
+        legacy row's roll credit was measured against the placed limits.
+        """
+        import sys
+        from pathlib import Path
+
+        backend = str(Path("dashboard/backend").resolve())
+        if backend not in sys.path:
+            sys.path.insert(0, backend)
+        from services import sweeps as dash
+
+        assert dash._resolved_roll_fill_mode({}) == "haircut"
+        assert dash._resolved_roll_fill_mode({"roll_fill_mode": None}) == "haircut"
+        assert dash._resolved_roll_fill_mode({"roll_fill_mode": "limit"}) == "limit"
+        assert dash._resolved_roll_fill_mode(None) == "haircut"
+
+
+class TestTheRollFieldsRoundTripOntoARow:
+    def _row(self, **cell_kw):
+        from src.backtesting.scenarios.runner import ScenarioResult, SweepResult
+
+        cell = ScenarioResult(
+            scenario="a", symbol="XYZ", start=date(2024, 6, 3),
+            end=date(2024, 6, 28), split="all", config_hash="cfg",
+            scenario_hash="arm", verdict="fit", **cell_kw)
+        result = SweepResult(rows=[cell], scenarios=["a"])
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-11T00:00:00+00:00",
+            engine_version="fc-116-roll-limit-fills")
+        return rows[0]
+
+    def test_every_roll_field_reaches_the_row(self):
+        row = self._row(
+            rolls_executed=3, itm_rolls=2, otm_roll_outs=1,
+            roll_skips={"no_credit_candidate": 4, "btc_timeout_canceled": 1},
+            roll_net_credit=412.5, itm_roll_credit=300.0,
+            otm_roll_out_credit=112.5, failed_roll_btc_debit=0.0,
+            roll_legs_resting=2, roll_legs_marketable=4,
+            roll_fill_mode="limit",
+        )
+        assert row["rolls_executed"] == 3
+        assert row["itm_rolls"] == 2 and row["otm_roll_outs"] == 1
+        assert row["roll_net_credit"] == 412.5
+        assert row["itm_roll_credit"] + row["otm_roll_out_credit"] == 412.5
+        assert row["roll_legs_resting"] == 2
+        assert row["roll_legs_marketable"] == 4
+        assert row["roll_fill_mode"] == "limit"
+
+    def test_roll_skips_round_trips_through_json(self):
+        """A STRING column, because the reason set is open and a RECORD would
+        need a schema change every time the roller learns a new one."""
+        skips = {"no_credit_candidate": 4, "btc_timeout_canceled": 1}
+        row = self._row(roll_skips=skips)
+        assert json.loads(row["roll_skips"]) == skips
+
+    def test_an_empty_skip_dict_is_null_not_an_empty_string(self):
+        assert self._row(roll_skips={})["roll_skips"] is None
+        assert self._row()["roll_skips"] is None
+
+    def test_roll_fill_mode_is_what_disambiguates_that_null(self):
+        """T3. `roll_skips IS NULL` means TWO different things — "this replay
+        skipped nothing" and "the engine that wrote this could not count
+        skips" — and the column above cannot separate them. `roll_fill_mode`
+        can, because it is never NULL from FC-116 on."""
+        row = self._row(roll_skips={}, roll_fill_mode="limit")
+        assert row["roll_skips"] is None and row["roll_fill_mode"] == "limit"
+
+
+class TestAnErroredCellStillCarriesTheMode:
+    """T3. A NULL `roll_fill_mode` must keep its ONE meaning: pre-FC-116.
+
+    An errored cell ran no replay, but it is still a cell of a post-FC-116
+    run — leaving it NULL would file every failed arm of an honest sweep under
+    the legacy fill rule, and `shape_results` would then serve those runs the
+    wrong footer (E3).
+    """
+
+    def _errored_rows(self, **kw):
+        import src.backtesting.scenarios.runner as R
+
+        result = R.SweepResult(
+            rows=[], scenarios=["base", "haircut_arm"],
+            scenario_config_hashes={"base": "cfg", "haircut_arm": "cfg"},
+            scenario_hashes={"base": "h1", "haircut_arm": "h2"},
+            scenario_roll_fill_modes={"base": "limit",
+                                      "haircut_arm": "haircut"},
+            **kw)
+        return result
+
+    def test_a_materialisation_failure_row_carries_its_arms_mode(self):
+        """The rows built in `run_sweep`'s materialise-failure handler."""
+        import src.backtesting.scenarios.runner as R
+
+        result = self._errored_rows()
+        for scenario in ("base", "haircut_arm"):
+            result.rows.append(R.ScenarioResult(
+                scenario=scenario, symbol="XYZ", start=date(2024, 6, 3),
+                end=date(2024, 6, 28), split="all",
+                config_hash=result.scenario_config_hashes[scenario],
+                scenario_hash=result.scenario_hashes[scenario],
+                error="boom",
+                roll_fill_mode=result.scenario_roll_fill_modes.get(
+                    scenario, "limit"),
+            ))
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-11T00:00:00+00:00",
+            engine_version="fc-116-roll-limit-fills")
+        by_arm = {r["scenario_name"]: r for r in rows}
+        assert by_arm["base"]["error"] and by_arm["haircut_arm"]["error"]
+        assert by_arm["base"]["roll_fill_mode"] == "limit"
+        assert by_arm["haircut_arm"]["roll_fill_mode"] == "haircut"
+
+    def test_the_runner_sets_it_on_every_error_path(self):
+        """Structural, over the AST: EVERY `ScenarioResult(...)` the runner
+        builds with an `error=` must also name `roll_fill_mode=`.
+
+        A string search would miss a third construction added later, which is
+        exactly the drift that leaves a NULL meaning two things again.
+        """
+        import ast
+        import inspect
+
+        import src.backtesting.scenarios.runner as R
+
+        tree = ast.parse(inspect.getsource(R))
+        errored = [
+            call for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", None) == "ScenarioResult"
+            and any(kw.arg == "error" for kw in call.keywords)
+        ]
+        assert len(errored) == 2, (
+            f"expected the 2 known errored-cell constructions, found "
+            f"{len(errored)} — a new one must set roll_fill_mode too")
+        for call in errored:
+            assert any(kw.arg == "roll_fill_mode" for kw in call.keywords), (
+                f"line {call.lineno}: an errored ScenarioResult left "
+                f"roll_fill_mode NULL, which means 'pre-FC-116' to every "
+                f"reader of the column")

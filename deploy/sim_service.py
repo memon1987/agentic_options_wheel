@@ -524,7 +524,9 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
         "run_sensitivity": run_sensitivity,
         "scenarios": [
             {"name": s.name, "overrides": dict(s.overrides),
-             "fill_haircut": s.fill_haircut}
+             "fill_haircut": s.fill_haircut,
+             # FC-116, carried where the haircut is carried.
+             "roll_fill_mode": s.roll_fill_mode}
             for s in scenarios
         ],
         # Always present on the normalised form, `wheel` included. It is the

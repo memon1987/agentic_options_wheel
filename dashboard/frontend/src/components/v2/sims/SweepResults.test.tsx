@@ -72,6 +72,74 @@ const show = (report: SweepReport, row: SweepRow = sweep(), raw?: unknown) =>
 const cell = (scenario: string, symbol: string, split: string) =>
   screen.getByTestId(`cell-${scenario}-${symbol}-${split}`);
 
+describe('SweepResults — the roll fill mode flag (FC-116 E1)', () => {
+  /**
+   * Driven THROUGH `normaliseReport`, which is where the bug was: it rebuilt
+   * `scenario_overrides` and `scenario_fill_haircuts` off the spec and never
+   * assigned `scenario_roll_fill_modes`, and `shape_results` did not serve it
+   * either — so this flag could never render, and the FC-116 tests that built
+   * `SweepReport` objects by hand all passed anyway.
+   */
+  const reportWithMode = (mode?: string) => {
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    return normaliseReport(
+      {
+        ...shapedHoldout,
+        spec: {
+          ...spec,
+          scenarios: [
+            { name: 'puts_15_25', overrides: { 'strategy.put_delta_range': [0.15, 0.25] } },
+            { name: 'call_floor_0_50', overrides: { 'strategy.min_call_premium': 0.5 } },
+            {
+              name: 'at_the_bid',
+              overrides: {},
+              fill_haircut: 1.0,
+              ...(mode === undefined ? {} : { roll_fill_mode: mode }),
+            },
+          ],
+        },
+      },
+      sweep(),
+    )!;
+  };
+
+  it('flags an arm that declared `haircut`', () => {
+    show(reportWithMode('haircut'));
+    // The arm appears in more than one table, so the flag does too.
+    expect(screen.getAllByText(/rolls: haircut \(pre-FC-116\)/).length).toBeGreaterThan(0);
+  });
+
+  it('does not flag an arm that declared nothing — it ran `limit`', () => {
+    const report = reportWithMode();
+    expect(report.scenario_roll_fill_modes?.at_the_bid).toBe('limit');
+    show(report);
+    expect(screen.queryAllByText(/rolls: haircut/)).toHaveLength(0);
+  });
+
+  it('does not flag an arm that declared `limit` explicitly', () => {
+    show(reportWithMode('limit'));
+    expect(screen.queryAllByText(/rolls: haircut/)).toHaveLength(0);
+  });
+
+  it('flags a legacy arm off the SERVED map, which declares nothing', () => {
+    // Confirmation miss: a pre-FC-116 run declares no mode on any arm, so the
+    // spec-derived map called it `limit` and this flag stayed dark — on the
+    // one class of run where it is ALWAYS warranted. `shape_results` resolves
+    // it off the stored cells instead, where a NULL is `haircut`.
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    const report = normaliseReport(
+      {
+        ...shapedHoldout,
+        scenario_roll_fill_modes: { at_the_bid: 'haircut' },
+        spec: { ...spec, scenarios: [{ name: 'at_the_bid', overrides: {} }] },
+      },
+      sweep(),
+    )!;
+    show(report);
+    expect(screen.getAllByText(/rolls: haircut \(pre-FC-116\)/).length).toBeGreaterThan(0);
+  });
+});
+
 describe('SweepResults — the five cell renderings', () => {
   it('renders a measured cell as a signed return plus the verdict glyph', () => {
     show(holdout());

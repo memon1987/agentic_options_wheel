@@ -402,6 +402,23 @@ def _runs_schema():
         f("config_hash", "STRING"),
         f("overrides_json", "STRING"),
         f("fill_haircut", "FLOAT"),
+        # FC-116 D2 — the RESOLVED roll fill mode ("limit" | "haircut"), never
+        # NULL from this PR on, INCLUDING on an errored cell (T3: an error row
+        # carries the mode its arm resolved to, even though it ran no replay).
+        # Deliberately unlike `fill_haircut`, which is stored VERBATIM and so
+        # forced the dashboard to grow `_resolved_haircut` just to tell "the
+        # default" from "unspecified". Here a NULL means exactly one thing:
+        # the row is PRE-FC-116 — written by an engine before
+        # `fc-116-roll-limit-fills`, i.e. the haircut model.
+        #
+        # It is also the disambiguator for the OTHER NULL on this row:
+        # `roll_skips` persists as NULL for an empty dict as well as for a
+        # legacy row (pinned by `test_an_empty_skip_dict_is_null_not_an_empty_
+        # string`), so "no skips" and "this engine could not count skips" look
+        # identical in that column alone. `roll_fill_mode IS NOT NULL` with
+        # `roll_skips IS NULL` is a post-FC-116 row that genuinely skipped
+        # nothing.
+        f("roll_fill_mode", "STRING"),
         # Cell
         f("symbol", "STRING"),
         f("split", "STRING"),
@@ -438,6 +455,30 @@ def _runs_schema():
         # Fill sensitivity — a verdict that flips is not a verdict
         f("bid_fill_return", "FLOAT"),
         f("verdict_flips_on_fill", "BOOL"),
+        # Rolling (FC-116 D6). NONE of these was a column before, although
+        # `rolls_executed`/`roll_skips`/`itm_rolls`/`otm_roll_outs` have been
+        # on `ScenarioResult` since FC-096 Phase C — they reached a reader only
+        # through the report and the cell artifact. FC-112 compares
+        # `rolling.itm_trigger_ratio` 0.98 vs 1.00 across the wheel's standing
+        # set and has to read them PER ROW, so they land here as additive
+        # columns (`_ensure_table` reconciles; no migration).
+        f("rolls_executed", "INTEGER"),
+        f("roll_skips", "STRING"),            # JSON: reason -> count
+        f("itm_rolls", "INTEGER"),
+        f("otm_roll_outs", "INTEGER"),
+        # PRE-FEE, matching the live roller's own `net_credit` and
+        # `call_roll_completed`; `failed_roll_btc_debit` is post-fee cash and
+        # is kept separate so `roll_net_credit` reconciles exactly against
+        # `sum(roll_records.net_credit)`.
+        f("roll_net_credit", "FLOAT"),
+        f("itm_roll_credit", "FLOAT"),
+        f("otm_roll_out_credit", "FLOAT"),
+        f("failed_roll_btc_debit", "FLOAT"),
+        # How much of this row's roll credit rests on the model's ONE
+        # approximation (a limit resting inside the modeled spread, assumed
+        # touched). Both 0 under `roll_fill_mode: haircut`.
+        f("roll_legs_resting", "INTEGER"),
+        f("roll_legs_marketable", "INTEGER"),
         # Cost and failure
         f("replay_seconds", "FLOAT"),
         f("error", "STRING"),
@@ -1166,6 +1207,23 @@ def rows_from_sweep(
 
             "bid_fill_return": cell.bid_fill_return,
             "verdict_flips_on_fill": cell.verdict_flips_on_fill,
+
+            # FC-116 D6. Off the cell, not off the sweep-level dicts: these are
+            # per-(arm, symbol, window) facts, unlike `fill_haircut` above.
+            "rolls_executed": cell.rolls_executed,
+            "roll_skips": (json.dumps(cell.roll_skips, sort_keys=True)
+                           if cell.roll_skips else None),
+            "itm_rolls": cell.itm_rolls,
+            "otm_roll_outs": cell.otm_roll_outs,
+            "roll_net_credit": cell.roll_net_credit,
+            "itm_roll_credit": cell.itm_roll_credit,
+            "otm_roll_out_credit": cell.otm_roll_out_credit,
+            "failed_roll_btc_debit": cell.failed_roll_btc_debit,
+            "roll_legs_resting": cell.roll_legs_resting,
+            "roll_legs_marketable": cell.roll_legs_marketable,
+            # RESOLVED on the cell by `_replay_one`, so a stored row never
+            # needs a default applied at read time.
+            "roll_fill_mode": cell.roll_fill_mode,
 
             "replay_seconds": cell.replay_seconds,
             "error": (cell.error[:1000] if cell.error else None),

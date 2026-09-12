@@ -152,6 +152,92 @@ describe('normaliseReport — provenance', () => {
     expect(report.scenario_overrides?.at_the_bid).toEqual({});
     expect(report.scenario_fill_haircuts?.at_the_bid).toBe(1);
   });
+
+  it('resolves every arm’s roll fill mode, absent meaning `limit`', () => {
+    // FC-116 E1: this map was declared on the type and produced by NOTHING —
+    // `shape_results` did not serve it and this function did not build it — so
+    // the `/sims` haircut flag never rendered, the console provenance row said
+    // "not declared" for an arm that DID declare, and `compareAlignment`'s
+    // last fallback was permanently `limit`.
+    const report = normaliseReport(shapedHoldout, sweep())!;
+    expect(report.scenario_roll_fill_modes?.at_the_bid).toBe('limit');
+    expect(report.scenario_roll_fill_modes?.puts_15_25).toBe('limit');
+
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    const declared = normaliseReport(
+      {
+        ...shapedHoldout,
+        spec: {
+          ...spec,
+          scenarios: [{ name: 'at_the_bid', overrides: {}, roll_fill_mode: 'haircut' }],
+        },
+      },
+      sweep(),
+    )!;
+    expect(declared.scenario_roll_fill_modes?.at_the_bid).toBe('haircut');
+  });
+
+  describe('the SERVED map outranks the spec-derived one', () => {
+    // FC-116 confirmation. `shape_results` now serves
+    // `scenario_roll_fill_modes` off the stored CELLS, where a legacy NULL
+    // reads `haircut`. The spec cannot reproduce that: a pre-FC-116 run
+    // declares nothing on any arm, so deriving off the spec alone renders
+    // `limit` in the /sims arm flag, in `compareAlignment`'s fallback and in
+    // the provenance footer's arm row — while the SAME footer prints
+    // ROLL_FILL_LEGACY from the run. The two readings contradicted each other
+    // on every legacy run.
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    const withServed = (served: unknown) =>
+      normaliseReport(
+        {
+          ...shapedHoldout,
+          scenario_roll_fill_modes: served,
+          spec: {
+            ...spec,
+            // Declares NOTHING — the legacy shape the spec cannot distinguish.
+            scenarios: [
+              { name: 'base', overrides: {} },
+              { name: 'x', overrides: {} },
+            ],
+          },
+        },
+        sweep(),
+      )!;
+
+    it('a legacy run reads `haircut` on every arm, not `limit`', () => {
+      const report = withServed({ base: 'haircut', x: 'haircut' });
+      expect(report.scenario_roll_fill_modes?.base).toBe('haircut');
+      expect(report.scenario_roll_fill_modes?.x).toBe('haircut');
+    });
+
+    it('tops up an arm the served map does not mention', () => {
+      // A `running` sweep can have a cell for one arm and none for another;
+      // the backend fills the gap from the spec, and so does this.
+      const report = withServed({ base: 'haircut' });
+      expect(report.scenario_roll_fill_modes?.base).toBe('haircut');
+      expect(report.scenario_roll_fill_modes?.x).toBe('limit');
+    });
+
+    it('falls back WHOLE on a value the SPA does not recognise', () => {
+      // Half-trusting a map the two sides disagree about would print a mode
+      // nothing ran under.
+      for (const bad of [
+        { base: 'LIMIT', x: 'haircut' },
+        { base: 'haircut', x: 7 },
+        { base: 'haircut', x: null },
+      ]) {
+        const report = withServed(bad);
+        expect(report.scenario_roll_fill_modes?.base).toBe('limit');
+        expect(report.scenario_roll_fill_modes?.x).toBe('limit');
+      }
+    });
+
+    it('falls back when the map is absent, empty or not an object', () => {
+      for (const bad of [undefined, null, {}, [], 'haircut']) {
+        expect(withServed(bad).scenario_roll_fill_modes?.base).toBe('limit');
+      }
+    });
+  });
 });
 
 describe('normaliseReport — in-sample runs', () => {
@@ -259,6 +345,12 @@ describe('the forecast is coerced, not cast (review round 1, F9)', () => {
       basis: 'mid',
       fill_haircut: 0.25,
       is_engine_default: true,
+      // FC-116. This fixture predates `fc-116-roll-limit-fills`, so it carries
+      // no `roll_fill_mode` — and that absence resolves to `haircut`, which is
+      // what the engine that produced it actually did. Defaulting to `limit`
+      // here would claim its roll credits were measured against the placed
+      // limits.
+      roll_fill_mode: 'haircut',
     });
     expect(base.portfolio.net_option_pnl!.annual_low).toBeCloseTo(5932.5668389, 6);
     expect(base.portfolio.included).toEqual(['GOOGL']);
@@ -305,7 +397,12 @@ describe('the forecast is coerced, not cast (review round 1, F9)', () => {
     expect(forecast.capital_base).toBeNull();
     expect(forecast.days).toEqual({ fit: null, holdout: null });
     const cell = forecast.by_scenario.base.symbols.GOOGL;
-    expect(cell.fill).toEqual({ basis: null, fill_haircut: null });
+    expect(cell.fill).toEqual({
+      basis: null,
+      fill_haircut: null,
+      // A poisoned/absent value is still the legacy reading, never `limit`.
+      roll_fill_mode: 'haircut',
+    });
     expect(cell.capital_base).toBeNull();
     expect(cell.net_option_pnl.annual_low).toBeNull();
     // `total_pnl: null` still yields the all-null shape the panel can render,

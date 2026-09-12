@@ -111,6 +111,12 @@ class ArtifactMeta:
             necessarily ``daily[0].day``/``daily[-1].day`` (a window can open on
             a holiday).
         fill_haircut: the arm's haircut, 0..1 from mid toward the near side.
+            Applies to ENTRY legs and the CC monitor leg only, post-FC-116.
+        roll_fill_mode: FC-116 — how the arm filled ROLL legs. ``"limit"``
+            (the default) prices each leg at the limit the live roller would
+            have placed, capped by the day's modeled book; ``"haircut"`` is the
+            pre-FC-116 regression arm. Read off the replay result when present,
+            so the stamp describes what RAN, not what was requested.
         starting_cash: the per-symbol notional, so a curve can be normalised.
         git_commit: provenance only; ``engine_identity`` is the identity.
         benchmark: THIS cell's scored ``FitnessReport.benchmark`` (FC-096 Phase
@@ -139,6 +145,7 @@ class ArtifactMeta:
     window_start: Optional[date] = None
     window_end: Optional[date] = None
     fill_haircut: Optional[float] = None
+    roll_fill_mode: Optional[str] = None
     starting_cash: Optional[float] = None
     git_commit: Optional[str] = None
     benchmark: Optional[BuyAndHold] = None
@@ -451,6 +458,16 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
         "fill": {
             "basis": MID_FILL_BASIS,
             "fill_haircut": _num(meta.fill_haircut),
+            # FC-116. The fill assumption is now TWO rules, not one: entry legs
+            # and the CC monitor leg take the haircut above; ROLL legs fill at
+            # their placed limit capped by the book unless this says
+            # `"haircut"`. A cell that stamped only the haircut would leave a
+            # reader unable to tell which of two very different roll-credit
+            # numbers they were looking at.
+            "roll_fill_mode": (
+                getattr(result, "roll_fill_mode", None)
+                or getattr(meta, "roll_fill_mode", None)
+            ),
         },
         "starting_cash": _num(meta.starting_cash
                               if meta.starting_cash is not None
@@ -546,6 +563,23 @@ def cell_artifact(result: SimulationResult, meta: ArtifactMeta) -> Dict[str, Any
             "calls_closed_early": int(getattr(result, "calls_closed_early", 0) or 0),
             "itm_rolls": int(getattr(result, "itm_rolls", 0) or 0),
             "otm_roll_outs": int(getattr(result, "otm_roll_outs", 0) or 0),
+            # FC-116 D6. The roll CREDIT, split the same way the counts are —
+            # FC-112's question is whether an OTM re-write is defence or churn,
+            # and the cost of crossing the spread twice is what decides it.
+            # PRE-FEE, and equal to `sum(roll_records.net_credit)` exactly.
+            "roll_net_credit": _num(getattr(result, "roll_net_credit", 0.0)),
+            "itm_roll_credit": _num(getattr(result, "itm_roll_credit", 0.0)),
+            "otm_roll_out_credit": _num(
+                getattr(result, "otm_roll_out_credit", 0.0)),
+            # Real money paid on the BTC leg of a roll that never completed.
+            # SEPARATE from the credit above so that reconciliation stays exact.
+            "failed_roll_btc_debit": _num(
+                getattr(result, "failed_roll_btc_debit", 0.0)),
+            # How many roll legs rested on the model's one approximation.
+            "roll_legs_resting": int(
+                getattr(result, "roll_legs_resting", 0) or 0),
+            "roll_legs_marketable": int(
+                getattr(result, "roll_legs_marketable", 0) or 0),
         },
         # The coverage split, never a single ratio (plan §C3): covered /
         # hold-uncovered / earnings-span / gate-rejected / post-call-away. Empty

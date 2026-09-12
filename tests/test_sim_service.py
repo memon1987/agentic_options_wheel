@@ -372,7 +372,13 @@ class TestTheSpecIsTheJobs:
             "run_sensitivity": False,
             "scenarios": [{"name": "tighter",
                            "overrides": {"strategy.put_delta_range": [0.1, 0.2]},
-                           "fill_haircut": None}],
+                           "fill_haircut": None,
+                           # FC-116: on BOTH normalised forms, for the same
+                           # reason `strategy` is. `None` is the honest
+                           # spelling of "the submitter did not ask", and
+                           # `scenario_arm_hash` folds it to absence, so this
+                           # key costs no stored `sweep_key`.
+                           "roll_fill_mode": None}],
             # FC-096 Phase C: present on BOTH normalised forms, `wheel`
             # included. Dropping the wheel case from the KEY is
             # `canonical_spec`'s job — asserted separately below — and doing it

@@ -9,6 +9,7 @@ the replay is right, and the failure is silent in every case.
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
@@ -89,6 +90,146 @@ class TestCanonicalisationByOmission:
         Canonicalisation must not refuse — the VALIDATORS do."""
         assert ident.canonical_spec(
             dict(LEGACY_SPEC, strategy="nonsense"))["strategy"] == "nonsense"
+
+    # -- FC-116 T8 -------------------------------------------------------- #
+    # Literal pins, computed on the tree BEFORE `roll_fill_mode` existed
+    # (`1e292a2`) and pasted here. No test pinned a literal arm hash until
+    # now, which is exactly how FC-116 could have shipped a payload that
+    # writes `"roll_fill_mode": null` as a fixed key and silently moved EVERY
+    # arm hash -> every `scenario_hash`, `sweep_key` and standing pin in the
+    # store. A hash that moves here is that bug, not a rebase artefact: these
+    # literals must survive every future change to `identity.py` unless the
+    # store is deliberately being invalidated.
+    LEGACY_ARM_HASH_NO_HAIRCUT = "c908ee20abc31f39"
+    LEGACY_ARM_HASH_HAIRCUT_05 = "f1be989a61b68a05"
+    LEGACY_TIGHTER_ARM_HASH = "245a9c1cf695f82e"
+    LEGACY_CANONICAL_JSON = (
+        '{"end": "2026-08-29", "holdout_start": "2026-06-01", '
+        '"run_sensitivity": false, "scenarios": [{"hash": '
+        '"245a9c1cf695f82e", "name": "tighter"}], "start": "2025-09-02", '
+        '"starting_cash": 100000.0, "symbols": ["GOOGL", "UNH"]}'
+    )
+
+    def test_a_legacy_arm_hash_is_a_literal_and_does_not_move(self):
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, None
+        ) == self.LEGACY_ARM_HASH_NO_HAIRCUT
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, 0.5
+        ) == self.LEGACY_ARM_HASH_HAIRCUT_05
+        assert ident.scenario_arm_hash(
+            {"strategy.call_delta_range": [0.1, 0.2]}, None
+        ) == self.LEGACY_TIGHTER_ARM_HASH
+
+    def test_the_default_haircut_still_folds_to_the_omitted_hash(self):
+        """The precedent the new fold copies: a spelled-out default and an
+        omitted one are ONE arm."""
+        assert ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, ident.DEFAULT_FILL_HAIRCUT
+        ) == self.LEGACY_ARM_HASH_NO_HAIRCUT
+
+    def test_the_canonical_json_of_a_legacy_spec_is_a_literal(self):
+        """Byte-level, not key-level: a new key added to the payload with a
+        `null` value passes a `"x" not in canonical` check and still moves
+        every stored key."""
+        assert json.dumps(
+            ident.canonical_spec(LEGACY_SPEC), sort_keys=True
+        ) == self.LEGACY_CANONICAL_JSON
+
+    # -- FC-116 T8, the new behaviour -------------------------------------- #
+    def test_the_default_mode_folds_to_absence_not_to_null(self):
+        """E1, and the reason the literals above exist.
+
+        `scenario_arm_hash`'s payload is a FIXED two-key dict that always
+        writes `"fill_haircut": null` for the default. Copying that shape for
+        `roll_fill_mode` would change the payload BYTES of every arm ever
+        hashed — every `scenario_hash`, `sweep_key` and standing pin in the
+        store, a silent and total dedup miss. So the default is spelled by
+        ABSENCE, exactly as a `"wheel"` strategy is in `canonical_spec`.
+        """
+        omitted = ident.scenario_arm_hash({"rolling.itm_trigger_ratio": 1.0}, None)
+        explicit = ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, None, "limit")
+        assert omitted == explicit == self.LEGACY_ARM_HASH_NO_HAIRCUT
+        assert ident.DEFAULT_ROLL_FILL_MODE == "limit"
+
+    def test_the_haircut_mode_moves_the_arm_hash_and_the_sweep_key(self):
+        """The regression arm must be a DIFFERENT arm, or the before/after
+        would dedup into one cell and the comparison would be impossible."""
+        honest = ident.scenario_arm_hash({"rolling.itm_trigger_ratio": 1.0}, None)
+        legacy = ident.scenario_arm_hash(
+            {"rolling.itm_trigger_ratio": 1.0}, None, "haircut")
+        assert legacy != honest
+
+        spec = dict(LEGACY_SPEC, scenarios=[
+            dict(LEGACY_SPEC["scenarios"][0], roll_fill_mode="haircut")])
+        assert _key(spec) != _key(LEGACY_SPEC)
+        assert ident.canonical_spec(spec)["scenarios"][0]["hash"] != \
+            self.LEGACY_TIGHTER_ARM_HASH
+
+    def test_an_explicit_limit_keys_identically_to_an_omitted_one(self):
+        """A console submission always stamps the field; a hand-written spec
+        does not. Without the fold those two identical runs would key
+        differently and never dedup against each other — the same failure the
+        `strategy: wheel` fold exists to prevent."""
+        spec = dict(LEGACY_SPEC, scenarios=[
+            dict(LEGACY_SPEC["scenarios"][0], roll_fill_mode="limit")])
+        assert _key(spec) == _key(LEGACY_SPEC)
+
+    def test_a_base_arm_carrying_any_mode_is_not_the_implicit_base(self):
+        """Folding it away would silently DROP the mode from the comparator
+        every other row is read against.
+
+        `limit` is refused too, not just `haircut` (review): the runner's
+        `_with_base_first` rejects a declared `base` carrying ANY
+        `roll_fill_mode`, so folding the default made `canonical_spec` agree
+        with a spec the engine refuses — and a dedup hit would hand that
+        submission a different run's numbers instead of the error it earned.
+        """
+        assert ident._is_implicit_base({"name": "base"})
+        assert not ident._is_implicit_base(
+            {"name": "base", "roll_fill_mode": "limit"})
+        assert not ident._is_implicit_base(
+            {"name": "base", "roll_fill_mode": "haircut"})
+
+    def test_the_two_sides_refuse_the_same_arm(self):
+        """The asymmetry this closes, stated as one assertion."""
+        import pytest
+
+        from src.backtesting.scenarios.runner import Scenario, _with_base_first
+
+        for mode in ("limit", "haircut"):
+            arm = {"name": "base", "roll_fill_mode": mode}
+            assert not ident._is_implicit_base(arm), mode
+            with pytest.raises(ValueError, match="roll_fill_mode"):
+                _with_base_first([Scenario("base", {}, roll_fill_mode=mode)])
+
+    def test_the_default_mode_is_the_same_string_in_every_copy(self):
+        """Three copies that cannot import each other: `identity` (stdlib-only,
+        flat-copied into the dashboard image), `evaluate` (the screen path),
+        and `engine.broker` (which the adapter imports — it cannot reach
+        `identity` without a circular import through
+        `scenarios/__init__` -> runner -> simulator -> adapter)."""
+        from src.backtesting import evaluate as ev
+        from src.backtesting.engine import broker as bk
+
+        assert (ident.DEFAULT_ROLL_FILL_MODE
+                == ev.DEFAULT_ROLL_FILL_MODE
+                == bk.ROLL_FILL_MODE_LIMIT
+                == "limit")
+        assert ident.ROLL_FILL_MODES == bk.ROLL_FILL_MODES == ("limit", "haircut")
+        # The non-default mode is named in both copies too (the dashboard's
+        # legacy-NULL fallback imports `identity`'s). Pinned as a MEMBER of the
+        # enum as well, because the two are declared independently: a rename of
+        # the tuple's second element that missed this constant would leave the
+        # fallback producing a mode the validator rejects.
+        assert (ident.ROLL_FILL_MODE_HAIRCUT
+                == bk.ROLL_FILL_MODE_HAIRCUT
+                == "haircut")
+        assert ident.ROLL_FILL_MODE_HAIRCUT in ident.ROLL_FILL_MODES
+        # The dashboard is NOT a fourth copy — it imports this one. Pinned
+        # by identity in `test_dashboard_sweeps.py` (E4), which has the
+        # path setup needed to import `services.sweeps`.
 
     def test_the_constant_is_the_same_string_in_all_three_copies(self):
         """It is spelled in three stdlib/engine modules that cannot import each
@@ -514,3 +655,69 @@ class TestTheMovedGate:
              "import sys; assert 'flask' not in sys.modules"],
             capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T9 — the CLI and the ENGINE VERSION
+# --------------------------------------------------------------------------- #
+class TestTheCliAcceptsTheRollFillMode:
+    """The CLI is one of three validators that must agree (the API and the
+    console are the others). A key accepted by one and refused by another is a
+    spec that runs from the terminal and 400s from the console."""
+
+    def _arms(self, entry):
+        return cli.scenarios_from_spec({"scenarios": [entry]})
+
+    def test_both_values_are_accepted_and_carried_onto_the_arm(self):
+        for mode in ("limit", "haircut"):
+            arm, = self._arms({"name": "a", "roll_fill_mode": mode})
+            assert arm.roll_fill_mode == mode
+
+    def test_an_omitted_mode_stays_none_and_resolves_later(self):
+        """`None` is not `"limit"` on the dataclass, deliberately: the RUNNER
+        resolves it, and the resolved value is what reaches the row. Writing
+        the default in here would make a stored spec claim the submitter asked
+        for something they did not."""
+        arm, = self._arms({"name": "a"})
+        assert arm.roll_fill_mode is None
+
+    def test_an_unknown_mode_is_refused_by_name(self):
+        with pytest.raises(SystemExit) as exc:
+            self._arms({"name": "a", "roll_fill_mode": "mid"})
+        assert "roll_fill_mode" in str(exc.value)
+        assert "'mid'" in str(exc.value)
+
+    def test_a_misspelled_field_is_still_refused(self):
+        """The unknown-field set had to GROW for this PR; a regression that
+        widened it instead would let every typo through silently."""
+        with pytest.raises(SystemExit) as exc:
+            self._arms({"name": "a", "roll_fill_modes": "haircut"})
+        assert "unknown field" in str(exc.value)
+
+
+class TestTheEngineVersionMovedAndStayedInSync:
+    """FC-116 D3. Rows written before and after this PR are NON-COMPARABLE on
+    every roll-bearing row. The identity hash would invalidate dedup anyway —
+    `sweep_key` mixes in the content hash of `src/**` — but the VERSION is what
+    makes the boundary queryable (`WHERE engine_version = ...`). FC-048 did not
+    bump, and the docs call that boundary "timestamp-only" as the regret."""
+
+    def test_all_three_copies_are_the_fc116_version(self):
+        from src.backtesting import screen
+        from src.backtesting.scenarios import engine_identity
+
+        assert (screen.ENGINE_VERSION
+                == engine_identity.ENGINE_VERSION
+                == "fc-116-roll-limit-fills")
+
+    def test_the_dashboard_copy_agrees(self):
+        import sys
+        from pathlib import Path
+
+        backend = str(Path("dashboard/backend").resolve())
+        if backend not in sys.path:
+            sys.path.insert(0, backend)
+        from services import sweeps as dash
+
+        from src.backtesting import screen
+        assert dash.ENGINE_VERSION == screen.ENGINE_VERSION

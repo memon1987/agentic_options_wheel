@@ -73,3 +73,4 @@ dmypy.json
 # Cloud Build writes this into /workspace, which IS the repo root there
 # (cloudbuild.yaml `compute-engine-identity`). Never a tracked file.
 engine_identity.txt
+.venv/

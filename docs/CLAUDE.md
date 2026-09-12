@@ -732,6 +732,13 @@ deltas for the same kind of reason.
     truth for realized behavior
   - BigQuery `options_wheel.backtest_runs` — screening results (see
     `docs/bigquery/backtest_runs.md`)
+  - BigQuery `options_wheel.scenario_runs` / `scenario_sweeps` — sweep cells
+    (see `docs/bigquery/scenario_runs.md`). **Any series over these that
+    touches ROLL numbers must partition on `engine_version`**: rows before
+    `fc-116-roll-limit-fills` filled roll legs at the haircut price rather than
+    at the limits the live roller places, and old and new rows share
+    `scenario_hash` and `config_hash` by design, so nothing else separates
+    them. A NULL `roll_fill_mode` means "before that boundary".
   - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
   - Google Cloud Storage: `gs://options-wheel-chain-lake/chains/v1/` — the
     **chain lake** (FC-060 Layer 1): the point-in-time option chains the
@@ -890,6 +897,17 @@ scheduler needed no change. Four properties are worth knowing:
   it. The cap matters because an engine-change week genuinely replays
   everything: the dedup key is a content hash of `src/**`, so any merge
   touching the engine invalidates every stored result exactly once.
+  **A merge that changes what a number MEANS must also bump `ENGINE_VERSION`**
+  in all three byte-pinned copies (`screen.py`, `scenarios/engine_identity.py`,
+  `dashboard/backend/services/sweeps.py`). The identity hash already
+  invalidates dedup; the version is what makes the boundary *queryable* after
+  the fact — FC-048 did not bump, and the docs still call that boundary
+  "timestamp-only" as the regret. The most recent one is
+  `fc-116-roll-limit-fills`: rows before it filled ROLL legs at the haircut
+  price, so they are **not comparable on any roll-bearing row**, and any trend
+  series over roll credits must partition on `engine_version` (or on the
+  `scenario_runs.roll_fill_mode` column, where NULL means "before that
+  boundary").
 - **The exit boundary is structural.** The backfill branch exits with the
   backfill's code and nothing can move it: the battery's return value is
   discarded and every way it can fail — a crash, or a `SystemExit` from its own

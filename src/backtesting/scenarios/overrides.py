@@ -16,13 +16,18 @@ not do what it says*:
   and the replay's day loop does not run the monitor. A sweep over them would
   return ten identical rows and read as "profit-taking does not matter".
 * ``strategy.{put,call}_limit_spread_fraction`` are selection-only and still
-  dead: the replay RECORDS a limit price and fills at the broker's
-  ``mid - haircut x half-spread`` anyway. Vary ``Scenario(fill_haircut=...)``.
+  dead: the replay RECORDS a limit price on an ENTRY leg and fills at the
+  broker's ``mid - haircut x half-spread`` anyway. Vary
+  ``Scenario(fill_haircut=...)``, and ``Scenario(roll_fill_mode=...)`` for roll
+  legs — FC-116 made those fill at their placed limits, but entry legs
+  deliberately still do not (FC-072 measured them against the haircut).
 * ``universe.min_open_interest`` reads a field the engine hardcodes to ``0``, so
   any floor rejects every call — a deterministic wipe-out dressed as a finding.
-* ``rolling.fallback_strike_attempts`` governs rungs the replay never reaches:
-  the adapter fills rung 1 unconditionally, so rung >= 3 came up 0 times over an
-  instrumented 37 rolls x 7 arms. Live in production, inert here.
+* ``rolling.fallback_strike_attempts`` governs rungs the replay does not reach:
+  a rung-1 limit is derived from the SAME day's snapshot the adapter then fills
+  against, so on any un-crossed book it lies inside ``[bid, ask]`` and fills.
+  No rung-1 leg expires, so no later rung is asked for. Live in production,
+  where the book moves between quote and fill; inert here.
 
 All four were on the plan's allowlist and were moved here by measurement, not by
 reading: **selection-only is necessary but not sufficient**. A key also has to be
@@ -226,13 +231,20 @@ REJECTED_OVERRIDES: Dict[str, str] = {
         "a documented model with a measured error, not an absent field."
     ),
     "rolling.fallback_strike_attempts": (
-        "unreachable in a replay. The knob decides how many FURTHER strikes the "
-        "roller tries after the first two rungs, and rung 1 always fills here: "
-        "`BacktestAlpacaClient.place_option_order` fills immediately at the "
-        "broker's haircut price rather than resting a limit that can go unfilled. "
-        "Instrumented over 37 rolls x 7 arms, rung >= 3 was reached 0 times, so "
-        "every arm returns the base row. It is live in production, where a real "
-        "limit can miss; it is inert here."
+        "inert in a replay. The knob decides how many FURTHER strikes the "
+        "roller tries after the first two rungs, and a later rung is asked for "
+        "only when an earlier one fails to fill. Structurally, that cannot "
+        "happen here: the roller derives its rung-1 limit from the SAME day "
+        "snapshot the adapter then fills it against, and the book is quantised "
+        "to cents before the comparison, so a base-mode limit sits AT the far "
+        "quote (`round(ask, 2) == ask_c` on the buy-to-close, `round(bid, 2) "
+        "== bid_c` on the sell-to-open) and an imminence-mode limit sits "
+        "strictly inside it (`mid +/- 0.05`, against a half-spread floored at "
+        "0.02). Either way the leg fills, so rung 1 never expires and rung >= "
+        "2 is reachable only on an INVERTED quote, which no lake or model "
+        "chain produces. It is live in production, where the book moves "
+        "between the quote and the fill; it is inert here. Measure before "
+        "allowing it."
     ),
     "strategy.opportunity_max_age_minutes": (
         "the replay hands opportunities from scan to execute in memory; there is "

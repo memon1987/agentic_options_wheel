@@ -76,8 +76,14 @@ from ..data.dividends import (
     should_assign_early,
 )
 from ..data.provider import OptionsDataProvider, StockBar
-from .alpaca_adapter import BacktestAlpacaClient
-from .broker import BacktestBroker
+from .alpaca_adapter import ROLL_INTENT, BacktestAlpacaClient
+from .broker import (
+    FILL_RULE_LIMIT_MARKETABLE,
+    FILL_RULE_LIMIT_RESTING,
+    ROLL_FILL_MODE_LIMIT,
+    ROLL_FILL_MODES,
+    BacktestBroker,
+)
 from .clock import SimClock
 from .historical_earnings import HistoricalEarningsCalendar
 from .no_op_analytics import NoOpAnalyticsWriter, NoOpTradeJournal
@@ -318,6 +324,60 @@ COVERAGE_REASONS = (
 COVERAGE_NOT_A_STAND_DOWN = frozenset(
     {COVERAGE_HOLD_UNCOVERED, COVERAGE_EARNINGS_SPAN})
 
+#: FC-116 D5 — the roller failure reasons that are INVISIBLE in a replay today
+#: and are folded into `roll_skips` from `execute_roll`'s return value.
+#:
+#: The allowlist is explicit rather than "any failed record's reason" for one
+#: concrete reason: `credit_gone_at_execution` is ALREADY tallied — it goes out
+#: through `log_terminal_skip` -> `call_roll_skipped` BEFORE `execute_roll`
+#: returns it (`call_roller.py:594-603`) — so folding it here would count it
+#: TWICE. What has no `call_roll_skipped` event, and therefore no tally entry,
+#: is every failure AFTER an order was placed:
+#:
+#:   btc_rejected             `:632`, `:672`  (log_error_event)
+#:   btc_timeout_canceled     `:684`          (call_roll_btc_timeout_canceled)
+#:   partial_naked_exposure   `:792`
+#:   stc_failed_naked_exposure`:852`
+#:   btc_disposition_unknown  `:879`
+#:   stc_disposition_unknown  `:879`
+#:
+#: `dry_run` (`:581`, emitted as `call_roll_dry_run`) is DELIBERATELY excluded
+#: and named here rather than omitted silently: it never occurs in a replay,
+#: and if it ever did it would be a configuration mistake, not a roll outcome.
+#:
+#: A reason outside this set is logged at WARNING and NOT counted — a future
+#: roller reason must be classified deliberately, not silently double-counted
+#: (if it is already a `call_roll_skipped`) or silently dropped (if it is not).
+_POST_PLACEMENT_ROLL_FAILURES = frozenset({
+    "btc_rejected",
+    "btc_timeout_canceled",
+    "partial_naked_exposure",
+    "stc_failed_naked_exposure",
+    "btc_disposition_unknown",
+    "stc_disposition_unknown",
+})
+
+#: Already counted by `RejectionTally` via `call_roll_skipped`; folding any of
+#: these would double-count. Kept as a named set so the WARNING below can say
+#: "already tallied" rather than "unknown".
+_ALREADY_TALLIED_ROLL_FAILURES = frozenset({"credit_gone_at_execution",
+                                            "dry_run"})
+
+
+def _merge_roll_skips(tallied: Dict[str, int],
+                      folded: Dict[str, int]) -> Dict[str, int]:
+    """`call_roll_skipped` counts plus the post-placement failures (D5).
+
+    One dict, keyed by the roller's own reason strings, ordered by the same
+    rule `RejectionTally.roll_skip_summary` uses (count descending, name
+    ascending) so the merged result is as deterministic as the half it came
+    from. The allowlist guarantees the two halves cannot overlap.
+    """
+    merged = dict(tallied)
+    for reason, count in folded.items():
+        merged[reason] = merged.get(reason, 0) + count
+    return dict(sorted(merged.items(), key=lambda kv: (-kv[1], kv[0])))
+
 
 @dataclass(frozen=True)
 class SyntheticLotPolicy:
@@ -449,6 +509,45 @@ class SimulationResult:
     #: A deep-ITM streak of `btc_quote_unavailable` / `no_credit_candidate`
     #: looks exactly like a credit-only roller correctly declining.
     roll_skips: Dict[str, int] = field(default_factory=dict)
+    #: FC-116 D6 — the roll CREDIT, which no aggregate anywhere in the engine,
+    #: the report, the artifact or the row carried before. FC-112 compares
+    #: `rolling.itm_trigger_ratio` 0.98 vs 1.00 and the whole question is
+    #: whether a same-day OTM re-write is defence or churn; the cost of
+    #: crossing the spread twice is exactly the number that decides it.
+    #:
+    #: **PRE-FEE, on purpose.** The roller's own
+    #: `net_credit = (stc - btc) * replaced * 100` (`call_roller.py:748`)
+    #: excludes `fees_per_contract`; it is the number the live credit invariant
+    #: guards and the number `call_roll_completed` reports, so the replay's
+    #: aggregate must be the same quantity or the two cannot be compared. The
+    #: ledger's `cash_delta` is the post-fee view.
+    roll_net_credit: float = 0.0
+    itm_roll_credit: float = 0.0
+    otm_roll_out_credit: float = 0.0
+    #: Post-fee cash paid on the BTC leg of a roll that did NOT complete, i.e.
+    #: a `buy_to_close` with NO `sell_call_open` after it — the roller's
+    #: `stc_failed_naked_exposure` / `stc_disposition_unknown` outcomes. Real
+    #: money that contributes 0 to `roll_net_credit`. Separate, not folded in,
+    #: so the identity `roll_net_credit == sum(roll_records.net_credit)` stays
+    #: exact. 0 on every model-built chain, where no roll leg can expire.
+    #:
+    #: NOT captured: `partial_naked_exposure`, where the STO fills for FEWER
+    #: contracts than the BTC closed. A `sell_call_open` event IS written, so
+    #: positional pairing sees a completed pair and the residual BTC cash on
+    #: the uncovered contracts is not counted here. Accepted as a known gap
+    #: rather than papered over: capturing it needs per-contract pairing, and
+    #: a partial fill cannot occur at all in the replay (the adapter fills a
+    #: leg whole or `expired`).
+    failed_roll_btc_debit: float = 0.0
+    #: Roll legs by how they filled (FC-116 D1c). `resting` legs are the ones
+    #: that rest on the model's ONE approximation — a limit inside the modeled
+    #: spread, assumed touched within its window — so this is how much of a
+    #: row's roll credit a reader should discount. Both 0 under
+    #: `roll_fill_mode: haircut`.
+    roll_legs_resting: int = 0
+    roll_legs_marketable: int = 0
+    #: The RESOLVED roll fill mode this replay ran under.
+    roll_fill_mode: str = ROLL_FILL_MODE_LIMIT
 
     @property
     def final_equity(self) -> float:
@@ -481,6 +580,7 @@ class Simulator:
         earnings_calendar: Optional[object] = None,
         dividend_schedule: Optional[DividendSchedule] = None,
         synthetic_lots: Optional["SyntheticLotPolicy"] = None,
+        roll_fill_mode: str = ROLL_FILL_MODE_LIMIT,
     ) -> None:
         self.config = restrict_symbols(config, symbols)
         # FC-096 Phase C. The strategy is read ONCE, off the resolved profile,
@@ -521,6 +621,19 @@ class Simulator:
         self.starting_cash = starting_cash
         self.max_dte = max_dte
         self.fill_haircut = fill_haircut
+        # FC-116 — how ROLL legs fill. Validated here (E5) rather than
+        # degraded downstream: the adapter's pricing branch is `!= "limit"`, so
+        # an unrecognised spelling such as `"LIMIT"` would hash as a distinct
+        # sweep arm, run as haircut, and persist a mode label that contradicts
+        # the model it ran under. `evaluate._simulator` threads the screen
+        # path's `DEFAULT_ROLL_FILL_MODE` explicitly, so the screen's mode is
+        # pinned by a test rather than inherited silently.
+        if roll_fill_mode not in ROLL_FILL_MODES:
+            raise ValueError(
+                f"roll_fill_mode must be one of {list(ROLL_FILL_MODES)}, "
+                f"got {roll_fill_mode!r}"
+            )
+        self.roll_fill_mode = roll_fill_mode
         self.fees_per_contract = fees_per_contract
         # Warm-up history, kept after FC-068 for a different reason than it was
         # introduced with. The original rationale was the gap detector's
@@ -801,7 +914,10 @@ class Simulator:
             fees_per_contract=self.fees_per_contract,
             fill_haircut=effective_haircut,
         )
-        client = BacktestAlpacaClient(broker, chains=chains, stock_bars=stock_bars)
+        client = BacktestAlpacaClient(
+            broker, chains=chains, stock_bars=stock_bars,
+            roll_fill_mode=self.roll_fill_mode,
+        )
 
         # Post-FC-068 the engine is housekeeping only: reconcile_positions()
         # before each cycle (as /run does) and the Friday roll.
@@ -870,6 +986,12 @@ class Simulator:
         self._calls_closed_early = 0
         self._itm_rolls = 0
         self._otm_roll_outs = 0
+        # FC-116 D5/D6 accumulators. All zero under `haircut` and on any replay
+        # that executes no roll, so their existence moves nothing.
+        self._roll_failures: Dict[str, int] = {}
+        self._roll_legs_resting = 0
+        self._roll_legs_marketable = 0
+        self._failed_roll_btc_debit = 0.0
         self._coverage: Dict[str, int] = {}
         self._seeded_symbols: Dict[str, bool] = {}
 
@@ -972,7 +1094,20 @@ class Simulator:
                     # This is the FC-068 tripwire firing as designed: the golden
                     # replay's `rolls_executed == 0` assertion flips here rather
                     # than every backtest number changing silently.
-                    rolls = engine.run_rolling_cycle() or {}
+                    #
+                    # FC-116 D1b: the roll seat is the ONE window in the day
+                    # loop where `CallRoller` is the only order placer (the
+                    # scan/execute phase ran above; the CC monitor leg runs
+                    # below), so it is where the adapter is told that the
+                    # orders it is about to see are ROLL legs — and must fill
+                    # at their placed limits against the modeled book rather
+                    # than at the entry haircut. The intent is scoped to this
+                    # `with`, never set as adapter state, so an exception here
+                    # cannot leak it onto tomorrow's entry legs.
+                    ledger_mark = len(broker.ledger)
+                    with client.order_intent(ROLL_INTENT):
+                        rolls = engine.run_rolling_cycle() or {}
+                    self._account_roll_legs(broker.ledger[ledger_mark:])
                     self._rolls_evaluated += int(rolls.get('rolls_evaluated', 0) or 0)
                     self._rolls_executed += int(rolls.get('rolls_executed', 0) or 0)
                     # The decision DAY is stamped here because here is the
@@ -1002,6 +1137,13 @@ class Simulator:
                     # gated on, not an approximation of it.
                     for record in (rolls.get('roll_details') or []):
                         if not record.get('success'):
+                            # FC-116 D5. Until now a failed roll record was
+                            # simply dropped, so `btc_rejected`, a BTC that
+                            # timed out, and a ladder that exhausted after the
+                            # BTC filled were invisible in EVERY replay — a
+                            # reader saw `rolls_executed` fall and had nothing
+                            # to attribute it to.
+                            self._count_roll_failure(record.get('reason'), day)
                             continue
                         stamped = self._stamp_roll_record(
                             record, day=day,
@@ -1069,7 +1211,11 @@ class Simulator:
             daily=daily,
             broker=broker,
             rejections=tally.summary(),
-            roll_skips=tally.roll_skip_summary(),
+            # FC-116 D5 — the tally's `call_roll_skipped` counts MERGED with
+            # the post-placement failures, under the roller's own reason
+            # strings (no aliases), re-sorted by the tally's own ordering rule.
+            roll_skips=_merge_roll_skips(
+                tally.roll_skip_summary(), self._roll_failures),
             candidate_days=tally.candidate_days,
             dividends_credited=sum(
                 e.cash_delta for e in broker.ledger if e.kind == "dividend"
@@ -1100,7 +1246,93 @@ class Simulator:
             calls_closed_early=self._calls_closed_early,
             itm_rolls=self._itm_rolls,
             otm_roll_outs=self._otm_roll_outs,
+            # FC-116 D6. Summed off the STAMPED records the simulator already
+            # builds, so the aggregate and the per-roll detail in the artifact
+            # can never disagree, and `roll_net_credit` reconciles exactly
+            # against `sum(roll_records.net_credit)`.
+            roll_net_credit=round(self._credit_sum(), 2),
+            itm_roll_credit=round(self._credit_sum("itm_defence"), 2),
+            otm_roll_out_credit=round(self._credit_sum("otm_roll_out"), 2),
+            failed_roll_btc_debit=round(self._failed_roll_btc_debit, 2),
+            roll_legs_resting=self._roll_legs_resting,
+            roll_legs_marketable=self._roll_legs_marketable,
+            roll_fill_mode=self.roll_fill_mode,
         )
+
+    def _credit_sum(self, roll_kind: Optional[str] = None) -> float:
+        """Pre-fee roll credit, optionally restricted to one `roll_kind`."""
+        return sum(
+            float(r.get("net_credit") or 0.0) for r in self._roll_records
+            if roll_kind is None or r.get("roll_kind") == roll_kind
+        )
+
+    # ------------------------------------------------------------------ #
+    # Roll accounting (FC-116 D5/D6)
+    # ------------------------------------------------------------------ #
+    def _count_roll_failure(self, reason: Optional[str], day: date) -> None:
+        """Fold ONE post-placement roll failure into `roll_skips` (D5).
+
+        Counted off the return value rather than off a log event, so it is
+        deterministic and identical on both profiles.
+        """
+        name = str(reason or "unknown")
+        if name in _POST_PLACEMENT_ROLL_FAILURES:
+            self._roll_failures[name] = self._roll_failures.get(name, 0) + 1
+            return
+        if name in _ALREADY_TALLIED_ROLL_FAILURES:
+            return  # the tally already has it; counting here would double it
+        logger.warning(
+            "Unclassified roll failure reason — NOT counted in roll_skips",
+            event_category="backtest", event_type="roll_failure_unclassified",
+            reason=name, day=day.isoformat(),
+        )
+
+    def _account_roll_legs(self, events: Sequence[Any]) -> None:
+        """Read the day's roll-window ledger slice for the D6 leg counters.
+
+        Two numbers come out of it:
+
+        * `roll_legs_resting` / `roll_legs_marketable` — how many roll legs
+          filled at a limit RESTING inside the modeled spread versus at the
+          book. The resting count is the measurability of the model's one
+          approximation; a row whose roll credit is mostly resting legs is the
+          row to distrust first.
+        * `failed_roll_btc_debit` — cash actually paid, post-fee, on the BTC
+          leg of a roll that then did NOT complete. That money is real in the
+          ledger and contributes 0 to `roll_net_credit`, which would otherwise
+          silently understate what the roll programme cost. Kept SEPARATE from
+          the credit aggregate rather than folded in, so
+          `roll_net_credit == sum(roll_records.net_credit)` stays an exact
+          reconciliation and an FC-112 reader can choose to net it.
+
+        Pairing is positional, which is exact here: the roller processes one
+        position at a time and holds at most one STO live at any instant, so a
+        `buy_to_close` followed by a `sell_call_open` before the next
+        `buy_to_close` is a completed roll, and a `buy_to_close` with no such
+        follower is an orphan BTC.
+
+        The one outcome positional pairing does NOT see is
+        `partial_naked_exposure`: the STO fills for fewer contracts than the
+        BTC closed, so a `sell_call_open` IS written and the pair looks
+        complete. See `SimulationResult.failed_roll_btc_debit` — a known gap,
+        unreachable in a replay because the adapter fills a leg whole or
+        `expired`.
+        """
+        pending_btc: Optional[Any] = None
+        for ev in events:
+            if ev.kind == "buy_to_close":
+                if pending_btc is not None:
+                    self._failed_roll_btc_debit += -pending_btc.cash_delta
+                pending_btc = ev
+            elif ev.kind == "sell_call_open":
+                pending_btc = None
+            rule = (ev.detail or {}).get("fill_rule")
+            if rule == FILL_RULE_LIMIT_RESTING:
+                self._roll_legs_resting += 1
+            elif rule == FILL_RULE_LIMIT_MARKETABLE:
+                self._roll_legs_marketable += 1
+        if pending_btc is not None:
+            self._failed_roll_btc_debit += -pending_btc.cash_delta
 
     # ------------------------------------------------------------------ #
     # Roll records (FC-078 stamp + FC-096 Phase C split)

@@ -52,6 +52,8 @@ from services.sweep_report_text import (
     MIN_DAYS_IN_POSITION,
     MODEL_SPREAD_BIAS,
     MONITOR_LEG_NOTE,
+    ROLL_FILL_LEGACY,
+    ROLL_FILL_RULE,
     ROLL_REACH_BIAS,
     SWEEP_BIASES,
     SYNTHETIC_LOT_BIAS,
@@ -69,7 +71,8 @@ from services.sweep_report_text import (
 # this silently importing something else.
 try:  # repo / test environment
     from src.backtesting.scenarios.identity import (
-        DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
+        DEFAULT_FILL_HAIRCUT, DEFAULT_ROLL_FILL_MODE, DEFAULT_STARTING_CASH,
+        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODE_HAIRCUT, ROLL_FILL_MODES,
         SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
         sweep_key, validate_scenario_name,
     )
@@ -79,7 +82,8 @@ try:  # repo / test environment
     )
 except ImportError:  # dashboard image: the same files, copied flat
     from scenario_identity import (  # type: ignore
-        DEFAULT_FILL_HAIRCUT, DEFAULT_STARTING_CASH, MAX_SCENARIO_NAME_CHARS,
+        DEFAULT_FILL_HAIRCUT, DEFAULT_ROLL_FILL_MODE, DEFAULT_STARTING_CASH,
+        MAX_SCENARIO_NAME_CHARS, ROLL_FILL_MODE_HAIRCUT, ROLL_FILL_MODES,
         SCENARIO_NAME_RE, STRATEGIES, WHEEL_STRATEGY, canonical_spec,
         sweep_key, validate_scenario_name,
     )
@@ -96,7 +100,7 @@ except ImportError:  # dashboard image: the same files, copied flat
 # dashboard that disagreed with the Job here would compute a key nothing ever
 # matches and the dedup would never fire — costing a full replay every time,
 # silently. Pinned by TestTheEngineVersionIsNotAFork.
-ENGINE_VERSION = "fc-069-scanner-rewire"
+ENGINE_VERSION = "fc-116-roll-limit-fills"
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +395,16 @@ SPEC_FIELDS = frozenset({
     # explicit-wheel case from the key, so no stored sweep loses its cache.
     "strategy",
 })
-SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut"})
+SCENARIO_FIELDS = frozenset({"name", "overrides", "fill_haircut",
+                             # FC-116 — the roll-leg fill rule. Absent means
+                             # `limit` (the honest default); `haircut` is the
+                             # pre-FC-116 regression arm, opt-in.
+                             "roll_fill_mode"})
+#: The closed set the API accepts is `ROLL_FILL_MODES`, IMPORTED from
+#: `identity.py` / `scenario_identity.py` above exactly as `DEFAULT_FILL_HAIRCUT`
+#: is (E4). A fourth literal copy here was the drift risk it claimed to avoid:
+#: the enum is stdlib-only data, it is flat-copied into this image with the rest
+#: of `identity.py`, and a second hand-maintained tuple is what actually drifts.
 
 # `MAX_SCENARIO_NAME_CHARS` / `SCENARIO_NAME_RE` / `validate_scenario_name` are
 # IMPORTED from `identity.py` above, not defined here: `main._scenarios_from_entries`
@@ -711,10 +724,24 @@ def validate_spec(spec: Any) -> Dict[str, Any]:
                     f"scenario '{name}' fill_haircut={haircut} is outside "
                     f"[0, 1] (0 = mid, 1 = at the bid)"
                 )
+        # FC-116. Carried through VERBATIM, including an explicit `"limit"`:
+        # `scenario_arm_hash` folds the default to absence itself, so the two
+        # spellings key identically and the stored spec still records what the
+        # submitter actually asked for.
+        roll_fill_mode = entry.get("roll_fill_mode")
+        if roll_fill_mode is not None:
+            roll_fill_mode = str(roll_fill_mode).strip()
+            if roll_fill_mode not in ROLL_FILL_MODES:
+                raise SweepValidationError(
+                    f"scenario '{name}' roll_fill_mode="
+                    f"{entry.get('roll_fill_mode')!r} is not one of "
+                    f"{list(ROLL_FILL_MODES)}"
+                )
         scenarios.append({
             "name": name,
             "overrides": {str(k): v for k, v in overrides.items()},
             "fill_haircut": haircut,
+            "roll_fill_mode": roll_fill_mode,
         })
 
     # -- the cell budget ----------------------------------------------------
@@ -1987,6 +2014,81 @@ def _resolved_haircut(row: Optional[Dict[str, Any]]) -> Tuple[float, bool]:
         return float(DEFAULT_FILL_HAIRCUT), True
 
 
+def _roll_fill_rule_for(legacy: Sequence[str]) -> Tuple[str, str]:
+    """``ROLL_FILL_RULE`` plus the trailing haircut-arm sentence (FC-116 D4).
+
+    A byte-for-byte copy of ``report.roll_fill_rule_for``, for the reason the
+    whole of ``sweep_report_text`` is a copy: this image cannot import
+    ``report.py``. Both sides take the arm NAMES rather than their own result
+    object precisely so a test can pass the same list to each and compare the
+    output — `tests/test_dashboard_sweeps.py`.
+    """
+    title, detail = ROLL_FILL_RULE
+    if legacy:
+        detail += (
+            "\n\nThis sweep also ran the PRE-FC-116 haircut model on "
+            f"{'this arm' if len(legacy) == 1 else 'these arms'}: "
+            + ", ".join(f"`{name}`" for name in legacy)
+            + ". Roll credits on "
+            f"{'that arm' if len(legacy) == 1 else 'those arms'} fill at "
+            "`mid -/+ fill_haircut x half-spread`, not at the placed limits, "
+            "and are NOT comparable with the rest of the table on any "
+            "roll-bearing row."
+        )
+    return title, detail
+
+
+def _ran_pre_fc116(sweep_row: Dict[str, Any],
+                   run_rows: Sequence[Dict[str, Any]]) -> bool:
+    """Did THIS run's roll legs fill at the pre-FC-116 haircut? (E3/T2)
+
+    Decided off what was STORED, never off the spec — a pre-FC-116 spec has no
+    `roll_fill_mode` on any arm, which resolves to `limit` and would label a
+    haircut run honest.
+
+    Two signals, in order of authority:
+
+    1. A cell carrying a non-null `roll_fill_mode` can only have been written
+       by an engine at or after `fc-116-roll-limit-fills`, because that is the
+       release that added the column's writer. One such cell settles it.
+    2. With cells present but EVERY one of them null, the run is pre-FC-116.
+    3. With no cells at all (a `submitted` or `running` sweep, or one that
+       died before its first row), the sweep row's `engine_version` decides:
+       anything other than this image's is a run from another engine, and
+       every engine older than this one filled roll legs at the haircut. A
+       *newer* engine would be misread here, which cannot happen while
+       `TestTheEngineVersionIsNotAFork` pins this image's constant to
+       `screen.ENGINE_VERSION` — the dashboard and the Job ship together.
+    """
+    saw_row = False
+    for row in run_rows:
+        saw_row = True
+        if row.get("roll_fill_mode"):
+            return False
+    if saw_row:
+        return True
+    version = str(sweep_row.get("engine_version") or "")
+    return bool(version) and version != ENGINE_VERSION
+
+
+def _resolved_roll_fill_mode(row: Optional[Dict[str, Any]]) -> str:
+    """The roll fill rule a stored row ran under (FC-116).
+
+    Unlike ``fill_haircut``, this column stores the RESOLVED value — that was
+    the whole point of choosing a different posture for it, so that this
+    function stays a one-line legacy fallback rather than growing into a second
+    ``_resolved_haircut``.
+
+    A NULL therefore has exactly ONE meaning: the row was written by an engine
+    before ``fc-116-roll-limit-fills``, which filled roll legs at
+    ``mid -/+ fill_haircut x half-spread``. That is ``"haircut"``, not
+    ``"unknown"`` — and reading it as ``"limit"`` would silently claim every
+    legacy row's roll credit was measured against the placed limits.
+    """
+    raw = (row or {}).get("roll_fill_mode")
+    return str(raw) if raw else ROLL_FILL_MODE_HAIRCUT
+
+
 def _basis_block(fit_per_day: Optional[float],
                  holdout_per_day: Optional[float]) -> Optional[Dict[str, Any]]:
     """One basis's range, or ``None`` when either window's rate is missing.
@@ -2132,7 +2234,13 @@ def _forecast(index, scenarios: Sequence[str], symbols: Sequence[str],
                 # exists to prevent.
                 "fill": {"basis": "mid",
                          "fill_haircut": haircut,
-                         "is_engine_default": haircut_is_default},
+                         "is_engine_default": haircut_is_default,
+                         # FC-116. A NULL here is not "unknown": it means the
+                         # row was written by an engine BEFORE
+                         # `fc-116-roll-limit-fills`, which filled roll legs at
+                         # the haircut price. Resolved on read so the console
+                         # never has to know that.
+                         "roll_fill_mode": _resolved_roll_fill_mode(fit)},
                 "days": {"fit": days_fit, "holdout": days_holdout},
                 "capital_base": capital_base,
                 "net_option_pnl": premium,
@@ -2235,11 +2343,22 @@ def shape_results(sweep_row: Dict[str, Any],
     # implementation of something already stored.
     scenario_hashes: Dict[str, Optional[str]] = {}
     scenario_config_hashes: Dict[str, Optional[str]] = {}
+    # FC-116 E1 — arm name -> the RESOLVED roll fill mode that arm actually ran
+    # under, read off the persisted cells (a NULL is a pre-FC-116 row, which is
+    # `haircut`). Served rather than left to the SPA because the SPA can only
+    # see the spec, and a spec cannot distinguish "declared limit" from "ran
+    # before the field existed". Three readers depend on it: the arm flag on
+    # `/sims`, the console provenance footer's fill row, and the alignment
+    # matrix's last fallback — all three of which read `limit` for everything
+    # while nothing produced this map at all.
+    scenario_roll_fill_modes: Dict[str, str] = {}
     windows: Dict[str, Dict[str, Any]] = {}
     for row in run_rows:
         name = str(row.get("scenario_name"))
         scenario_hashes.setdefault(name, row.get("scenario_hash"))
         scenario_config_hashes.setdefault(name, row.get("config_hash"))
+        scenario_roll_fill_modes.setdefault(
+            name, _resolved_roll_fill_mode(row))
         split = str(row.get("split"))
         if split not in windows:
             windows[split] = {
@@ -2382,6 +2501,33 @@ def shape_results(sweep_row: Dict[str, Any],
             CC_ROLL_SPLIT_NOTE, MODEL_SPREAD_BIAS,
         ])
 
+    # FC-116 D4, as amended by E3/T2 — BOTH strategies, and the choice of
+    # WHICH footer is made off the ENGINE that wrote the run, not off the spec.
+    #
+    # A pre-FC-116 run filled every roll leg at the haircut price no matter
+    # what its spec says (a spec stored before FC-116 has no `roll_fill_mode`
+    # on any arm, which resolves to `limit`), so describing the limit rule to
+    # its reader would be a straight lie about numbers already on the page. It
+    # gets `ROLL_FILL_LEGACY` instead — the clause retired from
+    # `ROLL_REACH_BIAS`, restored for exactly the rows it is still true of.
+    #
+    # A post-FC-116 run gets `ROLL_FILL_RULE` UNCONDITIONALLY. The earlier gate
+    # ("emit only if some arm resolves to `limit`") dropped the footer entirely
+    # for a haircut-only spec such as `[{"name": "haircut_fills",
+    # "roll_fill_mode": "haircut"}]` — and that run STILL runs the implicit
+    # `base` arm on `limit`, so the reader was left with no description of the
+    # rule at all on a table that has a limit-mode column in it.
+    if _ran_pre_fc116(sweep_row, run_rows):
+        known_biases.append(ROLL_FILL_LEGACY)
+    else:
+        known_biases.append(_roll_fill_rule_for(sorted(
+            str(arm.get("name") or "")
+            for arm in (spec.get("scenarios") or [])
+            if isinstance(arm, dict)
+            and str(arm.get("roll_fill_mode") or DEFAULT_ROLL_FILL_MODE)
+            != DEFAULT_ROLL_FILL_MODE
+        )))
+
     # FC-096 A4. Read off the PERSISTED row, never re-derived: this is a
     # property of the earnings table as it stood when the run replayed, and a
     # symbol onboarded today and refreshed tomorrow has the same spec and a
@@ -2423,6 +2569,18 @@ def shape_results(sweep_row: Dict[str, Any],
         "windows": windows,
         "scenario_hashes": scenario_hashes,
         "scenario_config_hashes": scenario_config_hashes,
+        # Arms with no cell yet fall back to what the spec DECLARED, so a
+        # `running` sweep's provenance footer is right about the arm it has not
+        # finished rather than empty.
+        "scenario_roll_fill_modes": {
+            **{
+                str(arm.get("name") or ""): str(
+                    arm.get("roll_fill_mode") or DEFAULT_ROLL_FILL_MODE)
+                for arm in (spec.get("scenarios") or [])
+                if isinstance(arm, dict) and arm.get("name")
+            },
+            **scenario_roll_fill_modes,
+        },
         "summary": summary,
         "delta_vs_base": delta_vs_base,
         "sign_agreement": sign_agreement,

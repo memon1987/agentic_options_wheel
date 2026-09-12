@@ -108,7 +108,7 @@
         },
         {
             "key": "rolling.fallback_strike_attempts",
-            "reason": "unreachable in a replay. The knob decides how many FURTHER strikes the roller tries after the first two rungs, and rung 1 always fills here: `BacktestAlpacaClient.place_option_order` fills immediately at the broker's haircut price rather than resting a limit that can go unfilled. Instrumented over 37 rolls x 7 arms, rung >= 3 was reached 0 times, so every arm returns the base row. It is live in production, where a real limit can miss; it is inert here."
+            "reason": "inert in a replay. The knob decides how many FURTHER strikes the roller tries after the first two rungs, and a later rung is asked for only when an earlier one fails to fill. Structurally, that cannot happen here: the roller derives its rung-1 limit from the SAME day snapshot the adapter then fills it against, and the book is quantised to cents before the comparison, so a base-mode limit sits AT the far quote (`round(ask, 2) == ask_c` on the buy-to-close, `round(bid, 2) == bid_c` on the sell-to-open) and an imminence-mode limit sits strictly inside it (`mid +/- 0.05`, against a half-spread floored at 0.02). Either way the leg fills, so rung 1 never expires and rung >= 2 is reachable only on an INVERTED quote, which no lake or model chain produces. It is live in production, where the book moves between the quote and the fill; it is inert here. Measure before allowing it."
         },
         {
             "key": "stocks.symbols",

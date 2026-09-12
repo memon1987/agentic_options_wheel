@@ -166,6 +166,15 @@ class TestTheReportProseIsNotAFork:
         # `spec_json.strategy`).
         "SYNTHETIC_LOT_BIAS", "MODEL_SPREAD_BIAS", "ROLL_REACH_BIAS",
         "CC_ROLL_SPLIT_NOTE", "MONITOR_LEG_NOTE",
+        # FC-116. Same posture again: the WORDS are pinned here, emission is
+        # derived on each side (the CLI off `SweepResult.
+        # scenario_roll_fill_modes`, the dashboard off the persisted
+        # `spec_json` arms, resolving an absent key to `limit`).
+        "ROLL_FILL_RULE",
+        # FC-116 E3/T2. The clause retired from `ROLL_REACH_BIAS`, restored as
+        # its own constant for the rows it is still true of — every run written
+        # by an engine before `fc-116-roll-limit-fills`.
+        "ROLL_FILL_LEGACY",
         # M1 (review round 1): the substitution's two KEYS and its two
         # replacements. The keys are titles taken from SWEEP_BIASES, so a drift
         # in either copy breaks the swap silently — matching on a title that no
@@ -265,6 +274,55 @@ class TestTheEngineVersionIsNotAFork:
         disagreed would compute a key nothing ever matches, so the dedup would
         never fire — silently, at the cost of a full replay every time."""
         assert S.ENGINE_VERSION == ENGINE_VERSION
+
+
+class TestTheRollFillModeEnumIsNotAFork:
+    """E4. `services/sweeps` held a FOURTH literal copy of `ROLL_FILL_MODES`.
+
+    `identity.py` already defines it, is stdlib-only, and is flat-copied into
+    the dashboard image as `scenario_identity` — the exact posture that lets
+    `DEFAULT_FILL_HAIRCUT` be an import here. A hand-maintained second tuple
+    was the drift risk its own comment claimed to be avoiding: the API's
+    validator would have kept accepting a value the engine had dropped, or
+    rejected one it had gained, with no test to say so.
+
+    Asserted by IDENTITY, not equality: equality would still pass on a
+    re-declared copy that happens to match today.
+    """
+
+    def test_the_enum_is_the_engine_object(self):
+        from src.backtesting.scenarios import identity as ident
+
+        assert S.ROLL_FILL_MODES is ident.ROLL_FILL_MODES
+        assert S.DEFAULT_ROLL_FILL_MODE is ident.DEFAULT_ROLL_FILL_MODE
+        assert S.ROLL_FILL_MODE_HAIRCUT is ident.ROLL_FILL_MODE_HAIRCUT
+
+    def test_no_bare_mode_literal_survives_in_the_module(self):
+        """The literals at the validator and the footer are gone too — a
+        re-introduced `"limit"` string is how the import gets quietly bypassed
+        one call site at a time.
+
+        `"haircut"` is scanned for the same reason and was the survivor: the
+        legacy-NULL fallback in `_resolved_roll_fill_mode` CONSTRUCTS the mode
+        rather than reading one back, so it is the one site that can drift
+        away from the enum without any import breaking. It now spells
+        `ROLL_FILL_MODE_HAIRCUT`.
+        """
+        source = Path(S.__file__).read_text()
+        # Docstrings and comments legitimately SAY "limit" / "haircut" (an
+        # ast.Constant for a docstring is the WHOLE string, so it never equals
+        # either mode); code must not.
+        tree = ast.parse(source)
+        literals = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and node.value in ("limit", "haircut")
+        ]
+        assert not literals, (
+            "bare roll-fill-mode literals at lines "
+            f"{sorted(n.lineno for n in literals)} — use "
+            "DEFAULT_ROLL_FILL_MODE / ROLL_FILL_MODE_HAIRCUT / "
+            "ROLL_FILL_MODES")
 
 
 class TestTheEngineIdentityIsReadNeverComputed:
@@ -1422,6 +1480,10 @@ def _sample_sweep() -> SweepResult:
             days_in_position_fraction=frac, decision_days=180,
             cycles_completed=3, cycles_open=0, puts_sold=12, calls_sold=5,
             error=err, replay_seconds=1.1,
+            # FC-116 E3/T2 — a cell written by THIS engine carries the
+            # resolved mode. Without it these rows look pre-FC-116 to
+            # `shape_results`, which is the whole point of the new branch.
+            roll_fill_mode="limit",
         )
 
     rows = []
@@ -2492,12 +2554,22 @@ class TestTheFooterIsPerRun:
         }, [])
 
     def test_a_dte_7_run_carries_the_ordinary_footer_only(self):
+        """FC-116 — plus `ROLL_FILL_RULE`, which every POST-FC-116 run carries.
+
+        It is not conditional on reach, strategy or arm: the roll fill rule is
+        a property of the engine that produced the numbers, and a reader of any
+        such run needs it to know what a roll credit means. It IS conditional
+        on that engine — a pre-FC-116 run gets `ROLL_FILL_LEGACY` instead (E3;
+        see `TestTheFooterFollowsTheEngineThatWroteTheRun`). The rest of the
+        footer is unchanged, which is what the equality below still says.
+        """
         shaped = self._shaped({"strategy.min_put_premium": 0.3})
         assert shaped["effective_max_dte"] == 7
         titles = [b["title"] for b in shaped["known_biases"]]
         assert T.DTE_REACH_BIAS[0] not in titles
         assert shaped["known_biases"] == [
-            {"title": t, "detail": d} for t, d in T.SWEEP_BIASES]
+            {"title": t, "detail": d} for t, d in T.SWEEP_BIASES
+        ] + [{"title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}]
 
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
@@ -2505,8 +2577,33 @@ class TestTheFooterIsPerRun:
         shaped = self._shaped({key: 14})
         assert shaped["effective_max_dte"] == 14
         title, detail = T.DTE_REACH_BIAS
-        assert shaped["known_biases"][-1] == {"title": title, "detail": detail}
-        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 1
+        titles = [b["title"] for b in shaped["known_biases"]]
+        assert title in titles
+        # `ROLL_FILL_RULE` is appended last, after the reach caveat.
+        assert shaped["known_biases"][-1] == {
+            "title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
+
+    def test_a_haircut_only_spec_still_gets_the_rule(self):
+        """T2. The old gate emitted the footer only if some arm resolved to
+        `limit`, so a spec of `[{"name": "haircut_fills", "roll_fill_mode":
+        "haircut"}]` got NO description of the fill rule at all — even though
+        the implicit `base` arm that spec always runs is on `limit`, and its
+        column is right there in the table.
+        """
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done", "in_sample_only": True,
+            "spec_json": json.dumps({
+                "symbols": ["AAPL"],
+                "scenarios": [{"name": "haircut_fills",
+                               "roll_fill_mode": "haircut"}],
+            }),
+        }, [])
+        footer = shaped["known_biases"][-1]
+        assert footer["title"] == T.ROLL_FILL_RULE[0]
+        # And it still NAMES the haircut arm, so the reader is told which
+        # column is the old model.
+        assert "`haircut_fills`" in footer["detail"]
 
     def test_the_two_renderings_agree_on_a_long_run(self):
         """The whole point of deriving the condition twice: `/sims` and
@@ -4039,11 +4136,120 @@ class TestThePerCellSignAgreement:
         assert shaped["grid"]["fit"]["tighter"]["AAPL"]["sign_agrees"] is True
 
 
+class TestTheFooterFollowsTheEngineThatWroteTheRun:
+    """E3 + T2. WHICH roll-fill footer a run gets is a fact about its ENGINE.
+
+    A pre-FC-116 run filled every roll leg at `mid -/+ haircut x half-spread`
+    no matter what its spec says — and a pre-FC-116 spec has no
+    `roll_fill_mode` on any arm, so resolving the spec would call it `limit`
+    and describe the wrong rule to a reader looking at numbers already on the
+    page. That is the failure this branch exists to prevent: the footer would
+    be a straight lie about a stored roll credit.
+    """
+
+    _SPEC = json.dumps({
+        "symbols": ["AAPL"],
+        "scenarios": [{"name": "tighter", "overrides": {}}],
+    })
+
+    def _titles(self, rows, **sweep):
+        shaped = S.shape_results(
+            {"run_id": "r", "status": "done", "in_sample_only": True,
+             "spec_json": self._SPEC, **sweep}, rows)
+        return [b["title"] for b in shaped["known_biases"]]
+
+    def test_a_legacy_run_gets_the_retired_clause_back(self):
+        """Every cell NULL in `roll_fill_mode` = written before FC-116."""
+        titles = self._titles([_cell_row("tighter", "AAPL", "fit", 0.10)])
+        assert titles[-1] == T.ROLL_FILL_LEGACY[0]
+        assert T.ROLL_FILL_RULE[0] not in titles
+        assert "biased UP" in T.ROLL_FILL_LEGACY[0], (
+            "the clause retired from ROLL_REACH_BIAS said credits are biased "
+            "UP under the haircut model; that is what a legacy reader needs")
+
+    def test_a_post_fc116_run_gets_the_rule(self):
+        titles = self._titles(
+            [_cell_row("tighter", "AAPL", "fit", 0.10, roll_fill_mode="limit")])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+        assert T.ROLL_FILL_LEGACY[0] not in titles
+
+    def test_one_stamped_cell_settles_it_for_the_run(self):
+        """The column's WRITER arrived with FC-116, so a single non-null value
+        proves the engine. A mixed run cannot be legacy."""
+        titles = self._titles([
+            _cell_row("tighter", "AAPL", "fit", 0.10),
+            _cell_row("tighter", "AAPL", "holdout", 0.10,
+                      roll_fill_mode="haircut"),
+        ])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+
+    def test_a_haircut_arm_of_a_post_fc116_run_is_not_legacy(self):
+        """`roll_fill_mode: haircut` is an opt-in REGRESSION arm of a current
+        engine, not a legacy row. It gets the rule, which names it."""
+        titles = self._titles(
+            [_cell_row("tighter", "AAPL", "fit", 0.10,
+                       roll_fill_mode="haircut")])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+
+    def test_a_cellless_run_falls_back_to_the_engine_version(self):
+        """A `submitted`/`running` sweep has a status row and nothing else."""
+        assert self._titles([], engine_version="fc-069-scanner-rewire")[-1] \
+            == T.ROLL_FILL_LEGACY[0]
+        assert self._titles([], engine_version=S.ENGINE_VERSION)[-1] \
+            == T.ROLL_FILL_RULE[0]
+        assert self._titles([])[-1] == T.ROLL_FILL_RULE[0], (
+            "no engine_version at all is a run this image submitted")
+
+
+class TestTheServedRollFillModes:
+    """E1 (backend half). Nothing produced `scenario_roll_fill_modes` at all,
+    so the `/sims` haircut-arm flag never rendered, the console provenance
+    footer printed "not declared — engine default limit" for a declared
+    haircut arm, and the alignment matrix's last fallback was permanently
+    `limit`.
+    """
+
+    _SPEC = json.dumps({
+        "symbols": ["AAPL"],
+        "scenarios": [{"name": "old_model", "roll_fill_mode": "haircut"},
+                      {"name": "unrun", "roll_fill_mode": "haircut"}],
+    })
+
+    def _shaped(self, rows):
+        return S.shape_results(
+            {"run_id": "r", "status": "running", "in_sample_only": True,
+             "spec_json": self._SPEC}, rows)
+
+    def test_it_is_the_resolved_mode_off_the_cells(self):
+        shaped = self._shaped([
+            _cell_row("base", "AAPL", "fit", 0.10, roll_fill_mode="limit"),
+            _cell_row("old_model", "AAPL", "fit", 0.09,
+                      roll_fill_mode="haircut"),
+        ])
+        modes = shaped["scenario_roll_fill_modes"]
+        assert modes["base"] == "limit"
+        assert modes["old_model"] == "haircut"
+
+    def test_a_legacy_cell_resolves_to_haircut_not_limit(self):
+        """The spec cannot tell you this: it has no key, which resolves to
+        `limit`, while the engine that wrote the row ran the haircut."""
+        shaped = self._shaped([_cell_row("base", "AAPL", "fit", 0.10)])
+        assert shaped["scenario_roll_fill_modes"]["base"] == "haircut"
+
+    def test_an_arm_with_no_cell_yet_falls_back_to_its_spec(self):
+        """A `running` sweep must not render a blank provenance row for the arm
+        it has not finished."""
+        shaped = self._shaped(
+            [_cell_row("base", "AAPL", "fit", 0.10, roll_fill_mode="limit")])
+        assert shaped["scenario_roll_fill_modes"]["unrun"] == "haircut"
+
+
 # --------------------------------------------------------------------------
 # The forecast (component 7)
 # --------------------------------------------------------------------------
 def _cell_row(scenario, symbol, split, ann, *, option_pnl=1000.0,
-              total_return=None, state="measured", fill_haircut=0.25):
+              total_return=None, state="measured", fill_haircut=0.25,
+              roll_fill_mode=None):
     """One persisted `scenario_runs` row, in the shape BigQuery hands back.
 
     Hand-built rather than round-tripped through `rows_from_sweep` because the
@@ -4062,6 +4268,10 @@ def _cell_row(scenario, symbol, split, ann, *, option_pnl=1000.0,
         "annualized_return": ann, "total_return": (
             ann if total_return is None else total_return),
         "option_pnl": option_pnl, "fill_haircut": fill_haircut,
+        # FC-116. `None` is the LEGACY state on purpose — a row written before
+        # `fc-116-roll-limit-fills` has no such column — so every fixture that
+        # does not ask for a mode exercises the pre-FC-116 read path.
+        "roll_fill_mode": roll_fill_mode,
         "error": None, "insufficient": False, "low_activity": False,
         "measured": False, "verdict": "fit",
     }
@@ -4171,7 +4381,23 @@ class TestTheForecastFormula:
         shaped = _split_run(_fit_holdout(fill_haircut=0.6))
         block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
         assert block["fill"] == {"basis": "mid", "fill_haircut": 0.6,
-                                 "is_engine_default": False}
+                                 "is_engine_default": False,
+                                 # FC-116 — the fixture row carries no
+                                 # `roll_fill_mode` column, i.e. it was written
+                                 # before `fc-116-roll-limit-fills`. That
+                                 # resolves to `haircut`, NOT to `limit`:
+                                 # reading a NULL as the new default would
+                                 # claim every legacy row's roll credit was
+                                 # measured against the placed limits.
+                                 "roll_fill_mode": "haircut"}
+
+    def test_a_post_fc116_row_serves_its_own_resolved_mode(self):
+        shaped = _split_run(_fit_holdout(roll_fill_mode="haircut"))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["fill"]["roll_fill_mode"] == "haircut"
+        shaped = _split_run(_fit_holdout(roll_fill_mode="limit"))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["fill"]["roll_fill_mode"] == "limit"
 
 
 class TestTheServedHaircutIsTheOneTheReplayRanAt:
@@ -4547,3 +4773,163 @@ class TestTheForecastSuppressesTotalPnlWithoutACapitalBase:
                                       "scenarios": [{"name": "tighter"}]})},
             _fit_holdout())
         assert shaped["forecast"]["capital_base"] == S.DEFAULT_STARTING_CASH
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T10 — the footer says the right thing, on both strategies
+#
+# Prose is not decoration here. `ROLL_REACH_BIAS` used to claim the fill model
+# biased roll credits UP; that clause is now FALSE, and a footer that keeps a
+# retired caveat is worse than one that never had it — a reader discounts a
+# number in the wrong direction and has no way to know.
+# --------------------------------------------------------------------------- #
+class TestTheRollFillRuleProse:
+    def test_the_retired_clause_is_gone_from_ROLL_REACH_BIAS(self):
+        title, detail = engine_report.ROLL_REACH_BIAS
+        assert "credits UP" not in title
+        assert "OPPOSITE direction" not in detail
+        assert "haircut price from the mark" not in detail
+        # What must SURVIVE: the reach truncation is still real and is still
+        # the reason roll counts and credits are floors.
+        assert "21 DTE" in title and "biased DOWN" in title
+        assert "FLOORS, not estimates" in detail
+        assert "roll_skips" in detail
+
+    def test_the_new_rule_states_the_model_width_and_the_direction(self):
+        """Roll credits now pay the FULL modeled spread on both legs, and the
+        model measures ~2.46x wider than the real book — so the honest fill
+        rule makes replayed roll credits AND counts biased DOWN versus live.
+        Saying the first without the second would read as a correction rather
+        than a new bias."""
+        _title, detail = engine_report.ROLL_FILL_RULE
+        assert "2.46" in detail
+        assert "biased DOWN" in detail
+        assert "MORE credit" in detail, (
+            "the residual cuts BOTH ways — an imminence roll on a chain with "
+            "hs > $0.20 carries more credit under this rule, not less")
+
+    def test_the_half_spread_is_never_quoted_as_the_bare_base_term(self):
+        """`hs = max(0.02, (0.05 + 0.10*|1 - K/S| [+0.05 if mark < 0.50]) *
+        mark)`. "5% of mark" is the BASE TERM ONLY; the OTM and cheap-contract
+        widenings are part of `hs`. A footer that quotes the base term as if it
+        were the spread understates the residual it is trying to disclose."""
+        _title, detail = engine_report.ROLL_FILL_RULE
+        for idx in range(len(detail)):
+            if detail.startswith("5% of mark", idx):
+                window = detail[idx:idx + 120]
+                assert "widened" in window, (
+                    f"'5% of mark' appears without 'widened': ...{window}...")
+
+    def test_the_two_things_a_zero_does_not_mean_are_stated(self):
+        _title, detail = engine_report.ROLL_FILL_RULE
+        assert "roll_skips" in detail
+        assert "upper bound on live ATTEMPTS" in detail
+
+
+class TestTheRollFillRuleIsEmittedOnBothStrategies:
+    def _result(self, strategy, modes):
+        from src.backtesting.scenarios.runner import SweepResult
+
+        return SweepResult(
+            scenarios=list(modes), strategy=strategy,
+            scenario_roll_fill_modes=dict(modes),
+        )
+
+    def test_a_wheel_sweep_carries_it(self):
+        biases = engine_report.sweep_biases(
+            self._result("wheel", {"base": "limit"}))
+        assert engine_report.ROLL_FILL_RULE[0] in [t for t, _d in biases]
+
+    def test_a_covered_call_sweep_carries_it(self):
+        biases = engine_report.sweep_biases(
+            self._result("covered_call", {"base": "limit"}))
+        titles = [t for t, _d in biases]
+        assert engine_report.ROLL_FILL_RULE[0] in titles
+        # ...alongside the CC-only lines, not instead of them.
+        assert engine_report.ROLL_REACH_BIAS[0] in titles
+
+    def test_a_mixed_sweep_names_its_haircut_arms(self):
+        """The arm field exists so a before/after is ONE submission. A reader
+        of that table must be told which column is the old model."""
+        biases = engine_report.sweep_biases(self._result(
+            "wheel", {"base": "limit", "haircut_fills": "haircut"}))
+        detail = dict(biases)[engine_report.ROLL_FILL_RULE[0]]
+        assert "`haircut_fills`" in detail
+        assert "NOT comparable" in detail
+
+    def test_an_all_haircut_sweep_does_not_claim_the_honest_rule(self):
+        biases = engine_report.sweep_biases(self._result(
+            "wheel", {"old_model": "haircut"}))
+        assert engine_report.ROLL_FILL_RULE[0] not in [t for t, _d in biases]
+
+    def test_the_two_sides_build_the_same_trailing_sentence(self):
+        """The dashboard copy takes the arm NAMES rather than its own result
+        object precisely so this comparison is possible. Both sides derive
+        EMISSION their own way (the CLI off `SweepResult`, the dashboard off
+        the persisted spec) — it is the WORDS that must not fork."""
+        from services import sweeps as dash
+
+        for legacy in ([], ["a"], ["a", "b"]):
+            assert (engine_report.roll_fill_rule_for(legacy)
+                    == dash._roll_fill_rule_for(legacy)), legacy
+
+
+# --------------------------------------------------------------------------- #
+# FC-116 T9 — the API validator, the third of three that must agree
+#
+# The CLI (`main.scenarios_from_spec`), this one, and the console
+# (`specValidation.parseScenariosJson`) all have to accept the same arm. A key
+# one takes and another refuses is a spec that runs from the terminal and 400s
+# from the console — or worse, one the console silently DROPS before sending.
+# --------------------------------------------------------------------------- #
+class TestTheApiAcceptsTheRollFillMode:
+    def test_both_values_survive_normalisation(self):
+        for mode in ("limit", "haircut"):
+            normalised = S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_mode": mode}]))
+            assert normalised["scenarios"][0]["roll_fill_mode"] == mode
+
+    def test_an_omitted_mode_normalises_to_none(self):
+        """Not to `"limit"`. The RUNNER resolves it, and the stored spec must
+        record what the submitter asked for — `scenario_arm_hash` folds the two
+        spellings to the same key anyway."""
+        normalised = S.validate_spec(spec())
+        assert normalised["scenarios"][0]["roll_fill_mode"] is None
+
+    def test_an_unknown_mode_is_refused_with_the_value_in_the_message(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_mode": "mid"}]))
+        assert "roll_fill_mode" in str(exc.value)
+        assert "'mid'" in str(exc.value)
+
+    def test_the_key_is_in_the_known_field_set(self):
+        """`SCENARIO_FIELDS` is the unknown-field guard. Adding the key without
+        adding it here would make every arm that carries it a hard 400."""
+        assert "roll_fill_mode" in S.SCENARIO_FIELDS
+
+    def test_a_misspelled_neighbour_is_still_refused(self):
+        with pytest.raises(S.SweepValidationError) as exc:
+            S.validate_spec(spec(scenarios=[
+                {"name": "a", "overrides": {}, "roll_fill_modes": "haircut"}]))
+        assert "unknown field" in str(exc.value)
+
+    def test_a_mode_only_arm_keys_differently_from_base(self):
+        """The whole point of the arm field: a before/after in ONE submission.
+        If the regression arm keyed the same as base it would dedup into it.
+        """
+        from src.backtesting.scenarios.identity import scenario_arm_hash
+
+        normalised = S.validate_spec(spec(scenarios=[
+            {"name": "haircut_fills", "overrides": {},
+             "roll_fill_mode": "haircut"}]))
+        arm = normalised["scenarios"][0]
+        assert scenario_arm_hash(arm["overrides"], arm["fill_haircut"],
+                                 arm["roll_fill_mode"]) != \
+            scenario_arm_hash({}, None)
+
+    def test_the_reserved_base_name_is_still_refused_with_a_mode(self):
+        with pytest.raises(S.SweepValidationError):
+            S.validate_spec(spec(scenarios=[
+                {"name": "base", "overrides": {},
+                 "roll_fill_mode": "haircut"}]))

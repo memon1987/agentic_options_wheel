@@ -1050,20 +1050,34 @@ class TestKeysTheReplayCannotReach:
     """Q1. `rolling.fallback_strike_attempts` joins the refused list.
 
     It was the one allowlisted key the build could not demonstrate moved a
-    replay, and it was kept on the reading that "unproven is not dead". A
-    reviewer settled it by instrumenting the roller: the knob governs the THIRD
-    and later strike rungs, and rung 1 always fills here — the adapter fills
-    immediately at the broker's haircut price rather than resting a limit that
-    can go unfilled — so over 37 rolls x 7 arms, rung >= 3 was reached 0 times.
-    Live in production, where a real limit can miss; inert in a replay.
+    replay, and it was kept on the reading that "unproven is not dead". The
+    knob governs the THIRD and later strike rungs, which a replay does not
+    reach — for the STRUCTURAL reason the assertions below pin, not for a rung
+    count (the pre-FC-116 count that once stood here measured the mechanism
+    FC-116 replaced, so it is gone rather than re-labelled). Live in
+    production, where a real limit can miss; inert in a replay.
     """
 
     def test_fallback_strike_attempts_is_refused(self, sweep_config):
         with pytest.raises(OverrideError) as exc:
             apply_overrides(sweep_config, {"rolling.fallback_strike_attempts": 5})
         message = str(exc.value)
-        assert "unreachable in a replay" in message
-        assert "rung 1 always fills" in message
+        # FC-116 replaced the MECHANISM the old wording named ("the adapter
+        # fills immediately at the broker's haircut price"), so the reason had
+        # to be re-derived. The replacement is STRUCTURAL, not a new
+        # measurement: the rung-1 limit comes from the same snapshot the
+        # adapter fills against, and the book is quantised to cents first, so
+        # the limit is marketable (base mode) or strictly inside the spread
+        # (imminence mode) either way. No leg expires, so no later rung is
+        # asked for.
+        assert "inert in a replay" in message
+        assert "quantised" in message
+        assert "INVERTED quote" in message
+        # E2: the refusal must NOT claim a post-FC-116 rung measurement. None
+        # was taken, and the pre-FC-116 count is not evidence for the new
+        # mechanism.
+        assert "37 rolls" not in message
+        assert "instrumented" not in message.lower()
 
     def test_the_other_roller_knobs_are_still_allowed(self, sweep_config):
         """The refusal is about this one rung counter, not about the roller."""
@@ -1960,13 +1974,19 @@ class TestAnArmIsNotChangedByItsNeighbours:
             "— the price path has stopped crossing rolling.itm_trigger_ratio"
         )
 
-    def test_the_roll_counts_are_not_persisted_in_this_pr(self, tmp_path):
-        """`rolls_evaluated` / `rolls_executed` live on the dataclass ONLY.
+    def test_the_roll_columns_landed_and_rolls_evaluated_did_not(self, tmp_path):
+        """FC-116 D6 (decision iv) — the schema change this file used to defer.
 
-        `rows_from_sweep` writes an explicit column list, so exposing them here
-        adds no `scenario_runs` column — which is the point: this PR is the DTE
-        knob, and a schema change belongs to the PR that needs it. Phase E's
-        console wants roll counts; that is when the column gets argued.
+        Until FC-116 this asserted the OPPOSITE: no roll field was a
+        `scenario_runs` column, because that PR was the DTE knob and a schema
+        change belongs to the PR that needs it. FC-112 is that PR's consumer —
+        it compares `rolling.itm_trigger_ratio` 0.98 vs 1.00 across the wheel's
+        standing set and has to read the roll counts, the split and the credit
+        PER ROW — so the eleven columns land here, additively.
+
+        `rolls_evaluated` deliberately does NOT: "the roller looked at 40
+        positions" is a diagnostic of the run, not a comparable measurement,
+        and it stays in-process on the dataclass and the cell artifact.
         """
         from src.backtesting.scenarios import persist as store
 
@@ -1976,9 +1996,20 @@ class TestAnArmIsNotChangedByItsNeighbours:
             engine_version="v")
         assert rows
         assert "rolls_evaluated" not in rows[0]
-        assert "rolls_executed" not in rows[0]
-        assert not any(
-            f.name.startswith("rolls_") for f in store._runs_schema())
+        assert not any(f.name == "rolls_evaluated" for f in store._runs_schema())
+
+        expected = {
+            "rolls_executed", "roll_skips", "itm_rolls", "otm_roll_outs",
+            "roll_net_credit", "itm_roll_credit", "otm_roll_out_credit",
+            "failed_roll_btc_debit", "roll_legs_resting",
+            "roll_legs_marketable", "roll_fill_mode",
+        }
+        assert len(expected) == 11
+        schema_names = {f.name for f in store._runs_schema()}
+        assert expected <= schema_names, sorted(expected - schema_names)
+        assert expected <= set(rows[0]), sorted(expected - set(rows[0]))
+        # The resolved mode, never NULL, on a row written by this engine.
+        assert rows[0]["roll_fill_mode"] == "limit"
 
     @pytest.mark.parametrize("neighbour", [
         pytest.param({"strategy.put_target_dte": 21}, id="put-dte-21"),

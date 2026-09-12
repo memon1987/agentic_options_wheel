@@ -43,6 +43,18 @@ BID_FILL_HAIRCUT = 1.0
 # indistinguishable from one produced under a different fill model.
 DEFAULT_FILL_HAIRCUT = 0.25
 
+# FC-116 — how ROLL legs fill on the screen / `backtest_runs` path. Named here
+# for the same reason the haircut is, and duplicated from
+# `identity.DEFAULT_ROLL_FILL_MODE` / `broker`'s copy for the reason that module
+# documents (stdlib-only, flat-copied into an image with no engine). Pinned
+# equal by a test.
+#
+# THREADED through `_simulator` below rather than left as dead documentation:
+# the screen path then states its mode at the call site, a test can pin it, and
+# the four copies stay pinned equal to each other. It is the `Simulator`
+# constructor default too, so this is a declaration, not a divergence.
+DEFAULT_ROLL_FILL_MODE = "limit"
+
 
 def evaluate_symbol(
     symbol: str,
@@ -168,10 +180,19 @@ def _simulator(
     starting_cash: float, fill_haircut: float, max_dte: int,
     dividends: Optional[DividendSchedule] = None,
 ) -> Simulator:
+    """The ONE constructor call the screen / `backtest_runs` path makes.
+
+    `roll_fill_mode` is passed EXPLICITLY (FC-116). It equals the `Simulator`
+    default, so this changes no behaviour — it makes the screen path's fill
+    rule a stated fact at the call site that a test can pin, instead of an
+    inherited default that a later constructor edit could move without any
+    screen-path test noticing.
+    """
     return Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte, fill_haircut=fill_haircut,
         dividend_schedule=dividends,
+        roll_fill_mode=DEFAULT_ROLL_FILL_MODE,
     )
 
 
@@ -273,6 +294,16 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
         "calls_closed_early": result.calls_closed_early,
         "itm_rolls": result.itm_rolls,
         "otm_roll_outs": result.otm_roll_outs,
+        # FC-116 D6 — the roll CREDIT, which no stored record carried before.
+        # PRE-FEE: the same quantity `call_roll_completed` reports live, so the
+        # replay's number and the live one are comparable.
+        "roll_net_credit": result.roll_net_credit,
+        "itm_roll_credit": result.itm_roll_credit,
+        "otm_roll_out_credit": result.otm_roll_out_credit,
+        "failed_roll_btc_debit": result.failed_roll_btc_debit,
+        "roll_legs_resting": result.roll_legs_resting,
+        "roll_legs_marketable": result.roll_legs_marketable,
+        "roll_fill_mode": result.roll_fill_mode,
         "blocked_days_by_reason": result.rejections,
         "ledger_events": len(result.broker.ledger),
         "cycles_still_open_at_end": sum(1 for c in cycles if c.is_open),

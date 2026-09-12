@@ -123,6 +123,7 @@ contract. It is the price — and on calls the strike — that drift.
 | put-leg premium | ~7% low (identical contracts) | conservative |
 | call-leg premium | ~32% low (identical contracts) | conservative |
 | modeled bid/ask spread | 2.46× wider than real, RTH-measured | conservative |
+| roll-leg credit (FC-116) | pays the full modeled spread on both legs | conservative |
 | dividends | modeled both legs since FC-042 C1 | ~neutral |
 | ex-div early assignment | **never fired on real data** | optimistic |
 
@@ -146,7 +147,7 @@ failure mode: it cannot flatter a symbol into looking tradeable.
 4. **The engine refuses split-spanning windows** (`UnadjustedCorporateAction`) by design —
    raw bars are correct for point-in-time chain work but cannot span a split. Pick a
    window that avoids the split date; the error message names it.
-5. **Three non-comparability boundaries in `backtest_runs`, and only two are machine-queryable.**
+5. **Four non-comparability boundaries in `backtest_runs`, and only three are machine-queryable.**
    - Rows before **2026-07-29** describe a **put-only** engine (FC-048 — every backtest
      this project ever ran before it misrouted covered calls to the put seller). FC-048
      did not bump `engine_version`, so this boundary is **timestamp-only**.
@@ -165,7 +166,24 @@ failure mode: it cannot flatter a symbol into looking tradeable.
      vocabulary that did not contain this bucket, and a post-bump `NULL` can now mean
      "the only thing that stopped it was already holding it."
 
-   Do not compare across any of the three boundaries. Old rows are never mutated —
+   - `engine_version = 'fc-116-roll-limit-fills'` (FC-116, **2026-09-11**) changes how
+     ROLL legs are priced, on both strategies. Before it, every order — entry and roll
+     alike — filled at `mid ∓ fill_haircut × half-spread` and the strategy's
+     `limit_price` was recorded and ignored. After it, a roll leg fills at the limit the
+     live `CallRoller` would have placed, capped by the day's modeled book **quantised
+     to cents**: a buy-to-close at or through the ask fills AT the ask, a sell-to-open at
+     or through the bid fills at the bid, one resting inside the spread fills at its
+     limit, and one outside the book does not fill at all. (The quantisation matters —
+     the roller places `round(·, 2)` limits, so comparing them against an unrounded model
+     book would tag about half of all base-mode legs `limit_resting` and fill them
+     fractionally inside the book.) **Rows before and after are non-comparable on
+     every roll-bearing row** — roll credits, and anything derived from them. Nothing
+     else moves: entry legs and the covered-call monitor leg keep the haircut model
+     (FC-072, FC-086). Rows also gained eleven roll columns; a NULL `roll_fill_mode` on
+     a `scenario_runs` row means "written before this boundary", i.e. the haircut model.
+     Query `engine_version` or `roll_fill_mode`, not the date.
+
+   Do not compare across any of these boundaries. Old rows are never mutated —
    provenance is `engine_version` + `timestamp` + `config_hash`.
 6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2
    filter; FC-068 removed the backtest's only caller with the engine path; **FC-069 item 5
@@ -655,9 +673,9 @@ pre-split engine.
 | refused | why |
 |---|---|
 | `risk.profit_taking.*`, the stop-loss switches | `/monitor`-only; the replay's day loop never runs the monitor, so every arm would return an identical row — which reads as "this knob does not matter" |
-| `strategy.{put,call}_limit_spread_fraction` | the replay does not honour limit prices — `BacktestAlpacaClient.place_option_order` *records* `limit_price` and fills at `mid − fill_haircut × half-spread` regardless. **Measured**: a `put_limit_spread_fraction: 0.0` arm came back byte-identical to base on all six symbols over a year. Vary `fill_haircut` on the scenario instead |
+| `strategy.{put,call}_limit_spread_fraction` | the replay does not honour ENTRY limit prices — `BacktestAlpacaClient.place_option_order` *records* an entry leg's `limit_price` and fills at `mid − fill_haircut × half-spread` regardless. **Measured**: a `put_limit_spread_fraction: 0.0` arm came back byte-identical to base on all six symbols over a year. Vary `fill_haircut` on the scenario instead. (FC-116 made ROLL legs fill at their placed limits; entry legs deliberately still do not, because that measurement is what this refusal rests on. For roll legs, vary `roll_fill_mode` on the scenario.) |
 | `universe.min_open_interest` | the engine has no OI data — `get_options_chain` hardcodes `open_interest: 0` — so any floor ≥ 1 rejects **every** call, and the arm reads as "this threshold kills the call leg" rather than "the engine cannot see the number". (`universe.max_spread_pct` *is* allowed: its input is a documented model with a measured error, not an absent field) |
-| `rolling.fallback_strike_attempts` | governs strike rungs the replay never reaches — the adapter fills rung 1 unconditionally, so rung ≥ 3 came up **0 times over an instrumented 37 rolls × 7 arms**. Live in production, inert here |
+| `rolling.fallback_strike_attempts` | governs strike rungs the replay does not reach. A later rung is asked for only when an earlier one fails to fill, and a rung-1 limit is derived from the *same* day snapshot the adapter then fills it against, with the book quantised to cents first — so a base-mode limit sits **at** the far quote (`round(ask, 2) == ask_c`, `round(bid, 2) == bid_c`) and an imminence-mode one strictly inside it (`mid ± $0.05` against a half-spread floored at $0.02). Rung 1 therefore always fills, and rung ≥ 2 is reachable only on an *inverted* quote, which no lake or model chain produces. Live in production, where the book moves between quote and fill; inert here |
 | `stocks.symbols` | the universe is run *scope*: pass `--symbols`. A candidate symbol is a cold materialisation |
 | `alpaca.*`, `strategy_id`, `bigquery_dataset` | not strategy parameters |
 | `earnings.enabled` / `rolling.enabled` **when `EARNINGS_ENABLED` / `ROLLER_ENABLED` is exported** | the env var wins over the yaml key (FC-013 DD-7, FC-078 DD-7), so the arm would be silently identical to base and the sweep would report two arms as tied |
@@ -833,13 +851,29 @@ of magnitude inside it.
 move at least one row at an extreme value over AAPL+NVDA × one year.
 
 `rolling.fallback_strike_attempts` was the twentieth, was carried as *unproven* on the
-reading that "did not bind" is not "cannot bind", and is now **refused**. A reviewer
-settled it by instrumenting the roller: the knob governs the third and later strike rungs,
-and rung 1 always fills in a replay — `BacktestAlpacaClient.place_option_order` fills
-immediately at the broker's haircut price rather than resting a limit that can go unfilled
-— so over 37 rolls × 7 arms, rung ≥ 3 was reached **0 times**. It is live in production,
-where a real limit can miss; it is inert here. The general lesson is in the allowlist's
-own docstring: *unproven* is a reason to go and measure, not a reason to ship the key.
+reading that "did not bind" is not "cannot bind", and is **refused**: the knob governs the
+third and later strike rungs, which a replay does not reach.
+
+**FC-116 changed the mechanism but not the answer, and the wording had to move with it.**
+The old reason was "rung 1 always fills in a replay, because the adapter fills immediately
+at the broker's haircut price rather than resting a limit that can go unfilled" — true of
+the mechanism FC-116 replaced. The replacement reason is **structural, and is not a
+re-measurement**: the roller derives its rung-1 limit from the *same* day snapshot the
+adapter then fills it against, and the adapter quantises that book to cents before
+comparing. A base-mode buy-to-close is placed at `round(ask, 2)`, which **is** `ask_c`, so
+it is marketable; the sell-to-open at `round(bid, 2)` is `bid_c`, likewise. An
+imminence-mode leg is placed at `mid ± $0.05` against a half-spread floored at $0.02, so
+it lies strictly inside `[bid_c, ask_c]`. Every rung-1 leg therefore fills, no leg
+expires, and the ladder is never advanced — rung ≥ 2 is reachable only through an
+*inverted* quote (`bid > ask`), which the lake cannot produce and the chain model does not
+generate. That argument holds for every chain of that shape, which is stronger than any
+count over one window would be, and **no rung instrumentation backs the current refusal**:
+the count that once stood above was taken against the mechanism FC-116 replaced, so it is
+not restated as evidence for this one and has been removed rather than re-labelled. It is live in production, where the book moves between the quote and the
+fill; it is inert here. The general lesson is in the allowlist's own docstring: *unproven*
+is a reason to go and measure, not a reason to ship the key — and a refusal's REASON has
+to be re-derived when the mechanism under it moves, or the key stays refused for something
+that is no longer true.
 
 Single warm pass over one symbol-year, before and after the row-conversion rewrite (D5):
 
@@ -948,12 +982,18 @@ told from "the roller was blind".
 
 **Reach.** A covered-call window materialises to `call_target_dte +
 rolling.max_extension_days` = 28, capped at the lake's `MAX_SWEEPABLE_DTE` (21).
-The residual truncation biases roll counts and credits DOWN; the engine's
-haircut fill model biases roll credits UP against a live roller that places its
-BTC at the ask and its STO at the bid. Both are named in the footer; neither is
-measured. The WHEEL carries the same truncation (7 + 14 against a 7-DTE
-materialisation), unfixed here because widening it would move every stored
-wheel number — FC-112 owns it.
+The residual truncation biases roll counts and credits DOWN, and it is named in
+the footer but not measured.
+
+The opposing bias that used to sit beside it — the haircut fill model crediting
+a roll MORE than the live roller's own limits would — is **gone as of FC-116**:
+roll legs now fill at the placed limit against the day's modeled book, so a
+replayed roll captures the credit the live credit invariant was computed on and
+never more. Two opposing unmeasured biases on one metric was the honest interim,
+not the answer, and FC-112 reads exactly that metric. The WHEEL carries the same
+reach truncation (7 + 14 against a 7-DTE materialisation), unfixed here because
+widening it would move every stored wheel number for a *different* reason —
+FC-112 owns it.
 
 **The spread gate is SUSPENDED** on model-built chains: the modelled
 half-spread is >= 5% of mark for an OTM contract, so the profile's

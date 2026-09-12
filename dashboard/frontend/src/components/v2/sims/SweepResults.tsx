@@ -189,6 +189,19 @@ export default function SweepResults({ sweep, report, raw }: Props) {
                               </span>
                             )
                           )}
+                          {/* FC-116 — flagged, not merely printed. A `haircut`
+                              arm's roll credits come from the PRE-FC-116 model
+                              and are not comparable with the rest of the table
+                              on any roll-bearing number, so it is called out in
+                              the same amber the fill-sensitivity arm uses. */}
+                          {report.scenario_roll_fill_modes?.[scenario] === 'haircut' && (
+                            <span
+                              className="text-amber-400/80 text-xs ml-2 font-sans"
+                              title="This arm fills ROLL legs at the pre-FC-116 haircut price (mid -/+ fill_haircut x half-spread) instead of at the limits the live roller would have placed. Its roll credits are NOT comparable with a `limit` arm's."
+                            >
+                              rolls: haircut (pre-FC-116)
+                            </span>
+                          )}
                           {(summary?.demote_flags ?? 0) > 0 && (
                             <span
                               className="text-xs text-gray-500 ml-2 font-sans"

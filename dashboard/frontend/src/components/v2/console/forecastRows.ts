@@ -74,7 +74,13 @@ export interface ForecastView {
   symbol: {
     symbol: string;
     capitalBase: number | null;
-    fill: { basis: string | null; fill_haircut: number | null; is_engine_default?: boolean } | null;
+    fill: {
+      basis: string | null;
+      fill_haircut: number | null;
+      is_engine_default?: boolean;
+      /** FC-116 — `'limit'` | `'haircut'`; a legacy row resolves to `'haircut'`. */
+      roll_fill_mode?: string;
+    } | null;
     days: { fit: number | null; holdout: number | null };
     ranges: ForecastRange[];
   } | null;

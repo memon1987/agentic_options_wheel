@@ -1427,7 +1427,9 @@ def _scenarios_from_entries(raw, where: str):
     into a container start.
     """
     from src.backtesting.scenarios import Scenario
-    from src.backtesting.scenarios.identity import validate_scenario_name
+    from src.backtesting.scenarios.identity import (
+        ROLL_FILL_MODES, validate_scenario_name,
+    )
 
     if not isinstance(raw, list):
         raise SystemExit(f"{where}: 'scenarios' must be a list, got {type(raw).__name__}")
@@ -1466,13 +1468,27 @@ def _scenarios_from_entries(raw, where: str):
                     f"{where}: scenario '{name}' fill_haircut={haircut} is outside "
                     "[0, 1] (0 = mid, 1 = at the bid)"
                 )
-        unknown = set(entry) - {'name', 'overrides', 'fill_haircut'}
+        # FC-116 — how ROLL legs fill. Absent means `limit`: the honest rule is
+        # the default, so every existing spec and standing pin gets it with no
+        # edit, and the pre-FC-116 haircut model is the thing you must ask for.
+        roll_fill_mode = entry.get('roll_fill_mode')
+        if roll_fill_mode is not None:
+            roll_fill_mode = str(roll_fill_mode).strip()
+            if roll_fill_mode not in ROLL_FILL_MODES:
+                raise SystemExit(
+                    f"{where}: scenario '{name}' roll_fill_mode="
+                    f"{entry.get('roll_fill_mode')!r} is not one of "
+                    f"{list(ROLL_FILL_MODES)}"
+                )
+        unknown = set(entry) - {'name', 'overrides', 'fill_haircut',
+                                'roll_fill_mode'}
         if unknown:
             raise SystemExit(
                 f"{where}: scenario '{name}' has unknown field(s) "
                 f"{sorted(unknown)}. A misspelled field would silently do nothing."
             )
-        scenarios.append(Scenario(str(name), dict(overrides), haircut))
+        scenarios.append(
+            Scenario(str(name), dict(overrides), haircut, roll_fill_mode))
     return scenarios
 
 
@@ -1987,7 +2003,12 @@ def run_sweep_cmd(args, config: Config, logger, *,
         'run_sensitivity': run_sensitivity,
         'scenarios': [
             {'name': s.name, 'overrides': dict(s.overrides),
-             'fill_haircut': s.fill_haircut}
+             'fill_haircut': s.fill_haircut,
+             # FC-116. Verbatim, including an explicit `limit`:
+             # `scenario_arm_hash` folds the default to absence itself, so both
+             # spellings key identically and the stored spec still records what
+             # the submitter asked for.
+             'roll_fill_mode': s.roll_fill_mode}
             for s in scenarios
         ],
         # FC-096 Phase C. Carried on the payload so the stored spec says which
