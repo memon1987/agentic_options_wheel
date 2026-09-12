@@ -686,22 +686,44 @@ FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps`
 WHERE pin_id = '<pin_id>'
 ORDER BY submitted_at DESC;
 
--- the weekly trend series, excluding smoke rows and ad-hoc runs.
--- `window_end` MOVES week to week because pins and the standing set are both
--- rolling; a series whose window_end never changed would be one measurement
+-- the weekly trend series, PER STRATEGY, excluding smoke rows and ad-hoc runs.
+-- `strategy` lives in spec_json (no column — FC-096 Phase C); absent means
+-- wheel, so IFNULL, never a bare equality. `window_end` MOVES every week for
+-- both strategies (pins and both standing sets re-anchor to the last settled
+-- day); a series whose window_end never changed would be one measurement
 -- repeated, which is the defect rolling pins exist to prevent.
+-- Never compare annualized_return ACROSS strategies: a wheel ratio is over
+-- starting_cash; a covered-call ratio is the EQUITY return of a synthetic
+-- 100-share lot (price move + net premium). The covered-call HEADLINE,
+-- premium_yield_on_lot, is artifact-only (no column; FC-118 would add one).
+-- Covered-call points also RE-BASE week to week: each Saturday's window
+-- seeds its lot at that window's first traded close, so adjacent points
+-- differ partly for a non-strategy reason. The wheel has no analogue.
+-- engine_identity: a step in one series that coincides with a change here is
+-- an engine change, not a market one (the covered-call profile rolls at 1.00
+-- and is the more roll-sensitive series).
 -- PARTITION ON `engine_version` (or `roll_fill_mode`): rows written before
 -- `fc-116-roll-limit-fills` filled ROLL legs at the haircut price and are NOT
 -- comparable on any roll-bearing row. Old and new rows share `scenario_hash`
 -- and `config_hash` by design, so nothing else in this query separates them.
-SELECT r.symbol, s.window_end, r.split, r.annualized_return,
-       s.engine_version, r.roll_fill_mode
+SELECT
+  IFNULL(JSON_VALUE(s.spec_json, '$.strategy'), 'wheel') AS strategy,
+  r.symbol, s.window_end, r.split, r.measured, r.verdict,
+  r.annualized_return, s.engine_identity, s.engine_version, r.roll_fill_mode
 FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps` s
 JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r
   USING (run_id)
-WHERE s.submitted_via = 'battery' AND s.status = 'done' AND r.measured
-ORDER BY s.window_end DESC, r.symbol;
+WHERE s.submitted_via = 'battery' AND s.status = 'done'
+  -- AND r.symbol IN ('GOOGL', 'UNH')   -- the live covered-call BOOK is a
+  --                                    -- filter over these rows, not a set
+ORDER BY strategy, s.window_end DESC, r.symbol, r.split;
 ```
+
+`r.measured` is selected, not filtered, so an `insufficient` symbol shows as a
+row with `measured = false` rather than vanishing from the series — which
+matters most on the covered-call half, where four names sit below the call
+premium floor by construction. A reader who wants only measured points adds
+`AND r.measured`.
 
 A `failed` battery row whose `error` begins `pin invalid: ` is a pin the
 current allowlist **refuses** — as opposed to one that ran and broke. Only the
@@ -765,8 +787,23 @@ predates Phase C sees exactly the columns it always saw.
 Reading the table with covered-call rows in it:
 
 * **`spec_json.strategy` absent means `wheel`.** Every row written before Phase
-  C is in that state, and the canonicaliser folds an explicit `"wheel"` to
-  absence, so the field appears only on non-wheel runs.
+  C is in that state. Rows written since carry an explicit `"wheel"` —
+  `spec_payload` writes the field unconditionally; it is only the dedup KEY
+  that folds `wheel` to absence (`identity.canonical_spec`). So segment with
+  `IFNULL(JSON_VALUE(spec_json, '$.strategy'), 'wheel')`, never a bare
+  `JSON_VALUE(...) = 'wheel'`: the bare form silently drops the entire
+  pre-Phase-C history.
+* **The weekly battery writes covered-call rows since FC-117.** Two standing
+  sets run every Saturday — the wheel's and the covered-call profile's over the
+  same 14 symbols — both stamped `submitted_via = 'battery'`, so segment them
+  with the `IFNULL` above. Two properties qualify every covered-call point:
+  it **RE-BASES weekly** (each Saturday's window seeds its synthetic lot at
+  that window's first traded close, so adjacent points differ partly for a
+  reason that has nothing to do with the strategy — the honest comparisons are
+  the same `window_end` across symbols, or a long series read for drift), and
+  `annualized_return` on such a row is the lot's **equity** return. The
+  covered-call headline, `premium_yield_on_lot`, is **artifact-only** — no
+  column here; promoting it is FC-118.
 * **Do not compare `annualized_return` across strategies.** A wheel row's ratio
   is over `starting_cash`; a covered-call row's is over the synthetic lot. They
   are different denominators describing different premises, which is why the
