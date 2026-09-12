@@ -1485,7 +1485,7 @@ steps:
           --args=main.py,--command,backfill \
           --set-env-vars=ALPACA_PAPER_TRADING=true,GCP_PROJECT=$PROJECT_ID,CHAIN_LAKE_BUCKET=options-wheel-chain-lake,GIT_COMMIT=$COMMIT_SHA,BACKFILL_THEN_BATTERY=true \
           --set-secrets=ALPACA_API_KEY=alpaca-api-key:latest,ALPACA_SECRET_KEY=alpaca-secret-key:latest,FINNHUB_API_KEY=finnhub-api-key:latest \
-          --memory=1Gi \
+          --memory=2Gi \
           --cpu=1 \
           --task-timeout=21600 \
           --max-retries=0 \
