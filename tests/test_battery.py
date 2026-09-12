@@ -216,6 +216,30 @@ def wired(monkeypatch):
     return writer
 
 
+# The wheel standing set, frozen. Captured with
+# `json.dumps(battery_standing_specs(_config(), today=date(2026, 9, 5)),
+# sort_keys=True)` on `main` at 1745f00 — BEFORE any FC-117 source change —
+# and pasted verbatim. FC-117 composes a second standing set out of the same
+# builder; DD-5 makes the wheel half a BYTE contract, because a moved field,
+# a reordered symbol or a changed window would re-key every wheel row and put
+# a step in the project's baseline trend series that no market move explains.
+_FROZEN_WHEEL_STANDING_SET_2026_09_05 = (
+    '[{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AAPL"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["MSFT"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["GOOGL"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AMZN"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["NVDA"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["AMD"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["QQQ"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["SPY"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["IWM"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["UNH"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["F"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["PFE"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["KMI"]}, '
+    '{"end": "2026-09-04", "holdout_start": "2026-06-06", "run_sensitivity": false, "scenarios": [], "start": "2025-09-04", "starting_cash": 100000.0, "strategy": "wheel", "symbols": ["VZ"]}]'
+)
+
 # ==========================================================================
 # The standing set
 # ==========================================================================
@@ -283,6 +307,300 @@ class TestTheStandingSet:
         )
         assert spec["run_sensitivity"] is False
 
+    def test_the_wheel_half_is_byte_identical_to_the_pre_fc_117_set(self):
+        """DD-5 (FC-117): the wheel standing set is a BYTE contract.
+
+        FC-117 composes a covered-call standing set out of the same builder.
+        The refactor that makes that possible must not move a single byte of
+        the wheel half: the wheel series is this project's baseline, and a
+        changed field, a reordered symbol or a changed window would re-key
+        every wheel row and step the series for a reason no market move
+        explains.
+
+        If the wheel's universe or window shape ever changes on purpose, this
+        literal is REGENERATED from the new code and the change is argued in
+        the PR — it is never edited field by field to make a red test green.
+        """
+        assert json.dumps(
+            cli.battery_standing_specs(_config(), today=date(2026, 9, 5)),
+            sort_keys=True,
+        ) == _FROZEN_WHEEL_STANDING_SET_2026_09_05
+
+
+# ==========================================================================
+# The covered-call standing set (FC-117)
+# ==========================================================================
+class TestTheCoveredCallStandingSet:
+    """A SECOND standing set: the wheel's universe, under the CC profile.
+
+    Everything here is a property that fails silently if it breaks. The set
+    doubles the weekly item count, so the ways it can go wrong are (a) one half
+    quietly missing, (b) the two halves deduping into each other and the CC
+    series measuring the wheel, (c) the wall cap sacrificing wheel cells to
+    make room for CC ones, and (d) counts that misattribute, so a half that
+    stopped running still reads as 28 measured.
+    """
+
+    def test_the_composed_set_is_both_halves_in_order(self, wired, monkeypatch):
+        """Wheel first, covered call second, pins last (DD-2).
+
+        Order is load-bearing rather than cosmetic: under a cap hit the LATER
+        items are the skipped ones, and the wheel series is the baseline this
+        project reads everything else against.
+        """
+        submitted = []
+        monkeypatch.setattr(cli, "run_sweep_cmd",
+                            lambda *a, **k: submitted.append(k) or 0)
+        symbols = _config().stock_symbols
+
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        assert len(submitted) == 2 * len(symbols)
+        halves = [k["spec_override"] for k in submitted]
+        assert [s["strategy"] for s in halves] == (
+            ["wheel"] * len(symbols) + ["covered_call"] * len(symbols))
+        assert [s["symbols"][0] for s in halves[:len(symbols)]] == list(symbols)
+        assert [s["symbols"][0] for s in halves[len(symbols):]] == list(symbols)
+
+    def test_a_cc_spec_is_its_wheel_twin_with_one_field_changed(self):
+        """Same window, same holdout, same cash, same arms — one field apart.
+
+        Any other difference would make the weekly comparison between the two
+        series a comparison of WINDOWS rather than of strategies, and nothing
+        on the row would say so.
+        """
+        today = date(2026, 9, 5)
+        wheel = cli.battery_standing_specs(_config(), today=today)
+        cc = cli.battery_covered_call_specs(_config(), today=today)
+        assert len(cc) == len(wheel) and cc, "the CC half is missing"
+        for w, c in zip(wheel, cc):
+            assert {k: v for k, v in c.items() if k != "strategy"} == {
+                k: v for k, v in w.items() if k != "strategy"}
+            assert w["strategy"] == "wheel"
+            assert c["strategy"] == "covered_call"
+
+    def test_the_cc_half_canonicalises_with_strategy_and_keys_apart(self):
+        """The CC spec must not be able to dedup into the wheel's row.
+
+        `canonical_spec` omits `strategy` for the wheel and KEEPS it for
+        everything else, so the two keys differ by construction. If they ever
+        collided, the CC series would silently serve the wheel's replay and
+        both series would be wrong with no failed row anywhere.
+        """
+        from src.backtesting.scenarios.identity import (
+            canonical_spec, sweep_key,
+        )
+
+        today = date(2026, 9, 5)
+        wheel = cli.battery_standing_specs(_config(), today=today)
+        cc = cli.battery_covered_call_specs(_config(), today=today)
+        def key(spec):
+            # Same engine on both sides, so the only thing that can move the
+            # key is the spec itself.
+            return sweep_key(spec, engine_version=ENGINE_VERSION,
+                             engine_identity="e")
+
+        for w, c in zip(wheel, cc):
+            assert canonical_spec(c)["strategy"] == "covered_call"
+            assert "strategy" not in canonical_spec(w)
+            assert key(c) != key(w)
+
+    def test_the_backfill_universe_covers_the_covered_call_set(
+            self, monkeypatch):
+        """DD-4, the structural guard.
+
+        The battery rides the backfill's execution precisely so that it
+        measures against a lake refreshed minutes earlier. A CC symbol the
+        backfill does not fetch has no chains, and would produce a `failed`
+        row every Saturday until somebody widened the lake by hand. Both lists
+        are drawn from the same process config today; this fails the day an
+        edit lets them diverge.
+
+        `BACKFILL_SYMBOLS` is cleared because `backfill_symbols` prefers it
+        over the config (`main.py:522`): with that variable set in the shell,
+        this guard would compare the CC set against whatever the operator last
+        exported and pass or fail for a reason that has nothing to do with the
+        repo. The ambient-environment class, again.
+        """
+        monkeypatch.delenv('BACKFILL_SYMBOLS', raising=False)
+        args = Namespace(symbols=None)
+        covered = set(cli.backfill_symbols(args, _config()))
+        wanted = {sym for spec in cli.battery_covered_call_specs(_config())
+                  for sym in spec["symbols"]}
+        assert wanted and wanted <= covered, (
+            f"the backfill does not fetch {sorted(wanted - covered)}, so the "
+            f"covered-call items for those symbols would fail every week"
+        )
+
+    def test_the_events_and_the_summary_carry_the_per_strategy_split(
+            self, wired, monkeypatch, capsys):
+        """A half that stopped running must not read as a full battery.
+
+        `measured` alone cannot say which series got its point this week, and
+        a CC half that failed to compose would look exactly like a healthy
+        one — 14 items measured, no degraded event.
+        """
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        logger = _Logger()
+        n = len(_config().stock_symbols)
+
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+
+        started = logger.payload("battery_started")
+        assert (started["standing_wheel"], started["standing_cc"]) == (n, n)
+        assert started["standing"] == 2 * n, "the total keeps its meaning"
+        done = logger.payload("battery_completed")
+        assert (done["measured_wheel"], done["measured_cc"]) == (n, n)
+        assert done["measured"] == 2 * n
+        out = capsys.readouterr().out
+        assert f"{n} wheel + {n} cc standing" in out
+        assert f"{2 * n} measured ({n} wheel + {n} cc)" in out
+
+    def test_a_failing_cc_item_is_attributed_to_cc_and_named(
+            self, wired, monkeypatch):
+        """Per-item isolation, with the count telling which series lost it."""
+        victim = _config().stock_symbols[0]
+
+        def run(*_a, **kw):
+            if kw["spec_override"].get("strategy") == "covered_call" and \
+                    kw["spec_override"]["symbols"] == [victim]:
+                raise RuntimeError("materialisation exploded")
+            return 0
+        monkeypatch.setattr(cli, "run_sweep_cmd", run)
+        logger = _Logger()
+        n = len(_config().stock_symbols)
+
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+
+        payload = logger.payload("battery_degraded")
+        assert payload["reason"] == "items_failed"
+        assert payload["measured_wheel"] == n
+        assert payload["measured_cc"] == n - 1
+        assert payload["failed_labels"] == [f"standing:cc:{victim}"]
+
+    def test_a_covered_call_pin_counts_as_cc(self, wired, monkeypatch):
+        """The counts are over EVERYTHING measured, not the standing sets.
+
+        A pin already may carry `strategy` — `validate_spec` accepts it and the
+        pin store keeps the normalised spec verbatim — so a count that only
+        looked at the standing halves would under-report the CC series by
+        exactly the pins an operator added to it.
+        """
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        wired._pins = [pin("pin00000000000cc",
+                           spec=valid_spec(strategy="covered_call"))]
+        logger = _Logger()
+        n = len(_config().stock_symbols)
+
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+
+        done = logger.payload("battery_completed")
+        assert (done["measured_wheel"], done["measured_cc"]) == (n, n + 1)
+
+    def test_the_wall_cap_sacrifices_the_cc_half_and_never_a_wheel_cell(
+            self, wired, monkeypatch):
+        """DD-2's ordering, asserted where it matters: at the cap.
+
+        A complete wheel series plus a missing covered-call series is a better
+        partial than two series with a hole in the same week. An interleaved
+        build would pass every other test in this file and fail only here —
+        silently, a year into a trend chart nobody re-derives.
+        """
+        n = len(_config().stock_symbols)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(cli, "battery_max_seconds", lambda: 10 * n)
+        import time as _time
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["t"])
+
+        def slow(*_a, **_k):
+            clock["t"] += 10.0
+            return 0
+        monkeypatch.setattr(cli, "run_sweep_cmd", slow)
+        wired._pins = [pin("pin0000000000001"), pin("pin0000000000002")]
+        logger = _Logger()
+
+        cli.run_battery_cmd(battery_args(), _config(), logger)
+
+        payload = logger.payload("battery_degraded")
+        assert payload["reason"] == "wall_cap"
+        assert payload["measured_wheel"] == n and payload["measured_cc"] == 0
+        assert payload["skipped_labels"] == (
+            [f"standing:cc:{sym}" for sym in _config().stock_symbols]
+            + ["pin:pin0000000000001", "pin:pin0000000000002"]), (
+            "the cap must consume the covered-call half BEFORE any pin and "
+            "AFTER every wheel item"
+        )
+
+    def test_the_skipped_label_list_names_forty_not_twenty(
+            self, wired, monkeypatch):
+        """28 standing items overflow the old `[:20]` on their own.
+
+        A cap hit between the two halves would then NAME 20 of the 28+ items it
+        skipped, and the label list is the only place an operator learns WHICH
+        series lost its week. The counts stay complete either way.
+        """
+        monkeypatch.setattr(cli, "run_sweep_cmd", lambda *a, **k: 0)
+        n = len(_config().stock_symbols)
+        pins = 41 - 2 * n
+        wired._pins = [pin(f"pin{i:013d}") for i in range(pins)]
+        logger = _Logger()
+
+        # Already past the cap before the first item: everything is skipped.
+        cli.run_battery_cmd(battery_args(), _config(), logger,
+                            elapsed_seconds=cli.battery_max_seconds() + 1)
+
+        payload = logger.payload("battery_degraded")
+        assert payload["skipped"] == 41, "the COUNT is never truncated"
+        assert len(payload["skipped_labels"]) == 40
+        # Pin-only and bounded by MAX_ACTIVE_PINS, so it stays at 20.
+        assert payload["oversized_labels"] == []
+
+    def test_every_cc_row_is_stamped_battery_and_replayed_under_the_profile(
+            self, wired, monkeypatch):
+        """Through the REAL `run_sweep_cmd`, not the entry point alone.
+
+        This drives `resolve_replay_config` -> `Config('config/covered_call.yaml')`
+        -> `base_config_snapshot`, which is the exact path Phase C's BLOCKER
+        lived on. An entry-point test that stops at the submission cannot tell
+        a battery that submits covered-call specs and REPLAYS THE WHEEL from
+        one that works: the rows would say `covered_call` and the numbers would
+        be the wheel's.
+        """
+        from src.utils.config import Config
+        import src.backtesting.scenarios as scenarios_pkg
+
+        replayed = []
+        monkeypatch.setattr(
+            scenarios_pkg, "run_sweep",
+            lambda *a, **k: replayed.append(a[0]) or clean_sweep())
+
+        cli.run_battery_cmd(battery_args(), _config(), _Logger())
+
+        # The hash below proves the row was STAMPED with the covered-call
+        # profile; this proves the object the replay actually ran on IS that
+        # profile. A build that snapshotted the CC config for the row and then
+        # handed `run_sweep` the wheel's would pass the hash assertion alone.
+        n = len(_config().stock_symbols)
+        assert [c.strategy_id for c in replayed[n:2 * n]] == ['covered_call'] * n
+        assert [c.strategy_id for c in replayed[:n]] == ['wheel'] * n
+
+        cc_rows = [r for r in wired.statuses
+                   if r["spec_json"]
+                   and json.loads(r["spec_json"]).get("strategy")
+                   == "covered_call"]
+        assert cc_rows, "no covered-call row was written at all"
+        assert {r["submitted_via"] for r in cc_rows} == {"battery"}
+
+        cc_hash = store.base_config_hash(
+            store.base_config_snapshot(Config("config/covered_call.yaml")))
+        wheel_hash = store.base_config_hash(
+            store.base_config_snapshot(_config()))
+        assert cc_hash != wheel_hash, "the two profiles must hash apart"
+        assert {r["base_config_hash"] for r in cc_rows} == {cc_hash}, (
+            "a covered-call row carrying the WHEEL's base config hash means "
+            "the replay ran under the wrong profile"
+        )
+
 
 # ==========================================================================
 # The loop: isolation, revalidation, the nag, the wall cap
@@ -298,7 +616,8 @@ class TestTheBatteryMeasuresEverything:
 
         rc = cli.run_battery_cmd(battery_args(), _config(), _Logger())
         assert rc == 0
-        assert len(submitted) == len(_config().stock_symbols) + 2
+        # Two standing halves since FC-117 (wheel + covered call), plus pins.
+        assert len(submitted) == 2 * len(_config().stock_symbols) + 2
         assert [k["pin_id"] for k in submitted][-2:] == [
             "pin0000000000001", "pin0000000000002"]
 
@@ -321,11 +640,18 @@ class TestTheBatteryMeasuresEverything:
                                                         monkeypatch):
         seen = []
         monkeypatch.setattr(cli, "run_sweep_cmd",
-                            lambda *a, **k: seen.append(k["submitted_via"]) or 0)
+                            lambda *a, **k: seen.append(k) or 0)
         wired._pins = [pin()]
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
-        assert set(seen) == {"battery"}
+        assert {k["submitted_via"] for k in seen} == {"battery"}
         assert cli.BATTERY_SUBMITTED_VIA == "battery"
+        # FC-117: `submitted_via` stays 'battery' on BOTH halves — segmenting
+        # on it (a 'battery-cc' value) would have made every existing consumer
+        # of `submitted_via='battery'` silently wheel-only. The strategy rides
+        # in the spec, which is where the trend query reads it from.
+        n = len(_config().stock_symbols)
+        assert [k["spec_override"].get("strategy") for k in seen[:2 * n]] == (
+            ["wheel"] * n + ["covered_call"] * n)
 
     def test_the_rows_a_real_submission_writes_carry_it_too(self, wired):
         """Not just the parameter — the ROW. The trend queries read the column.
@@ -340,9 +666,10 @@ class TestTheBatteryMeasuresEverything:
         assert {r["submitted_via"] for r in wired.statuses} == {"battery"}
         assert {r["pin_id"] for r in wired.statuses} == {None}
         run_ids = {r["run_id"] for r in wired.statuses}
-        assert len(run_ids) == len(_config().stock_symbols), (
-            "each standing symbol is its own run; sharing a run_id would "
-            "collapse fourteen runs into one unreadable timeline"
+        assert len(run_ids) == 2 * len(_config().stock_symbols), (
+            "each standing symbol is its own run in each half (wheel and "
+            "covered call, FC-117); sharing a run_id would collapse "
+            "twenty-eight runs into one unreadable timeline"
         )
 
     def test_the_per_execution_env_overrides_are_ignored(self, wired,
@@ -361,7 +688,7 @@ class TestTheBatteryMeasuresEverything:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         run_ids = [r["run_id"] for r in wired.statuses]
         assert "envrun0123456789" not in run_ids
-        assert len(set(run_ids)) == len(_config().stock_symbols)
+        assert len(set(run_ids)) == 2 * len(_config().stock_symbols)
         assert {r["submitted_at"] for r in wired.statuses} != {
             "2020-01-01T00:00:00+00:00"}
 
@@ -423,8 +750,9 @@ class TestTheBatteryRevalidatesEveryPin:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         done = [r for r in wired.statuses
                 if r["status"] == "done" and r["pin_id"] is None]
-        assert len(done) == len(_config().stock_symbols), (
-            "isolation: one bad pin must cost its own row and nothing else"
+        assert len(done) == 2 * len(_config().stock_symbols), (
+            "isolation: one bad pin must cost its own row and nothing else — "
+            "both standing halves (FC-117) survive it"
         )
 
     @pytest.mark.parametrize("spec_json,expected", [
@@ -556,12 +884,12 @@ class TestTheWallCap:
         assert payload["reason"] == "wall_cap"
         # Two ran (t=0 and t=60); everything after t>=100 was refused a start.
         assert payload["measured"] == 2
-        assert payload["skipped"] == len(_config().stock_symbols) - 2
+        assert payload["skipped"] == 2 * len(_config().stock_symbols) - 2
         assert payload["skipped_labels"][0] == (
             f"standing:{_config().stock_symbols[2]}"), (
             "the skipped items must be NAMED — a battery that silently "
-            "measured two of fourteen looks exactly like one that measured "
-            "fourteen"
+            "measured two of twenty-eight looks exactly like one that "
+            "measured twenty-eight"
         )
 
     def test_the_item_in_flight_when_the_cap_passes_is_never_interrupted(
@@ -638,9 +966,11 @@ class TestExitCodeClasses:
         monkeypatch.setattr(cli, "run_sweep_cmd", boom)
 
         assert cli.run_battery_cmd(battery_args(), _config(), logger) == 0
-        assert logger.payload("battery_degraded")["failed"] == len(
+        assert logger.payload("battery_degraded")["failed"] == 2 * len(
             _config().stock_symbols)
         assert logger.payload("battery_degraded")["measured"] == 0
+        assert logger.payload("battery_degraded")["measured_wheel"] == 0
+        assert logger.payload("battery_degraded")["measured_cc"] == 0
 
     def test_a_failing_item_that_REACHED_the_store_is_not_given_a_second_row(
             self, wired, monkeypatch):
@@ -661,7 +991,7 @@ class TestExitCodeClasses:
 
         cli.run_battery_cmd(battery_args(), _config(), logger)
         assert [r["status"] for r in wired.statuses] == [
-            "running"] * len(_config().stock_symbols), (
+            "running"] * (2 * len(_config().stock_symbols)), (
             "the battery must add nothing to a run that recorded itself"
         )
         assert logger.payload("battery_pin_failed")["invalid"] is False
@@ -1056,7 +1386,7 @@ class TestADedupHitWeekReplaysNothing:
         cli.run_battery_cmd(battery_args(), _config(), logger)
         assert replays == []
         assert "battery_degraded" not in logger.types()
-        assert logger.payload("battery_completed")["measured"] == len(
+        assert logger.payload("battery_completed")["measured"] == 2 * len(
             _config().stock_symbols)
 
 
@@ -1129,7 +1459,11 @@ class TestPinsAreRollingWindows:
                            holdout_days=90)]
 
         for today in self.SATURDAYS:
+            # BOTH standing halves out of the way (FC-117) — this test is
+            # about the PIN's window moving, and a standing item never dedups.
             monkeypatch.setattr(cli, "battery_standing_specs",
+                                lambda *_a, **_k: [])
+            monkeypatch.setattr(cli, "battery_covered_call_specs",
                                 lambda *_a, **_k: [])
             monkeypatch.setattr(
                 cli, "battery_pin_spec",
@@ -1163,6 +1497,8 @@ class TestPinsAreRollingWindows:
         wired.find_done_sweep = prior_for
         wired._pins = [pin("pin000000000aaa2")]
         monkeypatch.setattr(cli, "battery_standing_specs", lambda *_a, **_k: [])
+        monkeypatch.setattr(cli, "battery_covered_call_specs",
+                            lambda *_a, **_k: [])
         monkeypatch.setattr(cli, "battery_pin_spec",
                             lambda p, today=None: (json.loads(p["spec_json"]), ()))
 
@@ -1306,7 +1642,7 @@ class TestThePerPinCellCap:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         done = [r for r in wired.statuses
                 if r["status"] == "done" and r["pin_id"] is None]
-        assert len(done) == len(_config().stock_symbols)
+        assert len(done) == 2 * len(_config().stock_symbols)
 
     def test_the_cap_is_well_under_the_apis_per_submission_ceiling(self):
         from tests._dashboard_path import add_dashboard_backend_to_path
@@ -1351,7 +1687,7 @@ class TestTheExecutionClock:
         assert payload["measured"] == 0, (
             "the execution was already past the cap before the battery began"
         )
-        assert payload["skipped"] == len(_config().stock_symbols)
+        assert payload["skipped"] == 2 * len(_config().stock_symbols)
 
     def test_the_reported_wall_includes_it(self, wired, monkeypatch):
         logger = _Logger()
@@ -1367,7 +1703,7 @@ class TestTheExecutionClock:
             logger = _Logger()
             cli.run_battery_cmd(battery_args(), _config(), logger,
                                 elapsed_seconds=value)
-            assert logger.payload("battery_completed")["measured"] == len(
+            assert logger.payload("battery_completed")["measured"] == 2 * len(
                 _config().stock_symbols)
 
     def test_the_execution_budget_fits_the_job_timeout(self):
@@ -1394,6 +1730,33 @@ class TestTheExecutionClock:
                 + in_flight) < timeout, (
             f"{longest_backfill_chunk} + {cli.BATTERY_MAX_SECONDS} + "
             f"{in_flight} does not fit {timeout}s"
+        )
+
+    def test_the_two_standing_halves_leave_room_for_the_pins(self):
+        """FC-117 DD-2: the STANDING set must never become the cap's consumer.
+
+        Pins are the variable-size items the cap was designed around; a
+        standing set that filled the budget on its own would skip them week
+        after week with only the skip list to say so. So the composed set,
+        priced at its WORST case — every item a lake pull, and every
+        covered-call item additionally a 22-reach vendor rebuild, which is the
+        live PFE-class path — must still leave half the cap.
+
+        Catches a universe growth (or a per-item cost regression) that quietly
+        crosses that line.
+        """
+        materialise_per_symbol = 40          # measured, PR-c rollout
+        replay_per_cell = 2                  # measured 0.46-0.55 s, rounded up
+        vendor_rebuild_22_reach = 20         # ~3x a reach-8 build's contracts
+
+        wheel_item = materialise_per_symbol + 2 * replay_per_cell
+        cc_item = (materialise_per_symbol + vendor_rebuild_22_reach
+                   + 2 * replay_per_cell)
+        symbols = len(_config().stock_symbols)
+        assert symbols * (wheel_item + cc_item) <= cli.BATTERY_MAX_SECONDS // 2, (
+            f"{symbols} x ({wheel_item} + {cc_item}) = "
+            f"{symbols * (wheel_item + cc_item)}s of standing set against a "
+            f"{cli.BATTERY_MAX_SECONDS}s cap — pins would start being skipped"
         )
 
 

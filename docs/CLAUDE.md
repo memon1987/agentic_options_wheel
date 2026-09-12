@@ -763,6 +763,19 @@ Any query that segments by strategy must therefore read
 Each strategy also has its own dataset (`options_wheel`, `covered_call`), so
 within one dataset the column is a cross-check, not the primary filter.
 
+**Reading `strategy` on SWEEP rows (FC-096 Phase C / FC-117).** The twin rule,
+for the two measurement tables. `scenario_sweeps` / `scenario_runs` carry **no
+strategy column** — the strategy rides in `spec_json`, where it is ABSENT on
+rows written before Phase C (`f6a5a4d`, 2026-09-09) and an explicit `"wheel"`
+since (`spec_payload` carries it unconditionally; only the dedup KEY folds
+`wheel` to absence). Segment with
+`IFNULL(JSON_VALUE(spec_json, '$.strategy'), 'wheel')`, never a bare
+`JSON_VALUE(...) = 'wheel'` — the bare form drops the pre-Phase-C history, and
+since FC-117 the weekly battery writes covered-call rows into the same tables
+under the same `submitted_via='battery'`. Do **not** compare
+`annualized_return` across the two: a wheel ratio is over `starting_cash`, a
+covered-call ratio is the equity return of a synthetic 100-share lot.
+
 **Backtests are the exception, and the distinction matters.** The old
 `/backtest`, `/backtest/results`, `/backtest/history` and `/cache/*` endpoints
 were **deleted in FC-032** — the engine behind them had never produced a single
@@ -863,12 +876,51 @@ Three properties worth knowing before running it:
 
 **`--command battery` measures; it writes results, never data (FC-096 Phase B
 B4).** It re-submits a standing set — the base config, ONE sweep per live
-symbol, over the trailing year with a 90-day holdout — plus every ACTIVE pin,
-through the ordinary sweep machinery with persistence on. So every submission
-gets the same validators, the same engine-identity dedup, the same
+symbol **per strategy** (wheel and `covered_call` since **FC-117**), over the
+trailing year with a 90-day holdout — plus every ACTIVE pin, through the
+ordinary sweep machinery with persistence on. So every submission gets the same
+validators, the same engine-identity dedup, the same
 `scenario_sweeps`/`scenario_runs` rows and the same per-cell detail artifacts;
 `submitted_via='battery'` is what lets a trend query select the weekly series
 without picking up an operator's ad-hoc run or a deploy smoke row.
+
+**The covered-call half is a universe HYPOTHESIS, not the covered-call book.**
+`config/covered_call.yaml` has no `stocks:` section at all — that service's
+live universe is holdings-derived — so the CC standing set is one spec per
+symbol of the **wheel's** `stocks.symbols`, which is also where the backfill
+that precedes it draws the lake's universe from. The live book (GOOGL and UNH
+today) is a **filter** over these rows, never a second standing set; a CC
+holding *outside* the 14 has no series and no lake chains until it joins the
+wheel's list or `stocks.candidates`. The two halves are told apart by
+`spec_json.strategy`, not by `submitted_via` (see the `IFNULL` rule above) — 
+segmenting on `submitted_via` would have made every existing consumer of
+`submitted_via='battery'` silently wheel-only.
+
+Observability of the split: `battery_started` carries `standing_wheel` /
+`standing_cc`, and `battery_completed` / `battery_degraded` carry
+`measured_wheel` / `measured_cc` (the un-suffixed fields stay totals). Item
+labels are `standing:<SYMBOL>`, `standing:cc:<SYMBOL>` and `pin:<pin_id>`.
+**`measured_*` count completed SUBMISSIONS, not measured cells** — an item
+whose cells all came back unmeasured is still one measured item, so a CC half
+reporting 14 measured with several symbols unmeasured is the expected shape,
+not a bug; the per-cell truth is `r.measured` / `r.verdict` in `scenario_runs`.
+**The premium-floor names land `low_activity`, not `insufficient`.** F, PFE,
+KMI and VZ cannot find a call at the CC `$0.30` floor, so their coverage falls
+under `MIN_COVERED_FRACTION` (30 % of the days the strategy could have written
+one) — that is a `BLOCK:` reason, hence `verdict = 'unfit'` and
+`low_activity = true` (`fitness.py:613-621`, `runner.py:354-356`). CC
+`insufficient` means something else entirely: no synthetic lot was ever
+seeded, the window is shorter than one call tenor, or every day was a
+stand-down the strategy is supposed to take (`fitness.py:588-606`). Never
+"fix" a low measured-cell count by trimming the CC list — those rows ARE the
+measurement.
+
+**The `data-backfill` Job runs at 2 GiB since FC-117** (`cloudbuild.yaml`). The
+composed execution now does 28 materialisations in one container whose tmpfs
+bar and chain caches count against memory and accumulate for the whole run. An
+OOM is the one failure mode the battery cannot isolate: it is a SIGKILL of the
+container, so there is no `battery_degraded`, no `failed` row, and the
+BACKFILL's exit code is lost with it — a successful data run reads as a page.
 
 It rides the Saturday backfill: `BACKFILL_THEN_BATTERY=true` is set on the
 `data-backfill` Job by `cloudbuild.yaml`, so a bare weekly execution backfills
@@ -894,9 +946,12 @@ scheduler needed no change. Four properties are worth knowing:
   counts against it — measuring only from the battery's start would let a
   five-hour widening chunk give it a fresh four hours inside the six-hour task
   timeout, and the SIGKILL at that timeout takes the BACKFILL's exit code with
-  it. The cap matters because an engine-change week genuinely replays
-  everything: the dedup key is a content hash of `src/**`, so any merge
-  touching the engine invalidates every stored result exactly once.
+  it. **A STANDING item never dedups** — `window_end` re-anchors to the last
+  settled day every Saturday, so both standing halves genuinely replay every
+  week, engine change or not. Only PINS can dedup, and only when their window
+  did not move. What an engine change adds is that the pins replay too: the
+  dedup key is a content hash of `src/**`, so any merge touching the engine
+  invalidates every stored result exactly once.
   **A merge that changes what a number MEANS must also bump `ENGINE_VERSION`**
   in all three byte-pinned copies (`screen.py`, `scenarios/engine_identity.py`,
   `dashboard/backend/services/sweeps.py`). The identity hash already
@@ -917,8 +972,10 @@ scheduler needed no change. Four properties are worth knowing:
   no data work done rather than being swallowed six hours later. A SIGTERM
   between items is summarised and exits 0 too: Cloud Run reclaiming the
   container after a successful backfill is not a data failure.
-- **A quiet week is nearly free.** Every spec whose answer is already stored
-  deduplicates, replays nothing and still writes its row.
+- **A quiet week is nearly free FOR THE PINS.** A pin whose window did not move
+  deduplicates, replays nothing and still writes its row. The standing sets are
+  not in that population: they re-anchor weekly and are a full replay of
+  `2 × len(stocks.symbols)` items every Saturday, by construction.
 
 **Pins are ROLLING, and that is the whole point.** A pin stores the SHAPE of
 its window — `window_days` and `holdout_days`, derived at create time from the

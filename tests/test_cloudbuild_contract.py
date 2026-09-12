@@ -1108,6 +1108,36 @@ def test_backfill_job_never_retries_and_gets_a_six_hour_task_timeout(by_id):
     )
 
 
+def test_the_backfill_job_is_deployed_at_two_gibibytes(by_id):
+    """FC-117. The composed execution's memory ceiling, read off the flag.
+
+    The Saturday execution now does 28 standing materialisations in ONE
+    container whose tmpfs bar and chain caches count against memory and
+    accumulate for the whole run; the only covered-call replay ever measured
+    ran on the sim service at 2 GiB. An OOM is the one failure the battery
+    cannot isolate — a SIGKILL of the container means no `battery_degraded`,
+    no `failed` row, and the BACKFILL's exit code is lost with it, so a
+    successful data run reads as a page.
+
+    Asserted on the parsed flag rather than on prose, because a comment
+    claiming 2 GiB above a step that deploys 1 GiB is exactly the drift this
+    file exists to catch. `backtest-sweep` is also at 1 GiB and is NOT this
+    Job; the flag is read out of this step's script alone.
+    """
+    script = script_of(by_id[BACKFILL_JOB_STEP])
+    match = re.search(r"--memory=(\S+)", script)
+    assert match, (
+        f"{BACKFILL_JOB_STEP} must set --memory explicitly; without the flag "
+        "the Job falls back to the Cloud Run default and the 28-item "
+        "execution's headroom is whatever that default happens to be."
+    )
+    assert match.group(1) == "2Gi", (
+        f"{BACKFILL_JOB_STEP} deploys --memory={match.group(1)}; FC-117 sizes "
+        "the composed 28-item execution at 2Gi. Lowering it re-opens the OOM "
+        "the battery cannot report."
+    )
+
+
 def test_the_backfill_job_composes_the_weekly_battery(by_id):
     """`BACKFILL_THEN_BATTERY=true` is what makes the Saturday do both things.
 
