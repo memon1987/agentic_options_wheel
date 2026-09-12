@@ -98,7 +98,7 @@ from ..engine.simulator import (
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
 from ..reporting.bq_writer import config_hash
-from .identity import scenario_arm_hash
+from .identity import DEFAULT_ROLL_FILL_MODE, scenario_arm_hash
 from .overrides import (
     DTE_OVERRIDE_KEYS, MAX_SWEEPABLE_DTE, apply_overrides, validate_overrides,
 )
@@ -273,12 +273,32 @@ class ScenarioResult:
     coverage_by_reason: Optional[Dict[str, int]] = None
     calls_closed_early: Optional[int] = None
     synthetic_lots_opened: Optional[int] = None
+    #: FC-116 D6 — no longer gated to covered-call rows. FC-112 compares the
+    #: wheel's `rolling.itm_trigger_ratio` 0.98 vs 1.00, and the split IS the
+    #: question: an ITM roll is defence, an OTM roll-out is the roller
+    #: re-writing a call that was never threatened. A `None` here on a wheel
+    #: row is FC-112 arriving to find its number gated off.
     itm_rolls: Optional[int] = None
     otm_roll_outs: Optional[int] = None
-    #: ``call_roll_skipped`` reason -> count (H3). On EVERY measured row, wheel
+    #: ``call_roll_skipped`` reason -> count (H3), MERGED with the six
+    #: post-placement roller failures (FC-116 D5). On EVERY measured row, wheel
     #: included: the roller runs on both profiles, and this is the only thing
     #: that separates "declined 40 credit-only evaluations" from "blind".
     roll_skips: Optional[Dict[str, int]] = None
+    #: FC-116 D6 — the roll CREDIT, pre-fee (the quantity the live credit
+    #: invariant guards and `call_roll_completed` reports), and the same split.
+    roll_net_credit: Optional[float] = None
+    itm_roll_credit: Optional[float] = None
+    otm_roll_out_credit: Optional[float] = None
+    #: Post-fee cash paid on BTC legs of rolls that did not complete.
+    failed_roll_btc_debit: Optional[float] = None
+    #: How many roll legs rested inside the modeled spread (the model's one
+    #: approximation) versus filled at the book. Both 0 under `haircut`.
+    roll_legs_resting: Optional[int] = None
+    roll_legs_marketable: Optional[int] = None
+    #: The RESOLVED mode — `"limit"` or `"haircut"`, never None on a measured
+    #: row. Stored resolved on purpose, unlike `fill_haircut`.
+    roll_fill_mode: Optional[str] = None
     replay_seconds: Optional[float] = None
     error: Optional[str] = None
 
@@ -376,6 +396,10 @@ class SweepResult:
     scenario_hashes: Dict[str, str] = field(default_factory=dict)
     scenario_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     scenario_fill_haircuts: Dict[str, Optional[float]] = field(default_factory=dict)
+    #: FC-116 — arm name -> RESOLVED roll fill mode. The footer needs it to say
+    #: which arms (if any) ran the pre-FC-116 haircut model, so a reader of a
+    #: mixed sweep is never left guessing which column is the honest one.
+    scenario_roll_fill_modes: Dict[str, str] = field(default_factory=dict)
     materialise_seconds: Dict[str, float] = field(default_factory=dict)
     replay_seconds: Dict[str, float] = field(default_factory=dict)
     wall_seconds: float = 0.0
@@ -626,12 +650,29 @@ def _windows(
     ]
 
 
+#: FC-116 D6 — the roll fields a `SimulationResult` hands to the row, the cell
+#: artifact's `counters` and the `scenario_runs` schema. ONE list, because
+#: three call sites naming them separately is how one of them ends up missing a
+#: field and an FC-112 query silently reads a NULL.
+ROLL_METRIC_FIELDS = (
+    "roll_net_credit", "itm_roll_credit", "otm_roll_out_credit",
+    "failed_roll_btc_debit", "roll_legs_resting", "roll_legs_marketable",
+    "roll_fill_mode",
+)
+
+
+def roll_metrics(result) -> Dict[str, Any]:
+    """The D6 roll metrics off a `SimulationResult`, as row kwargs."""
+    return {name: getattr(result, name) for name in ROLL_METRIC_FIELDS}
+
+
 def _row_from_report(
     *, scenario: str, symbol: str, window: Tuple[str, date, date],
     cfg_hash: str, scenario_hash: str, report, sensitivity: Optional[dict],
     seconds: float, rolls_evaluated: Optional[int] = None,
     rolls_executed: Optional[int] = None,
     roll_skips: Optional[Dict[str, int]] = None,
+    roll_metrics: Optional[Dict[str, Any]] = None,
 ) -> ScenarioResult:
     split, start, end = window
     verdict = report.verdict()
@@ -680,9 +721,14 @@ def _row_from_report(
         calls_closed_early=(None if report.is_wheel else report.calls_closed_early),
         synthetic_lots_opened=(None if report.is_wheel
                                else report.synthetic_lots_opened),
-        itm_rolls=(None if report.is_wheel else report.itm_rolls),
-        otm_roll_outs=(None if report.is_wheel else report.otm_roll_outs),
+        # FC-116 D6 — the `None if report.is_wheel` gating is GONE. It was
+        # right when only the CC table printed the split; FC-112's whole
+        # question is the WHEEL's 0.98-vs-1.00 trigger, and it reads exactly
+        # these two numbers plus the credit split below.
+        itm_rolls=report.itm_rolls,
+        otm_roll_outs=report.otm_roll_outs,
         roll_skips=(dict(roll_skips) if roll_skips else None),
+        **(roll_metrics or {}),
         replay_seconds=round(seconds, 3),
     )
 
@@ -854,6 +900,13 @@ def run_sweep(
         scenario_hashes={s.name: s.scenario_hash() for s in scenarios},
         scenario_overrides={s.name: dict(s.overrides) for s in scenarios},
         scenario_fill_haircuts={s.name: s.fill_haircut for s in scenarios},
+        # RESOLVED, not verbatim: the footer's question is "did this arm fill
+        # rolls honestly?", and `None` is not an answer to it.
+        scenario_roll_fill_modes={
+            s.name: (DEFAULT_ROLL_FILL_MODE if s.roll_fill_mode is None
+                     else str(s.roll_fill_mode))
+            for s in scenarios
+        },
         starting_cash=starting_cash,
         run_sensitivity=run_sensitivity,
         effective_max_dte=max_dte,
@@ -1243,6 +1296,7 @@ def _replay_one(
             rolls_evaluated=result.rolls_evaluated,
             rolls_executed=result.rolls_executed,
             roll_skips=result.roll_skips,
+            roll_metrics=roll_metrics(result),
         )
         if artifact_sink is not None:
             _emit_artifact(

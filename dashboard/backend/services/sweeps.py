@@ -96,7 +96,7 @@ except ImportError:  # dashboard image: the same files, copied flat
 # dashboard that disagreed with the Job here would compute a key nothing ever
 # matches and the dedup would never fire — costing a full replay every time,
 # silently. Pinned by TestTheEngineVersionIsNotAFork.
-ENGINE_VERSION = "fc-069-scanner-rewire"
+ENGINE_VERSION = "fc-116-roll-limit-fills"
 
 logger = logging.getLogger(__name__)
 

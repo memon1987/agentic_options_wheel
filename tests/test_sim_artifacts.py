@@ -154,6 +154,32 @@ def _hand_built_result() -> SimulationResult:
                              mark=1.2, bid=1.0, opened=date(2024, 6, 24))
     broker.assign_call_early(call_b, date(2024, 6, 26), reason="ex_dividend")
 
+    # FC-116 D3(1) — ONE roll-intent pair, driven through the broker's new
+    # explicit-fill keywords.
+    #
+    # This is not decoration. `_key_sets` freezes the UNION of `detail` keys
+    # per ledger KIND, so a key the hand-built object never produces is never
+    # frozen: without this pair the only `buy_to_close` here is a PUT close and
+    # every `sell_call_open` is an entry leg, so `fill_rule`/`limit_price`
+    # would be missing from the fixture and the first stored artifact carrying
+    # them would sail past the frozen-schema test. Cross-checked against a real
+    # replay by `TestTheRollLegDetailMatchesARealReplay`.
+    # (The 100 shares left over after the early assignment are the cover.)
+    roll_old = "AAA240705C00106000"
+    broker.sell_call_to_open(roll_old, "AAA", 106.0, date(2024, 7, 5), 1,
+                             mark=1.4, bid=1.2, opened=date(2024, 6, 27))
+    broker.buy_to_close(
+        roll_old, 1, mark=1.6, ask=1.8, close_date=date(2024, 6, 28),
+        fill=1.8, fill_detail={"fill_rule": "limit_marketable",
+                               "limit_price": 1.82},
+    )
+    broker.sell_call_to_open(
+        "AAA240712C00107000", "AAA", 107.0, date(2024, 7, 12), 1,
+        mark=2.0, bid=1.85, opened=date(2024, 6, 28),
+        fill=1.9, fill_detail={"fill_rule": "limit_resting",
+                               "limit_price": 1.9},
+    )
+
     daily = [
         DailyState(day=date(2024, 6, 3), equity=100_000.0, cash=100_000.0,
                    reserved_collateral=10_000.0, open_options=1,
@@ -381,6 +407,41 @@ class TestTheSchemaIsFrozen:
         assert seeds[0].detail["lot_value"] == round(closes[days[0]] * 100, 2)
         assert "Synthetic lot" in seeds[0].detail["premise"]
 
+    def test_the_roll_leg_detail_matches_a_REAL_replay(self):
+        """FC-116 D3(1)(iii) — the same guard the seeding test above is.
+
+        `_key_sets` freezes the UNION of `detail` keys per ledger KIND, so a
+        key the HAND-BUILT object never produces is never frozen. The
+        hand-built roll pair is therefore only trustworthy while it carries
+        exactly what the adapter actually stamps. A field the adapter adds and
+        the hand-built object forgets fails HERE, rather than silently never
+        reaching a stored artifact.
+        """
+        from tests.test_backtest_simulator import (
+            dip_then_recovering_window, _simulator,
+        )
+
+        days, closes, exps = dip_then_recovering_window()
+        result = _simulator("XYZ", closes, exps, days,
+                            roll_fill_mode="limit").run()
+        assert result.rolls_executed, "the golden window executed no roll"
+
+        roll_days = {r["day"] for r in result.roll_records}
+        legs = [e for e in result.broker.ledger
+                if e.kind in ("buy_to_close", "sell_call_open")
+                and e.event_date.isoformat() in roll_days
+                and (e.detail or {}).get("limit_price") is not None]
+        kinds = {e.kind for e in legs}
+        assert kinds == {"buy_to_close", "sell_call_open"}, (
+            f"expected both roll legs in the ledger, got {sorted(kinds)}")
+
+        pinned = json.loads(FIXTURE.read_text())["ledger_detail_by_kind"]
+        for leg in legs:
+            assert sorted(leg.detail) == pinned[leg.kind], leg.kind
+            assert leg.detail["fill_rule"] in (
+                "limit_marketable", "limit_resting")
+            assert leg.detail["limit_price"] is not None
+
     def test_the_roll_record_shape_is_the_ROLLERS_shape(self):
         """The pin that the first cut of this file got wrong.
 
@@ -469,8 +530,19 @@ class TestTheFillAssumptionIsStamped:
         runs with no way to know it."""
         payload = cell_artifact(_hand_built_result(), _meta(fill_haircut=0.4))
         assert payload["provenance"]["fill"] == {
-            "basis": MID_FILL_BASIS, "fill_haircut": 0.4}
+            "basis": MID_FILL_BASIS, "fill_haircut": 0.4,
+            "roll_fill_mode": "limit"}
         assert MID_FILL_BASIS == "mid"
+
+    def test_the_stamp_carries_the_roll_fill_mode_the_replay_actually_ran(self):
+        """FC-116. The haircut alone no longer describes the fill assumption:
+        roll legs have their own rule, and the two produce materially different
+        roll credits. A reader of a stored cell must be able to tell which."""
+        for mode in ("limit", "haircut"):
+            result = _hand_built_result()
+            result.roll_fill_mode = mode
+            payload = cell_artifact(result, _meta())
+            assert payload["provenance"]["fill"]["roll_fill_mode"] == mode
 
 
 class TestTheMaskedReachIsTheArmsNotTheSweeps:

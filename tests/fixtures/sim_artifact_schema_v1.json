@@ -16,10 +16,16 @@
     "decision_days",
     "dividends_credited",
     "early_assignments",
+    "failed_roll_btc_debit",
     "final_equity",
+    "itm_roll_credit",
     "itm_rolls",
     "ledger_events",
+    "otm_roll_out_credit",
     "otm_roll_outs",
+    "roll_legs_marketable",
+    "roll_legs_resting",
+    "roll_net_credit",
     "rolls_evaluated",
     "rolls_executed",
     "synthetic_lots_opened",
@@ -80,7 +86,9 @@
   ],
   "ledger_detail_by_kind": {
     "buy_to_close": [
-      "collateral_released"
+      "collateral_released",
+      "fill_rule",
+      "limit_price"
     ],
     "call_assignment": [
       "reason"
@@ -94,7 +102,10 @@
       "collateral_released",
       "strike"
     ],
-    "sell_call_open": [],
+    "sell_call_open": [
+      "fill_rule",
+      "limit_price"
+    ],
     "sell_put_open": [
       "collateral"
     ],
@@ -124,7 +135,8 @@
   ],
   "provenance.fill": [
     "basis",
-    "fill_haircut"
+    "fill_haircut",
+    "roll_fill_mode"
   ],
   "provenance.masked_reach": [
     "dte_buffer",
