@@ -166,6 +166,11 @@ class TestTheReportProseIsNotAFork:
         # `spec_json.strategy`).
         "SYNTHETIC_LOT_BIAS", "MODEL_SPREAD_BIAS", "ROLL_REACH_BIAS",
         "CC_ROLL_SPLIT_NOTE", "MONITOR_LEG_NOTE",
+        # FC-116. Same posture again: the WORDS are pinned here, emission is
+        # derived on each side (the CLI off `SweepResult.
+        # scenario_roll_fill_modes`, the dashboard off the persisted
+        # `spec_json` arms, resolving an absent key to `limit`).
+        "ROLL_FILL_RULE",
         # M1 (review round 1): the substitution's two KEYS and its two
         # replacements. The keys are titles taken from SWEEP_BIASES, so a drift
         # in either copy breaks the swap silently — matching on a title that no
@@ -2492,12 +2497,20 @@ class TestTheFooterIsPerRun:
         }, [])
 
     def test_a_dte_7_run_carries_the_ordinary_footer_only(self):
+        """FC-116 — plus `ROLL_FILL_RULE`, which EVERY run carries.
+
+        It is not conditional on reach, strategy or arm: the roll fill rule is
+        a property of the engine that produced the numbers, and a reader of any
+        run needs it to know what a roll credit means. The rest of the footer
+        is unchanged, which is what the equality below still says.
+        """
         shaped = self._shaped({"strategy.min_put_premium": 0.3})
         assert shaped["effective_max_dte"] == 7
         titles = [b["title"] for b in shaped["known_biases"]]
         assert T.DTE_REACH_BIAS[0] not in titles
         assert shaped["known_biases"] == [
-            {"title": t, "detail": d} for t, d in T.SWEEP_BIASES]
+            {"title": t, "detail": d} for t, d in T.SWEEP_BIASES
+        ] + [{"title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}]
 
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
@@ -2505,8 +2518,12 @@ class TestTheFooterIsPerRun:
         shaped = self._shaped({key: 14})
         assert shaped["effective_max_dte"] == 14
         title, detail = T.DTE_REACH_BIAS
-        assert shaped["known_biases"][-1] == {"title": title, "detail": detail}
-        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 1
+        titles = [b["title"] for b in shaped["known_biases"]]
+        assert title in titles
+        # `ROLL_FILL_RULE` is appended last, after the reach caveat.
+        assert shaped["known_biases"][-1] == {
+            "title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
 
     def test_the_two_renderings_agree_on_a_long_run(self):
         """The whole point of deriving the condition twice: `/sims` and
@@ -4043,7 +4060,8 @@ class TestThePerCellSignAgreement:
 # The forecast (component 7)
 # --------------------------------------------------------------------------
 def _cell_row(scenario, symbol, split, ann, *, option_pnl=1000.0,
-              total_return=None, state="measured", fill_haircut=0.25):
+              total_return=None, state="measured", fill_haircut=0.25,
+              roll_fill_mode=None):
     """One persisted `scenario_runs` row, in the shape BigQuery hands back.
 
     Hand-built rather than round-tripped through `rows_from_sweep` because the
@@ -4062,6 +4080,10 @@ def _cell_row(scenario, symbol, split, ann, *, option_pnl=1000.0,
         "annualized_return": ann, "total_return": (
             ann if total_return is None else total_return),
         "option_pnl": option_pnl, "fill_haircut": fill_haircut,
+        # FC-116. `None` is the LEGACY state on purpose — a row written before
+        # `fc-116-roll-limit-fills` has no such column — so every fixture that
+        # does not ask for a mode exercises the pre-FC-116 read path.
+        "roll_fill_mode": roll_fill_mode,
         "error": None, "insufficient": False, "low_activity": False,
         "measured": False, "verdict": "fit",
     }
@@ -4171,7 +4193,23 @@ class TestTheForecastFormula:
         shaped = _split_run(_fit_holdout(fill_haircut=0.6))
         block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
         assert block["fill"] == {"basis": "mid", "fill_haircut": 0.6,
-                                 "is_engine_default": False}
+                                 "is_engine_default": False,
+                                 # FC-116 — the fixture row carries no
+                                 # `roll_fill_mode` column, i.e. it was written
+                                 # before `fc-116-roll-limit-fills`. That
+                                 # resolves to `haircut`, NOT to `limit`:
+                                 # reading a NULL as the new default would
+                                 # claim every legacy row's roll credit was
+                                 # measured against the placed limits.
+                                 "roll_fill_mode": "haircut"}
+
+    def test_a_post_fc116_row_serves_its_own_resolved_mode(self):
+        shaped = _split_run(_fit_holdout(roll_fill_mode="haircut"))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["fill"]["roll_fill_mode"] == "haircut"
+        shaped = _split_run(_fit_holdout(roll_fill_mode="limit"))
+        block = shaped["forecast"]["by_scenario"]["tighter"]["symbols"]["AAPL"]
+        assert block["fill"]["roll_fill_mode"] == "limit"
 
 
 class TestTheServedHaircutIsTheOneTheReplayRanAt:

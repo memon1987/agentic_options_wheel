@@ -43,6 +43,7 @@ from statistics import median
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
+from .identity import DEFAULT_ROLL_FILL_MODE as ROLL_FILL_MODE_LIMIT
 from .overrides import describe_allowlist
 from .runner import BASE_SCENARIO_NAME, ScenarioResult, SweepResult
 
@@ -296,7 +297,7 @@ MODEL_SPREAD_BIAS = (
 
 ROLL_REACH_BIAS = (
     "Covered-call ROLL candidates are truncated at 21 DTE, so roll counts and "
-    "credits are biased DOWN — and the fill model biases credits UP", (
+    "credits are biased DOWN", (
         "The roller's replacement search is bounded by `old_expiry + "
         "rolling.max_extension_days` and by nothing else. On this profile that "
         "is 14 + 14 = 28 DTE of chain for a full candidate set. The replay "
@@ -309,13 +310,6 @@ ROLL_REACH_BIAS = (
         "a freshly-written call's life, which is when an ITM move is most "
         "likely to need defending. Direction: FEWER candidates, never more. "
         "Roll counts and captured credits are FLOORS, not estimates. "
-        "\n\nIn the OPPOSITE direction, and not netted against it: the live "
-        "roller places its buy-to-close at the old contract's ASK and its "
-        "sell-to-open at the candidate's BID, while this engine fills every "
-        "order at its haircut price from the mark. A modelled roll therefore "
-        "captures MORE credit than the same roll would live, on both legs. "
-        "Neither bias is measured, so they are both named rather than "
-        "combined into a single number that would look like an estimate. "
         "\n\nThe WHEEL carries the same truncation, unmeasured and unfixed "
         "here: its horizon is 7 + 14 = 21 against a 7-DTE materialisation. "
         "Widening it would move every stored wheel number at once, so it is "
@@ -326,6 +320,49 @@ ROLL_REACH_BIAS = (
         "evaluations and a roller that could not price a single one both "
         "report the same `rolls_executed`, and only the skip reasons separate "
         "them."),
+)
+
+ROLL_FILL_RULE = (
+    "Roll legs fill at the placed limit against the day's modeled book, or "
+    "not at all", (
+        "The live roller is credit-only AT ITS PLACED LIMITS, so the replay "
+        "prices roll legs the same way. A buy-to-close whose limit is at or "
+        "through the ask fills AT THE ASK (never at a worse limit); a "
+        "sell-to-open whose limit is at or through the bid fills at the BID. "
+        "That is base mode. In imminence mode the roller rests both legs at "
+        "`mid +/- $0.05`, and a limit resting inside the modeled spread is "
+        "ASSUMED to fill at its limit within the leg's 120-second window — the "
+        "replay has one modeled book per decision day and no intraday tape. A "
+        "limit outside the book does not fill: the order expires and the "
+        "roller's own ladder and terminal dispositions apply, which "
+        "`roll_skips` now carries. Entry legs and the covered-call monitor leg "
+        "are NOT priced this way; they still fill at the haircut price "
+        "(FC-072, FC-086)."
+        "\n\nRoll credits therefore now pay the FULL modeled spread on both "
+        "legs — base-mode `credit = (mark_new - mark_old) - (hs_new + "
+        "hs_old)`, where `hs` is the modeled half-spread (5% of mark, widened "
+        "OTM and for cheap contracts, floor $0.02). The spread model measures "
+        "~2.46x WIDER than the real book, so replayed roll credits AND roll "
+        "counts (a credit invariant tested on wider spreads fails more often) "
+        "are biased DOWN versus live."
+        "\n\nThe model has exactly ONE residual, and it is measured rather "
+        "than estimated: an imminence-mode leg rests `hs - $0.05` per share "
+        "inside the far quote, which is NOT small on a high-mark chain (an "
+        "`hs` of $0.40-1.00 rests $0.35-0.95 per share per leg on the "
+        "assumption). It cuts BOTH ways against the old model: an imminence "
+        "roll on a chain with `hs > $0.20` carries MORE credit under this rule "
+        "than the haircut model gave it. `roll_legs_resting` on each row "
+        "counts how many legs rest on the assumption, and every roll-leg "
+        "ledger event carries `fill_rule` and `limit_price`, so a reader can "
+        "discount a row rather than guess at it."
+        "\n\nTwo things a zero here does NOT mean. On lake/model-built chains "
+        "no rung-1 roll leg can expire — every such limit lies inside the book "
+        "by construction — so a zero in `roll_skips`' post-placement terminals "
+        "is the model, not evidence that live rolls always fill. And the "
+        "replay attempts every roll the roller wants, whereas live per-position "
+        "and cycle budgets can truncate a ladder or skip a position entirely; "
+        "replayed roll counts are an upper bound on live ATTEMPTS, independent "
+        "of the fill rule."),
 )
 
 CC_ROLL_SPLIT_NOTE = (
@@ -392,7 +429,47 @@ def sweep_biases(result: SweepResult) -> List[Tuple[str, str]]:
         biases.append(CC_ROLL_SPLIT_NOTE)
         if getattr(result, "spread_gate_suspended", False):
             biases.append(MODEL_SPREAD_BIAS)
+    # FC-116 D4 — on BOTH strategies. The rule is shared: there is no
+    # `strategy_id` conditional anywhere on the fill path, so there must not be
+    # one on the footer that describes it either. The wheel needs it most —
+    # FC-112 reads the wheel's roll credit.
+    modes = sorted(set(
+        (getattr(result, "scenario_roll_fill_modes", None) or {}).values()))
+    if ROLL_FILL_MODE_LIMIT in modes or not modes:
+        biases.append(roll_fill_rule_for(sorted(
+            name for name, mode in (
+                getattr(result, "scenario_roll_fill_modes", None) or {}).items()
+            if mode != ROLL_FILL_MODE_LIMIT
+        )))
     return biases
+
+
+def roll_fill_rule_for(legacy: Sequence[str]) -> Tuple[str, str]:
+    """``ROLL_FILL_RULE``, plus a trailing sentence naming any haircut arm.
+
+    A mixed sweep is the whole point of the arm field — a before/after is one
+    submission — so the footer must say WHICH arms carry the old model, or a
+    reader compares the honest column against the dishonest one without being
+    told which is which.
+
+    Takes the NAMES rather than the result, so the dashboard's copy of this
+    function (`services/sweeps._roll_fill_rule_for`, which derives the same
+    list from the persisted spec) is comparable to it argument-for-argument and
+    a test can assert the two produce byte-identical prose.
+    """
+    title, detail = ROLL_FILL_RULE
+    if legacy:
+        detail += (
+            "\n\nThis sweep also ran the PRE-FC-116 haircut model on "
+            f"{'this arm' if len(legacy) == 1 else 'these arms'}: "
+            + ", ".join(f"`{name}`" for name in legacy)
+            + ". Roll credits on "
+            f"{'that arm' if len(legacy) == 1 else 'those arms'} fill at "
+            "`mid -/+ fill_haircut x half-spread`, not at the placed limits, "
+            "and are NOT comparable with the rest of the table on any "
+            "roll-bearing row."
+        )
+    return title, detail
 
 
 _VERDICT_GLYPH = {
@@ -450,6 +527,65 @@ def _measured(rows: Sequence[ScenarioResult]) -> List[ScenarioResult]:
     return [r for r in rows if r.measured]
 
 
+def _roll_cell(row: ScenarioResult) -> str:
+    """``itm/otm · $credit`` for one cell (FC-116 D6).
+
+    One helper, used by the covered-call detail table and by the roll table
+    below, so the two cannot disagree about how a roll cell is spelled.
+    """
+    credit = row.roll_net_credit
+    money = "—" if credit is None else f"${credit:,.0f}"
+    return f"{row.itm_rolls or 0}/{row.otm_roll_outs or 0} · {money}"
+
+
+def _roll_table(result: SweepResult) -> str:
+    """Per-cell roll activity AND roll credit, on BOTH strategies.
+
+    FC-116 D6. Before this, no roll-credit aggregate existed anywhere in the
+    engine, the report, the artifact or the row, and the ITM/OTM split was
+    printed only in the covered-call table — so FC-112, whose whole question is
+    whether the wheel's 0.98 trigger buys defence or churn, had no number to
+    read. The credit is PRE-FEE: it is the quantity the live roller's own
+    credit invariant guards and the one `call_roll_completed` reports.
+
+    Empty when nothing rolled, so a sweep that never rolled does not grow a
+    table of zeros.
+    """
+    rows = [r for r in result.rows if r.ok and (r.rolls_executed or 0) > 0]
+    if not rows:
+        return ""
+    lines = [
+        "### Roll activity and credit",
+        "",
+        "| scenario | symbol | split | rolls itm/otm · credit | resting/mktable "
+        "| failed BTC | fill mode |",
+        "|---|---|---|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        resting, marketable = row.roll_legs_resting, row.roll_legs_marketable
+        legs = ("—" if resting is None and marketable is None
+                else f"{resting or 0}/{marketable or 0}")
+        failed = row.failed_roll_btc_debit
+        lines.append(
+            f"| {row.scenario} | {row.symbol} | {row.split} "
+            f"| {_roll_cell(row)} | {legs} "
+            f"| {'—' if failed is None else f'${failed:,.0f}'} "
+            f"| `{row.roll_fill_mode or ROLL_FILL_MODE_LIMIT}` |")
+    lines.append("")
+    lines.append(
+        "**`credit` is PRE-FEE and is the sum of the roller's own "
+        "`net_credit`** — `(stc - btc) x contracts x 100` — so it is directly "
+        "comparable with what a live `call_roll_completed` reports. "
+        "`resting/mktable` splits the roll legs by how they filled: a "
+        "`resting` leg's limit lay INSIDE the modeled spread and is assumed to "
+        "have been touched within its window, which is the one assumption this "
+        "fill model makes, so a row that is mostly resting legs is the row to "
+        "discount first. `failed BTC` is post-fee cash paid to close a leg of "
+        "a roll that then did not complete; it contributes nothing to "
+        "`credit`. See *Known biases* for the rule itself.")
+    return "\n".join(lines)
+
+
 def _covered_call_table(result: SweepResult) -> str:
     """Premium yield and the coverage split, per cell — the CC headline numbers.
 
@@ -471,7 +607,7 @@ def _covered_call_table(result: SweepResult) -> str:
         "### Covered-call detail",
         "",
         "| scenario | symbol | split | lot return | premium yield | basis cut | "
-        "covered | below basis | earnings | gated | rolls (ITM/out) |",
+        "covered | below basis | earnings | gated | rolls itm/otm · credit |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
@@ -485,7 +621,7 @@ def _covered_call_table(result: SweepResult) -> str:
             f"| {by.get('hold_uncovered', 0)} "
             f"| {by.get('earnings_span', 0)} "
             f"| {by.get('gate_rejected', 0)} "
-            f"| {row.itm_rolls or 0}/{row.otm_roll_outs or 0} |")
+            f"| {_roll_cell(row)} |")
     lines.append("")
     lines.append(
         "**`lot return` is the verdict's number; `premium yield` is a "
@@ -638,6 +774,14 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
         a(_cc_table)
         a("")
 
+    # FC-116 D6 — BOTH strategies. The wheel is the one that needs it: FC-112
+    # reads the wheel's roll credit, and until now the split was printed only
+    # in the covered-call table above.
+    _rolls = _roll_table(result)
+    if _rolls:
+        a(_rolls)
+        a("")
+
     if result.has_holdout:
         a("## Fit vs holdout")
         a("")
@@ -672,8 +816,9 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
 
     a("## Scenario definitions")
     a("")
-    a("| scenario | scenario hash | config hash | fill haircut | overrides |")
-    a("|---|---|---|---|---|")
+    a("| scenario | scenario hash | config hash | fill haircut | roll fills | "
+      "overrides |")
+    a("|---|---|---|---|---|---|")
     base_cfg_hash = result.scenario_config_hashes.get(BASE_SCENARIO_NAME)
     for name in result.scenarios:
         overrides = result.scenario_overrides.get(name) or {}
@@ -687,8 +832,14 @@ def render_markdown(result: SweepResult, persistence=None) -> str:
                     else f"`{cfg}`")
         haircut = result.scenario_fill_haircuts.get(name)
         haircut_cell = "_(default)_" if haircut is None else f"{haircut:.2f}"
+        # FC-116 — printed WHERE the haircut is printed, because after this PR
+        # the haircut alone no longer describes an arm's fill assumption.
+        mode = (result.scenario_roll_fill_modes or {}).get(
+            name, ROLL_FILL_MODE_LIMIT)
+        mode_cell = ("`limit`" if mode == ROLL_FILL_MODE_LIMIT
+                     else f"**`{mode}`**")
         a(f"| {name} | `{result.scenario_hashes.get(name, '')}` | {cfg_cell} | "
-          f"{haircut_cell} | {rendered} |")
+          f"{haircut_cell} | {mode_cell} | {rendered} |")
     a("")
     a("**`scenario hash` is the identity of the ARM**; `config hash` exists to "
       "line a row up with a `backtest_runs` row and cannot tell two arms apart on "
@@ -926,6 +1077,9 @@ def render_json(result: SweepResult, persistence=None) -> str:
         "scenario_hashes": result.scenario_hashes,
         "scenario_overrides": result.scenario_overrides,
         "scenario_fill_haircuts": result.scenario_fill_haircuts,
+        # FC-116 — RESOLVED per arm. The JSON and the markdown footer must not
+        # be able to disagree about which arms filled rolls honestly.
+        "scenario_roll_fill_modes": result.scenario_roll_fill_modes,
         # THE headline caveat when true, and true by default: no holdout was
         # asked for, so nothing here is validated out of sample.
         "in_sample_only": result.in_sample_only,

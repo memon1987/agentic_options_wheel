@@ -174,7 +174,10 @@ class TestTheSweepProducesUsableEvidence:
         assert "### Covered-call detail" in markdown
         assert "premium yield" in markdown
         assert "below basis" in markdown
-        assert "rolls (ITM/out)" in markdown
+        # FC-116 D6 renamed the column: the split alone was never enough to
+        # answer "was that roll defence or churn", and the credit is what
+        # decides it.
+        assert "rolls itm/otm · credit" in markdown
         assert "`lot return` is the verdict's number" in markdown
 
     def test_the_legend_does_not_claim_insuf_means_no_closed_cycle(self, cc_sweep):
