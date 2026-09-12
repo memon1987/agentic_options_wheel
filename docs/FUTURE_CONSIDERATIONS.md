@@ -1146,7 +1146,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-112: revisit the wheel's roll trigger (`itm_trigger_ratio: 0.98`) with measured evidence
 
 **Scope:** wheel
-**Status:** Plan drafted 2026-09-12 (`docs/plans/fc-112.md`, Draft rev 1 — two plan reviews next). Three blocking operator questions (MIXED tie-break; PR-1 wheel roll-reach widening = one more wheel re-baseline; pre-registered thresholds).
+**Status:** Draft rev 2 — confirmation next; operator decisions pending (one-sided rule; PR-1 re-baseline; OOS instrument). Plan `docs/plans/fc-112.md` (rev 2, 2026-09-12: union of two adversarial plan reviews dispositioned — one-sided KEEP rule with committed constants and its null base rate, corrected resting-residual direction + no-imminence read, pins re-partitioned to 56 + 56 cells, DD-6 SQL specified, disjoint prior-year OOS read on the 5 symbols the lake covers).
 **Size estimate:** S (a simulation study on the console; a config change only if the numbers say so)
 
 **Problem:** the roll trigger fires at 98% of the strike. Both profiles write short-dated calls at 0.15–0.25 delta, which are born at 97–99% of the strike, so the roller can same-day re-write the engine's own call — buy back at the ask, sell a higher strike up to 14 days further out at any delta ≤ 0.60, bypassing every entry gate (delta band, DTE target, premium/spread floors). Live evidence: the wheel's IWM call was rolled on 09-04 and again on 09-08 (+$100 net credit, longer tenor, higher delta). Whether that is defence or churn has never been measured; FC-078 accepted 0.98 on the wheel by analogy, not data.

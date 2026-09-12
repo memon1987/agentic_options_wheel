@@ -115,4 +115,4 @@ _Plans added since that regeneration are appended below rather than re-sorted in
 
 - [fc-116.md](fc-116.md) — FC-116 — the replay fills roll legs at the placed limits, capped by the modeled book, with a deliberate wheel re-baseline (`roll_fill_mode`, default `limit`; `ENGINE_VERSION = fc-116-roll-limit-fills`), status: Executing
 
-- [fc-112.md](fc-112.md) — FC-112 — the wheel roll-trigger study (`itm_trigger_ratio` 0.98 vs 1.00): pre-registered decision rule, PR-1 wheel roll reach 7→21 re-baseline (`ENGINE_VERSION = fc-112-wheel-roll-reach`), two rolling pins + fill-mode bracket, `tools/diagnostics/fc112_roll_trigger_read.py`, status: Draft
+- [fc-112.md](fc-112.md) — FC-112 — the wheel roll-trigger study (`itm_trigger_ratio` 0.98 vs 1.00): pre-registered decision rule, PR-1 wheel roll reach 7→21 re-baseline (`ENGINE_VERSION = fc-112-wheel-roll-reach`), rev 2: one-sided pre-registered rule, decision + control pins, no-imminence bracket, disjoint OOS read, `tools/diagnostics/fc112_roll_trigger_read.py`, status: Draft
