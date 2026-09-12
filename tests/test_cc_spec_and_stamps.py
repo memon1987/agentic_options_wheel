@@ -708,7 +708,7 @@ class TestTheEngineVersionMovedAndStayedInSync:
 
         assert (screen.ENGINE_VERSION
                 == engine_identity.ENGINE_VERSION
-                == "fc-116-roll-limit-fills")
+                == "fc-112-wheel-roll-reach")
 
     def test_the_dashboard_copy_agrees(self):
         import sys

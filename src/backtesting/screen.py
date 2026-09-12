@@ -49,7 +49,7 @@ logger = structlog.get_logger(__name__)
 # both `blocked_days_by_reason` and `binding_constraint` semantics, on top of
 # any verdict the un-over-blocking moved. Not bumping would have reproduced the
 # FC-048 timestamp-only wart this very comment criticizes.
-ENGINE_VERSION = "fc-116-roll-limit-fills"
+ENGINE_VERSION = "fc-112-wheel-roll-reach"
 
 # Default lookback for a screening run. Long enough for a meaningful number of
 # cycles, short enough that a symbol's *recent* behavior dominates — a demotion

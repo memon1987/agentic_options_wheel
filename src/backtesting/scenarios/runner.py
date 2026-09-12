@@ -549,20 +549,41 @@ def roll_horizon_reach(config) -> int:
     residual truncation — 28 wanted, 21 available — is what
     ``ROLL_REACH_BIAS`` now states, with its direction.
 
-    **Zero for the WHEEL, deliberately, and it is not an oversight.** The wheel
-    carries the same arithmetic (7 + 14 = 21 against a 7-DTE materialisation),
-    so its roller is choosing from a truncated ladder too — but widening it here
-    would move every stored wheel number in the project at once, and §Behaviour
-    contract requires the wheel golden to stay byte-identical through Phase C.
-    That is a real finding about the wheel and it belongs to FC-112, which is
-    already the owner of the wheel's roll-trigger study; it is stated in
-    ``ROLL_REACH_BIAS`` rather than fixed as a side effect of a covered-call PR.
+    **The WHEEL is included since FC-112 (DD-2), and the exclusion that used to
+    sit here is gone.** Phase C parked the wheel's identical arithmetic (7 + 14
+    = 21 against a 7-DTE materialisation) on FC-112 because widening it moves
+    every stored wheel roll number at once, and Phase C's behaviour contract
+    required the wheel golden to stay byte-identical. FC-112 is the study that
+    needs the ladder: its question is what the wheel's `itm_trigger_ratio` does,
+    and at 0.98 the roll the trigger uniquely authorises is an OTM roll-OUT —
+    which needs tenor to sell into. On a 7-DTE materialisation there is none, so
+    the replay suppressed exactly the behaviour under test, on the arm under
+    test (`no_credit_candidate` dominated the wheel's skip counts). Measuring
+    the truncation instead of the trigger is the failure FC-112's D-2 signs off
+    against, so the re-baseline happens BEFORE the study rather than never.
 
-    Zero, too, for a profile with rolling off, so nothing widens for a run whose
-    roller will never fire.
+    **The wheel's residual is not zero — it is one roll later** (FC-112 review
+    round 1, T1; the first cut claimed "no residual truncation" here). 7 + 14 =
+    21 = ``MAX_SWEEPABLE_DTE`` exactly, which covers the FIRST roll of a chain:
+    a call entered at ``call_target_dte`` has at most 8 days to run and cannot
+    want a replacement past 21. A call that has already been rolled OUT is held
+    at roughly 15-22 DTE, so ITS horizon is ``old_expiry + 14`` = 29-36 days
+    against the same 21-DTE ladder — and this function returns 21 for it too,
+    because the lake has nothing further to give. Every chained roll past the
+    first is therefore truncated exactly as the covered-call profile's are, in
+    the same direction (fewer and shorter replacements), and on the arm that
+    rolls MORE. ``report.WHEEL_ROLL_REACH_NOTE`` states it to the reader.
+
+    Entries do not move. The reach is a MATERIALISATION bound, and the entry
+    path caps its own candidates at ``*_target_dte`` inside the scanner
+    (`_check_call_criteria_detailed`; the put scanner at ``put_target_dte``), so
+    a wider chain hands the roller more replacements and hands the scanner
+    contracts it already refuses. A test pins that.
+
+    Zero for a profile with rolling off, so nothing widens for a run whose
+    roller will never fire — the wheel included: `rolling.enabled: false` reads
+    7, not 21.
     """
-    if is_wheel(config):
-        return 0
     if not getattr(config, "rolling_enabled", False):
         return 0
     extension = int(getattr(config, "rolling_max_extension_days", 0) or 0)

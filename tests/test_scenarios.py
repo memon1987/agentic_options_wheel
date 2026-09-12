@@ -1674,9 +1674,43 @@ class TestTheArmMaxDrivesMaterialisation:
     """
 
     def _cfg(self, dte=7):
+        """The DTE ladder in isolation — **rolling OFF since FC-112**.
+
+        `effective_max_dte` is a max over three terms: the base's two DTE legs
+        and (FC-096 Phase C) the base's ROLL horizon. FC-112 stopped
+        short-circuiting that third term to 0 on the wheel, so a wheel config
+        with rolling on now floors at 21 and every assertion in this class
+        would read 21 whatever the DTE arms asked for — the class would still
+        pass and would have stopped measuring anything.
+
+        So rolling is off here, and the roll horizon's contribution is asserted
+        separately below rather than folded into every case.
+        """
         config = Config()
         config._config["strategy"]["put_target_dte"] = dte
+        config._config["rolling"]["enabled"] = False
         return config
+
+    def test_the_base_roll_horizon_is_the_third_term(self):
+        """FC-112. The term `_cfg` turns off, asserted once, on its own.
+
+        With the roller live the wheel's base reach is its roll horizon
+        (`call_target_dte` 7 + `rolling.max_extension_days` 14 = 21) even with
+        no DTE arm in the spec at all — and a DTE arm below that cannot pull it
+        back down.
+        """
+        from src.backtesting.scenarios.runner import effective_max_dte
+
+        rolling_on = Config()
+        rolling_on._config["strategy"]["put_target_dte"] = 7
+        assert rolling_on.rolling_enabled is True
+        assert effective_max_dte(rolling_on, [Scenario("base")]) == 21
+        assert effective_max_dte(
+            rolling_on, [Scenario("short", {"strategy.put_target_dte": 3})]) == 21
+        assert effective_max_dte(self._cfg(7), [Scenario("base")]) == 7, (
+            "the same config with the roller off must NOT be materialised to "
+            "21 — a `noroll` control arm that got the roller's reach would be "
+            "incomparable with the arms it controls for")
 
     def test_no_dte_arm_leaves_the_base_value(self):
         from src.backtesting.scenarios.runner import effective_max_dte
@@ -1724,8 +1758,15 @@ class TestTheArmMaxDrivesMaterialisation:
             self, tmp_path, two_symbols, sweep_config):
         """The end-to-end version, asserted on the STORED provenance rather than
         on the runner's own variable: a run that reported 14 and wrote 8-reach
-        files would pass a weaker test and fail every call arm in production."""
+        files would pass a weaker test and fail every call arm in production.
+
+        Rolling off (FC-112): with the roller live the base config already
+        reaches 21, which SUBSUMES the 14-DTE arm — the run would materialise
+        22-reach files and pass a test that had stopped watching the arm. The
+        arm has to be the thing that drives the reach for this to mean anything.
+        """
         days, provider = two_symbols
+        sweep_config._config["rolling"]["enabled"] = False
         store = ChainStore(str(tmp_path))
         result = run_sweep(
             sweep_config, [Scenario("dte14", {"strategy.call_target_dte": 14})],
@@ -1770,7 +1811,20 @@ class TestTheDteReadPathIsIdentityPreserving:
 
     def test_a_dte_7_sweep_is_identical_over_an_8_and_a_22_reach_lake(
             self, tmp_path, two_symbols, sweep_config):
+        """**Rolling OFF since FC-112**, and the scope note matters.
+
+        The invariant under test is the READ PATH's: a spec whose reach is 7
+        must see the same chain whether the file underneath it stores 8 or 22.
+        That is a property of `narrow_to_dte`, not of the roller.
+
+        FC-112 made a rolling-ON wheel spec reach 21, so it can no longer BE a
+        DTE-7 spec — over the 8-reach lake it is a `_covers` miss and rebuilds.
+        Keeping the roller on here would have quietly turned this into a test
+        of two 21-reach runs over two 22-reach lakes, i.e. of nothing. The
+        rolling-ON half is its own test below.
+        """
         days, provider = two_symbols
+        sweep_config._config["rolling"]["enabled"] = False
 
         narrow = ChainStore(str(tmp_path / "lake8"))
         seven = self._run(narrow, days, provider, sweep_config)
@@ -1794,6 +1848,28 @@ class TestTheDteReadPathIsIdentityPreserving:
         assert over_wide.scenario_hashes == seven.scenario_hashes
         assert over_wide.scenario_config_hashes == seven.scenario_config_hashes
         assert over_wide.base_config_hash == seven.base_config_hash
+
+    def test_a_rolling_on_wheel_sweep_widens_an_8_reach_lake(
+            self, tmp_path, two_symbols, sweep_config):
+        """FC-112 T-8, the other half — and the reason PR-1 is a re-baseline.
+
+        The SAME spec with the roller live asks for 21, which an 8-reach file
+        does not cover. The store must go back to the provider and rebuild at
+        22 rather than serve the narrow chain it already has: serving it would
+        put the wheel's roller back on the 7-DTE ladder while the run's
+        provenance claimed 21, which is the silent-fiction failure the reach
+        machinery exists to prevent.
+        """
+        days, provider = two_symbols
+        assert sweep_config.rolling_enabled is True
+
+        store = ChainStore(str(tmp_path / "lake8_then_22"))
+        narrow = self._run(store, days, provider, sweep_config)
+        assert narrow.effective_max_dte == 21, (
+            "a rolling-on wheel sweep reaches its roll horizon since FC-112")
+        assert not narrow.errors, [r.error for r in narrow.errors]
+        assert store.stored_window("AAA", days[5])["universe_dte"] == 22, (
+            "the 8-reach lake was served as-is to a 21-reach spec")
 
 
 class TestTheDteReachFooter:
@@ -1849,6 +1925,67 @@ class TestTheDteReachFooter:
         from src.backtesting.scenarios import report as engine_report
 
         assert engine_report.DTE_REACH_BIAS_THRESHOLD == 7
+
+
+class TestTheWheelRollReachNoteReachesWheelReaders:
+    """T2/E2 + T1, review round 1, on the ENGINE side.
+
+    `ROLL_REACH_BIAS` is appended only when `strategy != "wheel"`, so its wheel
+    paragraph — the chained-roll residual and the `fc-112-wheel-roll-reach`
+    version boundary — was prose no `sweep.md` for a wheel run could contain.
+    `WHEEL_ROLL_REACH_NOTE` is the copy a wheel reader gets, and unlike
+    `DTE_REACH_BIAS` it is NOT conditional on reach: a run replayed at 7 is
+    precisely the run whose numbers sit on the wrong side of the boundary.
+    """
+
+    def _result(self, reach):
+        result = _hand_built_holdout()
+        result.effective_max_dte = reach
+        return result
+
+    @pytest.mark.parametrize("reach", [7, 21])
+    def test_a_wheel_run_carries_it_at_either_reach(self, reach):
+        from src.backtesting.scenarios import report as engine_report
+
+        title, detail = engine_report.WHEEL_ROLL_REACH_NOTE
+        result = self._result(reach)
+        assert title in render_markdown(result)
+        assert {"title": title, "detail": detail} in json.loads(
+            render_json(result))["known_biases"]
+
+    def test_it_carries_both_facts_the_wheel_reader_was_missing(self):
+        from src.backtesting.scenarios import report as engine_report
+
+        detail = engine_report.WHEEL_ROLL_REACH_NOTE[1]
+        # T1 — the residual, which the retired claim said did not exist.
+        assert "FIRST roll of a chain" in detail
+        assert "29-36 days" in detail
+        assert "FEWER and SHORTER replacements" in detail
+        # T2/E2 — the boundary, and that it is not confined to roll columns.
+        assert "fc-112-wheel-roll-reach" in detail
+        assert "NOT comparable" in detail
+        assert "cycles_completed" in detail
+
+    def test_the_retired_claim_is_gone_from_every_footer(self):
+        """T1. "The wheel has NO residual roll-reach truncation" was false for
+        every roll after the first; a grep-style pin so it cannot come back by
+        copy-paste into either constant."""
+        from src.backtesting.scenarios import report as engine_report
+
+        for name in ("ROLL_REACH_BIAS", "WHEEL_ROLL_REACH_NOTE",
+                     "DTE_REACH_BIAS"):
+            detail = getattr(engine_report, name)[1]
+            assert "NO residual" not in detail, name
+            assert "no residual" not in detail, name
+
+    def test_a_covered_call_run_keeps_the_cc_copy_and_not_this_one(self):
+        from src.backtesting.scenarios import report as engine_report
+
+        result = self._result(21)
+        result.strategy = "covered_call"
+        titles = [t for t, _ in engine_report.sweep_biases(result)]
+        assert engine_report.WHEEL_ROLL_REACH_NOTE[0] not in titles
+        assert engine_report.ROLL_REACH_BIAS[0] in titles
 
 
 class TestTheSweepHeaderSurfacesEarningsGaps:
@@ -1929,10 +2066,17 @@ class TestAnArmIsNotChangedByItsNeighbours:
         return days, _MultiSymbolProvider(
             {"AAA": ScriptedProvider("AAA", closes, expirations)})
 
-    def _sweep(self, tmp_path, name, scenarios):
+    def _sweep(self, tmp_path, name, scenarios, extension_days=None):
         days, provider = self._rolling_path()
         config = Config()
         config._config["stocks"]["symbols"] = ["AAA"]
+        if extension_days is not None:
+            # FC-112. The base's roll horizon is `call_target_dte +
+            # rolling.max_extension_days`, and since FC-112 it is the wheel's
+            # materialisation floor. Narrowing the extension is the only way
+            # left to build a base that a DTE-21 neighbour can still WIDEN —
+            # see `test_a_long_dte_neighbour_does_not_move_the_other_arms`.
+            config._config["rolling"]["max_extension_days"] = extension_days
         return run_sweep(
             config, scenarios, ["AAA"], days[0], days[-1], starting_cash=50_000.0,
             chain_store=ChainStore(str(tmp_path / name)), bar_provider=provider,
@@ -2017,11 +2161,29 @@ class TestAnArmIsNotChangedByItsNeighbours:
     ])
     def test_a_long_dte_neighbour_does_not_move_the_other_arms(
             self, tmp_path, neighbour):
-        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
-        alone = self._sweep(tmp_path, "alone", [arm])
-        mixed = self._sweep(tmp_path, "mixed", [arm, Scenario("long", neighbour)])
+        """**`max_extension_days=3` since FC-112, and that is load-bearing.**
 
-        assert alone.effective_max_dte == 7
+        This test only has teeth when the neighbour actually WIDENS the run —
+        that is the whole defect: the shared materialisation grows, and an
+        unmasked arm's roller then sees candidates its own config could never
+        have produced. FC-112 raised the wheel's own base reach to its roll
+        horizon (7 + 14 = 21 = `MAX_SWEEPABLE_DTE`), so on the shipped config
+        NO neighbour can widen anything any more and this test would have gone
+        vacuously green — both sweeps at 21, the mask a no-op, the HIGH-severity
+        regression it guards free to come back unnoticed.
+
+        Narrowing the base's roll extension to 3 restores the gap (base reach
+        10, neighbour 21) with the roller still live, which is the condition the
+        defect needs. The alternative — asserting 21 == 21 and calling it
+        covered — would have been the re-baseline quietly eating a test.
+        """
+        arm = Scenario("x", {"strategy.min_put_premium": 0.30})
+        alone = self._sweep(tmp_path, "alone", [arm], extension_days=3)
+        mixed = self._sweep(tmp_path, "mixed", [arm, Scenario("long", neighbour)],
+                            extension_days=3)
+
+        assert alone.effective_max_dte == 10, (
+            "base = max(put 7, call 7, roll horizon 7 + 3)")
         assert mixed.effective_max_dte == 21, "the neighbour must widen the run"
         for scenario in ("base", "x"):
             assert self._rows(mixed, scenario) == self._rows(alone, scenario), (
@@ -2116,7 +2278,14 @@ class TestTheBaseConfigsCallLegCounts:
     """REVIEW: `effective_max_dte` read only the base's PUT leg, so the
     covered-call profile — which ships `call_target_dte: 14` and NO
     `put_target_dte` at all — would have materialised at 7 and reported "no call
-    ever qualified" for every arm."""
+    ever qualified" for every arm.
+
+    Rolling is off throughout (FC-112): the third term of `effective_max_dte`
+    is the base's ROLL horizon, which since FC-112 reaches 21 on any live
+    roller and would swallow the 14 these cases exist to observe. The roll
+    horizon has its own tests (`TestTheArmMaxDrivesMaterialisation.
+    test_the_base_roll_horizon_is_the_third_term`, and T-1 in
+    `test_cc_sweep_integration.py`)."""
 
     def test_a_base_call_target_widens_the_run_with_no_dte_arm_present(self):
         from src.backtesting.scenarios.runner import effective_max_dte
@@ -2124,6 +2293,7 @@ class TestTheBaseConfigsCallLegCounts:
         config = Config()
         config._config["strategy"]["put_target_dte"] = 7
         config._config["strategy"]["call_target_dte"] = 14
+        config._config["rolling"]["enabled"] = False
         assert effective_max_dte(config, [Scenario("base")]) == 14
 
     def test_a_profile_missing_put_target_dte_does_not_raise(self):
@@ -2138,6 +2308,7 @@ class TestTheBaseConfigsCallLegCounts:
         config = Config()
         del config._config["strategy"]["put_target_dte"]
         config._config["strategy"]["call_target_dte"] = 14
+        config._config["rolling"]["enabled"] = False
 
         with pytest.raises(KeyError):
             config.put_target_dte          # the hazard, stated
@@ -2188,3 +2359,215 @@ class TestTheThresholdTracksTheLiveConfig:
             f"were measured at the old target — re-argue the wording, then move "
             f"the constant (and its dashboard copy)."
         )
+
+
+# --------------------------------------------------------------------------- #
+# FC-112 PR-1 (DD-2) — the wheel's roll reach becomes its roll horizon.
+#
+# T-2 and T-3 both route through `run_sweep` / `_replay_one` DELIBERATELY.
+# `tests/test_backtest_simulator._simulator` hardcodes `max_dte=7`, so a test
+# built on it can never observe a widened ladder and would pass vacuously
+# whichever way the engine behaved (plan §Tests, T-3).
+# --------------------------------------------------------------------------- #
+def _roll_ladder_window():
+    """The `dip_then_recovering` price path with a ladder that reaches 21 DTE.
+
+    `dip_then_recovering_window` lists expirations only INSIDE its own window,
+    so the last few decision days have no Friday more than a week out and the
+    widened reach would have nothing to find — a fixture that cannot fail is
+    worse than no fixture. Fridays run 40 days past the window end here, which
+    is the "expirations every Friday for >= 3 weeks past each decision day" the
+    plan requires.
+    """
+    from .test_backtest_simulator import dip_then_recovering_window
+
+    days, closes, _inside_only = dip_then_recovering_window()
+    expirations, day = [], days[0]
+    while day <= days[-1] + timedelta(days=40):
+        if day.weekday() == 4:
+            expirations.append(day)
+        day += timedelta(days=1)
+    return days, _MultiSymbolProvider(
+        {"AAA": ScriptedProvider("AAA", closes, expirations)})
+
+
+def _occ_expiry(symbol: str, underlying: str = "AAA") -> date:
+    offset = len(underlying)
+    return datetime.strptime(symbol[offset:offset + 6], "%y%m%d").date()
+
+
+class TestTheWheelsRollReachIsTheRollHorizon:
+    """FC-112 PR-1, T-2 and T-3, on one scripted window through `run_sweep`.
+
+    The re-baseline's whole claim is a pair: the ROLLER sees the 8-to-21-DTE
+    ladder it sees live, and NOTHING ELSE moves — entries in particular. Both
+    halves are asserted here, because either one alone is consistent with a
+    wrong change (a reach that widened entries would satisfy T-3; a reach
+    masked straight back to 7 in `_replay_one` would satisfy T-2).
+    """
+
+    @staticmethod
+    def _sweep(tmp_path, name, *, reach, trigger=None, sink=None):
+        """One wheel sweep. `reach=7` replays the PRE-FC-112 wheel.
+
+        Forced by patching `roll_horizon_reach` to 0 — byte-for-byte the branch
+        FC-112 deleted — rather than by narrowing `rolling.max_extension_days`,
+        which would ALSO change the roller's own search bound and stop the two
+        runs from differing in exactly one thing.
+        """
+        from src.backtesting.scenarios import runner as runner_module
+
+        days, provider = _roll_ladder_window()
+        config = Config()
+        config._config["stocks"]["symbols"] = ["AAA"]
+        if trigger is not None:
+            config._config["rolling"]["itm_trigger_ratio"] = trigger
+
+        kw = {} if sink is None else {"artifact_sink": sink}
+
+        def go():
+            return run_sweep(
+                config, [], ["AAA"], days[0], days[-1], starting_cash=50_000.0,
+                chain_store=ChainStore(str(tmp_path / name)),
+                bar_provider=provider, quiet_logs=True, **kw)
+
+        if reach != 7:
+            return go()
+        with patch.object(runner_module, "roll_horizon_reach", lambda _c: 0):
+            return go()
+
+    @staticmethod
+    def _legs(artifact):
+        """`(entries, roll_legs)`, each `(date, kind, symbol, calendar_dte)`.
+
+        A roll leg is the one carrying a `limit_price`: the roller places
+        limits, the entry path does not (FC-116).
+        """
+        entries, rolls = [], []
+        for event in artifact["ledger"]:
+            symbol = event.get("symbol") or ""
+            if len(symbol) < 15:          # a stock leg, not an option
+                continue
+            day = datetime.strptime(event["date"], "%Y-%m-%d").date()
+            record = (event["date"], event["kind"], symbol,
+                      (_occ_expiry(symbol) - day).days)
+            if (event.get("detail") or {}).get("limit_price") is None:
+                entries.append(record)
+            else:
+                rolls.append(record)
+        return entries, rolls
+
+    # -- T-3 ------------------------------------------------------------- #
+    def test_the_roller_reaches_past_8_dte_and_only_the_roller_does(
+            self, tmp_path):
+        """T-3. The ladder is not merely materialised — it is USED.
+
+        At reach 7 the chain is cut off at `max_dte + 1` = 8 calendar days, so
+        every replacement the roller can name expires within 8 days of the
+        decision. At 21 it can extend to `old_expiry + max_extension_days`
+        exactly as the live roller does. Asserting the STORED replacement's own
+        expiry (off its OCC symbol) rather than the reach variable is what
+        catches the failure the plan names: a reach materialised at 21 and then
+        masked back to 7 inside `_replay_one` would report 21 and roll at 8.
+        """
+        narrow_seen, wide_seen = [], []
+        narrow = self._sweep(tmp_path, "t3_narrow", reach=7,
+                             sink=narrow_seen.append)
+        wide = self._sweep(tmp_path, "t3_wide", reach=21, sink=wide_seen.append)
+
+        assert narrow.effective_max_dte == 7 and wide.effective_max_dte == 21
+        _, narrow_rolls = self._legs(narrow_seen[0])
+        wide_entries, wide_rolls = self._legs(wide_seen[0])
+        assert narrow_rolls and wide_rolls, "the window executed no roll"
+
+        assert max(leg[-1] for leg in narrow_rolls) <= 8, (
+            "a 7-reach wheel replay cannot name a replacement past the 8-day "
+            "chain cutoff — if it did, this fixture is not measuring the reach")
+        assert max(leg[-1] for leg in wide_rolls) > 8, (
+            "the widened ladder was materialised and then not used: every "
+            "replacement still expires inside the old 8-day cutoff, which is "
+            "the mask-back-to-7 regression in `_replay_one`")
+        # ...and the widening is the ROLLER's alone.
+        assert max(leg[-1] for leg in wide_entries) <= 8
+
+    def test_the_roll_counts_move_in_the_direction_the_plan_predicts(
+            self, tmp_path):
+        """T-3's second half, and the reason the study needed PR-1.
+
+        At 0.98 the roll the trigger uniquely authorises is an OTM roll-OUT,
+        which has to sell tenor it does not have on a 7-DTE ladder. So the
+        widened reach must convert roll-outs the narrow replay could not price
+        into executed ones — measured here, not assumed.
+        """
+        narrow = self._sweep(tmp_path, "t3b_narrow", reach=7).rows[0]
+        wide = self._sweep(tmp_path, "t3b_wide", reach=21).rows[0]
+
+        assert narrow.rolls_executed and wide.rolls_executed
+        assert wide.otm_roll_outs > narrow.otm_roll_outs, (
+            f"OTM roll-outs did not rise on the wider ladder "
+            f"({narrow.otm_roll_outs} -> {wide.otm_roll_outs}); the truncation "
+            f"that suppressed the behaviour FC-112 measures is still in place")
+        assert wide.roll_net_credit > narrow.roll_net_credit
+        assert (wide.rolls_executed
+                == wide.itm_rolls + wide.otm_roll_outs), "the split must partition"
+
+    # -- T-2 ------------------------------------------------------------- #
+    def test_entries_are_capped_by_the_scanner_not_by_the_reach(self, tmp_path):
+        """T-2, the direct form. Every ENTRY leg respects its own DTE target.
+
+        The bound is `target + 1` CALENDAR days, not `target`: the scanner's
+        own `dte` is `(expiry - now).days` on a `now` that carries a time of
+        day, so an 8-calendar-day contract scores 7 and is legitimately sold.
+        Pinning `<= target` would fail on correct code; pinning `<= reach`
+        would pass on the broken code this exists to catch.
+        """
+        seen = []
+        result = self._sweep(tmp_path, "t2a", reach=21, sink=seen.append)
+        assert result.effective_max_dte == 21
+        entries, rolls = self._legs(seen[0])
+        assert entries and rolls, "nothing to invariance-check"
+
+        config = Config()
+        caps = {"sell_put_open": config.put_target_dte + 1,
+                "sell_call_open": config.call_target_dte + 1}
+        checked = 0
+        for day, kind, symbol, dte in entries:
+            cap = caps.get(kind)
+            if cap is None:            # assignments, expiries — not entries
+                continue
+            checked += 1
+            assert dte <= cap, (
+                f"{kind} {symbol} on {day} is {dte} calendar days out, past "
+                f"the scanner's {cap}-day cap — the reach leaked into entry "
+                f"selection, which would re-baseline far more than the roller")
+        assert checked >= 2, "no entry legs were actually checked"
+
+    def test_a_window_with_no_executed_roll_is_byte_identical_at_both_reaches(
+            self, tmp_path):
+        """T-2, the paired form — the strongest statement PR-1 can make.
+
+        Same price path, same live roller, `itm_trigger_ratio` raised to 1.20
+        so it evaluates every day and fires on none. If the reach touched
+        anything but the roller's candidate set, these two rows would differ.
+
+        The roller must still be LIVE and EVALUATING, or this is a comparison
+        of two runs with no roller in them and it would pass against any reach
+        whatsoever — so `rolls_evaluated` is asserted non-zero and
+        `rolls_executed` zero, on both.
+        """
+        def row(name, reach):
+            result = self._sweep(tmp_path, name, reach=reach, trigger=1.20)
+            payload = result.rows[0].as_dict()
+            payload.pop("replay_seconds", None)     # wall-clock noise
+            return result.rows[0], payload
+
+        narrow_row, narrow = row("t2b_narrow", 7)
+        wide_row, wide = row("t2b_wide", 21)
+
+        for tag, r in (("narrow", narrow_row), ("wide", wide_row)):
+            assert r.rolls_evaluated, f"{tag}: the roller never looked"
+            assert r.rolls_executed == 0, f"{tag}: the roller fired"
+            assert r.puts_sold and r.calls_sold, f"{tag}: nothing was sold"
+
+        assert wide == narrow, {
+            k: (narrow[k], wide[k]) for k in narrow if narrow[k] != wide[k]}

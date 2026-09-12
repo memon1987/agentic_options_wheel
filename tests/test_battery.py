@@ -1744,11 +1744,29 @@ class TestTheExecutionClock:
 
         Catches a universe growth (or a per-item cost regression) that quietly
         crosses that line.
+
+        **FC-112 note on WHICH HALF pays the vendor path (review round 1,
+        recommended).** The asymmetry below — only `cc_item` carrying
+        `vendor_rebuild_22_reach` — was true while the WHEEL replayed at reach
+        7 and could be served by an 8-reach lake object. After FC-112 the wheel
+        materialises to 21, so on a `dte_mismatch` day the WHEEL item takes the
+        rebuild too; the 09-12 battery recorded PFE at `lake_rejected 33` /
+        `provider_fetches 67`, all of it on the CC side. The arithmetic is
+        deliberately NOT changed here: rebuilt objects are shared, so once the
+        first post-FC-112 Saturday has paid for a symbol-day BOTH items read it
+        from the lake, and pricing the wheel item at a standing rebuild would
+        over-state the steady state and start failing this guard on a cost the
+        battery does not have. §Verification tracks the transient (expect
+        `lake_puts > 0` on 09-19 and PFE `provider_fetches` -> ~1 by 09-26); if
+        it does NOT decay, `wheel_item` gains the term and this guard is
+        re-derived.
         """
         materialise_per_symbol = 40          # measured, PR-c rollout
         replay_per_cell = 2                  # measured 0.46-0.55 s, rounded up
         vendor_rebuild_22_reach = 20         # ~3x a reach-8 build's contracts
 
+        # Steady state, per the note above: the wheel item reads the same
+        # rebuilt 22-reach objects the CC item paid for.
         wheel_item = materialise_per_symbol + 2 * replay_per_cell
         cc_item = (materialise_per_symbol + vendor_rebuild_22_reach
                    + 2 * replay_per_cell)

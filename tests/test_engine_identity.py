@@ -447,6 +447,82 @@ class TestTheEngineVersionIsNotAFork:
         import services.sweeps as S
         assert S.ENGINE_VERSION == EI.ENGINE_VERSION
 
+    def test_this_version_is_in_the_post_fc116_set(self):
+        """FC-112. `_ran_pre_fc116` decides the fill-rule footer for a sweep
+        with no cells to speak for it, and it used to reason "any version but
+        mine is older". FC-112's own bump falsified that: a rowless
+        `fc-116-roll-limit-fills` sweep would have been served the LEGACY
+        footer, claiming its roll credits were filled at the haircut price when
+        they were filled at the placed limits.
+
+        The set is append-only and this is the test that makes it so — a bump
+        that forgets to add itself fails here rather than in a footer nobody
+        re-reads.
+        """
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+        assert EI.ENGINE_VERSION in S.POST_FC116_ENGINE_VERSIONS
+        assert "fc-116-roll-limit-fills" in S.POST_FC116_ENGINE_VERSIONS, (
+            "the release the set is named for must stay in it")
+
+    def test_a_rowless_sweep_from_each_era_gets_the_right_footer(self):
+        """FC-112, the behaviour the set exists for — asserted, not assumed."""
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+
+        def pre(version):
+            return S._ran_pre_fc116({"engine_version": version}, [])
+
+        assert pre("fc-069-scanner-rewire") is True
+        assert pre("fc-116-roll-limit-fills") is False
+        assert pre(EI.ENGINE_VERSION) is False
+        assert pre("") is False, "an unknown era is not a claim either way"
+
+    def test_this_version_is_in_the_post_fc112_set(self):
+        """**E1, review round 1 — the reach boundary's half of the same pin.**
+
+        `spec_max_dte` reads the wheel's materialisation floor off the engine
+        that wrote the run, so `POST_FC112_ENGINE_VERSIONS` is append-only for
+        exactly the reason `POST_FC116_ENGINE_VERSIONS` is. A release that
+        bumps `ENGINE_VERSION` and forgets this set would serve its own wheel
+        runs `effective_max_dte: 7` and drop the `DTE_REACH_BIAS` caveat from
+        runs that earned it — silently, in a footer nobody re-reads. It fails
+        here instead.
+
+        The two sets are deliberately separate objects: the boundaries answer
+        different questions (how roll legs FILLED vs how far the ladder
+        REACHED) and a future engine could move one without the other.
+        """
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+        assert EI.ENGINE_VERSION in S.POST_FC112_ENGINE_VERSIONS
+        assert "fc-112-wheel-roll-reach" in S.POST_FC112_ENGINE_VERSIONS, (
+            "the release the set is named for must stay in it")
+        assert "fc-116-roll-limit-fills" not in S.POST_FC112_ENGINE_VERSIONS, (
+            "FC-116 predates the wheel's reach widening; if it were in the set "
+            "every row of the 09-12 battery would be served a 21-DTE reach it "
+            "never had")
+
+    def test_the_wheel_reach_floor_follows_the_engine_not_the_spec(self):
+        """E1, the behaviour the set exists for. The same wheel spec, read
+        against each era, must yield the reach that era's roller actually
+        had."""
+        from tests._dashboard_path import add_dashboard_backend_to_path
+        add_dashboard_backend_to_path()
+        import services.sweeps as S
+
+        spec = {"scenarios": [], "symbols": ["AAPL"]}
+        assert S.spec_max_dte(spec, engine_version=EI.ENGINE_VERSION) == 21
+        assert S.spec_max_dte(
+            spec, engine_version="fc-116-roll-limit-fills") == 7
+        assert S.spec_max_dte(spec, engine_version="fc-069-scanner-rewire") == 7
+        assert S.spec_max_dte(spec, engine_version=None) == 7, (
+            "declining to assert is the posture for a run this image cannot "
+            "identify")
+
 
 # ==========================================================================
 # (3) The key migration

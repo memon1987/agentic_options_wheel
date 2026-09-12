@@ -308,12 +308,47 @@ class TestTheRollHorizonReach:
         for art in artifacts:
             assert art["provenance"]["masked_reach"]["max_dte"] == 21
 
-    def test_the_wheel_reach_is_untouched(self):
-        """The golden contract: widening the CC reach must not widen the wheel's."""
+    def test_the_wheel_reach_is_the_wheels_roll_horizon(self):
+        """FC-112 T-1, and it INVERTS `test_the_wheel_reach_is_untouched`.
+
+        Phase C asserted the wheel stayed at 7 on purpose — widening it moves
+        every stored wheel roll number, and that re-baseline was not Phase C's
+        to spend. FC-112 D-2 spends it, because its own study cannot be run on
+        a 7-DTE ladder: at `itm_trigger_ratio: 0.98` the roll the trigger
+        uniquely authorises is an OTM roll-OUT, which needs tenor to sell into,
+        and on a 7-DTE materialisation there is none. The old assertion is
+        deleted rather than kept beside the new one: two tests claiming
+        opposite reaches is how a revert goes unnoticed.
+
+        7 + 14 = 21 = `MAX_SWEEPABLE_DTE`, so the wheel has no residual
+        truncation — the covered-call profile's 28-vs-21 gap has no wheel twin.
+        """
+        from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
+
         wheel = Config()
-        assert roll_horizon_reach(wheel) == 0
-        assert arm_max_dte(wheel) == 7
-        assert effective_max_dte(wheel, []) == 7
+        wanted = wheel.call_target_dte + wheel.rolling_max_extension_days
+        assert wanted == 21, "the wheel's roll horizon moved"
+        assert roll_horizon_reach(wheel) == MAX_SWEEPABLE_DTE == 21
+        assert arm_max_dte(wheel) == 21
+        assert effective_max_dte(wheel, []) == 21
+
+    def test_a_wheel_with_rolling_off_does_not_widen(self):
+        """FC-112 T-1's second half — the keep-condition.
+
+        A run whose roller will never fire must not be handed a 21-DTE
+        materialisation: it would cost the lake read for nothing, and (worse)
+        it would hand the `noroll` control arm a different reach from the one
+        its own config implies. `noroll` is a CONTROL in FC-112's control pin,
+        so a widened reach there would have made the control incomparable with
+        the arms it controls for.
+        """
+        from src.backtesting.scenarios.overrides import apply_overrides
+
+        off = apply_overrides(Config(), {"rolling.enabled": False})
+        assert off.rolling_enabled is False
+        assert roll_horizon_reach(off) == 0
+        assert arm_max_dte(off) == 7
+        assert effective_max_dte(off, []) == 7
 
     def test_the_horizon_is_capped_at_what_the_lake_stores(self):
         from src.backtesting.scenarios.overrides import MAX_SWEEPABLE_DTE
@@ -335,7 +370,33 @@ class TestTheRollHorizonReach:
         result, _artifacts, _sidecars, _days, _closes = cc_sweep
         spec = {"scenarios": [], "strategy": "covered_call"}
         assert S.spec_max_dte(spec) == result.effective_max_dte == 21
-        assert S.spec_max_dte({"scenarios": []}) == 7, "the wheel's floor"
+        # FC-112 T-6. The wheel's floor is 21 too now, and it must be the SAME
+        # 21 the engine computes rather than a literal that happens to match:
+        # `Found while planning` 4 — `spec_max_dte`'s wheel floor is a dashboard
+        # constant, and a PR that moved only the engine would leave the two
+        # footers disagreeing about whether the reach caveat had been earned.
+        # E1 (review round 1): the wheel floor is ENGINE-gated, so the
+        # comparison must name the engine whose `effective_max_dte` it is being
+        # compared against. `Config()` here is THIS image's wheel profile, so
+        # `S.ENGINE_VERSION` is the right era; a bare call would correctly
+        # answer 7, which is what every row written before this release had.
+        assert (S.spec_max_dte({"scenarios": []},
+                               engine_version=S.ENGINE_VERSION)
+                == effective_max_dte(Config(), []) == 21), "the wheel's floor"
+        assert S.spec_max_dte({"scenarios": []}) == 7, (
+            "and a run this image cannot place gets the pre-FC-112 answer")
+
+    def test_the_pinned_wheel_base_reach_matches_the_profile(self):
+        """FC-112 T-6, the constant half — the `CC_BASE_REACH` treatment."""
+        from tests._dashboard_path import add_dashboard_backend_to_path
+
+        add_dashboard_backend_to_path()
+        from services import sweeps as S
+
+        assert S.WHEEL_BASE_REACH == roll_horizon_reach(Config())
+        assert S.DTE_REACH_BIAS_THRESHOLD == 7, (
+            "the reach threshold answers a different question from the "
+            "materialisation floor and must not have been merged with it")
 
     def test_the_pinned_cc_base_reach_matches_the_profile(self):
         """H5's constant is a COPY of a number the dashboard cannot compute."""
