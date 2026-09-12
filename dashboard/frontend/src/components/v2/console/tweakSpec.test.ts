@@ -23,6 +23,7 @@ import {
   diffToBase,
   downwardOnlyWarnings,
   editableControls,
+  existingArmFor,
   initialFields,
   isValidArmName,
   listOnlyControls,
@@ -445,10 +446,61 @@ describe('the run’s other arms (review R2b)', () => {
 
   it('reads the run’s declared arms off spec_json', () => {
     expect(arms).toEqual([
-      { name: 'position_20pct', overrides: { 'risk.max_position_size': 0.2 } },
+      {
+        name: 'position_20pct',
+        overrides: { 'risk.max_position_size': 0.2 },
+        fillHaircut: null,
+        rollFillMode: null,
+      },
     ]);
     expect(parseRunArms(null)).toEqual([]);
     expect(parseRunArms('{ not json')).toEqual([]);
+  });
+
+  it('carries each arm’s fill declaration, not just its overrides', () => {
+    // FC-116 (review): dropping these made a haircut-fill arm and a
+    // limit-fill arm with identical overrides indistinguishable here.
+    expect(
+      parseRunArms(
+        JSON.stringify({
+          scenarios: [
+            { name: 'old_model', overrides: {}, roll_fill_mode: 'haircut' },
+            { name: 'at_the_bid', overrides: {}, fill_haircut: 1 },
+          ],
+        }),
+      ),
+    ).toEqual([
+      { name: 'old_model', overrides: {}, fillHaircut: null, rollFillMode: 'haircut' },
+      { name: 'at_the_bid', overrides: {}, fillHaircut: 1, rollFillMode: null },
+    ]);
+  });
+
+  it('does not call a haircut-fill arm the same question as a limit tweak', () => {
+    // The arm asks "what would these overrides do under the PRE-FC-116 fill
+    // model?"; the tweak asks "what would they do under the current one?".
+    // Reporting the first as already answering the second told the operator
+    // not to run the only arm that would have answered them.
+    const haircutArm = parseRunArms(
+      JSON.stringify({
+        scenarios: [
+          {
+            name: 'old_model',
+            overrides: { 'risk.max_position_size': 0.2 },
+            roll_fill_mode: 'haircut',
+          },
+        ],
+      }),
+    );
+    expect(existingArmFor({ 'risk.max_position_size': 0.2 }, haircutArm)).toBeNull();
+
+    const out = buildTweak({
+      controls,
+      fields: { ...fields, 'risk.max_position_size': { value: '0.2' } },
+      basis: parseRunSpec(sweep.spec_json),
+      arms: haircutArm,
+    });
+    expect(out.existingArm).toBeNull();
+    expect(out.spec).not.toBeNull();
   });
 
   it('refuses a tweak that reproduces an arm this run already has', () => {

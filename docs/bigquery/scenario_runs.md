@@ -438,13 +438,21 @@ something false, and all four are worth knowing before querying one:
   ROLL legs have their own rule, and the two produce materially different roll
   credits. That column stores the **RESOLVED** value (`limit` or `haircut`),
   never NULL from FC-116 on — precisely so it does not need a second
-  `_resolved_haircut` to disambiguate. A **NULL there therefore means exactly
-  one thing: the row was written by an engine before
-  `fc-116-roll-limit-fills`**, which filled roll legs at
+  `_resolved_haircut` to disambiguate. That includes an **errored** cell, which
+  ran no replay but still carries the mode its arm resolved to. A **NULL there
+  therefore means exactly one thing: the row is PRE-FC-116** — written by an
+  engine before `fc-116-roll-limit-fills`, which filled roll legs at
   `mid ∓ fill_haircut × half-spread`. Read it as `haircut`, never as `limit` —
   the latter would claim a legacy row's roll credit was measured against the
   limits the live roller places, which is the whole thing FC-116 changed. The
   sweep API's `forecast.fill` block resolves it that way for you.
+
+  This column is also what **disambiguates the other NULL on the row**.
+  `roll_skips` is written as NULL for an *empty* skip dict as well as for a
+  legacy row (pinned by `test_an_empty_skip_dict_is_null_not_an_empty_string`),
+  so that column alone cannot separate "this replay skipped nothing" from "the
+  engine that wrote this could not count skips". `roll_fill_mode IS NOT NULL
+  AND roll_skips IS NULL` is the first case; both NULL is the second.
 
   **Rows either side of that boundary are non-comparable on any roll-bearing
   row**, and they share `scenario_hash` and `config_hash` by design — so any

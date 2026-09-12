@@ -276,6 +276,43 @@ class TestTheEngineVersionIsNotAFork:
         assert S.ENGINE_VERSION == ENGINE_VERSION
 
 
+class TestTheRollFillModeEnumIsNotAFork:
+    """E4. `services/sweeps` held a FOURTH literal copy of `ROLL_FILL_MODES`.
+
+    `identity.py` already defines it, is stdlib-only, and is flat-copied into
+    the dashboard image as `scenario_identity` — the exact posture that lets
+    `DEFAULT_FILL_HAIRCUT` be an import here. A hand-maintained second tuple
+    was the drift risk its own comment claimed to be avoiding: the API's
+    validator would have kept accepting a value the engine had dropped, or
+    rejected one it had gained, with no test to say so.
+
+    Asserted by IDENTITY, not equality: equality would still pass on a
+    re-declared copy that happens to match today.
+    """
+
+    def test_the_enum_is_the_engine_object(self):
+        from src.backtesting.scenarios import identity as ident
+
+        assert S.ROLL_FILL_MODES is ident.ROLL_FILL_MODES
+        assert S.DEFAULT_ROLL_FILL_MODE is ident.DEFAULT_ROLL_FILL_MODE
+
+    def test_no_bare_mode_literal_survives_in_the_module(self):
+        """The literals at the validator and the footer are gone too — a
+        re-introduced `"limit"` string is how the import gets quietly bypassed
+        one call site at a time."""
+        source = Path(S.__file__).read_text()
+        # Docstrings and comments legitimately SAY "limit"; code must not.
+        tree = ast.parse(source)
+        literals = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value in ("limit",)
+        ]
+        assert not literals, (
+            "bare roll-fill-mode literals at lines "
+            f"{sorted(n.lineno for n in literals)} — use "
+            "DEFAULT_ROLL_FILL_MODE / ROLL_FILL_MODES")
+
+
 class TestTheEngineIdentityIsReadNeverComputed:
     """FC-096 Phase B B1: where the dashboard's half of `sweep_key` comes from.
 
@@ -2505,12 +2542,14 @@ class TestTheFooterIsPerRun:
         }, [])
 
     def test_a_dte_7_run_carries_the_ordinary_footer_only(self):
-        """FC-116 — plus `ROLL_FILL_RULE`, which EVERY run carries.
+        """FC-116 — plus `ROLL_FILL_RULE`, which every POST-FC-116 run carries.
 
         It is not conditional on reach, strategy or arm: the roll fill rule is
         a property of the engine that produced the numbers, and a reader of any
-        run needs it to know what a roll credit means. The rest of the footer
-        is unchanged, which is what the equality below still says.
+        such run needs it to know what a roll credit means. It IS conditional
+        on that engine — a pre-FC-116 run gets `ROLL_FILL_LEGACY` instead (E3;
+        see `TestTheFooterFollowsTheEngineThatWroteTheRun`). The rest of the
+        footer is unchanged, which is what the equality below still says.
         """
         shaped = self._shaped({"strategy.min_put_premium": 0.3})
         assert shaped["effective_max_dte"] == 7
@@ -2532,6 +2571,27 @@ class TestTheFooterIsPerRun:
         assert shaped["known_biases"][-1] == {
             "title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}
         assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
+
+    def test_a_haircut_only_spec_still_gets_the_rule(self):
+        """T2. The old gate emitted the footer only if some arm resolved to
+        `limit`, so a spec of `[{"name": "haircut_fills", "roll_fill_mode":
+        "haircut"}]` got NO description of the fill rule at all — even though
+        the implicit `base` arm that spec always runs is on `limit`, and its
+        column is right there in the table.
+        """
+        shaped = S.shape_results({
+            "run_id": "r", "status": "done", "in_sample_only": True,
+            "spec_json": json.dumps({
+                "symbols": ["AAPL"],
+                "scenarios": [{"name": "haircut_fills",
+                               "roll_fill_mode": "haircut"}],
+            }),
+        }, [])
+        footer = shaped["known_biases"][-1]
+        assert footer["title"] == T.ROLL_FILL_RULE[0]
+        # And it still NAMES the haircut arm, so the reader is told which
+        # column is the old model.
+        assert "`haircut_fills`" in footer["detail"]
 
     def test_the_two_renderings_agree_on_a_long_run(self):
         """The whole point of deriving the condition twice: `/sims` and
@@ -4062,6 +4122,114 @@ class TestThePerCellSignAgreement:
         ]
         shaped = S.shape_results({"run_id": "r", "status": "done"}, rows)
         assert shaped["grid"]["fit"]["tighter"]["AAPL"]["sign_agrees"] is True
+
+
+class TestTheFooterFollowsTheEngineThatWroteTheRun:
+    """E3 + T2. WHICH roll-fill footer a run gets is a fact about its ENGINE.
+
+    A pre-FC-116 run filled every roll leg at `mid -/+ haircut x half-spread`
+    no matter what its spec says — and a pre-FC-116 spec has no
+    `roll_fill_mode` on any arm, so resolving the spec would call it `limit`
+    and describe the wrong rule to a reader looking at numbers already on the
+    page. That is the failure this branch exists to prevent: the footer would
+    be a straight lie about a stored roll credit.
+    """
+
+    _SPEC = json.dumps({
+        "symbols": ["AAPL"],
+        "scenarios": [{"name": "tighter", "overrides": {}}],
+    })
+
+    def _titles(self, rows, **sweep):
+        shaped = S.shape_results(
+            {"run_id": "r", "status": "done", "in_sample_only": True,
+             "spec_json": self._SPEC, **sweep}, rows)
+        return [b["title"] for b in shaped["known_biases"]]
+
+    def test_a_legacy_run_gets_the_retired_clause_back(self):
+        """Every cell NULL in `roll_fill_mode` = written before FC-116."""
+        titles = self._titles([_cell_row("tighter", "AAPL", "fit", 0.10)])
+        assert titles[-1] == T.ROLL_FILL_LEGACY[0]
+        assert T.ROLL_FILL_RULE[0] not in titles
+        assert "biased UP" in T.ROLL_FILL_LEGACY[0], (
+            "the clause retired from ROLL_REACH_BIAS said credits are biased "
+            "UP under the haircut model; that is what a legacy reader needs")
+
+    def test_a_post_fc116_run_gets_the_rule(self):
+        titles = self._titles(
+            [_cell_row("tighter", "AAPL", "fit", 0.10, roll_fill_mode="limit")])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+        assert T.ROLL_FILL_LEGACY[0] not in titles
+
+    def test_one_stamped_cell_settles_it_for_the_run(self):
+        """The column's WRITER arrived with FC-116, so a single non-null value
+        proves the engine. A mixed run cannot be legacy."""
+        titles = self._titles([
+            _cell_row("tighter", "AAPL", "fit", 0.10),
+            _cell_row("tighter", "AAPL", "holdout", 0.10,
+                      roll_fill_mode="haircut"),
+        ])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+
+    def test_a_haircut_arm_of_a_post_fc116_run_is_not_legacy(self):
+        """`roll_fill_mode: haircut` is an opt-in REGRESSION arm of a current
+        engine, not a legacy row. It gets the rule, which names it."""
+        titles = self._titles(
+            [_cell_row("tighter", "AAPL", "fit", 0.10,
+                       roll_fill_mode="haircut")])
+        assert titles[-1] == T.ROLL_FILL_RULE[0]
+
+    def test_a_cellless_run_falls_back_to_the_engine_version(self):
+        """A `submitted`/`running` sweep has a status row and nothing else."""
+        assert self._titles([], engine_version="fc-069-scanner-rewire")[-1] \
+            == T.ROLL_FILL_LEGACY[0]
+        assert self._titles([], engine_version=S.ENGINE_VERSION)[-1] \
+            == T.ROLL_FILL_RULE[0]
+        assert self._titles([])[-1] == T.ROLL_FILL_RULE[0], (
+            "no engine_version at all is a run this image submitted")
+
+
+class TestTheServedRollFillModes:
+    """E1 (backend half). Nothing produced `scenario_roll_fill_modes` at all,
+    so the `/sims` haircut-arm flag never rendered, the console provenance
+    footer printed "not declared — engine default limit" for a declared
+    haircut arm, and the alignment matrix's last fallback was permanently
+    `limit`.
+    """
+
+    _SPEC = json.dumps({
+        "symbols": ["AAPL"],
+        "scenarios": [{"name": "old_model", "roll_fill_mode": "haircut"},
+                      {"name": "unrun", "roll_fill_mode": "haircut"}],
+    })
+
+    def _shaped(self, rows):
+        return S.shape_results(
+            {"run_id": "r", "status": "running", "in_sample_only": True,
+             "spec_json": self._SPEC}, rows)
+
+    def test_it_is_the_resolved_mode_off_the_cells(self):
+        shaped = self._shaped([
+            _cell_row("base", "AAPL", "fit", 0.10, roll_fill_mode="limit"),
+            _cell_row("old_model", "AAPL", "fit", 0.09,
+                      roll_fill_mode="haircut"),
+        ])
+        modes = shaped["scenario_roll_fill_modes"]
+        assert modes["base"] == "limit"
+        assert modes["old_model"] == "haircut"
+
+    def test_a_legacy_cell_resolves_to_haircut_not_limit(self):
+        """The spec cannot tell you this: it has no key, which resolves to
+        `limit`, while the engine that wrote the row ran the haircut."""
+        shaped = self._shaped([_cell_row("base", "AAPL", "fit", 0.10)])
+        assert shaped["scenario_roll_fill_modes"]["base"] == "haircut"
+
+    def test_an_arm_with_no_cell_yet_falls_back_to_its_spec(self):
+        """A `running` sweep must not render a blank provenance row for the arm
+        it has not finished."""
+        shaped = self._shaped(
+            [_cell_row("base", "AAPL", "fit", 0.10, roll_fill_mode="limit")])
+        assert shaped["scenario_roll_fill_modes"]["unrun"] == "haircut"
 
 
 # --------------------------------------------------------------------------

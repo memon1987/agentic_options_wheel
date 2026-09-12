@@ -152,6 +152,30 @@ describe('normaliseReport — provenance', () => {
     expect(report.scenario_overrides?.at_the_bid).toEqual({});
     expect(report.scenario_fill_haircuts?.at_the_bid).toBe(1);
   });
+
+  it('resolves every arm’s roll fill mode, absent meaning `limit`', () => {
+    // FC-116 E1: this map was declared on the type and produced by NOTHING —
+    // `shape_results` did not serve it and this function did not build it — so
+    // the `/sims` haircut flag never rendered, the console provenance row said
+    // "not declared" for an arm that DID declare, and `compareAlignment`'s
+    // last fallback was permanently `limit`.
+    const report = normaliseReport(shapedHoldout, sweep())!;
+    expect(report.scenario_roll_fill_modes?.at_the_bid).toBe('limit');
+    expect(report.scenario_roll_fill_modes?.puts_15_25).toBe('limit');
+
+    const spec = (shapedHoldout as Record<string, unknown>).spec as Record<string, unknown>;
+    const declared = normaliseReport(
+      {
+        ...shapedHoldout,
+        spec: {
+          ...spec,
+          scenarios: [{ name: 'at_the_bid', overrides: {}, roll_fill_mode: 'haircut' }],
+        },
+      },
+      sweep(),
+    )!;
+    expect(declared.scenario_roll_fill_modes?.at_the_bid).toBe('haircut');
+  });
 });
 
 describe('normaliseReport — in-sample runs', () => {

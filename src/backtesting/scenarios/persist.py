@@ -403,11 +403,21 @@ def _runs_schema():
         f("overrides_json", "STRING"),
         f("fill_haircut", "FLOAT"),
         # FC-116 D2 — the RESOLVED roll fill mode ("limit" | "haircut"), never
-        # NULL from this PR on. Deliberately unlike `fill_haircut`, which is
-        # stored VERBATIM and so forced the dashboard to grow `_resolved_
-        # haircut` just to tell "the default" from "unspecified". Here a NULL
-        # means exactly one thing: written by an engine before
+        # NULL from this PR on, INCLUDING on an errored cell (T3: an error row
+        # carries the mode its arm resolved to, even though it ran no replay).
+        # Deliberately unlike `fill_haircut`, which is stored VERBATIM and so
+        # forced the dashboard to grow `_resolved_haircut` just to tell "the
+        # default" from "unspecified". Here a NULL means exactly one thing:
+        # the row is PRE-FC-116 — written by an engine before
         # `fc-116-roll-limit-fills`, i.e. the haircut model.
+        #
+        # It is also the disambiguator for the OTHER NULL on this row:
+        # `roll_skips` persists as NULL for an empty dict as well as for a
+        # legacy row (pinned by `test_an_empty_skip_dict_is_null_not_an_empty_
+        # string`), so "no skips" and "this engine could not count skips" look
+        # identical in that column alone. `roll_fill_mode IS NOT NULL` with
+        # `roll_skips IS NULL` is a post-FC-116 row that genuinely skipped
+        # nothing.
         f("roll_fill_mode", "STRING"),
         # Cell
         f("symbol", "STRING"),

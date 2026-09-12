@@ -1564,3 +1564,84 @@ class TestTheRollFieldsRoundTripOntoARow:
     def test_an_empty_skip_dict_is_null_not_an_empty_string(self):
         assert self._row(roll_skips={})["roll_skips"] is None
         assert self._row()["roll_skips"] is None
+
+    def test_roll_fill_mode_is_what_disambiguates_that_null(self):
+        """T3. `roll_skips IS NULL` means TWO different things — "this replay
+        skipped nothing" and "the engine that wrote this could not count
+        skips" — and the column above cannot separate them. `roll_fill_mode`
+        can, because it is never NULL from FC-116 on."""
+        row = self._row(roll_skips={}, roll_fill_mode="limit")
+        assert row["roll_skips"] is None and row["roll_fill_mode"] == "limit"
+
+
+class TestAnErroredCellStillCarriesTheMode:
+    """T3. A NULL `roll_fill_mode` must keep its ONE meaning: pre-FC-116.
+
+    An errored cell ran no replay, but it is still a cell of a post-FC-116
+    run — leaving it NULL would file every failed arm of an honest sweep under
+    the legacy fill rule, and `shape_results` would then serve those runs the
+    wrong footer (E3).
+    """
+
+    def _errored_rows(self, **kw):
+        import src.backtesting.scenarios.runner as R
+
+        result = R.SweepResult(
+            rows=[], scenarios=["base", "haircut_arm"],
+            scenario_config_hashes={"base": "cfg", "haircut_arm": "cfg"},
+            scenario_hashes={"base": "h1", "haircut_arm": "h2"},
+            scenario_roll_fill_modes={"base": "limit",
+                                      "haircut_arm": "haircut"},
+            **kw)
+        return result
+
+    def test_a_materialisation_failure_row_carries_its_arms_mode(self):
+        """The rows built in `run_sweep`'s materialise-failure handler."""
+        import src.backtesting.scenarios.runner as R
+
+        result = self._errored_rows()
+        for scenario in ("base", "haircut_arm"):
+            result.rows.append(R.ScenarioResult(
+                scenario=scenario, symbol="XYZ", start=date(2024, 6, 3),
+                end=date(2024, 6, 28), split="all",
+                config_hash=result.scenario_config_hashes[scenario],
+                scenario_hash=result.scenario_hashes[scenario],
+                error="boom",
+                roll_fill_mode=result.scenario_roll_fill_modes.get(
+                    scenario, "limit"),
+            ))
+        rows = store.rows_from_sweep(
+            result, run_id="r", submitted_at="2026-09-11T00:00:00+00:00",
+            engine_version="fc-116-roll-limit-fills")
+        by_arm = {r["scenario_name"]: r for r in rows}
+        assert by_arm["base"]["error"] and by_arm["haircut_arm"]["error"]
+        assert by_arm["base"]["roll_fill_mode"] == "limit"
+        assert by_arm["haircut_arm"]["roll_fill_mode"] == "haircut"
+
+    def test_the_runner_sets_it_on_every_error_path(self):
+        """Structural, over the AST: EVERY `ScenarioResult(...)` the runner
+        builds with an `error=` must also name `roll_fill_mode=`.
+
+        A string search would miss a third construction added later, which is
+        exactly the drift that leaves a NULL meaning two things again.
+        """
+        import ast
+        import inspect
+
+        import src.backtesting.scenarios.runner as R
+
+        tree = ast.parse(inspect.getsource(R))
+        errored = [
+            call for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", None) == "ScenarioResult"
+            and any(kw.arg == "error" for kw in call.keywords)
+        ]
+        assert len(errored) == 2, (
+            f"expected the 2 known errored-cell constructions, found "
+            f"{len(errored)} — a new one must set roll_fill_mode too")
+        for call in errored:
+            assert any(kw.arg == "roll_fill_mode" for kw in call.keywords), (
+                f"line {call.lineno}: an errored ScenarioResult left "
+                f"roll_fill_mode NULL, which means 'pre-FC-116' to every "
+                f"reader of the column")

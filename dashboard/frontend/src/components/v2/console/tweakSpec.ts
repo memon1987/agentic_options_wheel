@@ -503,6 +503,14 @@ export function buildTweak(args: {
 export interface RunArm {
   name: string;
   overrides: Record<string, unknown>;
+  /**
+   * FC-116 (review) — the arm's FILL declaration, carried because two arms
+   * with identical overrides and different fill rules are different questions.
+   * `null` on both means the arm takes the engine defaults, which is what a
+   * tweak from this bar always produces.
+   */
+  fillHaircut: number | null;
+  rollFillMode: string | null;
 }
 
 /** Every declared arm of the run, `base` excluded (it is implicit). */
@@ -519,13 +527,23 @@ export function parseRunArms(specJson: string | null | undefined): RunArm[] {
   const arms: RunArm[] = [];
   for (const entry of scenarios) {
     if (!entry || typeof entry !== 'object') continue;
-    const arm = entry as { name?: unknown; overrides?: unknown };
+    const arm = entry as {
+      name?: unknown;
+      overrides?: unknown;
+      fill_haircut?: unknown;
+      roll_fill_mode?: unknown;
+    };
     if (typeof arm.name !== 'string' || !arm.name) continue;
     const overrides =
       arm.overrides && typeof arm.overrides === 'object' && !Array.isArray(arm.overrides)
         ? (arm.overrides as Record<string, unknown>)
         : {};
-    arms.push({ name: arm.name, overrides });
+    arms.push({
+      name: arm.name,
+      overrides,
+      fillHaircut: typeof arm.fill_haircut === 'number' ? arm.fill_haircut : null,
+      rollFillMode: typeof arm.roll_fill_mode === 'string' ? arm.roll_fill_mode : null,
+    });
   }
   return arms;
 }
@@ -551,7 +569,20 @@ export function existingArmFor(
   overrides: Record<string, unknown>,
   arms: RunArm[],
 ): RunArm | null {
-  return arms.find((arm) => sameOverrides(arm.overrides, overrides)) ?? null;
+  // FC-116 (review): matching on overrides ALONE reported a haircut-fill arm
+  // as "already carries exactly these overrides" for a tweak that would have
+  // run on the limit rule — a different question, and the warning told the
+  // operator not to ask it. A tweak from this bar always takes the engine
+  // defaults (`tweakSpec` emits `{name, overrides}` and nothing else), so an
+  // arm matches only when it, too, declares no fill of its own.
+  return (
+    arms.find(
+      (arm) =>
+        sameOverrides(arm.overrides, overrides) &&
+        arm.fillHaircut === null &&
+        (arm.rollFillMode === null || arm.rollFillMode === 'limit'),
+    ) ?? null
+  );
 }
 
 /**

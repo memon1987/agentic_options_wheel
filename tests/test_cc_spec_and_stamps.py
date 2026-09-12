@@ -176,13 +176,33 @@ class TestCanonicalisationByOmission:
             dict(LEGACY_SPEC["scenarios"][0], roll_fill_mode="limit")])
         assert _key(spec) == _key(LEGACY_SPEC)
 
-    def test_a_base_arm_carrying_a_mode_is_not_the_implicit_base(self):
+    def test_a_base_arm_carrying_any_mode_is_not_the_implicit_base(self):
         """Folding it away would silently DROP the mode from the comparator
-        every other row is read against."""
+        every other row is read against.
+
+        `limit` is refused too, not just `haircut` (review): the runner's
+        `_with_base_first` rejects a declared `base` carrying ANY
+        `roll_fill_mode`, so folding the default made `canonical_spec` agree
+        with a spec the engine refuses — and a dedup hit would hand that
+        submission a different run's numbers instead of the error it earned.
+        """
         assert ident._is_implicit_base({"name": "base"})
-        assert ident._is_implicit_base({"name": "base", "roll_fill_mode": "limit"})
+        assert not ident._is_implicit_base(
+            {"name": "base", "roll_fill_mode": "limit"})
         assert not ident._is_implicit_base(
             {"name": "base", "roll_fill_mode": "haircut"})
+
+    def test_the_two_sides_refuse_the_same_arm(self):
+        """The asymmetry this closes, stated as one assertion."""
+        import pytest
+
+        from src.backtesting.scenarios.runner import Scenario, _with_base_first
+
+        for mode in ("limit", "haircut"):
+            arm = {"name": "base", "roll_fill_mode": mode}
+            assert not ident._is_implicit_base(arm), mode
+            with pytest.raises(ValueError, match="roll_fill_mode"):
+                _with_base_first([Scenario("base", {}, roll_fill_mode=mode)])
 
     def test_the_default_mode_is_the_same_string_in_every_copy(self):
         """Three copies that cannot import each other: `identity` (stdlib-only,
@@ -198,6 +218,9 @@ class TestCanonicalisationByOmission:
                 == bk.ROLL_FILL_MODE_LIMIT
                 == "limit")
         assert ident.ROLL_FILL_MODES == bk.ROLL_FILL_MODES == ("limit", "haircut")
+        # The dashboard is NOT a fourth copy — it imports this one. Pinned
+        # by identity in `test_dashboard_sweeps.py` (E4), which has the
+        # path setup needed to import `services.sweeps`.
 
     def test_the_constant_is_the_same_string_in_all_three_copies(self):
         """It is spelled in three stdlib/engine modules that cannot import each

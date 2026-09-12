@@ -49,6 +49,45 @@ const show = (over: Partial<React.ComponentProps<typeof ProvenanceFooter>> = {})
 
 const text = () => screen.getByTestId('provenance-footer').textContent ?? '';
 
+describe('the roll fill mode reaches the footer (FC-116 E1)', () => {
+  /**
+   * Through `normaliseSweepDetail`, deliberately.
+   *
+   * The original FC-116 tests built `SweepReport` objects by hand with
+   * `scenario_roll_fill_modes` already populated — and nothing ever populated
+   * it: `normaliseReport` rebuilt `scenario_overrides` and
+   * `scenario_fill_haircuts` off the spec and never assigned this one, and
+   * `shape_results` did not serve it. So this row printed "not declared" for
+   * an arm that declared `haircut`, and every hand-built test passed.
+   */
+  const withArm = (arm: Record<string, unknown>) =>
+    normaliseSweepDetail({
+      ...shaped13cc,
+      spec: { ...(shaped13cc as Record<string, unknown>).spec as object, scenarios: [arm] },
+    } as unknown as Parameters<typeof normaliseSweepDetail>[0])!.results!;
+
+  it('prints the declared haircut mode, not the engine default', () => {
+    show({
+      report: withArm({ name: 'old_model', overrides: {}, roll_fill_mode: 'haircut' }),
+      scenario: 'old_model',
+    });
+    const row = within(screen.getByTestId('provenance-footer')).getByText('roll_fill_mode')
+      .parentElement!;
+    expect(row.textContent).toContain('haircut');
+    expect(row.textContent).not.toContain('not declared');
+  });
+
+  it('resolves an arm that declares nothing to `limit`', () => {
+    show({
+      report: withArm({ name: 'plain', overrides: {} }),
+      scenario: 'plain',
+    });
+    const row = within(screen.getByTestId('provenance-footer')).getByText('roll_fill_mode')
+      .parentElement!;
+    expect(row.textContent).toContain('limit');
+  });
+});
+
 describe('the run block', () => {
   it('prints the run identity and both windows', () => {
     show();

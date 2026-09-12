@@ -381,10 +381,14 @@ def _is_implicit_base(entry: Mapping[str, Any]) -> bool:
         str(entry.get("name")) == BASE_SCENARIO_NAME
         and not (entry.get("overrides") or {})
         and entry.get("fill_haircut") is None
-        # FC-116 — a `base` that names a roll fill mode is NOT the implicit
-        # base; folding it away would silently drop the mode. (The runner and
-        # both validators refuse such a base outright, same as a haircut.)
-        and entry.get("roll_fill_mode") in (None, DEFAULT_ROLL_FILL_MODE)
+        # FC-116 — a `base` that names a roll fill mode AT ALL is not the
+        # implicit base, `limit` included. Folding it away would silently drop
+        # the mode, and `runner._with_base_first` refuses such an arm outright
+        # (`roll_fill_mode is not None`, no default exemption) — so folding
+        # `limit` made the key AGREE with a spec the engine would reject, and
+        # a dedup hit would then serve that submission another run's numbers.
+        # Refused on both sides rather than documented as an asymmetry.
+        and entry.get("roll_fill_mode") is None
     )
 
 
