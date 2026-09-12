@@ -100,7 +100,18 @@ except ImportError:  # dashboard image: the same files, copied flat
 # dashboard that disagreed with the Job here would compute a key nothing ever
 # matches and the dedup would never fire — costing a full replay every time,
 # silently. Pinned by TestTheEngineVersionIsNotAFork.
-ENGINE_VERSION = "fc-116-roll-limit-fills"
+ENGINE_VERSION = "fc-112-wheel-roll-reach"
+
+# FC-112. Every `ENGINE_VERSION` at or after `fc-116-roll-limit-fills`, i.e.
+# every engine that filled ROLL legs at the placed limits rather than at the
+# haircut price. Consulted only by `_ran_pre_fc116`, and only for a sweep with
+# no cells to speak for it. APPEND-ONLY: a release that bumps `ENGINE_VERSION`
+# adds the new value here in the same commit, which
+# `TestTheEngineVersionIsNotAFork` enforces by asserting membership.
+POST_FC116_ENGINE_VERSIONS = frozenset({
+    "fc-116-roll-limit-fills",
+    "fc-112-wheel-roll-reach",
+})
 
 logger = logging.getLogger(__name__)
 
@@ -1855,6 +1866,23 @@ def _ordering(sweep_row: Dict[str, Any], run_rows: Sequence[Dict[str, Any]]):
 # footers.
 CC_BASE_REACH = 21
 
+# FC-112 (DD-2). The WHEEL profile's BASE materialisation reach, on the same
+# terms: `call_target_dte` (7) + `rolling.max_extension_days` (14) = 21, which
+# is `MAX_SWEEPABLE_DTE` exactly — so unlike the covered-call 28-vs-21 the wheel
+# has no residual truncation. Before FC-112 this side's wheel floor was
+# `DTE_REACH_BIAS_THRESHOLD` (7) and the engine agreed, because
+# `roll_horizon_reach` short-circuited to 0 on the wheel. FC-112 removed that
+# short-circuit, so the floor moves here in the SAME commit or the two footers
+# disagree about whether the reach caveat has been earned — `Found while
+# planning` item 4. Pinned equal to the profile by
+# `TestTheWheelBaseReachIsNotAFork`, exactly as `CC_BASE_REACH` is.
+#
+# Deliberately NOT merged with `DTE_REACH_BIAS_THRESHOLD`, which stays 7: one is
+# "what this run materialised", the other is "the reach every fidelity figure in
+# the footer was measured at". They were numerically equal for the wheel by
+# coincidence, and FC-112 separates them.
+WHEEL_BASE_REACH = 21
+
 
 def spec_max_dte(spec: Dict[str, Any]) -> int:
     """The DTE reach a persisted spec's arms imply — the dashboard's half of
@@ -1875,7 +1903,13 @@ def spec_max_dte(spec: Dict[str, Any]) -> int:
     parity test exists to prevent, arriving through a strategy the test did not
     cover.
 
-    ``CC_BASE_REACH`` is pinned to the profile by an equality test rather than
+    **Since FC-112 the WHEEL's floor is ``WHEEL_BASE_REACH`` (21), not 7**, for
+    the identical reason: the engine now folds the wheel's roll horizon (7 + 14)
+    into its materialisation too. The two floors are separate constants because
+    the two profiles reach 21 by different arithmetic and either can be retuned
+    alone.
+
+    Both constants are pinned to their profile by an equality test rather than
     derived here, because this module is the dashboard's and holds no ``Config``.
 
     Reads the SPEC rather than the per-cell ``overrides_json`` because the spec
@@ -1883,7 +1917,7 @@ def spec_max_dte(spec: Dict[str, Any]) -> int:
     its reach, and the caveat is about the DATA the window was built on, not
     about which cells came back.
     """
-    reach = (DTE_REACH_BIAS_THRESHOLD
+    reach = (WHEEL_BASE_REACH
              if str(spec.get("strategy") or WHEEL_STRATEGY) == WHEEL_STRATEGY
              else CC_BASE_REACH)
     for arm in (spec.get("scenarios") or []):
@@ -2053,12 +2087,19 @@ def _ran_pre_fc116(sweep_row: Dict[str, Any],
        release that added the column's writer. One such cell settles it.
     2. With cells present but EVERY one of them null, the run is pre-FC-116.
     3. With no cells at all (a `submitted` or `running` sweep, or one that
-       died before its first row), the sweep row's `engine_version` decides:
-       anything other than this image's is a run from another engine, and
-       every engine older than this one filled roll legs at the haircut. A
-       *newer* engine would be misread here, which cannot happen while
-       `TestTheEngineVersionIsNotAFork` pins this image's constant to
-       `screen.ENGINE_VERSION` — the dashboard and the Job ship together.
+       died before its first row), the sweep row's `engine_version` decides,
+       against `POST_FC116_ENGINE_VERSIONS`.
+
+       **FC-112 corrected this branch.** It used to read "anything other than
+       THIS image's version is older, and every older engine filled roll legs
+       at the haircut" — true only until the next bump. FC-112 bumped
+       `ENGINE_VERSION` to `fc-112-wheel-roll-reach`, which would have made a
+       rowless `fc-116-roll-limit-fills` sweep read as pre-FC-116 and served
+       its reader the legacy footer about numbers that were filled at the
+       placed limits. The set below is append-only: every release at or after
+       FC-116 joins it in the commit that bumps the constant, and
+       `TestTheEngineVersionIsNotAFork` pins this image's own version to be a
+       member.
     """
     saw_row = False
     for row in run_rows:
@@ -2068,7 +2109,7 @@ def _ran_pre_fc116(sweep_row: Dict[str, Any],
     if saw_row:
         return True
     version = str(sweep_row.get("engine_version") or "")
-    return bool(version) and version != ENGINE_VERSION
+    return bool(version) and version not in POST_FC116_ENGINE_VERSIONS
 
 
 def _resolved_roll_fill_mode(row: Optional[Dict[str, Any]]) -> str:
