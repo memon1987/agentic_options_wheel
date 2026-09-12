@@ -1514,6 +1514,14 @@ def _sample_sweep() -> SweepResult:
                             "wider": {"strategy.min_put_premium": 0.25}},
         scenario_fill_haircuts={"base": None, "tighter": None, "wider": None},
         wall_seconds=120.0, starting_cash=100_000.0,
+        # FC-112. A real wheel sweep of this spec materialises to 21 — the
+        # base's roll horizon, 7 + 14 — so the fixture says 21 too. Leaving the
+        # default here would have made the ENGINE side of every parity test
+        # omit `DTE_REACH_BIAS` while the dashboard side (which derives the
+        # reach from the same spec through `spec_max_dte`) emitted it, and the
+        # footer-parity test would have failed on a disagreement the fixture
+        # invented rather than on one the code has.
+        effective_max_dte=21,
     )
 
 
@@ -2506,27 +2514,57 @@ class TestTheDteReachCaveatIsNotAFork:
 
 
 class TestSpecMaxDte:
-    def test_a_spec_with_no_dte_arms_sits_at_the_threshold(self):
+    """**FC-112 moved the wheel's floor from 7 to `WHEEL_BASE_REACH` (21).**
+
+    Both strategy floors now sit at `MAX_SWEEPABLE_DTE`, and every DTE override
+    is validated at or below that same cap — so on TODAY's constants no arm can
+    raise `spec_max_dte` above its floor, and the function is (for the moment) a
+    constant. That is a fact about the two profiles' current knobs, not a
+    licence to delete the arm scan: either floor can be retuned down, and an
+    arm-scan that had quietly stopped being exercised would come back wrong.
+    So the arm cases below are asserted against a LOWERED floor, and the
+    floor-is-the-floor cases against the real one.
+    """
+
+    def test_a_spec_with_no_dte_arms_sits_at_the_floor(self):
         assert S.spec_max_dte({"scenarios": [
-            {"name": "a", "overrides": {"strategy.min_put_premium": 0.3}}]}) == 7
+            {"name": "a", "overrides": {"strategy.min_put_premium": 0.3}}]}) \
+            == S.WHEEL_BASE_REACH == 21
+
+    def test_the_wheel_floor_is_not_the_caveat_threshold(self):
+        """FC-112. They were equal by coincidence and are now different
+        questions: `WHEEL_BASE_REACH` is what the run materialised,
+        `DTE_REACH_BIAS_THRESHOLD` is the reach every fidelity figure in the
+        footer was measured at. Merging them would have silenced the caveat on
+        every wheel run at once."""
+        assert S.WHEEL_BASE_REACH == 21
+        assert S.DTE_REACH_BIAS_THRESHOLD == 7
 
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
-    def test_either_leg_raises_it(self, key):
+    def test_either_leg_raises_it(self, key, monkeypatch):
+        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {key: 14}}]}) == 14
 
-    def test_the_maximum_wins(self):
+    def test_the_maximum_wins(self, monkeypatch):
+        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {"strategy.put_target_dte": 3}},
             {"name": "b", "overrides": {"strategy.call_target_dte": 21}},
         ]}) == 21
 
-    def test_a_shorter_arm_never_lowers_it(self):
-        """Below the threshold the answer is the threshold: the caveat asks
-        "did this run reach PAST 7", and a DTE-3 arm did not."""
+    def test_a_shorter_arm_never_lowers_it(self, monkeypatch):
+        """Below the floor the answer is the floor: a DTE-3 arm does not narrow
+        the materialisation the rest of the run was built on."""
+        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         assert S.spec_max_dte({"scenarios": [
             {"name": "a", "overrides": {"strategy.put_target_dte": 3}}]}) == 7
+        # And on the real floor, likewise — a short arm cannot pull a wheel run
+        # back off its roller's ladder.
+        monkeypatch.undo()
+        assert S.spec_max_dte({"scenarios": [
+            {"name": "a", "overrides": {"strategy.put_target_dte": 3}}]}) == 21
 
     @pytest.mark.parametrize("spec", [
         {}, {"scenarios": None}, {"scenarios": []}, {"scenarios": ["not-a-dict"]},
@@ -2536,11 +2574,11 @@ class TestSpecMaxDte:
         {"scenarios": [{"name": "a", "overrides": {"strategy.put_target_dte": "14"}}]},
         {"scenarios": [{"name": "a", "overrides": {"strategy.put_target_dte": True}}]},
     ])
-    def test_a_malformed_or_absent_spec_degrades_to_the_threshold(self, spec):
+    def test_a_malformed_or_absent_spec_degrades_to_the_floor(self, spec):
         """A `submitted` run has no cells and a run from before this field
         existed has no DTE keys; neither may 500 the results page, and neither
-        may invent a caveat."""
-        assert S.spec_max_dte(spec) == 7
+        may invent a reach the run did not have."""
+        assert S.spec_max_dte(spec) == S.WHEEL_BASE_REACH == 21
 
 
 class TestTheFooterIsPerRun:
@@ -2553,7 +2591,8 @@ class TestTheFooterIsPerRun:
             }),
         }, [])
 
-    def test_a_dte_7_run_carries_the_ordinary_footer_only(self):
+    def test_a_run_below_the_threshold_carries_the_ordinary_footer_only(
+            self, monkeypatch):
         """FC-116 — plus `ROLL_FILL_RULE`, which every POST-FC-116 run carries.
 
         It is not conditional on reach, strategy or arm: the roll fill rule is
@@ -2562,7 +2601,17 @@ class TestTheFooterIsPerRun:
         on that engine — a pre-FC-116 run gets `ROLL_FILL_LEGACY` instead (E3;
         see `TestTheFooterFollowsTheEngineThatWroteTheRun`). The rest of the
         footer is unchanged, which is what the equality below still says.
+
+        **FC-112: the floor is monkeypatched down to reach this branch at all.**
+        Since the wheel's materialisation floor became its roll horizon, no real
+        wheel spec sits at or below `DTE_REACH_BIAS_THRESHOLD` — the
+        caveat-absent branch is live code (a CC profile retune, or a future
+        lower floor) that no production spec exercises today. Asserting it on a
+        patched floor keeps it covered; deleting it would leave the emission
+        conditional itself untested in the negative direction, and a footer that
+        fires unconditionally is a footer nobody can trust to mean anything.
         """
+        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         shaped = self._shaped({"strategy.min_put_premium": 0.3})
         assert shaped["effective_max_dte"] == 7
         titles = [b["title"] for b in shaped["known_biases"]]
@@ -2571,9 +2620,32 @@ class TestTheFooterIsPerRun:
             {"title": t, "detail": d} for t, d in T.SWEEP_BIASES
         ] + [{"title": T.ROLL_FILL_RULE[0], "detail": T.ROLL_FILL_RULE[1]}]
 
+    def test_every_wheel_run_now_carries_the_reach_caveat(self):
+        """FC-112, the live half of the pair above — and the consequence D-2
+        signed off on.
+
+        A wheel run with no DTE arm at all materialises to 21 now, so it earns
+        the thin-print caveat where it used not to. That is not over-warning:
+        the roller really does choose replacements out of 8-to-21-DTE prints,
+        which really are thinner. `DTE_REACH_BIAS` carries the leg split so the
+        reader is not left thinking the ENTRIES moved — they did not.
+        """
+        shaped = self._shaped({"strategy.min_put_premium": 0.3})
+        assert shaped["effective_max_dte"] == 21
+        titles = [b["title"] for b in shaped["known_biases"]]
+        assert T.DTE_REACH_BIAS[0] in titles
+        assert len(shaped["known_biases"]) == len(T.SWEEP_BIASES) + 2
+        detail = next(b["detail"] for b in shaped["known_biases"]
+                      if b["title"] == T.DTE_REACH_BIAS[0])
+        assert "caps every ENTRY at 7" in detail, (
+            "the caveat must say WHICH leg reached past 7 on a wheel run, or "
+            "it reads as a claim the wheel started writing long-dated puts")
+
     @pytest.mark.parametrize("key", [
         "strategy.put_target_dte", "strategy.call_target_dte"])
-    def test_a_long_dte_run_gains_the_caveat_and_nothing_else(self, key):
+    def test_a_long_dte_run_gains_the_caveat_and_nothing_else(
+            self, key, monkeypatch):
+        monkeypatch.setattr(S, "WHEEL_BASE_REACH", 7)
         shaped = self._shaped({key: 14})
         assert shaped["effective_max_dte"] == 14
         title, detail = T.DTE_REACH_BIAS
@@ -2610,11 +2682,15 @@ class TestTheFooterIsPerRun:
         `sweep.md` must warn the same reader in the same words about the same
         run."""
         sweep = _sample_sweep()
-        sweep.effective_max_dte = 14
+        # FC-112: 21, not 14 — the two sides must agree on the reach a real
+        # wheel run of this spec has, and since the wheel's floor became its
+        # roll horizon that is 21 on BOTH sides. Pinning 14 here would have had
+        # the engine side describing a run the dashboard side cannot produce.
+        sweep.effective_max_dte = 21
         rendered = json.loads(engine_report.render_json(sweep))
         shaped = self._shaped({"strategy.put_target_dte": 14})
         assert shaped["known_biases"] == rendered["known_biases"]
-        assert shaped["effective_max_dte"] == rendered["effective_max_dte"]
+        assert shaped["effective_max_dte"] == rendered["effective_max_dte"] == 21
 
 
 class TestTheEarningsGapsAreStoredAndServed:

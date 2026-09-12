@@ -989,7 +989,17 @@ class TestTheSink:
 
         MUTATION CHECK: pass `materialised.max_dte` instead of the arm's
         `max_dte` into `_emit_artifact` and this fails on the `base` row.
+
+        **FC-112: the base's roll extension is narrowed to 3 so that a gap
+        between the arm's reach and the sweep's still EXISTS.** The wheel's base
+        reach became its roll horizon (7 + 14 = 21 = `MAX_SWEEPABLE_DTE`), and
+        every DTE override is capped at the same 21 — so on the shipped config
+        no arm can out-reach the base any more and this test would have stamped
+        21 on both arms, asserted `21 == 21`, and stopped watching the mask
+        entirely. A narrower extension restores the mixed case the mutation
+        check above is written against.
         """
+        one_symbol_config._config["rolling"]["max_extension_days"] = 3
         seen = []
         result = _sweep(tmp_path, one_symbol, one_symbol_config,
                         [Scenario("longdte", {"strategy.put_target_dte": 21})],
@@ -997,8 +1007,8 @@ class TestTheSink:
         assert not result.errors
         reach = {a["provenance"]["scenario"]: a["provenance"]["masked_reach"]
                  for a in seen}
-        assert reach["base"]["max_dte"] == 7
-        assert reach["base"]["dte_cutoff"] == 8
+        assert reach["base"]["max_dte"] == 10, "max(put 7, call 7, roll 7 + 3)"
+        assert reach["base"]["dte_cutoff"] == 11
         assert reach["base"]["sweep_max_dte"] == 21
         assert reach["longdte"]["max_dte"] == 21
         assert reach["longdte"]["dte_cutoff"] == 22
@@ -1007,13 +1017,18 @@ class TestTheSink:
             self, tmp_path, one_symbol, one_symbol_config):
         """With no DTE arm the mask removes nothing, and the arm's reach and the
         sweep's are the same number — which is what makes the mixed case above
-        the interesting one rather than the only correct-looking one."""
+        the interesting one rather than the only correct-looking one.
+
+        FC-112: that number is 21 on the shipped wheel config, not 7 — the
+        roller's horizon, materialised since FC-112.
+        """
         seen = []
         _sweep(tmp_path, one_symbol, one_symbol_config, [Scenario("a", {})],
                artifact_sink=seen.append)
+        assert seen
         for art in seen:
             reach = art["provenance"]["masked_reach"]
-            assert reach["max_dte"] == reach["sweep_max_dte"] == 7
+            assert reach["max_dte"] == reach["sweep_max_dte"] == 21
 
     def test_the_artifact_carries_the_rows_own_hashes(
             self, tmp_path, one_symbol, one_symbol_config):
