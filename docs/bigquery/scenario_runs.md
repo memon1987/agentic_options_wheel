@@ -765,6 +765,68 @@ current allowlist **refuses** — as opposed to one that ran and broke. Only the
 first kind counts towards `battery_pin_nag`, because a vendor outage is not
 something an operator can fix by editing a pin.
 
+#### The FC-112 contrast (a paired arm-vs-arm read at one window)
+
+The selection FC-112's study is entitled to make, and the shape any paired
+arm-vs-arm read over this table should copy. It is the query
+`tools/diagnostics/fc112_roll_trigger_read.py` sends; the tool adds `r.measured`
+and DD-1's four non-deciding metrics to the SELECT, and its own
+`resolve_dedup` raises `VOID(dedup_target_not_done)` on what the
+`status = 'done'` filter below would silently drop.
+
+**Three things here are load-bearing, and each was a bug before it was a rule.**
+
+* **The window filter belongs on the SWEEP row.** `scenario_runs.window_end` is
+  **per split**: a fit cell carries `holdout_start − 1` (the 09-11 battery's fit
+  rows read `2026-06-12`), so filtering the RUNS row on the Saturday date
+  returns the holdout cells only and silently drops every cell a decision would
+  be made on.
+* **Partition on `pin_id`.** The 09-11 battery holds GOOGL **twice** — the
+  standing item and the GOOGL proof pin. A per-window aggregate that forgets
+  double-counts it. Pin rows are `pin_id IN UNNEST(...)`; standing rows are
+  `pin_id IS NULL`.
+* **Follow `deduplicated_to`, and check the target.** A `deduplicated` sweep
+  writes no cell rows of its own. The realistic collision is a one-shot
+  submitted at the coming Saturday's window, which the pin's first point then
+  dedups INTO (the cell key carries no `pin_id` and no `submitted_via`) — so
+  submit one-shots Mon–Thu, never Saturday morning UTC.
+
+```sql
+WITH latest AS (
+  SELECT * EXCEPT(rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY
+      written_at DESC, CASE status WHEN 'deduplicated' THEN 2 WHEN 'done' THEN 4
+                  WHEN 'failed' THEN 3 WHEN 'running' THEN 1
+                  WHEN 'submitted' THEN 0 ELSE -1 END DESC) AS rn
+    FROM `gen-lang-client-0607444019.options_wheel.scenario_sweeps`
+    WHERE submitted_at >= @since) WHERE rn = 1),
+resolved AS (  -- follow deduplicated_to once; the target must be done
+  SELECT l.pin_id, l.window_end, l.submitted_via,
+         IFNULL(t.run_id, l.run_id) AS run_id, IFNULL(t.status, l.status) AS status,
+         IFNULL(t.engine_version, l.engine_version) AS engine_version,
+         IFNULL(t.engine_identity, l.engine_identity) AS engine_identity
+  FROM latest l LEFT JOIN latest t ON t.run_id = l.deduplicated_to AND l.status = 'deduplicated'
+  WHERE IFNULL(JSON_VALUE(l.spec_json, '$.strategy'), 'wheel') = 'wheel')
+SELECT s.pin_id, s.window_end, s.engine_version, s.engine_identity,
+       r.symbol, r.split, r.scenario_name, r.verdict, r.annualized_return,
+       r.option_pnl, r.stock_pnl_realized, r.stock_pnl_unrealized,
+       r.rolls_executed, r.itm_rolls, r.otm_roll_outs, r.roll_net_credit,
+       r.itm_roll_credit, r.otm_roll_out_credit, r.failed_roll_btc_debit,
+       r.roll_legs_resting, r.roll_legs_marketable, r.roll_skips, r.roll_fill_mode
+FROM resolved s
+JOIN `gen-lang-client-0607444019.options_wheel.scenario_runs` r USING (run_id)
+WHERE s.status = 'done'
+  AND s.pin_id IN UNNEST(@pin_ids)     -- or: s.pin_id IS NULL AND s.submitted_via = 'battery'
+  AND s.window_end = @window_end
+ORDER BY r.symbol, r.split, r.scenario_name;
+```
+
+`engine_version` and `engine_identity` must be **single-valued** across every
+row of one read: a point that straddled a deploy is not a read, because the
+arms were replayed by two different engines and the contrast between them is
+the deploy. The wheel's own boundary is `fc-112-wheel-roll-reach` — rows before
+it replayed the roller on a 7-DTE ladder instead of its 21-DTE roll horizon.
+
 ## Operational notes
 
 - **The tables are created by the Job's writer**, not by the dashboard. The
