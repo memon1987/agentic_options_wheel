@@ -341,7 +341,8 @@ class TestTheBatteryMeasuresEverything:
 
         rc = cli.run_battery_cmd(battery_args(), _config(), _Logger())
         assert rc == 0
-        assert len(submitted) == len(_config().stock_symbols) + 2
+        # Two standing halves since FC-117 (wheel + covered call), plus pins.
+        assert len(submitted) == 2 * len(_config().stock_symbols) + 2
         assert [k["pin_id"] for k in submitted][-2:] == [
             "pin0000000000001", "pin0000000000002"]
 
@@ -383,9 +384,10 @@ class TestTheBatteryMeasuresEverything:
         assert {r["submitted_via"] for r in wired.statuses} == {"battery"}
         assert {r["pin_id"] for r in wired.statuses} == {None}
         run_ids = {r["run_id"] for r in wired.statuses}
-        assert len(run_ids) == len(_config().stock_symbols), (
-            "each standing symbol is its own run; sharing a run_id would "
-            "collapse fourteen runs into one unreadable timeline"
+        assert len(run_ids) == 2 * len(_config().stock_symbols), (
+            "each standing symbol is its own run in each half (wheel and "
+            "covered call, FC-117); sharing a run_id would collapse "
+            "twenty-eight runs into one unreadable timeline"
         )
 
     def test_the_per_execution_env_overrides_are_ignored(self, wired,
@@ -404,7 +406,7 @@ class TestTheBatteryMeasuresEverything:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         run_ids = [r["run_id"] for r in wired.statuses]
         assert "envrun0123456789" not in run_ids
-        assert len(set(run_ids)) == len(_config().stock_symbols)
+        assert len(set(run_ids)) == 2 * len(_config().stock_symbols)
         assert {r["submitted_at"] for r in wired.statuses} != {
             "2020-01-01T00:00:00+00:00"}
 
@@ -466,8 +468,9 @@ class TestTheBatteryRevalidatesEveryPin:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         done = [r for r in wired.statuses
                 if r["status"] == "done" and r["pin_id"] is None]
-        assert len(done) == len(_config().stock_symbols), (
-            "isolation: one bad pin must cost its own row and nothing else"
+        assert len(done) == 2 * len(_config().stock_symbols), (
+            "isolation: one bad pin must cost its own row and nothing else — "
+            "both standing halves (FC-117) survive it"
         )
 
     @pytest.mark.parametrize("spec_json,expected", [
@@ -599,12 +602,12 @@ class TestTheWallCap:
         assert payload["reason"] == "wall_cap"
         # Two ran (t=0 and t=60); everything after t>=100 was refused a start.
         assert payload["measured"] == 2
-        assert payload["skipped"] == len(_config().stock_symbols) - 2
+        assert payload["skipped"] == 2 * len(_config().stock_symbols) - 2
         assert payload["skipped_labels"][0] == (
             f"standing:{_config().stock_symbols[2]}"), (
             "the skipped items must be NAMED — a battery that silently "
-            "measured two of fourteen looks exactly like one that measured "
-            "fourteen"
+            "measured two of twenty-eight looks exactly like one that "
+            "measured twenty-eight"
         )
 
     def test_the_item_in_flight_when_the_cap_passes_is_never_interrupted(
@@ -681,9 +684,11 @@ class TestExitCodeClasses:
         monkeypatch.setattr(cli, "run_sweep_cmd", boom)
 
         assert cli.run_battery_cmd(battery_args(), _config(), logger) == 0
-        assert logger.payload("battery_degraded")["failed"] == len(
+        assert logger.payload("battery_degraded")["failed"] == 2 * len(
             _config().stock_symbols)
         assert logger.payload("battery_degraded")["measured"] == 0
+        assert logger.payload("battery_degraded")["measured_wheel"] == 0
+        assert logger.payload("battery_degraded")["measured_cc"] == 0
 
     def test_a_failing_item_that_REACHED_the_store_is_not_given_a_second_row(
             self, wired, monkeypatch):
@@ -704,7 +709,7 @@ class TestExitCodeClasses:
 
         cli.run_battery_cmd(battery_args(), _config(), logger)
         assert [r["status"] for r in wired.statuses] == [
-            "running"] * len(_config().stock_symbols), (
+            "running"] * (2 * len(_config().stock_symbols)), (
             "the battery must add nothing to a run that recorded itself"
         )
         assert logger.payload("battery_pin_failed")["invalid"] is False
@@ -1099,7 +1104,7 @@ class TestADedupHitWeekReplaysNothing:
         cli.run_battery_cmd(battery_args(), _config(), logger)
         assert replays == []
         assert "battery_degraded" not in logger.types()
-        assert logger.payload("battery_completed")["measured"] == len(
+        assert logger.payload("battery_completed")["measured"] == 2 * len(
             _config().stock_symbols)
 
 
@@ -1172,7 +1177,11 @@ class TestPinsAreRollingWindows:
                            holdout_days=90)]
 
         for today in self.SATURDAYS:
+            # BOTH standing halves out of the way (FC-117) — this test is
+            # about the PIN's window moving, and a standing item never dedups.
             monkeypatch.setattr(cli, "battery_standing_specs",
+                                lambda *_a, **_k: [])
+            monkeypatch.setattr(cli, "battery_covered_call_specs",
                                 lambda *_a, **_k: [])
             monkeypatch.setattr(
                 cli, "battery_pin_spec",
@@ -1206,6 +1215,8 @@ class TestPinsAreRollingWindows:
         wired.find_done_sweep = prior_for
         wired._pins = [pin("pin000000000aaa2")]
         monkeypatch.setattr(cli, "battery_standing_specs", lambda *_a, **_k: [])
+        monkeypatch.setattr(cli, "battery_covered_call_specs",
+                            lambda *_a, **_k: [])
         monkeypatch.setattr(cli, "battery_pin_spec",
                             lambda p, today=None: (json.loads(p["spec_json"]), ()))
 
@@ -1349,7 +1360,7 @@ class TestThePerPinCellCap:
         cli.run_battery_cmd(battery_args(), _config(), _Logger())
         done = [r for r in wired.statuses
                 if r["status"] == "done" and r["pin_id"] is None]
-        assert len(done) == len(_config().stock_symbols)
+        assert len(done) == 2 * len(_config().stock_symbols)
 
     def test_the_cap_is_well_under_the_apis_per_submission_ceiling(self):
         from tests._dashboard_path import add_dashboard_backend_to_path
@@ -1394,7 +1405,7 @@ class TestTheExecutionClock:
         assert payload["measured"] == 0, (
             "the execution was already past the cap before the battery began"
         )
-        assert payload["skipped"] == len(_config().stock_symbols)
+        assert payload["skipped"] == 2 * len(_config().stock_symbols)
 
     def test_the_reported_wall_includes_it(self, wired, monkeypatch):
         logger = _Logger()
@@ -1410,7 +1421,7 @@ class TestTheExecutionClock:
             logger = _Logger()
             cli.run_battery_cmd(battery_args(), _config(), logger,
                                 elapsed_seconds=value)
-            assert logger.payload("battery_completed")["measured"] == len(
+            assert logger.payload("battery_completed")["measured"] == 2 * len(
                 _config().stock_symbols)
 
     def test_the_execution_budget_fits_the_job_timeout(self):

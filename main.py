@@ -683,10 +683,14 @@ def run_backfill_cmd(args, config: Config, logger) -> int:
 #   nag: a stale trend chart is not an outage, and paging for one is how the
 #   channel gets filtered. So the battery exits 0 and says `battery_degraded`.
 # * **A wall cap.** The battery shares a 6 h Job execution with the backfill.
-#   Without a cap, an engine-change week (every stored key invalidated, so every
-#   sweep genuinely replays) could run the execution into its task timeout —
+#   Without a cap, a heavy week could run the execution into its task timeout —
 #   and a SIGKILL at the timeout would take the BACKFILL's exit code with it,
-#   turning a successful data run into a page.
+#   turning a successful data run into a page. Note what is NOT the variable
+#   here: a STANDING item never dedups. `end` re-anchors to the last settled
+#   day every Saturday, so both standing halves genuinely replay every week,
+#   engine change or not. Only PINS can dedup, and only when their window did
+#   not move. (Corrected FC-117 §Context; the earlier "engine-change week"
+#   framing here had the cause wrong.)
 # --------------------------------------------------------------------------- #
 
 # Wall-clock budget for the battery, in seconds, measured across the whole
@@ -702,6 +706,13 @@ def run_backfill_cmd(args, config: Config, logger) -> int:
 #   longest supervised backfill chunk (measured ~66 min)
 #   + this cap (14400 s)
 #   + the ONE sweep that may be in flight when the cap passes
+# Inside the cap, the standing sets are the fixed cost: the wheel half measured
+# ~6 min for 14 items (2026-09-05), and the covered-call half added by FC-117 is
+# ~3–4 min warm — both splits local-hit the wheel item's chain files — rising to
+# ~12 min in the worst case, where every symbol needs a lake pull plus a 22-reach
+# vendor rebuild (the covered-call replay's reach is 21 against the wheel's 7, so
+# a day the wheel rebuilt narrow is a day the covered-call item rebuilds wide,
+# repairing the lake object as a side effect).
 # The last term is bounded by `BATTERY_MAX_PIN_CELLS` and the lake being warm
 # (the backfill just ran): a 12-symbol, 2-split pin is 24 materialisations at
 # the measured ~40 s warm = ~16 min. 66 + 240 + 16 = ~322 min against 360.
@@ -791,37 +802,25 @@ def battery_after_backfill_requested() -> bool:
         '1', 'true', 'yes', 'on')
 
 
-def battery_standing_specs(config: Config, *, today=None) -> list:
-    """The standing set: base config, one spec per live symbol, trailing year.
+def _standing_specs(config: Config, *, strategy: str, today=None) -> list:
+    """The standing set for ONE strategy: one spec per live symbol.
 
-    One sweep PER SYMBOL rather than one sweep over all fourteen, which is the
-    non-obvious half. Per symbol, a materialisation that fails (a corporate
-    action the engine will not model, a symbol whose lake day is missing) costs
-    that symbol's row and leaves the other thirteen measured; in one sweep it
-    is one `failed` run and a week with no trend point at all. The dedup is
-    also per key, so a symbol whose window did not move is free either way.
+    The shared body behind `battery_standing_specs` (wheel) and
+    `battery_covered_call_specs` (covered call, FC-117). The two sets differ in
+    exactly one field — `strategy` — and in nothing else, which is what makes
+    the two weekly series a comparison of strategies rather than of windows.
+    The wheel half is a BYTE contract (FC-117 DD-5): it is this project's
+    baseline series, and a byte of drift here would re-key every wheel row and
+    step that series for a reason no market move explains.
 
-    `end` is `last_settled_day` — the SAME function the backfill resolves its
-    own window with, so the battery never asks for a session the run that just
-    preceded it could not have written. `end = date.today()` would ask for a
-    day the lake is structurally incapable of holding (today's chain is still
-    forming), which is the trailing-gap shape PR-c's coverage review found.
-
-    **Still wheel-only, now by CHOICE rather than by incapacity.** Phase C gave
-    the replay profile awareness, so a covered-call standing set is buildable —
-    and it is deliberately not built here in the same commit that makes it
-    possible. A CC standing set doubles the weekly cell count and its rows would
-    be the first covered-call measurements this project has ever taken; turning
-    it on belongs with an operator who is watching the first Saturday, not with
-    the merge that makes it possible. Each spec now STATES `strategy: wheel`, so
-    flipping the set is a one-line change per item with nothing implicit left.
+    The symbol list is the PROCESS config's live universe for both halves, and
+    `backfill_symbols` draws the lake's universe from the same place — so the
+    lake covers both sets by construction rather than by coincidence.
     """
     from datetime import timedelta
 
     from src.backtesting.data.bar_store import last_settled_day
-    from src.backtesting.scenarios.identity import (
-        DEFAULT_STARTING_CASH, WHEEL_STRATEGY,
-    )
+    from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH
     from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
 
     end = last_settled_day(today)
@@ -840,21 +839,99 @@ def battery_standing_specs(config: Config, *, today=None) -> list:
             # engine fitted, and the whole point of a weekly series is to watch
             # a config hold up out of sample.
             'holdout_start': holdout_start.isoformat(),
+            # The wheel's cash, on both halves. On the covered-call profile it
+            # is a DEAD identity axis — the replay REPLACES it with the
+            # covered-call float (`scenarios/runner.py`) while `canonical_spec`
+            # still keys on it, so two CC specs differing only in cash buy two
+            # keys and two identical replays (FC-117 OQ-3). The default is
+            # therefore the only value that can dedup against a console sim.
             'starting_cash': float(DEFAULT_STARTING_CASH),
             # OFF. The bid-fill replay doubles every cell for a scalar that
             # matters on the arm you finally choose; fourteen symbols a week is
             # the wrong place to pay for it.
             'run_sensitivity': False,
+            # Base arm only, both halves. FC-116's `roll_fill_mode` is an ARM
+            # field inside `scenarios[]`, so an empty list inherits its default
+            # and there is nothing here to state.
             'scenarios': [],
             # FC-096 Phase C. STATED, not left to the absent-means-wheel
             # default, so the stored spec_json says which strategy the weekly
             # trend point measures and `validate_spec(spec) == spec` round-trips
-            # (the API normalises the field in either way). It costs nothing in
-            # the key: `canonical_spec` omits the wheel case, so every stored
-            # battery run keeps its sweep_key and its dedup.
-            'strategy': WHEEL_STRATEGY,
+            # (the API normalises the field in either way). On the WHEEL value
+            # it costs nothing in the key: `canonical_spec` omits the wheel
+            # case, so every stored wheel battery run keeps its sweep_key and
+            # its dedup. On any other value `canonical_spec` KEEPS it — which is
+            # why a symbol's covered-call spec cannot dedup into that symbol's
+            # wheel row (FC-117 DD-1), the second belt being that the two
+            # profiles' `base_config_hash` differ by construction.
+            'strategy': strategy,
         })
     return specs
+
+
+def battery_standing_specs(config: Config, *, today=None) -> list:
+    """The WHEEL standing set: base config, one spec per live symbol.
+
+    One sweep PER SYMBOL rather than one sweep over all fourteen, which is the
+    non-obvious half. Per symbol, a materialisation that fails (a corporate
+    action the engine will not model, a symbol whose lake day is missing) costs
+    that symbol's row and leaves the other thirteen measured; in one sweep it
+    is one `failed` run and a week with no trend point at all. The dedup is
+    also per key, so a symbol whose window did not move is free either way.
+
+    `end` is `last_settled_day` — the SAME function the backfill resolves its
+    own window with, so the battery never asks for a session the run that just
+    preceded it could not have written. `end = date.today()` would ask for a
+    day the lake is structurally incapable of holding (today's chain is still
+    forming), which is the trailing-gap shape PR-c's coverage review found.
+
+    **The wheel half, since FC-117.** Phase C gave the replay profile awareness
+    and then left the battery wheel-only BY CHOICE, every spec STATING
+    `strategy: wheel` so that turning a covered-call set on would be a one-line
+    change per item with nothing implicit left. FC-117 made that change — not
+    by flipping this set but by composing a SECOND one beside it
+    (`battery_covered_call_specs`), so that what this returns, and every key
+    and row built from it, is byte-for-byte what it was.
+    """
+    from src.backtesting.scenarios.identity import WHEEL_STRATEGY
+
+    return _standing_specs(config, strategy=WHEEL_STRATEGY, today=today)
+
+
+def battery_covered_call_specs(config: Config, *, today=None) -> list:
+    """The COVERED-CALL standing set (FC-117): the wheel's shape, one field apart.
+
+    **The symbol list is the WHEEL profile's live universe**, because `config`
+    here is the PROCESS config — `config/settings.yaml` on the Saturday Job,
+    which passes no `--config`. `config/covered_call.yaml` has no `stocks:`
+    section at all, by design: the covered-call service's live universe is
+    holdings-derived and `Config.stock_symbols` returns `[]` on that profile.
+    A covered-call sweep has always iterated the wheel's live universe; this
+    set is that, measured every Saturday.
+
+    So this is a UNIVERSE HYPOTHESIS — what writing calls against 100 shares of
+    each of these names would have yielded — and NOT the covered-call book. The
+    live book (GOOGL and UNH today, different after the next assignment) is a
+    FILTER over these rows, never a second standing set: a set that changed
+    with whatever happens to be held is not a trend series. The hazard runs the
+    other way — a covered-call holding OUTSIDE this universe has no series and
+    no lake chains, and would have to join the wheel's list or
+    `stocks.candidates` first; the battery does not discover holdings.
+
+    The replay PROFILE is resolved per item by `resolve_replay_config` from the
+    spec's own `strategy`, so `config/covered_call.yaml` supplies the strategy
+    rules while the process context — dataset, store, writer — stays the
+    wheel's. That split is the FC-075 DD-4 exception Phase C argued: these are
+    SIMULATION rows in the wheel's scenario tables, not trading rows, and
+    `spec_json.strategy` is what tells the two series apart.
+
+    Lake coverage is by construction, not coincidence: `backfill_symbols`
+    defaults to this same config's `stock_symbols + candidate_symbols`, and a
+    test fails if a future edit ever lets the two lists diverge (DD-4).
+    """
+    from src.backtesting.scenarios.identity import COVERED_CALL_STRATEGY
+
+    return _standing_specs(config, strategy=COVERED_CALL_STRATEGY, today=today)
 
 
 def battery_cell_count(spec: dict) -> int:
@@ -952,13 +1029,24 @@ def battery_pin_spec(pin: dict, *, today=None):
 class BatteryItem:
     """One thing the battery measures: a spec, and what to call it in a log."""
 
-    __slots__ = ('label', 'spec', 'pin_id', 'note')
+    __slots__ = ('label', 'spec', 'pin_id', 'note', 'strategy')
 
     def __init__(self, *, label: str, spec, pin_id=None, note=None):
         self.label = label
         self.spec = spec
         self.pin_id = pin_id
         self.note = note
+        # For COUNTING only (FC-117 DD-6) — never for validation, which stays
+        # `run_sweep_cmd`'s job. Read off the spec rather than passed in, so a
+        # PIN whose stored spec names a strategy is attributed to it too;
+        # absent means wheel, the same default the identity module uses. A spec
+        # that is not a dict is a refusal on its way to `_refuse`: it has no
+        # strategy, and `None` keeps it out of both per-strategy counts.
+        from src.backtesting.scenarios.identity import WHEEL_STRATEGY
+
+        self.strategy = (
+            (spec.get('strategy') or WHEEL_STRATEGY) if isinstance(spec, dict)
+            else None)
 
     @property
     def is_pin(self) -> bool:
@@ -1136,9 +1224,19 @@ def run_battery_cmd(args, config: Config, logger, *,
         return 0
     writer = BatteryWriter(inner)
 
-    standing = battery_standing_specs(config)
+    # TWO standing sets since FC-117, in this order: wheel, then covered call,
+    # then pins. Under a wall-cap hit the LATER items are the ones skipped, and
+    # a complete wheel series plus a missing covered-call series is a better
+    # partial than two half series — a hole in a rolling series is the defect
+    # the series exists to avoid. Pins stay last: they are the variable-size
+    # experiments the cap was designed around, and every skip is named.
+    standing_wheel = battery_standing_specs(config)
+    standing_cc = battery_covered_call_specs(config)
     items = [BatteryItem(label=f"standing:{spec['symbols'][0]}", spec=spec)
-             for spec in standing]
+             for spec in standing_wheel]
+    items += [BatteryItem(label=f"standing:cc:{spec['symbols'][0]}", spec=spec)
+              for spec in standing_cc]
+    standing = standing_wheel + standing_cc
     pins = writer.list_pins(active_only=True)
     if len(pins) > sweep_store.MAX_ACTIVE_PINS:
         # NOT truncated. The cap is a write-time rule the API enforces, and a
@@ -1172,18 +1270,31 @@ def run_battery_cmd(args, config: Config, logger, *,
         items.append(BatteryItem(label=f"pin:{pin_id}", spec=spec,
                                  pin_id=pin_id, note=pin.get('note')))
 
-    print(f"\nWeekly battery: {len(standing)} standing + {len(pins)} pinned "
+    print(f"\nWeekly battery: {len(standing_wheel)} wheel + "
+          f"{len(standing_cc)} cc standing + {len(pins)} pinned "
           f"spec(s), wall cap {cap_seconds}s"
           f"{f' ({elapsed_seconds:.0f}s already spent this execution)' if elapsed_seconds else ''}"
           f"...\n")
     logger.info(
         "Weekly battery starting",
         event_category="backtest", event_type="battery_started",
-        standing=len(standing), pins=len(pins), max_seconds=cap_seconds,
+        standing=len(standing), standing_wheel=len(standing_wheel),
+        standing_cc=len(standing_cc),
+        pins=len(pins), max_seconds=cap_seconds,
         elapsed_seconds=round(float(elapsed_seconds or 0.0), 1),
         engine_identity=identity)
 
-    measured, failures, skipped, oversized, nags = 0, [], [], [], 0
+    # Per-strategy counts (FC-117 DD-6). These count COMPLETED SUBMISSIONS —
+    # `rc == 0`, whatever the verdicts inside — not measured cells: an item
+    # whose two cells both came back `insufficient` is one measured item here,
+    # and the per-cell truth lives in `scenario_runs.measured`/`verdict`. Pins
+    # are attributed by their own spec's strategy, so the totals are over
+    # EVERYTHING measured rather than over the standing sets alone.
+    from src.backtesting.scenarios.identity import (
+        COVERED_CALL_STRATEGY, WHEEL_STRATEGY,
+    )
+    measured_by = {WHEEL_STRATEGY: 0, COVERED_CALL_STRATEGY: 0}
+    failures, skipped, oversized, nags = [], [], [], 0
     terminated = False
 
     def _refuse(item, run_id, reason):
@@ -1296,9 +1407,14 @@ def run_battery_cmd(args, config: Config, logger, *,
                         reason=f"exit code {rc}", invalid=False)
                     failures.append(item.label)
                 else:
-                    measured += 1
+                    # `.get`, not `[...]`: a pin naming a strategy this build
+                    # does not know still counts towards the TOTAL, which is
+                    # the number the summary and the nag are about.
+                    measured_by[item.strategy] = (
+                        measured_by.get(item.strategy, 0) + 1)
     except (SweepTerminated, KeyboardInterrupt) as exc:
         terminated = True
+        measured = sum(measured_by.values())
         remaining = [i.label for i in items
                      if i.label not in failures and i.label not in skipped]
         logger.warning(
@@ -1308,8 +1424,12 @@ def run_battery_cmd(args, config: Config, logger, *,
             measured=measured, failed=len(failures),
             not_started=max(len(remaining) - measured, 0))
 
+    measured = sum(measured_by.values())
+    measured_wheel = measured_by.get(WHEEL_STRATEGY, 0)
+    measured_cc = measured_by.get(COVERED_CALL_STRATEGY, 0)
     wall = round(time.monotonic() - started, 1)
-    summary = (f"battery: {measured} measured, {len(failures)} failed, "
+    summary = (f"battery: {measured} measured ({measured_wheel} wheel + "
+               f"{measured_cc} cc), {len(failures)} failed, "
                f"{len(skipped)} skipped in {wall}s")
     print(f"\n{summary}")
     if failures or skipped or terminated:
@@ -1327,8 +1447,15 @@ def run_battery_cmd(args, config: Config, logger, *,
             f"preceded this is unaffected.",
             event_category="backtest", event_type="battery_degraded",
             reason=reason,
-            measured=measured, failed=len(failures), skipped=len(skipped),
-            failed_labels=failures[:20], skipped_labels=skipped[:20],
+            measured=measured, measured_wheel=measured_wheel,
+            measured_cc=measured_cc,
+            failed=len(failures), skipped=len(skipped),
+            # 40, not 20, since FC-117: the standing set alone is 28 items, so
+            # a cap hit between the two halves would otherwise NAME 20 of the
+            # 28+ it skipped. The COUNTS are always complete; only the label
+            # lists are capped, and 28 standing + 20 pins can still exceed 40.
+            failed_labels=failures[:40], skipped_labels=skipped[:40],
+            # Pin-only and bounded by MAX_ACTIVE_PINS — unchanged.
             oversized_labels=oversized[:20],
             nags=nags, wall_seconds=wall, max_seconds=cap_seconds)
         if skipped:
@@ -1338,7 +1465,9 @@ def run_battery_cmd(args, config: Config, logger, *,
         logger.info(
             "Weekly battery complete",
             event_category="backtest", event_type="battery_completed",
-            measured=measured, wall_seconds=wall, max_seconds=cap_seconds)
+            measured=measured, measured_wheel=measured_wheel,
+            measured_cc=measured_cc,
+            wall_seconds=wall, max_seconds=cap_seconds)
     # ALWAYS 0, including after a SIGTERM. See the docstring: a stale trend
     # chart is not a page, and the backfill's exit code must not be able to
     # inherit this one's opinion.
