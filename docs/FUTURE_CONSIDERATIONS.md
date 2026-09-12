@@ -1191,18 +1191,6 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-100, FC-112, `docs/CLAUDE.md` §Config discipline.
 
-### FC-116: the replay fills rolls at the haircut-from-mid price, not at the placed limits
-
-**Scope:** shared (backtest engine)
-**Status:** EXECUTING 2026-09-11 — built from `docs/plans/fc-116.md` rev 3 on branch `fc-116-roll-fill-limit`; PR https://github.com/memon1987/agentic_options_wheel/pull/130 open, two adversarial reviews pending. `ENGINE_VERSION` is now `fc-116-roll-limit-fills` in all three byte-pinned copies. Operator decisions 2026-09-11: proceed; `limit` is the default fill mode; named `ENGINE_VERSION` bump; D6 ships here (FC-112 queued behind it). **Rollout step 4 — the GOOGL CC before/after on sim `a5c9c5626b4148eb` — is the OPERATOR's post-merge step;** the command sheet is in the PR body, and its numbers belong in the plan's §Execution and here. FC-117's build follows.
-**Size estimate:** S–M
-
-**Problem:** `BacktestBroker` fills every order at the haircut price from mid (the engine's single fill model), while the live roller is credit-only at the PLACED limits (BTC at the ask, STO at the bid or mid−$0.05). The FC-100 hand-off required the replay to mirror that, but a fill-model change on the roll path alters every wheel replay's numbers and breaks the "wheel golden byte-identical" contract Phase C is bound by. Phase C therefore kept the haircut fills and labels the bias: replay roll credits biased UP vs live (haircut fills), counts/credits biased DOWN vs live (22-DTE lake vs a 28-DTE need). Two opposing biases on one metric is the honest interim, not the answer.
-
-**Proposal:** a per-order-kind fill mode — roll legs fill at the placed limit (or not at all within the leg's timeout, mirroring `_poll_order_fill`), entry legs keep the haircut — behind a config key on the sim spec so the wheel golden can be re-baselined deliberately in one PR (new golden fixtures, engine identity moves once); the report footer then drops the "credits biased up" clause. Decide whether FC-112's wheel trigger study should wait for this (it should: the study's roll-credit metric is exactly what this fixes).
-
-**Links:** FC-096 Phase C (PR #129 body, deviation 1), FC-100 §Phase C hand-off, FC-112.
-
 ### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
 
 **Scope:** shared
@@ -1248,6 +1236,18 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 
 ## Completed
+
+### FC-116: the replay fills rolls at the haircut-from-mid price, not at the placed limits
+
+**Scope:** shared (backtest engine)
+**Status:** COMPLETED 2026-09-11 — PR #130 squash-merged `1745f00` (plan `docs/plans/fc-116.md`, Done). Roll legs now fill against the modeled book capped by the placed limit (`roll_fill_mode` arm field, default `limit`, `haircut` opt-in); `ENGINE_VERSION` → `fc-116-roll-limit-fills`; wheel and CC re-baselined; FC-112's roll-credit metrics persisted. Operator rollout steps 3–5 in the PR body still to run.
+**Size estimate:** S–M
+
+**Problem:** `BacktestBroker` fills every order at the haircut price from mid (the engine's single fill model), while the live roller is credit-only at the PLACED limits (BTC at the ask, STO at the bid or mid−$0.05). The FC-100 hand-off required the replay to mirror that, but a fill-model change on the roll path alters every wheel replay's numbers and breaks the "wheel golden byte-identical" contract Phase C is bound by. Phase C therefore kept the haircut fills and labels the bias: replay roll credits biased UP vs live (haircut fills), counts/credits biased DOWN vs live (22-DTE lake vs a 28-DTE need). Two opposing biases on one metric is the honest interim, not the answer.
+
+**Proposal:** a per-order-kind fill mode — roll legs fill at the placed limit (or not at all within the leg's timeout, mirroring `_poll_order_fill`), entry legs keep the haircut — behind a config key on the sim spec so the wheel golden can be re-baselined deliberately in one PR (new golden fixtures, engine identity moves once); the report footer then drops the "credits biased up" clause. Decide whether FC-112's wheel trigger study should wait for this (it should: the study's roll-credit metric is exactly what this fixes).
+
+**Links:** FC-096 Phase C (PR #129 body, deviation 1), FC-100 §Phase C hand-off, FC-112.
 
 ### FC-096: simulation studio — interactive sim service, weekly data backfill, two universes, covered-call sims, PM console behind IAP
 
