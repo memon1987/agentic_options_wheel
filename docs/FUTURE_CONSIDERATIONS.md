@@ -993,22 +993,6 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
-### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
-
-**Scope:** covered_call
-**Status:** BUILT — PR #127 merged `fc1a946` 2026-09-08 (config + alert twin + tests); operator steps O1–O9 pending, `cc-roll-daily` resume gated on FC-107. Decision: wire rolling, with `itm_trigger_ratio: 1.00` on the covered-call profile (operator-confirmed after the plan review: true-ITM-only defence, a stated Symmetry difference; the wheel's 0.98 → FC-112); plan `docs/plans/fc-100.md` rev 2 in progress, lands before the FC-096 Phase C build. Originally: Filed 2026-09-02 (found by the FC-096 Phase C plan review; live-verified: `covered-call-engine` has no `ROLLER_ENABLED` env, no roll scheduler exists, `config/covered_call.yaml` contains zero `rolling` keys, so `Config.rolling_enabled` defaults False and `run_rolling_cycle` skips)
-**Size estimate:** S (decision) / S (build either way)
-**Owner:** zeshan (operator decision)
-**Plan file:** not yet
-
-**Problem:** `docs/CLAUDE.md`'s covered-call management inventory lists "the daily credit-only roller" as item 5, and FC-078's roller is a wheel-profile feature that was implicitly assumed to carry over. It did not: the CC profile ships without a `rolling:` block, the service has no roll scheduler, and the env lever is absent. A CC position that rallies through its strike today rides into assignment with no defensive roll. That may be acceptable (CC assignment = called away at a profit above basis) — but it is currently an ACCIDENT of config, not a decision.
-
-**Decide:** (a) wire CC rolling — add the `rolling:` block to `covered_call.yaml`, create the CC roll scheduler, set the env lever; or (b) declare CC no-roll deliberate — correct `docs/CLAUDE.md`'s inventory and the FC-075 phase docs, and record the rationale (assignment above basis is the strategy completing, not a defect). The FC-096 Phase C replay will mirror whichever is decided (its plan currently documents the roller as inert for CC).
-
-**Links:** FC-078 (the wheel roller), FC-075 (CC profile), `docs/plans/fc-096-c.md` (plan-review finding HIGH-4). Renumbered from a duplicate FC-097 — that number was already taken by the OI-sourcing entry filed in another session (see RELEASE_2026-09-01.md, which also filed FC-098/FC-099).
-
----
-
 ### FC-101: annualised run-rates have no minimum-span floor — a 1-day window annualises ×365 with nothing refusing it
 
 **Scope:** shared
@@ -1224,6 +1208,22 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 
 ## Completed
+
+### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
+
+**Scope:** covered_call
+**Status:** COMPLETED 2026-09-17 — PR #127 merged; operator steps O1–O9 done; O6 dry-run PASSED (GOOGL C345 → C347.5 10/02 pair, $394 credit, pricing path exercised); `cc-roll-daily` enabled 2026-09-17, first live cycle 15:30 ET. Plan `docs/plans/fc-100.md` Done.
+**Size estimate:** S (decision) / S (build either way)
+**Owner:** zeshan (operator decision)
+**Plan file:** not yet
+
+**Problem:** `docs/CLAUDE.md`'s covered-call management inventory lists "the daily credit-only roller" as item 5, and FC-078's roller is a wheel-profile feature that was implicitly assumed to carry over. It did not: the CC profile ships without a `rolling:` block, the service has no roll scheduler, and the env lever is absent. A CC position that rallies through its strike today rides into assignment with no defensive roll. That may be acceptable (CC assignment = called away at a profit above basis) — but it is currently an ACCIDENT of config, not a decision.
+
+**Decide:** (a) wire CC rolling — add the `rolling:` block to `covered_call.yaml`, create the CC roll scheduler, set the env lever; or (b) declare CC no-roll deliberate — correct `docs/CLAUDE.md`'s inventory and the FC-075 phase docs, and record the rationale (assignment above basis is the strategy completing, not a defect). The FC-096 Phase C replay will mirror whichever is decided (its plan currently documents the roller as inert for CC).
+
+**Links:** FC-078 (the wheel roller), FC-075 (CC profile), `docs/plans/fc-096-c.md` (plan-review finding HIGH-4). Renumbered from a duplicate FC-097 — that number was already taken by the OI-sourcing entry filed in another session (see RELEASE_2026-09-01.md, which also filed FC-098/FC-099).
+
+---
 
 ### FC-117: the weekly battery measures the covered-call profile too (symmetry of the standing set)
 
