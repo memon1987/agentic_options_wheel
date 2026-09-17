@@ -1214,6 +1214,19 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ## Completed
 
+### FC-120: live roller — the buy-to-close limit at the snapshot ask did not fill (execution quality of the roll's first leg)
+
+**Status:** Filed 2026-09-17 from the first live covered-call roll cycle (FC-100 O9).
+**Scope:** `src/strategy/call_roller.py` BTC pricing / timeout handling; observability of the quote the limit was priced from.
+**Size estimate:** S–M (study first: how stale/wide was the quote; then either re-price once at timeout, use a marketable buffer above the ask, or widen `btc_fill_timeout_seconds`).
+**Owner:** unassigned.
+
+**Problem:** 2026-09-17 15:30 ET, GOOGL260918C00345000 (deep ITM, expiring the next day): `call_roll_btc_placed` at 3.38 — `round(ask, 2)` from the service's snapshot — sat unfilled for the full 120 s and was cancelled (`btc_timeout_canceled`). A marketable limit at the ask should fill immediately in a liquid name; that it did not says the snapshot ask was stale (delayed feed?) or the real market had moved up. Consequence: the roll is abandoned for the day and, on expiry day, the position is called away instead of rolled — the exact outcome the roller exists to avoid. The sim (FC-116) fills this leg at the ask by construction, so this is a live-vs-sim gap in the sim's favour.
+
+**Open questions:** (1) What quote source feeds `get_option_quote` on the CC service, and its delay? (2) Log the bid/ask/timestamp the limit was priced from on `call_roll_btc_placed` so the next occurrence is diagnosable. (3) Policy: one re-price at timeout (fresh ask) vs a buffer (`ask + k·spread`) vs a longer timeout — bounded by the FC-113 per-position budget. (4) Should expiry-day rolls run earlier than 15:30?
+
+**Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
+
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
 **Scope:** covered_call
