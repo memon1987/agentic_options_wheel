@@ -116,3 +116,5 @@ _Plans added since that regeneration are appended below rather than re-sorted in
 - [fc-116.md](fc-116.md) — FC-116 — the replay fills roll legs at the placed limits, capped by the modeled book, with a deliberate wheel re-baseline (`roll_fill_mode`, default `limit`; `ENGINE_VERSION = fc-116-roll-limit-fills`), status: Executing
 
 - [fc-112.md](fc-112.md) — FC-112 — the wheel roll-trigger study (`itm_trigger_ratio` 0.98 vs 1.00): pre-registered decision rule, PR-1 wheel roll reach 7→21 re-baseline (`ENGINE_VERSION = fc-112-wheel-roll-reach`), rev 2: one-sided pre-registered rule, decision + control pins, no-imminence bracket, disjoint OOS read, `tools/diagnostics/fc112_roll_trigger_read.py`, status: Executing (PR-1 open: #132)
+- [fc-117.md](fc-117.md) — the weekly battery measures the covered-call profile too (Done)
+- [fc-120.md](fc-120.md) — live roller first-leg execution quality: quote instrumentation (PR-1), tick snap + 0.10 buffer + escalating BTC re-price + IEX intrinsic floor (PR-2); FC-113 folded in
