@@ -1227,6 +1227,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Observation 2026-09-18 (expiry-day cycle):** the BTC at the snapshot ask (6.94) filled in 20 s, but the STC at the snapshot bid (9.03) then sat unfilled for the full 120 s and only the second placement (6.90) filled — net credit still $205. Two marketable-on-paper limits unfilled for 120 s on consecutive days, on both sides of the book, points at the QUOTE (delay/staleness), not the ladder. Diagnostic (2) above is the first step.
 
+**Week 1 tally (09-17 → 09-25):** four BTC attempts on GOOGL (C345 9/18 ×2, C350 10/02 ×2) — three timed out at the snapshot ask (09-17, 09-21, 09-22), one filled (09-18, expiry day) and that roll's STC needed a second placement. 09-23: `open_order_conflict` on a new GOOGL C352.5 9/25. Roll success rate on the first leg: 1 of 4. Every other cycle: `not_itm_enough`. No error terminals, never uncovered.
+
 **Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
 
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
