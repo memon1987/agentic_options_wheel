@@ -1212,11 +1212,9 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Links:** FC-117 (`docs/plans/fc-117.md` §Risks, §Rollout step 4), FC-013 (live earnings gate), FC-042 Track C (dividends).
 
 
-## Completed
-
 ### FC-120: live roller — the buy-to-close limit at the snapshot ask did not fill (execution quality of the roll's first leg)
 
-**Status:** Filed 2026-09-17 from the first live covered-call roll cycle (FC-100 O9).
+**Status:** Plan drafted 2026-09-26 (`docs/plans/fc-120.md`, Draft rev 1 — two plan reviews next). Findings: no quote logged on placements; feed is Alpaca `indicative`; every placed limit off the tick grid (roller never calls `round_to_tick`) — a real-money precondition. Operator decisions pending: PR-2 sequencing; OPRA feed before real money.
 **Scope:** `src/strategy/call_roller.py` BTC pricing / timeout handling; observability of the quote the limit was priced from.
 **Size estimate:** S–M (study first: how stale/wide was the quote; then either re-price once at timeout, use a marketable buffer above the ask, or widen `btc_fill_timeout_seconds`).
 **Owner:** unassigned.
@@ -1230,6 +1228,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Week 1 tally (09-17 → 09-25):** four BTC attempts on GOOGL (C345 9/18 ×2, C350 10/02 ×2) — three timed out at the snapshot ask (09-17, 09-21, 09-22), one filled (09-18, expiry day) and that roll's STC needed a second placement. 09-23: `open_order_conflict` on a new GOOGL C352.5 9/25. Roll success rate on the first leg: 1 of 4. Every other cycle: `not_itm_enough`. No error terminals, never uncovered.
 
 **Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
+
+## Completed
 
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
