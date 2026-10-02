@@ -134,12 +134,10 @@ live-verified 2026-08-04 with `gcloud scheduler jobs list`):
 | `activities-ingest-market-hours` / `-off-hours` | every 15 min 09–16 ET / hourly otherwise | `/ingest-activities` |
 | `portfolio-history-ingest-daily` / `stock-history-ingest-daily` | 16:30 / 17:00 ET | ingest endpoints |
 
-`options-wheel-roll-friday` is **PAUSED and is deleted by FC-107's rollout step
-6** — FC-078 replaced it with the daily job, and nothing references it. It
-carries the 180 s default `attemptDeadline`: applied to the last 22 wheel roll
-cycles that deadline would have reported `DEADLINE_EXCEEDED` on three of them
-(187 s, 199 s, 259 s), so resumed by mistake it would report failures on
-ordinary days. The daily job's deadline is 1800 s.
+`options-wheel-roll-friday` **no longer exists** — deleted 2026-10-02 (FC-121's
+rollout; FC-107's rollout step 6 had listed it). FC-078 replaced it with the
+daily job on 2026-08-04 and it sat paused until then. `options-wheel-roll-daily`
+(deadline 1800 s) and `cc-roll-daily` are the only schedulers that target `/roll`.
 
 `cc-roll-daily` is the covered-call service's twin of `options-wheel-roll-daily`,
 created by FC-100 and **created PAUSED**: it is resumed once FC-107's
