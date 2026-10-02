@@ -511,5 +511,28 @@ class TestTheCCAlertPolicies:
             for informational in ("call_roll_leg_settled",
                                   "call_roll_stc_timeout_canceled",
                                   "call_roll_btc_timeout_canceled",
-                                  "call_roll_quote_refresh_failed"):
+                                  "call_roll_quote_refresh_failed",
+                                  "call_roll_quote_sample",
+                                  "call_roll_instrumentation_failed"):
                 assert informational not in f, (name, informational)
+
+    @pytest.mark.parametrize("name", ("cc_roll_executed_alert_policy.json",
+                                      "roll_executed_alert_policy.json"))
+    def test_the_conditions_are_mains(self, name):
+        """FC-120 T-14: a runbook edit must not touch a condition. Compared
+        with main's file via git; skipped where git or the ref is absent (the
+        CI image has no git)."""
+        import shutil
+        import subprocess
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+        repo = Path(__file__).resolve().parent.parent
+        for ref in ("origin/main", "main"):
+            proc = subprocess.run(
+                ["git", "show", f"{ref}:deploy/monitoring/{name}"],
+                cwd=repo, capture_output=True, text=True)
+            if proc.returncode == 0:
+                break
+        else:
+            pytest.skip("main's policy file is not reachable via git")
+        assert self._doc(name)["conditions"] == json.loads(proc.stdout)["conditions"]

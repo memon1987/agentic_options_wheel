@@ -32,6 +32,15 @@ this contract: a position that placed a BTC and two STO rungs emits three of
 them and still exactly one terminal. ``call_roll_stc_timeout_canceled`` is
 per-rung for the same reason. Both are informational and never alert-wired.
 
+FC-120 PR-1 instrumentation never sits on the order path (rev-4 ruling A):
+the order-path broker calls (pricing quotes, place, poll, cancel) and their
+order are main's. A leg's diagnostic re-read follows its placement; a zero-fill
+leg's post-settle quote follows its terminal event (BTC) or the next rung's
+placement (STO), and its fields ride on the later ``call_roll_leg_settled`` row
+only. Every diagnostic read is deadline-bounded in a daemon worker (ruling B).
+``call_roll_quote_sample`` (ruling D) is emitted by the cycle after every
+terminal, never by ``execute_roll``.
+
 Events must tell the truth about what filled. A cancel that fails *because the
 order filled* is a fill, not an error — which is why every cancel on this path
 is followed by a re-fetch before anything is reported.
