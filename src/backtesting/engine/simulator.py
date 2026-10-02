@@ -932,6 +932,9 @@ class Simulator:
             wheel_state=WheelStateManager(),
             allow_bigquery_cost_basis=False,
             earnings_calendar=self.earnings_calendar,
+            # FC-120 PR-1 (ruling D): the end-of-cycle quote sampler is a LIVE
+            # feed measurement; on a replay it would only re-read the model.
+            emit_quote_samples=False,
         )
         # ONE MarketDataManager, shared by the scanner and both sellers, on the
         # same injected adapter client — the single seam that redirects the

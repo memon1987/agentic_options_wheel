@@ -1,5 +1,6 @@
 """Core options wheel strategy engine."""
 
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import structlog
@@ -12,7 +13,7 @@ from ..utils.logging_events import log_system_event, log_trade_event, log_error_
 from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import (
     occ_root, parse_option_symbol, strict_option_type)
-from .call_roller import CallRoller
+from .call_roller import CallRoller, sample_short_call_quotes
 from .wheel_state_manager import WheelStateManager
 from ..risk.risk_manager import RiskManager
 from ..api.earnings_calendar import EarningsCalendarService
@@ -53,7 +54,8 @@ class WheelEngine:
     def __init__(self, config: Config, alpaca_client: Optional[AlpacaClient] = None,
                  wheel_state: Optional[WheelStateManager] = None,
                  allow_bigquery_cost_basis: bool = True,
-                 earnings_calendar: Optional[Any] = None):
+                 earnings_calendar: Optional[Any] = None,
+                 emit_quote_samples: bool = True):
         """Initialize the wheel strategy engine.
 
         Args:
@@ -79,6 +81,12 @@ class WheelEngine:
                 backtest injects a point-in-time calendar, because Finnhub can
                 only answer "when is the *next* earnings date" — meaningless
                 when replaying 2024.
+            emit_quote_samples: FC-120 PR-1 (ruling D) — after the roll cycle,
+                log one read-only ``call_roll_quote_sample`` row per held short
+                call. ON for the live engine; the backtest ``Simulator`` passes
+                False (explicit injection, the seam every other replay gate
+                here uses — not a ``clock.is_frozen()`` check), because a
+                replayed quote sample is a modeled book, not a feed reading.
         """
         self.config = config
         self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
@@ -89,6 +97,7 @@ class WheelEngine:
         self._allow_bigquery_cost_basis = allow_bigquery_cost_basis
 
         self._injected_earnings_calendar = earnings_calendar
+        self._emit_quote_samples = emit_quote_samples
 
         logger.info("Wheel engine initialized with state management",
                    event_category="system", event_type="engine_initialized")
@@ -718,6 +727,7 @@ class WheelEngine:
             Summary dict with rolls_evaluated, rolls_executed, rolls_skipped.
         """
         start_time = clock.now()
+        start_monotonic = time.monotonic()
 
         if not self.config.rolling_enabled:
             return {'skipped': 'rolling_disabled'}
@@ -880,5 +890,14 @@ class WheelEngine:
             rolls_skipped=results['rolls_skipped'],
             duration_seconds=round(duration, 2),
         )
+
+        # FC-120 PR-1 (ruling D): read-only quote samples, strictly AFTER every
+        # position is processed and every terminal emitted, and only when the
+        # cycle finished inside 600 s. No order; no effect on ``results``.
+        if self._emit_quote_samples:
+            sample_short_call_quotes(
+                self.alpaca,
+                [p.get('symbol', '') for p, _ in short_calls + uncovered_calls],
+                roller.skip_reasons, start_monotonic)
 
         return results

@@ -1726,8 +1726,11 @@ class TestTheTerminalTaxonomyIsExhaustive:
         """Any new ``call_roll_*`` event added to the roller must be classified
         as terminal or non-terminal deliberately — not discovered in
         production."""
-        source = (Path(__file__).resolve().parent.parent / 'src' / 'strategy'
-                  / 'call_roller.py').read_text()
+        # wheel_engine.py too: it emits call_roll_* names of its own (the
+        # execution-error terminal; FC-120's quote sampler is called from it).
+        strategy = Path(__file__).resolve().parent.parent / 'src' / 'strategy'
+        source = ''.join((strategy / name).read_text()
+                         for name in ('call_roller.py', 'wheel_engine.py'))
         emitted = set(re.findall(r'"(call_roll_[a-z_]+)"', source))
         non_terminal = {
             'call_roll_evaluated', 'call_roll_btc_placed', 'call_roll_btc_filled',
@@ -1747,6 +1750,12 @@ class TestTheTerminalTaxonomyIsExhaustive:
             # Breadcrumb: the post-settle instrumentation quote failed. The
             # disposition was already final; its fields log as None.
             'call_roll_quote_refresh_failed',
+            # Breadcrumb: an FC-120 field/row builder swallowed a failure
+            # (ruling C) — makes a lost or nulled row detectable.
+            'call_roll_instrumentation_failed',
+            # FC-120 ruling D: the read-only end-of-cycle quote sample, one
+            # row per held short call AFTER every terminal of the cycle.
+            'call_roll_quote_sample',
         }
         unclassified = emitted - TERMINAL_EVENTS - non_terminal
         assert not unclassified, (
@@ -1843,22 +1852,33 @@ class TestTheFlagshipRoll:
         assert mock_alpaca.place_option_order.call_count == 1
 
 
+
 # =========================================================================== #
 # FC-120 PR-1 — the quote every roll leg is priced from (docs/plans/fc-120.md
-# §Tests T-1 .. T-5). LOGGING ONLY: TestNoBehaviourChange pins that the new
-# reads never reach a limit.
+# §Tests T-1 .. T-5, plus the rev-4 code-review rulings A-E). LOGGING ONLY:
+# TestNoBehaviourChange pins that the new reads never reach a limit, and
+# TestTheOrderPathIsMains pins that the broker-call sequence between order
+# actions is main's and that no diagnostic read sits inside it.
+#
+# Module helpers are reached through call_roller_module (never imported by
+# name) so this file still IMPORTS against main's call_roller.py — which is how
+# the main-sequence goldens below are re-derived (FC120_PRINT_GOLDEN=1).
 # =========================================================================== #
 
+import os  # noqa: E402
+import threading  # noqa: E402
 from datetime import timezone  # noqa: E402
 
-from src.strategy.call_roller import _limit_on_tick, _quote_fields  # noqa: E402
+cr = call_roller_module
 
 PRIMITIVES = (str, int, float, bool, type(None))
 INSTRUMENTED_EVENTS = (
     'call_roll_btc_placed', 'call_roll_stc_placed', 'call_roll_btc_filled',
     'call_roll_stc_filled', 'call_roll_btc_timeout_canceled',
     'call_roll_stc_timeout_canceled', 'call_roll_stc_unfilled',
-    'call_roll_leg_settled', 'call_roll_dry_run')
+    'call_roll_leg_settled', 'call_roll_dry_run', 'call_roll_evaluated',
+    'call_roll_quote_sample', 'call_roll_quote_refresh_failed',
+    'call_roll_instrumentation_failed')
 
 
 def _stamp(age_s: float) -> datetime:
@@ -1876,8 +1896,8 @@ def _q(bid, ask, *, age_s=40.0, stamp='auto', bid_size=10, ask_size=12):
 def _sequenced(seqs):
     """get_option_quote stub with a per-SYMBOL call counter: call n returns
     ``seqs[symbol][n]`` (the last entry repeats); an Exception entry raises.
-    Call 1 is the read a limit is priced from, call 2 the same-second
-    re-read, call 3 the post-settle read."""
+    Call 1 is the read a limit is priced from, call 2 the re-read taken
+    right after that leg is placed, call 3 the post-settle read."""
     counts = {}
 
     def quote(symbol):
@@ -1992,9 +2012,193 @@ LADDER_TO_RUNG_3 = {
     'sto-3': {'poll': _o('sto-3', 'filled', 1, 8.55, latency_s=3)},
 }
 
+#: The BTC never fills: the poll sees `new`, the cancel settles zero-fill.
+BTC_TIMEOUT = {
+    'btc-1': {'poll': _o('btc-1', 'new'),
+              'after_cancel': _o('btc-1', 'canceled')},
+}
+
+
+def _expired(oid):
+    return {'poll': _o(oid, 'expired')}
+
+
+def _times_out(oid):
+    return {'poll': _o(oid, 'new'), 'after_cancel': _o(oid, 'canceled')}
+
+
+BTC_FILLED = {'poll': _o('btc-1', 'filled', 1, 8.35, latency_s=5)}
+
+#: BTC fills; every rung ends terminal zero-fill on its first poll.
+LADDER_EXHAUSTED = {'btc-1': BTC_FILLED, 'sto-1': _expired('sto-1'),
+                    'sto-2': _expired('sto-2'), 'sto-3': _expired('sto-3')}
+
+#: BTC fills; every rung times out and its cancel settles zero-fill.
+ALL_RUNGS_TIME_OUT = {'btc-1': BTC_FILLED, 'sto-1': _times_out('sto-1'),
+                      'sto-2': _times_out('sto-2'), 'sto-3': _times_out('sto-3')}
+
+
+class _Timeline:
+    """One ordered record of every broker call AND every log event of a roll.
+
+    Broker calls are tagged by KIND — ``place`` / ``cancel`` / ``get_order`` /
+    ``quote`` / ``stock_quote`` — when made on the test's own thread (which is
+    where main makes every call, and where the roller makes every PRICING
+    read), and ``diag`` when made on any other thread: FC-120's bounded
+    instrumentation reads run in a daemon worker (ruling B), so the thread is
+    the discriminator. ``on_diag`` lets a test block or poison diag reads only.
+    """
+
+    KINDS = {'place_option_order': 'place', 'cancel_order': 'cancel',
+             'get_order_by_id': 'get_order', 'get_option_quote': 'quote',
+             'get_stock_quote': 'stock_quote'}
+
+    def __init__(self, on_diag=None):
+        self.entries = []
+        self.main = threading.get_ident()
+        self.on_diag = on_diag
+
+    def wrap(self, mock_alpaca):
+        for name, kind in self.KINDS.items():
+            inner = getattr(mock_alpaca, name)
+            setattr(mock_alpaca, name,
+                    Mock(side_effect=self._recorder(name, kind, inner)))
+
+    def _recorder(self, name, kind, inner):
+        def call_(*args, **kwargs):
+            diag = threading.get_ident() != self.main
+            if kind == 'place':
+                key = (kwargs.get('symbol'), kwargs.get('side'),
+                       kwargs.get('limit_price'))
+            else:
+                key = args[0] if args else None
+            self.entries.append(('diag' if diag else kind, key))
+            if diag and self.on_diag is not None:
+                return self.on_diag(name, args, lambda: inner(*args, **kwargs))
+            return inner(*args, **kwargs)
+        return call_
+
+    def log_sink(self, mock_logger):
+        def sink(*_args, **kwargs):
+            if kwargs.get('event_type'):
+                self.entries.append(('log', kwargs['event_type']))
+        for level in (mock_logger.info, mock_logger.error,
+                      mock_logger.warning):
+            level.side_effect = sink
+
+    def order_path(self):
+        """The broker calls main also makes: everything but ``diag``/``log``."""
+        return [e for e in self.entries if e[0] not in ('diag', 'log')]
+
+
+def _drive_timeline(roller, mock_alpaca, script, *, on_diag=None, n_orders=4):
+    """``_drive`` with a ``_Timeline`` recording calls and events in order."""
+    opp_timeline = _Timeline(on_diag=on_diag)
+    opp_timeline.wrap(mock_alpaca)
+    broker = _Broker(script)
+    mock_alpaca.place_option_order.side_effect = opp_timeline._recorder(
+        'place_option_order', 'place', Mock(side_effect=(
+            [accepted('btc-1')]
+            + [accepted(f'sto-{i}') for i in range(1, n_orders)])))
+    mock_alpaca.get_order_by_id.side_effect = opp_timeline._recorder(
+        'get_order_by_id', 'get_order', broker.by_id)
+    mock_alpaca.cancel_order.side_effect = opp_timeline._recorder(
+        'cancel_order', 'cancel', broker.cancel)
+    with patch('src.strategy.call_roller.logger') as log:
+        opp_timeline.log_sink(log)
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        assert opp is not None
+        result = roller.execute_roll(opp)
+    return result, log, opp_timeline
+
+
+#: fixture name -> broker script (all on the instrumented base book)
+ORDER_PATH_FIXTURES = {
+    'full_fill': FULL_FILL,
+    'btc_timeout': BTC_TIMEOUT,
+    'ladder_to_rung_3': LADDER_TO_RUNG_3,
+    'ladder_exhausted': LADDER_EXHAUSTED,
+}
+
+#: MAIN's ordered broker calls of kind {place, cancel, get_order, quote,
+#: stock_quote} per fixture — derived by running this class against
+#: ``git show origin/main:src/strategy/call_roller.py`` with
+#: FC120_PRINT_GOLDEN=1 (which prints instead of asserting), then pinned.
+_O, _N, _F = OLD_SYMBOL, C375['symbol'], C380['symbol']
+_PRELUDE = [('stock_quote', 'GOOGL'), ('quote', _O), ('quote', _N),
+            ('place', (_O, 'buy', 8.4)), ('get_order', 'btc-1')]
+MAIN_ORDER_PATH = {
+    'btc_timeout': _PRELUDE + [('cancel', 'btc-1'), ('get_order', 'btc-1')],
+    'full_fill': _PRELUDE + [('place', (_N, 'sell', 10.9)),
+                             ('get_order', 'sto-1')],
+    'ladder_exhausted': _PRELUDE + [
+        ('place', (_N, 'sell', 10.9)), ('get_order', 'sto-1'),
+        ('place', (_N, 'sell', 8.35)), ('get_order', 'sto-2'),
+        ('quote', _F),
+        ('place', (_F, 'sell', 8.5)), ('get_order', 'sto-3')],
+    'ladder_to_rung_3': _PRELUDE + [
+        ('place', (_N, 'sell', 10.9)), ('get_order', 'sto-1'),
+        ('cancel', 'sto-1'), ('get_order', 'sto-1'),
+        ('place', (_N, 'sell', 8.35)), ('get_order', 'sto-2'),
+        ('quote', _F),
+        ('cancel', 'sto-2'), ('get_order', 'sto-2'),
+        ('place', (_F, 'sell', 8.5)), ('get_order', 'sto-3')],
+}
+
+
+class TestTheOrderPathIsMains:
+    """Ruling A + 1(a): the ordered list of order-path broker calls is
+    identical to main's, and no diagnostic read sits (i) between the pre-BTC
+    re-check and the BTC placement, (ii) between a BTC fill and an STC
+    placement, (iii) between a settle and the next rung's placement, or (iv)
+    between a final disposition and its terminal event.
+
+    The structural rule checked: walking back from any ``diag`` read over
+    other ``diag`` reads and non-terminal log events, the first thing found is
+    an order PLACEMENT or a TERMINAL event. Each forbidden window above ends
+    in something else (a quote, a poll read), so a diag read inside one fails.
+    *Mutation:* move the BTC re-read back above ``place_option_order`` → (i)
+    fails; take the post-settle quote before ``call_roll_btc_timeout_canceled``
+    → (iv) fails; flush the rung's post-settle work before the next placement
+    → (iii) fails.
+    """
+
+    @pytest.mark.parametrize('name', sorted(ORDER_PATH_FIXTURES))
+    def test_order_path_is_mains(self, roller, instrumented, name):
+        _r, _log, timeline = _drive_timeline(
+            roller, instrumented, ORDER_PATH_FIXTURES[name])
+        if os.environ.get('FC120_PRINT_GOLDEN'):
+            print(f"\nGOLDEN {name}: {timeline.order_path()!r}")
+            return
+        assert timeline.order_path() == MAIN_ORDER_PATH[name]
+
+    @pytest.mark.parametrize('name', sorted(ORDER_PATH_FIXTURES))
+    def test_no_diag_read_inside_a_forbidden_window(self, roller, instrumented,
+                                                    name):
+        if os.environ.get('FC120_PRINT_GOLDEN'):
+            pytest.skip('golden derivation run')
+        _r, _log, timeline = _drive_timeline(
+            roller, instrumented, ORDER_PATH_FIXTURES[name])
+        entries = timeline.entries
+        assert any(kind == 'diag' for kind, _ in entries), entries
+        for i, (kind, _key) in enumerate(entries):
+            if kind != 'diag':
+                continue
+            j = i - 1
+            while j >= 0 and (entries[j][0] == 'diag' or (
+                    entries[j][0] == 'log'
+                    and entries[j][1] not in TERMINAL_EVENTS)):
+                j -= 1
+            anchor = entries[j] if j >= 0 else None
+            assert anchor is not None and (
+                anchor[0] == 'place'
+                or (anchor[0] == 'log' and anchor[1] in TERMINAL_EVENTS)), (
+                f"diag read at {i} follows {anchor}: {entries}")
+
 
 class TestQuoteFieldsOnRollEvents:
-    """T-1. Every placement carries the quote it was priced from.
+    """T-1. Every placement carries the quote it was priced from; the re-read
+    (taken after the order is out — ruling A) rides on the leg's later rows.
 
     *Catches:* a field on one leg only; an age computed from our clock instead
     of the broker stamp; a datetime reaching the logger; ``Decimal(float)`` in
@@ -2015,16 +2219,42 @@ class TestQuoteFieldsOnRollEvents:
         assert isinstance(btc['quote_ts'], str)
         # The BROKER's stamp, ~40 s old — not 0 from our own clock.
         assert btc['quote_age_s'] == pytest.approx(40, abs=3)
-        assert btc['quote_reread_ask'] == 8.42
-        assert btc['quote_reread_delta'] == 0.02    # reread_ask - ask
         assert btc['stock_bid'] == 376.90 and btc['stock_ask'] == 377.10
         assert isinstance(btc['stock_quote_ts'], str)
+        assert btc['stock_bid_ts'] == btc['stock_quote_ts']
         assert btc['stock_quote_age_s'] == pytest.approx(1, abs=3)
         assert btc['intrinsic_at_placement'] == 6.90  # 376.90 - 370
         assert btc['limit_minus_intrinsic'] == 1.50
         assert btc['limit_on_tick'] is True           # 8.40 on the nickel grid
         assert btc['limit_vs_quote'] == 0.0           # base mode: at the ask
         assert isinstance(btc['placed_at'], str)
+        assert isinstance(btc['roll_id'], str) and len(btc['roll_id']) == 32
+        # The re-read is NOT read yet when this event is written (ruling A).
+        assert 'quote_reread_ask' not in btc
+
+    def test_the_btc_reread_rides_on_the_fill_and_settled_rows(
+            self, roller, instrumented):
+        _result, log = _drive(roller, instrumented, FULL_FILL)
+        for row in (_first(log, 'call_roll_btc_filled'),
+                    _all(log, 'call_roll_leg_settled')[0]):
+            assert row['quote_reread_ask'] == 8.42
+            assert row['quote_reread_delta'] == 0.02   # reread_ask - ask
+            assert isinstance(row['quote_reread_ts'], str)
+            # Distinct broker stamps on the two reads.
+            assert row['quote_reread_same_tick'] is False
+
+    def test_same_tick_is_true_only_for_the_same_stored_quote(self):
+        stamp = _stamp(5.0)
+        same = cr._reread_fields(_q(8.00, 8.40, stamp=stamp),
+                                 _q(8.00, 8.40, stamp=stamp), 'buy')
+        assert same['quote_reread_same_tick'] is True
+        assert same['quote_reread_delta'] == 0.0
+        moved = cr._reread_fields(_q(8.00, 8.40, stamp=stamp),
+                                  _q(8.00, 8.40, stamp=_stamp(1.0)), 'buy')
+        assert moved['quote_reread_same_tick'] is False
+        unknown = cr._reread_fields(_q(8.00, 8.40, stamp=None),
+                                    _q(8.00, 8.40, stamp=stamp), 'buy')
+        assert unknown['quote_reread_same_tick'] is None
 
     def test_stc_rung_1_carries_its_own_quote_and_the_chain_age(
             self, roller, instrumented):
@@ -2035,14 +2265,21 @@ class TestQuoteFieldsOnRollEvents:
         assert stc['pricing_mode'] == 'base'
         assert stc['limit_price'] == 10.90
         assert stc['quote_bid'] == 10.90 and stc['quote_ask'] == 11.10
-        assert stc['quote_reread_bid'] == 10.92
-        assert stc['quote_reread_delta'] == -0.02   # bid - reread_bid
         assert stc['limit_vs_quote'] == 0.0          # base mode: at the bid
         assert stc['quote_age_s'] == pytest.approx(40, abs=3)
         assert stc['chain_quote_age_s'] == pytest.approx(100, abs=3)
+        assert stc['chain_quote_feed'] is None       # the chain call names none
         assert stc['quote_reused_from_rung'] is None
         assert stc['intrinsic_at_placement'] == 1.90  # 376.90 - 375
         assert stc['limit_minus_intrinsic'] == 9.00
+        # The roll key, on every STO row (T-MEDIUM-4).
+        btc = _first(log, 'call_roll_btc_placed')
+        assert stc['roll_id'] == btc['roll_id']
+        assert stc['old_option_symbol'] == OLD_SYMBOL
+        assert stc['btc_order_id'] == 'btc-1'
+        filled = _first(log, 'call_roll_stc_filled')
+        assert filled['quote_reread_bid'] == 10.92
+        assert filled['quote_reread_delta'] == -0.02  # bid - reread_bid
 
     def test_rungs_2_and_3_carry_their_quotes(self, roller, instrumented):
         _result, log = _drive(roller, instrumented, LADDER_TO_RUNG_3)
@@ -2055,15 +2292,19 @@ class TestQuoteFieldsOnRollEvents:
         assert rung2['quote_bid'] == 10.90
         assert rung2['limit_price'] == 8.35          # btc fill + $0.00 floor
         assert rung2['limit_vs_quote'] == 2.55       # 10.90 - 8.35
-        assert rung2['chain_quote_age_s'] is None    # rung 1 only
         # Rung 3 is the C380 fallback, priced from its own per-rung read.
-        assert rung3['quote_bid'] == 8.50 and rung3['quote_reread_bid'] == 8.52
-        assert rung3['quote_reread_delta'] == -0.02
+        assert rung3['quote_bid'] == 8.50
         assert rung3['intrinsic_at_placement'] == 0.0  # OTM: 376.90 < 380
         assert rung3['limit_minus_intrinsic'] == 8.50
         assert rung3['quote_age_s'] == pytest.approx(40, abs=3)
+        rows = {r['rung']: r for r in _all(log, 'call_roll_leg_settled')
+                if r['leg'] == 'stc'}
+        # Rung 2 reuses rung 1's re-read too; rung 3 has its own.
+        assert rows[2]['quote_reread_bid'] == rows[1]['quote_reread_bid'] == 10.92
+        assert rows[3]['quote_reread_bid'] == 8.52
+        assert rows[3]['quote_reread_delta'] == -0.02
 
-    def test_the_dry_run_carries_the_btc_placement_set(
+    def test_the_dry_run_carries_both_legs_quote_sets(
             self, roller, instrumented, rolling_config):
         rolling_config.roller_dry_run = True
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
@@ -2072,10 +2313,18 @@ class TestQuoteFieldsOnRollEvents:
         dry = _first(log, 'call_roll_dry_run')
 
         assert dry['would_be_btc_limit'] == 8.40
-        assert dry['quote_ask'] == 8.40 and dry['quote_reread_delta'] == 0.02
+        assert dry['quote_ask'] == 8.40
         assert dry['quote_age_s'] == pytest.approx(40, abs=3)
         assert dry['limit_on_tick'] is True and dry['stock_bid'] == 376.90
+        # The STO candidate's set, from the chain row it was screened on.
+        assert dry['stc_quote_bid'] == 10.90 and dry['stc_quote_ask'] == 11.10
+        assert dry['stc_limit_vs_quote'] == 0.0
+        assert dry['stc_quote_age_s'] == pytest.approx(100, abs=3)
+        assert dry['stc_quote_feed'] is None
+        assert dry['stc_intrinsic_at_placement'] == 1.90
         instrumented.place_option_order.assert_not_called()
+        # The dry run reads nothing beyond evaluation's pricing reads.
+        assert instrumented.get_option_quote.call_count == 1
 
     @pytest.mark.parametrize('limit,underlying,expected', [
         (6.94, 'GOOGL', False),   # off the nickel grid above $3.00
@@ -2087,21 +2336,129 @@ class TestQuoteFieldsOnRollEvents:
         (0, 'GOOGL', None),       # no limit -> no verdict, never False
     ])
     def test_limit_on_tick(self, limit, underlying, expected):
-        assert _limit_on_tick(limit, underlying) is expected
+        assert cr._limit_on_tick(limit, underlying) is expected
 
-    def test_every_new_field_is_a_json_primitive(self, roller, instrumented):
+    @pytest.mark.parametrize('name', ['full', 'ladder', 'timeout', 'exhausted'])
+    def test_every_new_field_is_a_json_primitive(self, roller, instrumented,
+                                                 name):
         """S8: the broker stamp is a datetime; it must reach the log as a
-        string. Checked on every instrumented event of a full ladder."""
-        _result, log = _drive(roller, instrumented, LADDER_TO_RUNG_3)
+        string. Checked on every instrumented event of each shape."""
+        script = {'full': FULL_FILL, 'ladder': LADDER_TO_RUNG_3,
+                  'timeout': BTC_TIMEOUT, 'exhausted': LADDER_EXHAUSTED}[name]
+        with patch('src.strategy.call_roller.logger') as log:
+            opp = roller.evaluate_roll_opportunity(call_position(),
+                                                   stock_position())
+        instrumented.get_option_quote.side_effect = _book()   # fresh counters
+        _result, log2 = _drive(roller, instrumented, script)
         seen = 0
-        for event_type, kwargs in events(log):
+        for event_type, kwargs in events(log) + events(log2):
             if event_type not in INSTRUMENTED_EVENTS:
                 continue
             seen += 1
             bad = {k: type(v).__name__ for k, v in kwargs.items()
                    if not isinstance(v, PRIMITIVES)}
             assert not bad, f"{event_type} carries non-primitives: {bad}"
-        assert seen >= 9, event_types(log)
+        assert seen >= 3, event_types(log2)
+        assert opp is not None
+
+    def test_one_roll_id_per_execute_roll_call(self, roller, instrumented):
+        _r, log_a = _drive(roller, instrumented, LADDER_TO_RUNG_3)
+        ids_a = {kw['roll_id'] for e, kw in events(log_a)
+                 if e in ('call_roll_btc_placed', 'call_roll_stc_placed',
+                          'call_roll_leg_settled', 'call_roll_stc_filled',
+                          'call_roll_btc_filled',
+                          'call_roll_stc_timeout_canceled')}
+        assert len(ids_a) == 1 and None not in ids_a
+        instrumented.reset_mock()
+        instrumented.get_option_quote.side_effect = _book()
+        _r, log_b = _drive(roller, instrumented, FULL_FILL)
+        assert _first(log_b, 'call_roll_btc_placed')['roll_id'] not in ids_a
+
+    def test_stock_age_is_computed_at_placement_from_the_stored_stamp(
+            self, roller, instrumented):
+        """T-MEDIUM-3: same time base as ``quote_age_s`` — the stamp is
+        stored on the opportunity and aged when the row is written."""
+        instrumented.get_stock_quote.return_value = {
+            'bid': 376.90, 'ask': 377.10, 'timestamp': _stamp(30.0)}
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        assert 'stock_quote_age_s' not in opp           # a stamp, not an age
+        opp['stock_quote_ts'] = _stamp(90.0).isoformat()   # "time passed"
+        instrumented.place_option_order.side_effect = [accepted('btc-1'),
+                                                       accepted('sto-1')]
+        broker = _Broker(FULL_FILL)
+        instrumented.get_order_by_id.side_effect = broker.by_id
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert _first(log, 'call_roll_btc_placed')['stock_quote_age_s'] == \
+            pytest.approx(90, abs=3)
+
+
+class TestTheEvaluationQuoteSetOnSkips:
+    """T-MEDIUM-7 / S-MEDIUM-4: ``call_roll_evaluated`` and every skip AFTER the
+    BTC quote read carry that quote and the IEX stock quote — with NO extra
+    read. *Catches:* the cycles that never place an order logging no quote."""
+
+    def _eval(self, roller, instrumented):
+        with patch('src.strategy.call_roller.logger') as log:
+            opp = roller.evaluate_roll_opportunity(call_position(),
+                                                   stock_position())
+        return opp, log
+
+    def test_evaluated_carries_the_btc_set_without_a_reread(self, roller,
+                                                           instrumented):
+        _opp, log = self._eval(roller, instrumented)
+        ev = _first(log, 'call_roll_evaluated')
+        assert ev['quote_ask'] == 8.40 and ev['quote_bid'] == 8.00
+        assert ev['quote_age_s'] == pytest.approx(40, abs=3)
+        assert ev['stock_bid'] == 376.90 and isinstance(ev['stock_bid_ts'], str)
+        assert ev['intrinsic_at_placement'] == 6.90
+        assert ev['limit_on_tick'] is True
+        assert 'quote_reread_ask' not in ev
+        assert instrumented.get_option_quote.call_count == 1
+
+    def test_no_credit_candidate_carries_it(self, roller, instrumented,
+                                            mock_market_data):
+        mock_market_data.find_suitable_calls.return_value = [
+            dict(C375, bid=1.00, ask=1.20)]
+        opp, log = self._eval(roller, instrumented)
+        assert opp is None
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['skip_reason'] == 'no_credit_candidate'
+        assert skip['quote_ask'] == 8.40 and skip['stock_bid'] == 376.90
+
+    def test_no_suitable_replacement_carries_it(self, roller, instrumented,
+                                                mock_market_data):
+        mock_market_data.find_suitable_calls.return_value = []
+        _opp, log = self._eval(roller, instrumented)
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['skip_reason'] == 'no_suitable_replacement'
+        assert skip['quote_ask'] == 8.40 and skip['limit_minus_intrinsic'] == 1.50
+
+    def test_earnings_unknown_carries_it(self, roller, instrumented,
+                                         mock_earnings):
+        mock_earnings.next_earnings_info.return_value = ('unknown', None)
+        _opp, log = self._eval(roller, instrumented)
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['skip_reason'] == 'earnings_unknown'
+        assert skip['quote_ask'] == 8.40
+
+    def test_credit_gone_at_execution_carries_it(self, roller, instrumented):
+        opp, _log = self._eval(roller, instrumented)
+        instrumented.get_option_quote.side_effect = _book(**{
+            C375['symbol']: [_q(1.00, 1.20)]})
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+        assert result['reason'] == 'credit_gone_at_execution'
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['quote_ask'] == 8.40 and skip['stock_bid'] == 376.90
+        instrumented.place_option_order.assert_not_called()
+
+    def test_skip_reasons_are_remembered_for_the_sampler(self, roller,
+                                                         instrumented,
+                                                         mock_market_data):
+        mock_market_data.find_suitable_calls.return_value = []
+        self._eval(roller, instrumented)
+        assert roller.skip_reasons == {OLD_SYMBOL: 'no_suitable_replacement'}
 
 
 class TestMissingQuoteDataLogsNone:
@@ -2111,17 +2468,19 @@ class TestMissingQuoteDataLogsNone:
 
     @pytest.mark.parametrize('stamp', [None, 'not-a-time', '', 12345])
     def test_an_unreadable_stamp_is_none(self, stamp):
-        fields = _quote_fields(_q(8.00, 8.40, stamp=stamp), None, 8.40, 'buy',
-                               'GOOGL', 370.0, 376.90)
+        fields = cr._quote_fields(_q(8.00, 8.40, stamp=stamp), 8.40, 'buy',
+                                  'GOOGL', 370.0, 376.90)
         assert fields['quote_ts'] is None
         assert fields['quote_age_s'] is None
-        assert fields['quote_reread_delta'] is None
+        reread = cr._reread_fields(_q(8.00, 8.40, stamp=stamp), None, 'buy')
+        assert reread['quote_reread_delta'] is None
+        assert reread['quote_reread_same_tick'] is None
 
     def test_an_absent_quote_is_all_none_not_zero(self):
-        fields = _quote_fields({}, {}, 8.40, 'buy', 'GOOGL', 370.0, None)
+        fields = cr._quote_fields({}, 8.40, 'buy', 'GOOGL', 370.0, None)
         for key in ('quote_bid', 'quote_ask', 'quote_mid', 'quote_spread',
                     'limit_vs_quote', 'intrinsic_at_placement',
-                    'limit_minus_intrinsic', 'quote_reread_delta'):
+                    'limit_minus_intrinsic'):
             assert fields[key] is None, key
         assert fields['limit_on_tick'] is True   # the limit itself is known
 
@@ -2136,7 +2495,7 @@ class TestMissingQuoteDataLogsNone:
 
         assert result['success'] is True
         assert terminals(log) == ['call_roll_completed']
-        for event_type in ('call_roll_btc_placed', 'call_roll_stc_placed'):
+        for event_type in ('call_roll_btc_filled', 'call_roll_stc_filled'):
             kw = _first(log, event_type)
             assert kw['quote_reread_delta'] is None, event_type
             assert kw['quote_reread_ask'] is None, event_type
@@ -2145,37 +2504,29 @@ class TestMissingQuoteDataLogsNone:
                 instrumented.place_option_order.call_args_list] == [8.40, 10.90]
 
 
-#: The BTC never fills: the poll sees `new`, the cancel settles zero-fill.
-BTC_TIMEOUT = {
-    'btc-1': {'poll': _o('btc-1', 'new'),
-              'after_cancel': _o('btc-1', 'canceled')},
-}
+class TestTheTimeoutPathReadsAfterTheTerminal:
+    """T-3 under ruling A. The terminal goes out first with the fields in
+    hand; one option quote and one stock quote follow it; their fields ride on
+    the leg_settled row ONLY. *Catches:* a refresh before the settle or before
+    the terminal; ``polls`` overwritten by the settle's re-entry."""
 
-
-class TestTheTimeoutPathReadsOneQuoteAfterTheSettle:
-    """T-3. *Catches:* the refresh changing the disposition; a refresh before
-    the settle; ``polls`` overwritten by the settle's re-entry."""
-
-    def test_call_order_quote_after_settle_never_before(self, roller,
-                                                        instrumented):
-        result, log = _drive(roller, instrumented, BTC_TIMEOUT)
+    def test_call_and_event_order(self, roller, instrumented):
+        result, _log, timeline = _drive_timeline(roller, instrumented,
+                                                 BTC_TIMEOUT)
         assert result['reason'] == 'btc_timeout_canceled'
-
-        wanted = ('get_option_quote', 'place_option_order', 'get_order_by_id',
-                  'cancel_order')
-        seq = [(name, c.args[0] if name == 'get_option_quote' else None)
-               for name, c in ((mc[0], mc) for mc in instrumented.mock_calls)
-               if name in wanted]
-        assert seq == [
-            ('get_option_quote', OLD_SYMBOL),       # evaluation: priced from
-            ('get_option_quote', OLD_SYMBOL),       # same-second re-read
-            ('get_option_quote', C375['symbol']),   # pre-BTC re-check
-            ('get_option_quote', C375['symbol']),   # its re-read
-            ('place_option_order', None),
-            ('get_order_by_id', None),              # the poll
-            ('cancel_order', None),
-            ('get_order_by_id', None),              # the settle
-            ('get_option_quote', OLD_SYMBOL),       # exactly one, after it
+        tail = [e for e in timeline.entries
+                if e[0] != 'log' or e[1] in ('call_roll_btc_timeout_canceled',
+                                             'call_roll_leg_settled')]
+        assert tail[-9:] == [
+            ('place', (OLD_SYMBOL, 'buy', 8.4)),
+            ('diag', OLD_SYMBOL),                   # the re-read, AFTER placing
+            ('get_order', 'btc-1'),                 # the poll
+            ('cancel', 'btc-1'),
+            ('get_order', 'btc-1'),                 # the settle
+            ('log', 'call_roll_btc_timeout_canceled'),   # terminal FIRST
+            ('diag', OLD_SYMBOL),                   # then the post-settle quote
+            ('diag', 'GOOGL'),                      # and the cancel-time stock
+            ('log', 'call_roll_leg_settled'),
         ]
 
     def test_quote_drift_sign_and_the_cancel_set(self, roller, instrumented):
@@ -2184,21 +2535,28 @@ class TestTheTimeoutPathReadsOneQuoteAfterTheSettle:
             OLD_SYMBOL: [_q(7.30, 7.38), _q(7.30, 7.38), _q(7.40, 7.45)]})
         _result, log = _drive(roller, instrumented, BTC_TIMEOUT)
         ev = _first(log, 'call_roll_btc_timeout_canceled')
-
         assert ev['disposition'] == 'timeout_canceled'
         assert ev['pricing_mode'] == 'base' and ev['limit_price'] == 7.38
-        assert ev['quote_ask'] == 7.38 and ev['cancel_quote_ask'] == 7.45
-        assert ev['cancel_quote_bid'] == 7.40
-        assert ev['quote_drift'] == 0.07     # positive: market moved away
-        assert isinstance(ev['cancel_quote_ts'], str)
-        assert ev['cancel_quote_age_s'] == pytest.approx(40, abs=3)
+        assert ev['order_status'] == 'canceled'
         assert ev['order_submitted_at'] == '2026-09-28T19:30:00+00:00'
         assert isinstance(ev['leg_elapsed_s'], float)
         assert ev['limit_on_tick'] is False   # 7.38 is off the nickel grid
+        # Ruling A: no post-settle field on the terminal itself.
+        assert 'quote_drift' not in ev and 'cancel_quote_ask' not in ev
+
+        row = _first(log, 'call_roll_leg_settled')
+        assert row['quote_ask'] == 7.38 and row['cancel_quote_ask'] == 7.45
+        assert row['cancel_quote_bid'] == 7.40
+        assert row['quote_drift'] == 0.07     # positive: market moved away
+        assert isinstance(row['cancel_quote_ts'], str)
+        assert row['cancel_quote_age_s'] == pytest.approx(40, abs=3)
+        assert row['cancel_stock_bid'] == 376.90
+        assert isinstance(row['cancel_stock_quote_ts'], str)
+        assert row['order_status'] == 'canceled'
         assert terminals(log) == ['call_roll_btc_timeout_canceled']
 
-    def test_a_raising_refresh_is_a_breadcrumb_not_a_raise(self, roller,
-                                                           instrumented):
+    def test_a_raising_refresh_is_a_trade_breadcrumb_not_a_raise(
+            self, roller, instrumented):
         instrumented.get_option_quote.side_effect = _book(**{
             OLD_SYMBOL: [_q(8.00, 8.40), _q(8.00, 8.40),
                          RuntimeError("quote endpoint down")]})
@@ -2206,11 +2564,17 @@ class TestTheTimeoutPathReadsOneQuoteAfterTheSettle:
 
         assert result['reason'] == 'btc_timeout_canceled'
         assert terminals(log) == ['call_roll_btc_timeout_canceled']
-        ev = _first(log, 'call_roll_btc_timeout_canceled')
+        row = _first(log, 'call_roll_leg_settled')
         for key in ('cancel_quote_bid', 'cancel_quote_ask', 'cancel_quote_ts',
                     'cancel_quote_age_s', 'quote_drift'):
-            assert ev[key] is None, key
-        assert event_types(log).count('call_roll_quote_refresh_failed') == 1
+            assert row[key] is None, key
+        crumbs = _all(log, 'call_roll_quote_refresh_failed')
+        assert len(crumbs) == 1 and crumbs[0]['reason'] == 'error'
+        # On the TRADE logger, never the error logger (T-LOW: errors_all).
+        assert crumbs[0]['event_category'] == 'trade'
+        assert not [c for c in log.error.call_args_list
+                    if c.kwargs.get('event_type')
+                    == 'call_roll_quote_refresh_failed']
 
     def test_polls_is_the_primary_poll_not_primary_plus_settle(
             self, roller, instrumented, monkeypatch):
@@ -2229,16 +2593,6 @@ class TestTheTimeoutPathReadsOneQuoteAfterTheSettle:
             assert ev['settle_polls'] == 2, event_type   # the settle's own
 
 
-def _expired(oid):
-    return {'poll': _o(oid, 'expired')}
-
-
-def _times_out(oid):
-    return {'poll': _o(oid, 'new'), 'after_cancel': _o(oid, 'canceled')}
-
-
-BTC_FILLED = {'poll': _o('btc-1', 'filled', 1, 8.35, latency_s=5)}
-
 #: scenario -> (broker script, expected (leg, rung, disposition) per row,
 #:              the one terminal)
 LEG_SCENARIOS = {
@@ -2256,10 +2610,14 @@ LEG_SCENARIOS = {
          ('stc', 2, 'filled')],
         'call_roll_completed'),
     'ladder_exhausted': (
-        {'btc-1': BTC_FILLED, 'sto-1': _expired('sto-1'),
-         'sto-2': _expired('sto-2'), 'sto-3': _expired('sto-3')},
+        LADDER_EXHAUSTED,
         [('btc', None, 'filled'), ('stc', 1, 'terminal_no_fill'),
          ('stc', 2, 'terminal_no_fill'), ('stc', 3, 'terminal_no_fill')],
+        'call_roll_naked_exposure'),
+    'all_rungs_time_out': (
+        ALL_RUNGS_TIME_OUT,
+        [('btc', None, 'filled'), ('stc', 1, 'timeout_canceled'),
+         ('stc', 2, 'timeout_canceled'), ('stc', 3, 'timeout_canceled')],
         'call_roll_naked_exposure'),
     'btc_unknown_disposition': (
         {'btc-1': {'poll': _o('btc-1', 'new'),
@@ -2274,6 +2632,16 @@ LEG_SCENARIOS = {
                    'after_cancel': _o('sto-1', 'pending_cancel')}},
         [('btc', None, 'filled'), ('stc', 1, 'unknown')],
         'call_roll_unknown_disposition'),
+    # The settle shows the order EXPIRED, not canceled by us: the true
+    # disposition from order_status (T-LOW), not "timeout_canceled".
+    'rung1_settles_expired': (
+        {'btc-1': BTC_FILLED,
+         'sto-1': {'poll': _o('sto-1', 'new'),
+                   'after_cancel': _o('sto-1', 'expired')},
+         'sto-2': {'poll': _o('sto-2', 'filled', 1, 8.40, latency_s=2)}},
+        [('btc', None, 'filled'), ('stc', 1, 'terminal_no_fill'),
+         ('stc', 2, 'filled')],
+        'call_roll_completed'),
 }
 
 
@@ -2289,10 +2657,13 @@ class TestOneSettledRowPerPlacedOrder:
         _result, log = _drive(roller, instrumented, script)
 
         rows = _all(log, 'call_roll_leg_settled')
-        assert [(r['leg'], r.get('rung'), r['disposition'])
-                for r in rows] == expected_rows
+        assert sorted((r['leg'], r.get('rung') or 0, r['disposition'])
+                      for r in rows) == sorted(
+            (leg, rung or 0, d) for leg, rung, d in expected_rows)
         assert len(rows) == instrumented.place_option_order.call_count
         assert terminals(log) == [terminal]          # T-5: still exactly one
+        roll_ids = {row['roll_id'] for row in rows}
+        assert len(roll_ids) == 1 and None not in roll_ids
         for row in rows:
             assert row['strategy'] == 'roll_call'
             assert row['requested_qty'] == 1
@@ -2302,6 +2673,10 @@ class TestOneSettledRowPerPlacedOrder:
                 assert row['cancel_quote_ask'] is None   # none on fills
             if row['disposition'] in ('timeout_canceled', 'terminal_no_fill'):
                 assert row['cancel_quote_ask'] is not None
+                assert row['order_status'] in ('canceled', 'expired')
+            if row['leg'] == 'stc':
+                assert row['old_option_symbol'] == OLD_SYMBOL
+                assert row['btc_order_id'] == 'btc-1'
             assert isinstance(row['leg_elapsed_s'], float)
 
     def test_fill_rows_carry_latency_and_fill_quality(self, roller,
@@ -2310,29 +2685,47 @@ class TestOneSettledRowPerPlacedOrder:
         btc, stc = _all(log, 'call_roll_leg_settled')
 
         assert btc['fill_vs_limit'] == 0.05      # limit 8.40 - fill 8.35
+        assert btc['fill_price_source'] == 'broker'
         assert btc['fill_latency_s'] == 5.0      # filled_at - submitted_at
         assert btc['filled_price'] == 8.35 and btc['filled_qty'] == 1
         assert btc['polls'] == 1 and btc['settle_polls'] is None
+        assert btc['order_status'] == 'filled'
         assert stc['fill_vs_limit'] == 0.05      # fill 10.95 - limit 10.90
         assert stc['fill_latency_s'] == 4.0
         assert stc['order_id'] == 'sto-1' and btc['order_id'] == 'btc-1'
-        # The fill events gain the same fields.
         filled = _first(log, 'call_roll_btc_filled')
         assert filled['limit_price'] == 8.40 and filled['fill_vs_limit'] == 0.05
         assert filled['fill_latency_s'] == 5.0 and filled['polls'] == 1
         stc_filled = _first(log, 'call_roll_stc_filled')
         assert stc_filled['rung'] == 1 and stc_filled['fill_vs_limit'] == 0.05
 
-    def test_the_timed_out_rung_emits_its_own_event(self, roller,
-                                                    instrumented):
+    def test_an_absent_fill_price_is_a_fallback_not_a_measurement(
+            self, roller, instrumented):
+        """T-LOW-8: with no ``filled_avg_price`` the limit stands in for the
+        fill; comparing a limit with itself would log a fake 0.00."""
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, None)},
+                  'sto-1': {'poll': _o('sto-1', 'filled', 1, None)}}
+        result, log = _drive(roller, instrumented, script)
+        assert result['success'] is True
+        for row in _all(log, 'call_roll_leg_settled') + [
+                _first(log, 'call_roll_btc_filled'),
+                _first(log, 'call_roll_stc_filled')]:
+            assert row['fill_vs_limit'] is None
+            assert row['fill_price_source'] == 'fallback'
+
+    def test_rung_2_fill_logs_rung_1s_miss_offset(self, roller, instrumented):
+        """Ruling E: ``prior_rung_miss_offset = rung1_limit - rung2_fill``."""
         script, _rows, _t = LEG_SCENARIOS['rung1_timeout_then_rung2_fill']
         _result, log = _drive(roller, instrumented, script)
-
-        ev = _first(log, 'call_roll_stc_timeout_canceled')
-        assert ev['rung'] == 1 and ev['order_id'] == 'sto-1'
-        assert ev['disposition'] == 'timeout_canceled'
-        assert ev['quote_drift'] == 0.0          # post-settle bid unchanged
-        assert ev['polls'] == 1 and ev['settle_polls'] == 1
+        filled = _first(log, 'call_roll_stc_filled')
+        assert filled['rung'] == 2
+        assert filled['prior_rung_miss_offset'] == 2.50   # 10.90 - 8.40
+        row = [r for r in _all(log, 'call_roll_leg_settled')
+               if r.get('rung') == 2][0]
+        assert row['prior_rung_miss_offset'] == 2.50
+        rung1 = [r for r in _all(log, 'call_roll_leg_settled')
+                 if r.get('rung') == 1][0]
+        assert 'prior_rung_miss_offset' not in rung1
 
     def test_a_synchronous_rejection_is_one_rejected_row(self, roller,
                                                          instrumented):
@@ -2346,90 +2739,5 @@ class TestOneSettledRowPerPlacedOrder:
         assert [(r['leg'], r['disposition'], r['order_id']) for r in rows] == [
             ('btc', 'rejected', None)]
         assert terminals(log) == ['call_roll_btc_rejected']
-
-
-def _placements(mock_alpaca):
-    return [dict(c.kwargs) for c in mock_alpaca.place_option_order.call_args_list]
-
-
-def _poisoned_book(old=(8.00, 8.40)):
-    """Every instrumentation read (call >= 2 per symbol: the re-read and the
-    post-settle read) returns an absurd book. If any of them reached a limit,
-    an order argument would move."""
-    absurd = _q(0.01, 99.00, stamp=None)
-    return _sequenced({
-        OLD_SYMBOL: [_q(*old), absurd],
-        C375['symbol']: [_q(10.90, 11.10), absurd],
-        C380['symbol']: [_q(8.50, 8.70), absurd]})
-
-
-def _order(symbol, side, limit):
-    return {'symbol': symbol, 'qty': 1, 'side': side, 'order_type': 'limit',
-            'limit_price': limit}
-
-
-#: scenario -> (old book, broker script, the order arguments main places)
-GOLDEN_PLACEMENTS = {
-    'full_fill': ((8.00, 8.40), FULL_FILL, [
-        _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90)]),
-    'ladder_to_rung_3': ((8.00, 8.40), LADDER_TO_RUNG_3, [
-        _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90),
-        _order(C375['symbol'], 'sell', 8.35),
-        _order(C380['symbol'], 'sell', 8.50)]),
-    'btc_timeout': ((8.00, 8.40), BTC_TIMEOUT, [
-        _order(OLD_SYMBOL, 'buy', 8.40)]),
-    # Extrinsic 7.10 - 7.00 = 0.10 <= 0.20: imminence prices both legs at
-    # mid +/- 0.05 — 7.15 and 11.00 - 0.05 = 10.95.
-    'imminence_full_fill': ((7.00, 7.20), FULL_FILL, [
-        _order(OLD_SYMBOL, 'buy', 7.15), _order(C375['symbol'], 'sell', 10.95)]),
-}
-
-
-class TestNoBehaviourChange:
-    """FC-120 PR-1 is instrumentation with NO behaviour change.
-
-    ``place_option_order`` receives byte-identical arguments to main on each
-    fixture (the goldens are main's, verified by running this class against
-    main's ``call_roller.py``), and stays identical when every
-    instrumentation read returns garbage — so the extra same-second read and
-    the post-settle read can never alter a pricing input: limits are computed
-    from the FIRST read exactly as before.
-    """
-
-    @pytest.mark.parametrize('name', sorted(GOLDEN_PLACEMENTS))
-    def test_order_arguments_match_main(self, roller, instrumented, name):
-        old, script, golden = GOLDEN_PLACEMENTS[name]
-        instrumented.get_option_quote.side_effect = _book(old=old)
-        _drive(roller, instrumented, script)
-        assert _placements(instrumented) == golden
-
-    @pytest.mark.parametrize('name', sorted(GOLDEN_PLACEMENTS))
-    def test_garbage_instrumentation_reads_change_nothing(
-            self, roller, instrumented, name):
-        old, script, golden = GOLDEN_PLACEMENTS[name]
-        instrumented.get_option_quote.side_effect = _book(old=old)
-        clean_result, clean_log = _drive(roller, instrumented, script)
-
-        instrumented.reset_mock()
-        instrumented.get_option_quote.side_effect = _poisoned_book(old=old)
-        poisoned_result, poisoned_log = _drive(roller, instrumented, script)
-
-        assert _placements(instrumented) == golden
-        assert poisoned_result == clean_result
-        assert terminals(poisoned_log) == terminals(clean_log)
-
-    def test_raising_instrumentation_reads_change_nothing(self, roller,
-                                                          instrumented):
-        """Every NEW read raises: re-reads at evaluation and pre-BTC, the
-        post-settle read on the timeout path. The roll proceeds exactly as
-        main's would, with the fields logged as None."""
-        boom = RuntimeError("down")
-        instrumented.get_option_quote.side_effect = _sequenced({
-            OLD_SYMBOL: [_q(8.00, 8.40), boom],
-            C375['symbol']: [_q(10.90, 11.10), boom]})
-        result, log = _drive(roller, instrumented, BTC_TIMEOUT)
-
-        assert result == {'success': False, 'reason': 'btc_timeout_canceled',
-                          'order_id': 'btc-1', 'underlying': 'GOOGL'}
-        assert _placements(instrumented) == GOLDEN_PLACEMENTS['btc_timeout'][2]
-        assert _first(log, 'call_roll_btc_timeout_canceled')['quote_drift'] is None
+        # Nothing was live, so nothing was re-read.
+        assert instrumented.get_option_quote.call_count == 2
