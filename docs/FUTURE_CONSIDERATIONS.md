@@ -1217,6 +1217,31 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-122: migrate the dashboard to the Options Wheel design system — tokens, contrast fixes, provenance chips
+
+**Status:** Consideration — **ON HOLD by operator decision (2026-10-01)**. The design system itself is signed off; only the migration waits.
+**Scope:** shared (dashboard frontend — serves both strategies)
+**Size estimate:** L (touches most of the ~70 components under `dashboard/frontend/src/components/v2` and `pages/v2`, plus `tailwind.config.js`, `index.css`, `utils/format.ts`)
+**Owner:** zeshan + Claude
+**Plan file:** `docs/plans/fc-122.md` (not yet drafted)
+
+**Problem / opportunity:** the dashboard has no token layer. Colors are raw Tailwind classes plus 90+ hex literals in Recharts props; the `profit` / `loss` / `warning` tokens in `tailwind.config.js` are defined but unused. An audit at `e3005cf` found real defects: `text-gray-500` labels (~157 uses) fail contrast at 3.0–3.7:1; gain vs loss differ by hue only (1.6:1, unreadable to red-green colorblind users); profit is drawn in two greens; the PAPER badge uses warning yellow; the put-sold chart marker uses the profit green; and **backtest panels are visually identical to live ones**. The signed-off design system codifies the existing look (Tailwind v3 values, system font, dark only) and fixes these 13 items.
+
+**Design system (source of truth):** artifact https://claude.ai/artifact/T11QKL5tZ8UJootqVDf6Pb — `project/README.md` (rules), `project/tokens.json` (47 colors, type, spacing, radius), `project/fixes.md` (the 13 fixes, each mapped old → new), 8 component specs (StatTile, ResultCell, ProvenanceChip, Banner, DataTable, ChartFrame, EventMarker, NavItem).
+
+**Decisions already made (operator, 2026-10-01):** codify-and-fix, not a redesign; dark only, tokens named by role; red/green P&L kept with a mandatory `+`/`−` sign; no web fonts.
+
+**Open questions (for the plan):**
+- **Token delivery:** CSS variables generated from `tokens.json` + Tailwind theme mapped onto them (lets Recharts read `var(--…)`), vs Tailwind theme only. Recharts needs the variables, so the first looks forced; confirm.
+- **PR slicing:** one PR per concern (tokens + config; contrast/class rename; charts off hex literals; ProvenanceChip + SIM frame; event markers; new formatters) vs per page. One-PR-per-FC rule means either sub-FCs or phased PRs under one plan.
+- **New formatters** (U+2212 minus, `0.25Δ`, `21 DTE`, `AAPL Oct 16 C230`) change `format.ts` output that existing tests and CSV export (`ledgerCsv.ts`) assert on — CSV should probably keep ASCII `-`.
+- **Regression guard:** a lint/test that fails on new hex literals or raw `gray-*` classes in `components/v2`, so the system doesn't drift again.
+- **Account chip data:** where the UI learns LIVE vs PAPER (today `isPaperTrading` in `LayoutV2.tsx`) and the run ID for SIM chips.
+
+**Links:** FC-022 (dashboard polish), FC-028 (`fmtDate` calendar-date rule the system keeps), FC-096 (simulation console — the SIM surfaces), FC-113/114/116 (real-money gates — when LIVE chips first appear).
+
+---
+
 ## Completed
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
