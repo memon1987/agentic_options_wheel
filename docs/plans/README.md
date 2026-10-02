@@ -96,6 +96,7 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-096-b.md](fc-096-b.md) — FC-096 Phase B — sim service, detail artifacts, engine-identity dedup, pinning + battery, status: Done
 - [fc-096-c.md](fc-096-c.md) — FC-096 Phase C — covered-call selector: profile-aware replay on a synthetic lot, status: Approved (build gated on the operator’s post-call-away answer)
 - [fc-096-d.md](fc-096-d.md) — FC-096 Phase D — IAP over the dashboard: Google SSO, operator/viewer roles, token retirement, status: Approved
+- [fc-096-e.md](fc-096-e.md) — FC-096 Phase E — the PM simulation console behind IAP (six PRs), status: Done (merged 2026-09-03/04; operator browser smoke PASSED 2026-09-04)
 - [fc-065.md](fc-065.md) — One floor, one path, one decision record — the covered-call gating layer, status: Done
 - [fc-068.md](fc-068.md) — Delete the dead engine call path; repoint the backtest to the real pipeline, status: Done
 - [fc-069.md](fc-069.md) — FC-069 — the decommission sweep. 15 decision cards for operator sign-off, status: DONE
@@ -109,12 +110,14 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-079.md](fc-079.md) — FC-079 — Rewire the last OCC-substring sites on the reconcile paths (absorbs FC-054), status: Done
 - [fc-081.md](fc-081.md) — FC-081 follow-up — merged-vs-deployed freshness check + alert, status: Done
 - [fc-084.md](fc-084.md) — FC-084 — Serialize builds per trigger; pin the smoke test to a build-owned revision; promote with `--to-latest`, status: Done
-- [fc-091.md](fc-091.md) — FC-091 — chain lake merge-on-put, status: Done
+- [fc-091.md](fc-091.md) — FC-091 — chain lake merge-on-put, status: Done (code); production verify blocked — the screen Job is still pinned to a pre-merge image (2026-10-01)
 
 _Plans added since that regeneration are appended below rather than re-sorted into it, so the list above stays comparable with the 2026-08-28 snapshot._
 
 - [fc-116.md](fc-116.md) — FC-116 — the replay fills roll legs at the placed limits, capped by the modeled book, with a deliberate wheel re-baseline (`roll_fill_mode`, default `limit`; `ENGINE_VERSION = fc-116-roll-limit-fills`), status: Executing
 
-- [fc-112.md](fc-112.md) — FC-112 — the wheel roll-trigger study (`itm_trigger_ratio` 0.98 vs 1.00): pre-registered decision rule, PR-1 wheel roll reach 7→21 re-baseline (`ENGINE_VERSION = fc-112-wheel-roll-reach`), rev 2: one-sided pre-registered rule, decision + control pins, no-imminence bracket, disjoint OOS read, `tools/diagnostics/fc112_roll_trigger_read.py`, status: Executing (PR-1 open: #132)
+- [fc-112.md](fc-112.md) — FC-112 — the wheel roll-trigger study (`itm_trigger_ratio` 0.98 vs 1.00): pre-registered decision rule, PR-1 wheel roll reach 7→21 re-baseline (`ENGINE_VERSION = fc-112-wheel-roll-reach`), rev 2: one-sided pre-registered rule, decision + control pins, no-imminence bracket, disjoint OOS read, `tools/diagnostics/fc112_roll_trigger_read.py`, status: Executing (PR-1 #132 + PR-2 #133 merged 2026-09-12; awaiting operator runbook steps — lake widen, pins, one-shot; read on the first Saturday with pin rows)
 - [fc-117.md](fc-117.md) — the weekly battery measures the covered-call profile too (Done)
-- [fc-120.md](fc-120.md) — live roller first-leg execution quality: quote instrumentation (PR-1), tick snap + 0.10 buffer + escalating BTC re-price + IEX intrinsic floor (PR-2); FC-113 folded in
+- [fc-120.md](fc-120.md) — live roller first-leg execution quality: quote instrumentation (PR-1), tick snap + 0.10 buffer + escalating BTC re-price + IEX intrinsic floor (PR-2); FC-113 folded in, status: Approved rev 3 (2026-09-26), operator decisions signed, PR-1 building
+- [fc-100.md](fc-100.md) — FC-100 — the covered-call service rolls: `rolling:` block, `cc-roll-daily` scheduler, nine operator steps, status: Done (PR #127; O1–O9 complete 2026-09-17)
+- [fc-107.md](fc-107.md) — FC-107 — Cloud Run `--timeout` 300 → 1800 on both bot services + seam-invariant contract test, status: Done (PR #128 `7c22fac`, live-verified 2026-09-09)

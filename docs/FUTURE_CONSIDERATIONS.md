@@ -870,7 +870,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
 
 **Scope:** shared (backtest engine)
-**Status:** Done (code) — merged 2026-08-28 (PR #101, `6d7f6be`), plan `docs/plans/fc-091.md`; **verify on the 2026-09-01 monthly screen** (SPY/IWM/PFE should merge once, then be warm). Rule as shipped: DTE-equal, strike-union, same model/close, overlap-consistent; refusals counted and surfaced
+**Status:** Done (code) — merged 2026-08-28 (PR #101, `6d7f6be`), plan `docs/plans/fc-091.md`. **Production verification 2026-10-01: NOT YET EXERCISED — the merge code has never run on the monthly screen.** `backtest-screen` is deliberately SHA-pinned (cloudbuild.yaml step-12 comment: a monthly screen must be reproducible) and still runs image `5e98ff7`, the 08-28 operator update that predates this merge. The 2026-10-01 execution (`backtest-screen-9r9cj`, 06:02–06:57 UTC) reported `lake_hits=3472 lake_misses=42 lake_puts=42 lake_rejected=1144 lake_skipped=1144` and no `lake_merged` / `lake_merge_refused` counters at all (the keys do not exist in that image) — the window-thrashed symbols rebuilt cold again, exactly the FC-060 first-run signature. The 09-01 execution's logs are past the 30-day retention. `backtest-sweep` and `data-backfill` track `main` (`ff8ab85`) and so carry the merge code. **Operator decision + step before the 2026-11-01 screen:** re-pin the Job to current `main` — `gcloud run jobs update backtest-screen --region us-central1 --project gen-lang-client-0607444019 --image us-central1-docker.pkg.dev/gen-lang-client-0607444019/options-wheel/options-wheel-strategy:<main SHA>` (the 08-28 recipe; `claude-operator` lacks `artifactregistry.repositories.downloadArtifacts`) — accepting that November's `backtest_runs` rows come off a different engine identity than Aug–Oct's. Then verify `lake_merged` > 0 for SPY/IWM/PFE once, `lake_skipped` ≈ 0 the month after.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** `docs/plans/fc-091.md`
@@ -880,24 +880,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 **Fix direction (merge-on-put):** when a downloaded lake file is rejected by `_covers` and the day is rebuilt, `put()` merges the two snapshots — union of `ChainQuote`s keyed by contract symbol (same model fingerprint, same session close; the new build wins on duplicates), provenance = union of the strike windows (`strike_gte = min`, `strike_lte = max`) **with `universe_dte` required EQUAL on both sides** (corrected in review 2026-08-28: `max` would claim longer-dated contracts for strikes only the short-DTE side fetched — a union of two rectangles is not a rectangle); the merge also verifies the two fetches agree on the overlapping strikes — writes the merged file locally and uploads it (now a superset → accepted, `if_generation_match` from the download). If the two strike windows do not overlap (a gap of strikes neither file fetched), skip the merge and log `chain_lake_merge_gap` — never claim coverage the file does not have. Count `lake_merged`. Layer 2's `Materialised` split does not change this path.
 
 **Links:** `docs/plans/fc-060-chain-lake.md` (§Execution first-run notes), `src/backtesting/data/chain_store.py` (`_mirror_to_lake`, `_window_regression`), `docs/plans/fc-060-scenario-runner.md` (Layer 2, in build — merge FC-091 after it to avoid a `chain_store.py` conflict).
-
----
-
-### FC-092: `RejectionTally` only counts the first replay per process — 13 of 14 monthly `backtest_runs` rows carry an empty tally; and its summary is order-nondeterministic
-
-**Scope:** shared (backtest engine)
-**Status:** **RESOLVED 2026-09-01 by FC-096 PR-a (#109):** item 1 (first-replay-only tally — cached structlog proxies) fixed via contextvar-bound dispatch; item 2 (order nondeterminism) fixed via sorted summaries. Both mutation-checked. Entry retained for the schema note; `binding_constraint` backfill remains N/A (pre-fix rows read as "not measured").
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem (two defects, both pre-existing on `main`):**
-1. `setup_logging` configures structlog with `cache_logger_on_first_use=True`; a lazy logger proxy caches its processor chain on first use and `RejectionTally.__enter__`'s `structlog.configure()` does not invalidate it. Measured: two `evaluate_symbol` calls in one process → the first returns a populated `blocked_days_by_reason`, the second `{}`. **The monthly screen evaluates 14 symbols in one process, so 13 of every 14 `backtest_runs` rows already have an empty tally, `candidate_days=0` and a NULL `binding_constraint`** — the "binding constraint" column FC-057 made nameable has been mostly NULL since the screen went live. The Layer 2 sweep deliberately ships no `binding_constraint` column on its rows rather than one that is NULL by artifact.
-2. `RejectionTally.summary()` iterates a `set` into a `Counter`, so `most_common()` tie-breaks depend on the hash seed — `binding_constraint` (and the NVDA replay's markdown) can flip between runs. Layer 2's identity proof had to pin `PYTHONHASHSEED=0` because `main` alone alternates between two NVDA hashes.
-
-**Fix direction:** stop relying on process-global `structlog.configure()` inside the tally — bind the tally processor through a thread-local/contextvar the configured chain always consults (or disable `cache_logger_on_first_use` for the backtest path and re-bind per replay); make `summary()` deterministic (sorted iteration, explicit tie-break). Then backfill nothing — re-run the screen; note in `docs/bigquery/backtest_runs.md` that `binding_constraint` before the fix is NULL by artifact for all but the first symbol of each run.
-
-**Links:** PR #100 (discovery), FC-057 (the tally's purpose), `src/backtesting/engine/rejections.py`, `src/utils/logger.py`, `src/backtesting/screen.py`.
 
 ---
 
@@ -1074,18 +1056,6 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-096 Phase E (`docs/plans/fc-096-e.md` §Closeout), the signed component inventory (FC-096 entry), FC-060 guardrails.
 
-### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
-
-**Scope:** shared
-**Status:** MERGED — PR #128 `7c22fac` 2026-09-09 (both bot services → 1800 s; seam-invariant contract test); LIVE-VERIFIED 2026-09-09 on both services; FC-100 O8 satisfied. Found by the FC-100 plan; live-verified on both services.
-**Size estimate:** S (deploy flag + fixture re-freeze) — a real-money precondition
-
-**Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. **Measured:** wheel `/roll` cycles with instant paper fills ran 14, 141, 140, 150, 124, 26 s for 2–4 positions — ~35 s/position of chain fetch and evaluation before any order. The covered-call arithmetic (two positions): ≈70 s evaluation + one BTC poll to timeout (120 s) + cancel settle (15 s) = **205 s before any STO is placed**; one STO rung to timeout (+135 s) ≈ **340 s > 300 s**. The cycle-budget guard assumes an 1800 s request and refuses nothing at 300. Measured (wheel, last 22 cycles): durations up to 259 s; STO rung 1 timed out in 4 of 8 executed rolls since 08-28; 09-07 IWM a genuine BTC timeout. **What the cut does, measured (2026-08-13 `/scan`: 504 at 300.0 s, thread kept emitting for 10 more minutes with no request in flight):** Cloud Run returns 504 to the scheduler (a job failure no alert policy watches; retries are 0) and does **not** kill the handler thread. CPU throttling slows an I/O-bound poll loop; it does not park it — the ladder keeps running roughly on schedule, its terminals (`call_roll_completed`, `call_roll_naked_exposure`) still fire if the instance lives, and the `/roll` response (`duration_seconds`, `results`) is lost. The dangerous residual is instance **scale-in mid-ladder** (~15 min with no request — unlikely in the roll window given the 15-min ingest cadence, but real): BTC filled, STO never placed, no terminal event — uncovered long stock until the next `/run` re-covers.
-
-**Proposal:** `--timeout=1800` on both bot services in ONE commit with the fixture re-freeze (next ledger deviation), plus a contract test asserting the service timeout ≥ the roller's budget + the scheduler deadline relationship. Precondition before any real-money roll — and, per the FC-100 plan (rev 2, DD-7), a precondition for resuming `cc-roll-daily` on the paper covered-call service.
-
-**Links:** FC-078, FC-100 (`docs/plans/fc-100.md` §Found while planning), `docs/CLAUDE.md` §Deploy/CI.
-
 ### FC-108: `/regression` is roll-blind on both profiles
 
 **Scope:** shared
@@ -1149,7 +1119,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-113: the roller's per-position budget under-counts the cancel-settle legs
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-107 plan); WIDENED 2026-09-08 by the FC-107 round-1 reviews — a real-money precondition
+**Status:** Filed 2026-09-08 (found by the FC-107 plan); WIDENED 2026-09-08 by the FC-107 round-1 reviews — a real-money precondition **2026-09-26: (a) the derived per-position budget and (b) monotonic wall-clock poll accounting are absorbed by FC-120 PR-2 (plan rev 2, R4); (c) the admission-time deadline / lock-wait bound stays here — coordinate with FC-089.**
 **Size estimate:** S–M
 
 **Problem:** three ways the roller's deadline accounting is blind, all on the same seam (BTC filled, STO not yet placed). (a) `_PER_POSITION_BUDGET_SECONDS = 600` assumes five 120 s legs; each leg also carries a 15 s `_CANCEL_SETTLE_TIMEOUT_SECONDS` on timeout, so the true worst case is 675 s and a position started at the latest permitted 900 s ends at 1575 s, past the 1500 s `_CYCLE_BUDGET_SECONDS`. (b) `_poll_order_fill` counts only `elapsed += poll_interval` (`call_roller.py:1124`) — the 24 `get_order_by_id` round-trips per 120 s poll, the settle polls, the cancel and the place calls are unaccounted: per-position worst ≈ 730 s at 0.3 s RTT, ≈ 825 s at 1 s, ≈ 960 s at 2 s; under FC-107's 1800 s the margin is ≈ 160 s at normal RTT and NEGATIVE at ≥ ~1.5 s. (c) Cloud Run's clock starts at admission but the cycle's starts after `strategy_lock` (`cloud_run_server.py:1305` vs `wheel_engine.py:721`), so a `/roll` queued N s behind a slow `/run`/`/monitor` (observed lock-holders 63 s, 79 s, 300 s) has 1800 − N platform seconds while believing it has 1500.
@@ -1216,7 +1186,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-120: live roller — the buy-to-close limit at the snapshot ask did not fill (execution quality of the roll's first leg)
 
-**Status:** Draft rev 2 (`docs/plans/fc-120.md`, 2026-09-26) — confirmation next; operator decisions Q1 (OPRA, blocking for the DD-1 gate) / Q2 (sequencing, default R7) pending. Rev 2 re-tabulated the full 30-day record on both services (BTC 13/18 real-market fills, STC rung-1 8/13, every fill ≤ 25 s and strictly through its limit; 25/26 observed offsets ≤ $0.10) and adopted the program-owner rulings: buffer 0.10, pre-committed BTC re-price escalation (3 × 40 s), deep-ITM parity floor from the IEX stock bid, FC-113 (a)+(b) folded into PR-2, a covered-call log sink as an operator prerequisite (the CC service has none), and new real-money gate rows. Correction to rev 1: off-grid limits are the fingerprint of a modified quote, not the miss mechanism (on-grid misses exist); live Alpaca routes a non-conforming limit to NOM and rejects only if it cannot.
+**Status:** Plan **Approved rev 3** (`docs/plans/fc-120.md`, 2026-09-26); operator decisions signed 2026-09-26 — **Q1 YES** (OPRA / Algo Trader Plus before the CC account trades real money; the DD-1 buffer re-read runs on OPRA data; 0.10 stands for the paper era) and **Q2 PR-2 opens immediately after PR-1 merges** (R7's ≥ 3-trading-day wait waived). **PR-1 (quote instrumentation, no behaviour change) is the queued Opus build**; PR-2 (marketable tick-legal limits + 3 × 40 s BTC re-price escalation + IEX parity floor) absorbs FC-113 (a)+(b). Evidence base (rev 2, both services, 2026-08-26 → 09-26): BTC 13/18 real-market fills, STC rung-1 8/13, every fill ≤ 25 s and strictly through its limit, 25/26 observed offsets ≤ $0.10; CC week-1 BTC first leg 1 of 4. Correction to rev 1: off-grid limits are the fingerprint of a modified quote, not the miss mechanism. Operator prerequisite: a covered-call log sink (the CC service has none).
 **Scope:** `src/strategy/call_roller.py` BTC pricing / timeout handling; observability of the quote the limit was priced from.
 **Size estimate:** S–M (study first: how stale/wide was the quote; then either re-price once at timeout, use a marketable buffer above the ask, or widen `btc_fill_timeout_seconds`).
 **Owner:** unassigned.
@@ -1232,6 +1202,38 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
 
 ## Completed
+
+### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
+
+**Scope:** shared
+**Status:** COMPLETED 2026-09-09 — PR #128 `7c22fac`: both bot services → `--timeout=1800` + seam-invariant contract test; `timeoutSeconds: 1800` live-verified on both services 2026-09-09; FC-100 O8 satisfied. Plan `docs/plans/fc-107.md` Done. Moved to Completed 2026-10-01 (bookkeeping sweep).
+**Size estimate:** S (deploy flag + fixture re-freeze) — a real-money precondition
+
+**Problem:** `options-wheel-strategy` and `covered-call-engine` deploy with `--timeout=300`, pinned by `cloudbuild.yaml` and the frozen contract fixture, while `/roll`'s cycle budget is 1500 s and the daily scheduler's attempt deadline is 1800 s. FC-078 said "raise to ≥ 1800" and it never stuck. **Measured:** wheel `/roll` cycles with instant paper fills ran 14, 141, 140, 150, 124, 26 s for 2–4 positions — ~35 s/position of chain fetch and evaluation before any order. The covered-call arithmetic (two positions): ≈70 s evaluation + one BTC poll to timeout (120 s) + cancel settle (15 s) = **205 s before any STO is placed**; one STO rung to timeout (+135 s) ≈ **340 s > 300 s**. The cycle-budget guard assumes an 1800 s request and refuses nothing at 300. Measured (wheel, last 22 cycles): durations up to 259 s; STO rung 1 timed out in 4 of 8 executed rolls since 08-28; 09-07 IWM a genuine BTC timeout. **What the cut does, measured (2026-08-13 `/scan`: 504 at 300.0 s, thread kept emitting for 10 more minutes with no request in flight):** Cloud Run returns 504 to the scheduler (a job failure no alert policy watches; retries are 0) and does **not** kill the handler thread. CPU throttling slows an I/O-bound poll loop; it does not park it — the ladder keeps running roughly on schedule, its terminals (`call_roll_completed`, `call_roll_naked_exposure`) still fire if the instance lives, and the `/roll` response (`duration_seconds`, `results`) is lost. The dangerous residual is instance **scale-in mid-ladder** (~15 min with no request — unlikely in the roll window given the 15-min ingest cadence, but real): BTC filled, STO never placed, no terminal event — uncovered long stock until the next `/run` re-covers.
+
+**Proposal:** `--timeout=1800` on both bot services in ONE commit with the fixture re-freeze (next ledger deviation), plus a contract test asserting the service timeout ≥ the roller's budget + the scheduler deadline relationship. Precondition before any real-money roll — and, per the FC-100 plan (rev 2, DD-7), a precondition for resuming `cc-roll-daily` on the paper covered-call service.
+
+**Links:** FC-078, FC-100 (`docs/plans/fc-100.md` §Found while planning), `docs/CLAUDE.md` §Deploy/CI.
+
+---
+
+### FC-092: `RejectionTally` only counts the first replay per process — 13 of 14 monthly `backtest_runs` rows carry an empty tally; and its summary is order-nondeterministic
+
+**Scope:** shared (backtest engine)
+**Status:** COMPLETED 2026-09-01 — resolved by FC-096 PR-a (#109): item 1 (first-replay-only tally — cached structlog proxies) fixed via contextvar-bound dispatch; item 2 (order nondeterminism) fixed via sorted summaries; both mutation-checked. No plan file of its own (S, delivered inside FC-096 Phase B). `binding_constraint` backfill N/A — pre-fix rows read as "not measured". Moved to Completed 2026-10-01 (bookkeeping sweep).
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem (two defects, both pre-existing on `main`):**
+1. `setup_logging` configures structlog with `cache_logger_on_first_use=True`; a lazy logger proxy caches its processor chain on first use and `RejectionTally.__enter__`'s `structlog.configure()` does not invalidate it. Measured: two `evaluate_symbol` calls in one process → the first returns a populated `blocked_days_by_reason`, the second `{}`. **The monthly screen evaluates 14 symbols in one process, so 13 of every 14 `backtest_runs` rows already have an empty tally, `candidate_days=0` and a NULL `binding_constraint`** — the "binding constraint" column FC-057 made nameable has been mostly NULL since the screen went live. The Layer 2 sweep deliberately ships no `binding_constraint` column on its rows rather than one that is NULL by artifact.
+2. `RejectionTally.summary()` iterates a `set` into a `Counter`, so `most_common()` tie-breaks depend on the hash seed — `binding_constraint` (and the NVDA replay's markdown) can flip between runs. Layer 2's identity proof had to pin `PYTHONHASHSEED=0` because `main` alone alternates between two NVDA hashes.
+
+**Fix direction:** stop relying on process-global `structlog.configure()` inside the tally — bind the tally processor through a thread-local/contextvar the configured chain always consults (or disable `cache_logger_on_first_use` for the backtest path and re-bind per replay); make `summary()` deterministic (sorted iteration, explicit tie-break). Then backfill nothing — re-run the screen; note in `docs/bigquery/backtest_runs.md` that `binding_constraint` before the fix is NULL by artifact for all but the first symbol of each run.
+
+**Links:** PR #100 (discovery), FC-057 (the tally's purpose), `src/backtesting/engine/rejections.py`, `src/utils/logger.py`, `src/backtesting/screen.py`.
+
+---
 
 ### FC-100: the live covered-call service does NOT roll — profile has no rolling block; docs list the roller as CC management item 5
 
