@@ -1110,6 +1110,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Proposal:** wall-clock deadline accounting in `_poll_order_fill` (monotonic elapsed, not summed sleeps); an admission-time deadline passed into `run_rolling_cycle` from `/roll` (or a lock-acquire timeout on `/roll` — coordinate with FC-089 so exactly one owns it); derive the per-position budget from the leg constants (`legs × (poll + settle)` = 675 s) and assert it in a test alongside FC-107's seam-invariant contract test. Both profiles by Symmetry.
 
+**Measurement (FC-120 PR-1):** `call_roll_leg_settled.leg_elapsed_s` (FC-120 PR-1) is the measured per-leg wall-clock the proposal asks for; (a)+(b) are built by FC-120 PR-2.
+
 **Links:** FC-107 (D1, D4), FC-078 §4, FC-089.
 
 ### FC-114: `_is_market_open()` has no holiday calendar — orders placed into a closed market

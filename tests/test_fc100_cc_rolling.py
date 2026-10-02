@@ -492,3 +492,24 @@ class TestTheCCAlertPolicies:
                        "covered_call.trades_from_activities",
                        "ROLLER_ENABLED=false"):
             assert needle in content, needle
+
+    @pytest.mark.parametrize("name", ("cc_roll_executed_alert_policy.json",
+                                      "roll_executed_alert_policy.json"))
+    def test_the_runbooks_name_the_fc120_diagnostics_not_the_filters(self, name):
+        """FC-120 T-14 (PR-1 half). Both roll runbooks tell a responder which
+        fields diagnose a BTC timeout and where the per-leg rows are; neither
+        alert FILTER pages on them — `call_roll_leg_settled` and
+        `call_roll_stc_timeout_canceled` are informational, and
+        `call_roll_btc_timeout_canceled` stays un-paged (a clean no-op)."""
+        doc = self._doc(name)
+        content = doc["documentation"]["content"]
+        for needle in ("quote_drift", "call_roll_leg_settled", "quote_age_s",
+                       "limit_on_tick", "cancel_quote_ask"):
+            assert needle in content, (name, needle)
+        for condition in doc["conditions"]:
+            f = (condition.get("conditionMatchedLog") or {})["filter"]
+            for informational in ("call_roll_leg_settled",
+                                  "call_roll_stc_timeout_canceled",
+                                  "call_roll_btc_timeout_canceled",
+                                  "call_roll_quote_refresh_failed"):
+                assert informational not in f, (name, informational)
