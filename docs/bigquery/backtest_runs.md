@@ -31,7 +31,9 @@
 
 One row per **symbol per screening run** (FC-032 Phase 5). Was written by
 `src/backtesting/reporting/bq_writer.py` via `python main.py --command screen`
-(the `backtest-screen` Job, or locally); nothing writes it now.
+(the `backtest-screen` Job, or locally). Nothing **scheduled** writes it now; the
+CLI command still exists until FC-121 PR-2 removes it, and a local run of it would
+still persist rows.
 
 Day-partitioned on `timestamp`.
 
@@ -157,11 +159,13 @@ full screen took ~1h47m, which is why it was never served over HTTP: the
 The scheduler was paused on 2026-10-02 and FC-121 deletes it and the Job
 (`docs/plans/fc-121.md`); the CLI command and its writer module are removed in
 the same FC. A failed run wrote **zero** rows — persistence was a single write
-after the loop — so the table holds no partial runs from a crash. Ad-hoc subset
-runs are present and carry `run_kind='adhoc'`.
+after the loop — so the table holds no partial runs from a crash. `run_kind`
+can be `adhoc`, but no ad-hoc row was ever written: the table holds 7 full runs,
+98 rows, all `run_kind='full'` (BigQuery, 2026-10-02).
 
-The Job's deploy recipe is in `docs/BACKTEST_ENGINE.md` at `fbdb6f9` (repository
-history only).
+The Job's attribute table (image, resources, schedule — not a command) is in
+`docs/BACKTEST_ENGINE.md` at `fbdb6f9` (repository history only); the Job's
+exported spec is recorded in `docs/plans/fc-121.md` §Execution.
 
 ## Queries
 

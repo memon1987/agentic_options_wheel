@@ -890,6 +890,9 @@ def test_sweep_job_step_deploys_this_builds_image_with_the_sweep_command(by_id):
         "SWEEP_SPEC_JSON`. The spec arrives as a per-execution env override "
         "(D2); a job whose args say otherwise ignores the submission entirely."
     )
+    assert BACKFILL_JOB_NAME not in script, (
+        f"{SWEEP_JOB_STEP} must not touch another Job's definition."
+    )
 
 
 def test_sweep_job_step_carries_every_env_var_and_secret_the_sweep_needs(by_id):

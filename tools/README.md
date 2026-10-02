@@ -4,6 +4,12 @@ This directory contains all development, testing, deployment, and monitoring too
 
 ## Directory Structure
 
+### 📊 `/backtesting/`
+**Backtest data tools (operator-run)**
+- `coverage_report.py` - FC-032 data-coverage gate: per symbol, how often Alpaca's option history has a usable put candidate (needs Alpaca credentials; not run in CI)
+- `fetch_dividend_table.py` - Build the committed static dividend table the backtest replays against (from Alpaca corporate actions)
+- `fetch_earnings_table.py` - Build the committed static historical earnings table the backtest replays against (from yfinance)
+
 ### 🚀 `/deployment/`
 **Deployment and infrastructure management**
 - `deploy.sh` - Main deployment script for Cloud Run

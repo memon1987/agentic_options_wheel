@@ -578,9 +578,9 @@ prefix scan per live symbol) and compares the newest stored chain-day against
 `jobs:run` is asynchronous** — it records success when the API call returns, so
 a paused scheduler, a deleted scheduler and a Job that fails every execution
 all leave a clean scheduler history. The Job-failure alert policy
-(`deploy/monitoring/job_failure_alert_policy.json`, which watches all three
-Jobs — the first policy here to match `cloud_run_job` at all; the others match
-`cloud_run_revision` or `build`) catches an execution that runs and fails; this
+(`deploy/monitoring/job_failure_alert_policy.json`, which watches both Jobs —
+`backtest-sweep` and `data-backfill` — and was the first policy here to match
+`cloud_run_job`) catches an execution that runs and fails; this
 catches the one that never runs. Both events have their own policy:
 `lake_freshness_alert_policy.json` on the `fail`, and
 `lake_freshness_degraded_alert_policy.json` as a 24h-rate-limited nag on the
