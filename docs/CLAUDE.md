@@ -479,13 +479,16 @@ this list — not any single plan — is where readiness is judged. Status as of
 
 | Gate | Profile | Owner | Status |
 |---|---|---|---|
-| Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open |
-| Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 | both | FC-088 | filed |
+| Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open — blocks FC-120's DD-1 gate decision (Q1); the buffer default is feed-specific |
+| Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 (the roller half closes only when FC-120 PR-2 merges — PR-1 is instrumentation and changes no limit) | both | FC-088 | filed |
 | `AlpacaClient` HTTP calls have no socket timeout; a hung lock-holder has no in-session bound (Cloud Run's cut does not stop the thread) | both | FC-089 | filed |
-| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case | both | FC-113 | filed |
+| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case (699 s when all twelve FC-120 PR-1 diagnostic reads hang to their 2 s cap) | both | FC-113 | filed; (a)+(b) land in FC-120 PR-2; (c) remains |
 | `_is_market_open()` has no holiday calendar — orders can be placed into a closed market (09-07 IWM) | both | FC-114 | filed |
 | Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | PR #128; verify live per §Deploy / CI |
 | Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | merged (#127); policy not yet deployed |
+| Rung-2 exchange price protection: rung 2 (`btc_fill + min_credit`) sits 20–60 % through the NBBO; Cboe / NOM limit-order price protection can reject or re-price a limit that far through — on paper it filled 5/5, live it may come back `stc_rejected` and the ladder falls to rung 3 | both | FC-120 (verify on the first live roll; do not assume the floor rung exists) | open |
+| Live `btc_rejected` / `stc_rejected` handling — never observed on paper; live, a tick or price-protection rejection is the terminal. Confirm the rejected paths (`execute_roll`'s synchronous and after-placement `call_roll_btc_rejected`, and `_place_stc`'s `call_roll_stc_rejected`) leave the position covered and page | both | FC-120 | open |
+| Periodic `ppind` re-verification of `VERIFIED_PENNY_PROGRAM_ROOTS` (penny-program membership changes; a root that leaves it prices at nickels below $3 and is rejected) | both | operator, quarterly | open |
 
 **The fee note.** `rolling.min_net_credit_per_contract: 0.00` makes the roller
 credit-only on the *placed limit prices* — gross. A live account pays roughly
