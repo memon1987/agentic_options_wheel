@@ -1329,6 +1329,24 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-127: post-hoc truth for roll misses — OPRA trade prints near each placement, and a stock-quote decomposition of every miss
+
+**Status:** Filed 2026-10-02 (deferred out of FC-120 PR-1 by the program owner at the PR-1 code review; do not build inside FC-120)
+**Scope:** shared (both roll services; analysis + possibly a read-only backfill tool)
+**Size estimate:** S–M (depends on the market-data entitlement)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-120 PR-1 logs what the INDICATIVE feed said at placement, at a re-read just after placement, at the post-settle read, and (via `call_roll_quote_sample`) at the end of each cycle. None of that is the true market. A miss (`call_roll_leg_settled` with `disposition=timeout_canceled`) still cannot say whether the limit was inside the real book: `quote_drift` is indicative-vs-indicative over ~2 min and is confounded by the underlying's move and by selection (FC-120 rev-4 ruling E), so it cannot size PR-2's buffer.
+
+**Proposal:** (a) if the Alpaca entitlement allows historical OPRA trades (Algo Trader Plus — FC-120 Q1, signed for "before real money"), backfill the option's trade prints in a window around each roll placement (`placed_at` ± 2 min, keyed by `roll_id` / `order_id`) and record whether any print traded through the placed limit; (b) decompose every miss with the IEX stock quote — `stock_bid` at placement vs `cancel_stock_bid` at the post-settle read — into the part of the move explained by the underlying (delta × stock move) and the residual feed offset. Read-only; a diagnostic tool under `tools/diagnostics/` plus an investigation note, not production code.
+
+**Why deferred:** PR-1 is instrumentation-only and must not grow an analysis surface; the entitlement is an operator purchase not yet made.
+
+**Links:** FC-120 (`docs/plans/fc-120.md` §Amendments rev 4, rulings D/E), FC-072 (`quote_feed`), FC-113.
+
+---
+
 ## Completed
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
