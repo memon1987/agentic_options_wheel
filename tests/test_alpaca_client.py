@@ -707,3 +707,32 @@ class TestAlpacaClientGetOrders:
         _, kwargs = tc.get_orders.call_args
         req = kwargs.get('filter') or tc.get_orders.call_args.args[0]
         assert req.limit is not None and req.limit >= 100
+
+
+class TestOptionsChainCarriesTheQuoteStamp:
+    """FC-120 PR-1 (T-LOW): each chain row carries its quote's broker stamp as
+    ``quote_timestamp`` — the roller's ``chain_quote_age_s`` reads it. The
+    chain call passes no feed, so no feed is implied on the row."""
+
+    @patch('src.api.alpaca_client.TradingClient')
+    @patch('src.api.alpaca_client.StockHistoricalDataClient')
+    @patch('src.api.alpaca_client.OptionHistoricalDataClient')
+    def test_rows_carry_quote_timestamp(self, mock_option_client,
+                                        mock_stock_client, mock_trading_client,
+                                        mock_config):
+        stamp = datetime(2026, 9, 30, 19, 30, 1, tzinfo=timezone.utc)
+        quote = Mock(bid_price=8.0, ask_price=8.4, bid_size=3, ask_size=4,
+                     timestamp=stamp)
+        stale = Mock(spec=['bid_price', 'ask_price', 'bid_size', 'ask_size'],
+                     bid_price=1.0, ask_price=1.2, bid_size=1, ask_size=1)
+        mock_option_client.return_value.get_option_chain.return_value = {
+            'GOOGL261016C00350000': Mock(latest_quote=quote, latest_trade=None,
+                                         greeks=None, implied_volatility=None),
+            'GOOGL261016C00355000': Mock(latest_quote=stale, latest_trade=None,
+                                         greeks=None, implied_volatility=None),
+        }
+        rows = AlpacaClient(mock_config).get_options_chain('GOOGL')
+        by_symbol = {r['symbol']: r for r in rows}
+        assert by_symbol['GOOGL261016C00350000']['quote_timestamp'] == stamp
+        assert by_symbol['GOOGL261016C00355000']['quote_timestamp'] is None
+        assert 'feed' not in by_symbol['GOOGL261016C00350000']

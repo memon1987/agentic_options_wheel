@@ -895,9 +895,14 @@ class WheelEngine:
         # position is processed and every terminal emitted, and only when the
         # cycle finished inside 600 s. No order; no effect on ``results``.
         if self._emit_quote_samples:
-            sample_short_call_quotes(
-                self.alpaca,
-                [p.get('symbol', '') for p, _ in short_calls + uncovered_calls],
-                roller.skip_reasons, start_monotonic)
+            try:
+                skip_reasons = getattr(roller, 'skip_reasons', None)
+                sample_short_call_quotes(
+                    self.alpaca,
+                    [p.get('symbol', '') for p, _ in short_calls + uncovered_calls],
+                    skip_reasons if isinstance(skip_reasons, dict) else {},
+                    start_monotonic)
+            except Exception:
+                pass   # the sampler is total; this guards only its arguments
 
         return results

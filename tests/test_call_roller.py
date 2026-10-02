@@ -1867,6 +1867,7 @@ class TestTheFlagshipRoll:
 
 import os  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 from datetime import timezone  # noqa: E402
 
 cr = call_roller_module
@@ -2741,3 +2742,348 @@ class TestOneSettledRowPerPlacedOrder:
         assert terminals(log) == ['call_roll_btc_rejected']
         # Nothing was live, so nothing was re-read.
         assert instrumented.get_option_quote.call_count == 2
+
+
+class TestStcLegFieldsKillTheSurvivingMutants:
+    """T-MEDIUM-5. The STO fixture's post-settle read DIFFERS from the base
+    quote on both sides by different amounts, so each mutant reads a
+    different number:
+
+    - drift sign flipped (``cancel_bid - quote_bid``) -> -0.15, not +0.15
+    - drift on the wrong side (asks: ``quote_ask - cancel_ask``) -> +0.05
+    - ``polls`` overwritten by the settle's count -> 2, not 1
+    - ``chain_quote_age_s`` on rungs other than 1 -> not None on rung 2/3
+    """
+
+    def _book(self):
+        # C375: priced 10.90/11.10, re-read shifted, post-settle 10.75/11.05.
+        return _book(**{C375['symbol']: [
+            _q(10.90, 11.10), _q(10.92, 11.12), _q(10.75, 11.05)]})
+
+    def test_stc_drift_sign_and_side(self, roller, instrumented):
+        instrumented.get_option_quote.side_effect = self._book()
+        script, _rows, _t = LEG_SCENARIOS['rung1_timeout_then_rung2_fill']
+        _result, log = _drive(roller, instrumented, script)
+        rung1 = [r for r in _all(log, 'call_roll_leg_settled')
+                 if r.get('rung') == 1][0]
+        assert rung1['cancel_quote_bid'] == 10.75
+        assert rung1['cancel_quote_ask'] == 11.05
+        assert rung1['quote_drift'] == 0.15     # quote_bid - cancel_bid
+        ev = _first(log, 'call_roll_stc_timeout_canceled')
+        assert 'quote_drift' not in ev           # ruling A: settled row only
+
+    def test_stc_polls_is_the_primary_poll(self, roller, instrumented,
+                                           monkeypatch):
+        monkeypatch.setattr(call_roller_module,
+                            '_CANCEL_SETTLE_TIMEOUT_SECONDS', 5)
+        script = {'btc-1': BTC_FILLED,
+                  'sto-1': {'poll': _o('sto-1', 'new'),
+                            'after_cancel': [_o('sto-1', 'pending_cancel'),
+                                             _o('sto-1', 'canceled')]},
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 8.40)}}
+        _result, log = _drive(roller, instrumented, script)
+        ev = _first(log, 'call_roll_stc_timeout_canceled')
+        assert ev['polls'] == 1 and ev['settle_polls'] == 2
+        rung1 = [r for r in _all(log, 'call_roll_leg_settled')
+                 if r.get('rung') == 1][0]
+        assert rung1['polls'] == 1 and rung1['settle_polls'] == 2
+
+    def test_chain_age_is_rung_1_only(self, roller, instrumented):
+        _result, log = _drive(roller, instrumented, LADDER_TO_RUNG_3)
+        for event_type in ('call_roll_stc_placed', 'call_roll_leg_settled'):
+            by_rung = {r['rung']: r for r in _all(log, event_type)
+                       if r.get('leg') == 'stc'}
+            assert by_rung[1]['chain_quote_age_s'] == pytest.approx(100, abs=3)
+            assert by_rung[2]['chain_quote_age_s'] is None, event_type
+            assert by_rung[3]['chain_quote_age_s'] is None, event_type
+
+
+def _placements(mock_alpaca):
+    return [dict(c.kwargs) for c in mock_alpaca.place_option_order.call_args_list]
+
+
+def _order(symbol, side, limit):
+    return {'symbol': symbol, 'qty': 1, 'side': side, 'order_type': 'limit',
+            'limit_price': limit}
+
+
+_LADDER_3_ORDERS = [
+    _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90),
+    _order(C375['symbol'], 'sell', 8.35), _order(C380['symbol'], 'sell', 8.50)]
+
+#: scenario -> (old book, broker script, the order arguments main places)
+GOLDEN_PLACEMENTS = {
+    'full_fill': ((8.00, 8.40), FULL_FILL, [
+        _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90)]),
+    'ladder_to_rung_3': ((8.00, 8.40), LADDER_TO_RUNG_3, _LADDER_3_ORDERS),
+    'ladder_exhausted': ((8.00, 8.40), LADDER_EXHAUSTED, _LADDER_3_ORDERS),
+    'all_rungs_time_out': ((8.00, 8.40), ALL_RUNGS_TIME_OUT, _LADDER_3_ORDERS),
+    'btc_timeout': ((8.00, 8.40), BTC_TIMEOUT, [
+        _order(OLD_SYMBOL, 'buy', 8.40)]),
+    # Extrinsic 7.10 - 7.00 = 0.10 <= 0.20: imminence prices both legs at
+    # mid +/- 0.05 — 7.15 and 11.00 - 0.05 = 10.95.
+    'imminence_full_fill': ((7.00, 7.20), FULL_FILL, [
+        _order(OLD_SYMBOL, 'buy', 7.15), _order(C375['symbol'], 'sell', 10.95)]),
+}
+
+
+def _diag_garbage(_name, _args, _real):
+    """Every instrumentation read returns an absurd book."""
+    return _q(0.01, 99.00, stamp=None)
+
+
+def _diag_raises(_name, _args, _real):
+    raise RuntimeError("instrumentation endpoint down")
+
+
+class TestNoBehaviourChange:
+    """FC-120 PR-1 is instrumentation with NO behaviour change: same order
+    arguments, same result dict, same terminals in the same order — when the
+    instrumentation reads are clean, return garbage, raise, or never return.
+
+    Diagnostic reads are told apart by THREAD (``_Timeline``): only reads made
+    off the roller's own thread are poisoned, so every pricing read is real.
+    """
+
+    def _clean(self, roller, instrumented, name):
+        old, script, golden = GOLDEN_PLACEMENTS[name]
+        instrumented.get_option_quote.side_effect = _book(old=old)
+        result, log, _t = _drive_timeline(roller, instrumented, script)
+        return result, terminals(log), golden
+
+    @pytest.mark.parametrize('name', sorted(GOLDEN_PLACEMENTS))
+    def test_order_arguments_match_main(self, roller, instrumented, name):
+        _r, _t, golden = self._clean(roller, instrumented, name)
+        assert _placements(instrumented) == golden
+
+    @pytest.mark.parametrize('poison', ['garbage', 'raises'])
+    @pytest.mark.parametrize('name', sorted(GOLDEN_PLACEMENTS))
+    def test_poisoned_instrumentation_reads_change_nothing(
+            self, roller, instrumented, name, poison):
+        """Covers the STO ladder too (exhausted, all-rungs-timeout, rung-3
+        fill) — S/T 1(c)."""
+        clean_result, clean_terminals, golden = self._clean(
+            roller, instrumented, name)
+        instrumented.reset_mock()
+        old, script, _g = GOLDEN_PLACEMENTS[name]
+        instrumented.get_option_quote.side_effect = _book(old=old)
+        hook = _diag_garbage if poison == 'garbage' else _diag_raises
+        result, log, timeline = _drive_timeline(roller, instrumented, script,
+                                                on_diag=hook)
+
+        assert _placements(instrumented) == golden
+        assert result == clean_result
+        assert terminals(log) == clean_terminals
+        assert any(kind == 'diag' for kind, _ in timeline.entries)
+
+    @pytest.mark.parametrize('name', ['btc_timeout', 'ladder_exhausted',
+                                      'all_rungs_time_out', 'ladder_to_rung_3'])
+    def test_a_diagnostic_read_that_never_returns_delays_nothing(
+            self, roller, instrumented, monkeypatch, name):
+        """Ruling B / 1(b): every diag read blocks on an Event that is only
+        set at teardown. The cap (shrunk to 50 ms here) abandons each one;
+        the terminals and order arguments are main's, inside the bound."""
+        monkeypatch.setattr(call_roller_module, '_DIAG_READ_TIMEOUT_SECONDS',
+                            0.05)
+        clean_result, clean_terminals, golden = self._clean(
+            roller, instrumented, name)
+        instrumented.reset_mock()
+        old, script, _g = GOLDEN_PLACEMENTS[name]
+        instrumented.get_option_quote.side_effect = _book(old=old)
+        release = threading.Event()
+
+        def hang(_name, _args, _real):
+            release.wait(30)
+            return _q(1.0, 2.0)
+        try:
+            started = time.monotonic()
+            result, log, _t = _drive_timeline(roller, instrumented, script,
+                                              on_diag=hang)
+            wall = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert result == clean_result
+        assert terminals(log) == clean_terminals
+        assert _placements(instrumented) == golden
+        assert wall < 5.0, wall
+        # The rows still exist, with the unreadable fields null.
+        rows = _all(log, 'call_roll_leg_settled')
+        assert len(rows) == len(golden)
+        assert all(r.get('cancel_quote_ask') is None for r in rows)
+        if name == 'btc_timeout':
+            crumb = _first(log, 'call_roll_quote_refresh_failed')
+            assert crumb['reason'] == 'timeout'
+
+
+_JUNK = [10 ** 400, 1e308, -1e308, float('nan'), float('inf'),
+         float('-inf'), 'junk', '', None, True, object(), [1], {'a': 1}]
+_JUNK_STAMPS = ['not-a-time', '9999-99-99', 12345, '', object(),
+                datetime(2026, 1, 1), _stamp(1.0)]
+
+
+def _all_primitive_and_finite(fields):
+    for key, value in fields.items():
+        assert isinstance(value, PRIMITIVES), (key, value)
+        if isinstance(value, float):
+            assert value == value and value not in (float('inf'),
+                                                    float('-inf')), key
+
+
+class TestFieldBuildersAreTotal:
+    """Ruling C / S-MEDIUM-6. Every builder survives absurd inputs — a huge
+    int (``OverflowError``), a 1e308 limit (``decimal.InvalidOperation`` on
+    the tick modulo), a non-string underlying, NaN/inf, junk stamps — and
+    returns only finite JSON primitives or None."""
+
+    @pytest.mark.parametrize('junk', _JUNK, ids=repr)
+    def test_quote_and_reread_and_fill_fields(self, junk):
+        quote = {'bid': junk, 'ask': junk, 'bid_size': junk, 'ask_size': junk,
+                 'timestamp': junk, 'feed': junk}
+        for underlying in ('GOOGL', 123, None):
+            _all_primitive_and_finite(cr._evaluation_quote_set(
+                quote, junk, underlying, junk, junk, junk, junk))
+        _all_primitive_and_finite(cr._reread_fields(quote, quote, 'buy'))
+        _all_primitive_and_finite(cr._reread_fields(junk, junk, 'sell'))
+        _all_primitive_and_finite(CallRoller._fill_fields(
+            limit=junk, filled_price=junk, side='buy',
+            order={'filled_at': junk, 'submitted_at': junk},
+            elapsed=junk, polls=junk, settle_polls=junk))
+        assert cr._limit_on_tick(junk, 'GOOGL') in (True, False, None)
+        assert cr._limit_on_tick(6.95, 123) is None
+        assert cr._diff(cr._num(junk), 1.0) is None or isinstance(
+            cr._diff(cr._num(junk), 1.0), float)
+
+    def test_the_named_overflow_cases(self):
+        assert cr._num(10 ** 400) is None
+        assert cr._limit_on_tick(1e308, 'GOOGL') is None
+        assert cr._diff(1e308, -1e308) is None        # inf is not a value
+
+    @pytest.mark.parametrize('stamp', _JUNK_STAMPS, ids=repr)
+    def test_junk_stamps(self, stamp):
+        assert cr._iso(stamp) is None or isinstance(cr._iso(stamp), str)
+        assert cr._age_s(stamp) is None or isinstance(cr._age_s(stamp), float)
+        assert cr._same_tick(stamp, _stamp(1.0)) in (True, False, None)
+
+    @pytest.mark.parametrize('junk', _JUNK, ids=repr)
+    def test_placement_and_post_settle_and_leg_row(self, roller, junk):
+        opportunity = {'underlying': junk, 'stock_bid': junk,
+                       'stock_ask': junk, 'stock_quote_ts': junk,
+                       'pricing_mode': junk, 'fc120': junk,
+                       'old_option_symbol': junk}
+        quote = {'bid': junk, 'ask': junk, 'timestamp': junk}
+        for leg in ('btc', 'stc'):
+            _all_primitive_and_finite(roller._placement_fields(
+                opportunity, leg=leg, quote=quote, limit=junk, strike=junk,
+                rung=junk, reused_from_rung=junk, chain_stamp=junk))
+        roller.alpaca.get_option_quote.side_effect = lambda _s: dict(quote)
+        roller.alpaca.get_stock_quote.side_effect = lambda _s: dict(quote)
+        _all_primitive_and_finite(roller._post_settle_quote(
+            'X', 'GOOGL', quote, 'sell'))
+        with patch('src.strategy.call_roller.logger') as log:
+            roller._log_leg_settled(
+                symbol='X', underlying='GOOGL', order_id=junk,
+                disposition='filled', placement={'leg': 'btc'}, limit=junk,
+                requested_qty=junk, filled_qty=junk, filled_price=junk,
+                order={'status': junk, 'submitted_at': junk}, elapsed=junk)
+        for _e, kwargs in events(log):
+            _all_primitive_and_finite(
+                {k: v for k, v in kwargs.items() if k != 'timestamp_ms'})
+
+    def test_a_swallowed_row_failure_leaves_one_breadcrumb(self, roller):
+        with patch('src.strategy.call_roller.logger') as log:
+            roller._log_leg_settled(
+                symbol='X', underlying='GOOGL', order_id='o', disposition='filled',
+                placement=None, limit=1.0, requested_qty=1)   # None.get raises
+        assert event_types(log) == ['call_roll_instrumentation_failed']
+        crumb = _first(log, 'call_roll_instrumentation_failed')
+        assert crumb['where'] == 'leg_settled'
+        assert crumb['event_category'] == 'system'
+        assert log.error.call_count == 0      # low severity, not an error
+
+    def test_bounded_read_reports_why(self):
+        assert cr._bounded_read(lambda: {'bid': 1})[1] == 'ok'
+        assert cr._bounded_read(lambda: {})[1] == 'empty'
+        assert cr._bounded_read(lambda: Mock())[1] == 'empty'
+
+        def boom():
+            raise RuntimeError('x')
+        assert cr._bounded_read(boom) == (None, 'error')
+        gate = threading.Event()
+        try:
+            assert cr._bounded_read(lambda: gate.wait(30), timeout=0.05) == (
+                None, 'timeout')
+        finally:
+            gate.set()
+
+
+class _SampleAlpaca:
+    """A read-only quote source for the sampler (it must never be asked to
+    place, cancel or poll anything)."""
+
+    def __init__(self, first, second, stock):
+        self.reads = [first, second]
+        self.stock = stock
+        self.calls = []
+
+    def get_option_quote(self, symbol):
+        self.calls.append(('quote', symbol))
+        return dict(self.reads.pop(0)) if self.reads else {}
+
+    def get_stock_quote(self, symbol):
+        self.calls.append(('stock', symbol))
+        return dict(self.stock)
+
+
+class TestTheEndOfCycleQuoteSampler:
+    """Ruling D. One ``call_roll_quote_sample`` row per held short call; two
+    back-to-back option reads plus the IEX quote; read-only; silent on
+    failure; nothing once the cycle has run 600 s."""
+
+    def test_one_row_with_the_feed_measurements(self):
+        stamp = _stamp(3.0)
+        alpaca = _SampleAlpaca(_q(7.90, 8.30, stamp=stamp),
+                               _q(7.90, 8.32, stamp=stamp),
+                               {'bid': 376.90, 'ask': 377.10,
+                                'timestamp': _stamp(1.0)})
+        with patch('src.strategy.call_roller.logger') as log:
+            n = cr.sample_short_call_quotes(
+                alpaca, [OLD_SYMBOL], {OLD_SYMBOL: 'not_itm_enough'},
+                time.monotonic())
+        assert n == 1
+        row = _first(log, 'call_roll_quote_sample')
+        assert row['strike'] == 370.0 and row['underlying'] == 'GOOGL'
+        assert row['quote_ask'] == 8.30 and row['quote_reread_ask'] == 8.32
+        assert row['same_tick'] is True
+        assert row['quote_reread_delta_ask'] == 0.02
+        assert row['quote_reread_delta_bid'] == 0.0
+        assert row['quote_age_s'] == pytest.approx(3, abs=3)
+        assert row['quote_feed'] == 'indicative'
+        assert row['intrinsic'] == 6.90
+        assert row['ask_minus_intrinsic'] == 1.40
+        assert row['limit_on_tick'] is True       # the ask 8.30: nickel grid
+        assert row['cycle_skip_reason'] == 'not_itm_enough'
+        assert alpaca.calls == [('quote', OLD_SYMBOL), ('quote', OLD_SYMBOL),
+                                ('stock', 'GOOGL')]
+        _all_primitive_and_finite(
+            {k: v for k, v in row.items() if k != 'timestamp_ms'})
+
+    def test_failures_are_silent_and_rows_still_come(self):
+        broken = Mock()
+        broken.get_option_quote.side_effect = RuntimeError('down')
+        broken.get_stock_quote.side_effect = RuntimeError('down')
+        with patch('src.strategy.call_roller.logger') as log:
+            n = cr.sample_short_call_quotes(broken, [OLD_SYMBOL, 'JUNK'], {},
+                                            time.monotonic())
+        assert n == 2
+        assert all(r['quote_ask'] is None
+                   for r in _all(log, 'call_roll_quote_sample'))
+        assert log.error.call_count == 0
+
+    def test_nothing_after_600_seconds(self):
+        alpaca = _SampleAlpaca({}, {}, {})
+        with patch('src.strategy.call_roller.logger') as log:
+            n = cr.sample_short_call_quotes(alpaca, [OLD_SYMBOL], {},
+                                            time.monotonic() - 600.0)
+        assert n == 0 and alpaca.calls == []
+        assert not _all(log, 'call_roll_quote_sample')

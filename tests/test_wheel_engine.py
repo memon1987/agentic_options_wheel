@@ -1251,3 +1251,57 @@ class TestClassShareCallsReachTheRoller(_CycleFixture):
 
         assert seen['evaluated'] == [
             (_occ('AAPL', self.EXPIRY, 100.0), 'AAPL')]
+
+
+class TestTheQuoteSamplerRunsLastAndLiveOnly(_CycleFixture):
+    """FC-120 PR-1 ruling D. The read-only quote sampler runs AFTER every
+    position's terminal and after ``roll_cycle_completed``; the backtest
+    ``Simulator`` turns it off by explicit injection."""
+
+    def _run(self, engine):
+        order = []
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls, \
+                patch('src.strategy.wheel_engine.sample_short_call_quotes') as sampler, \
+                patch('src.strategy.wheel_engine.log_system_event') as sys_ev:
+            roller = roller_cls.return_value
+            roller.skip_reasons = {'X': 'not_itm_enough'}
+            roller.evaluate_roll_opportunity.side_effect = (
+                lambda *a, **k: order.append('evaluate'))
+            sys_ev.side_effect = lambda _l, event_type, **k: order.append(event_type)
+            sampler.side_effect = lambda *a, **k: order.append('sample')
+            engine.run_rolling_cycle()
+        return order, sampler
+
+    def test_samples_after_every_terminal(self):
+        engine, alpaca = self._engine(['AAA', 'BBB'])
+        order, sampler = self._run(engine)
+        assert order[-1] == 'sample'
+        assert order.index('roll_cycle_completed') < order.index('sample')
+        assert order.count('evaluate') == 2
+        args = sampler.call_args.args
+        assert args[0] is alpaca
+        assert args[1] == [_occ('AAA', self.EXPIRY, 100.0),
+                           _occ('BBB', self.EXPIRY, 100.0)]
+        assert args[2] == {'X': 'not_itm_enough'}
+
+    def test_off_when_the_engine_is_built_for_a_replay(self):
+        engine, _ = self._engine(['AAA'])
+        engine._emit_quote_samples = False
+        _order, sampler = self._run(engine)
+        sampler.assert_not_called()
+
+    def test_the_simulator_builds_its_engine_with_sampling_off(self):
+        """The replay seam is explicit injection (the allow_bigquery idiom),
+        so the Simulator's WheelEngine call must pass the flag."""
+        import inspect
+        from src.backtesting.engine import simulator
+        source = inspect.getsource(simulator)
+        call = source[source.index('engine = WheelEngine('):]
+        call = call[:call.index('\n        )')]
+        assert 'emit_quote_samples=False' in call
+
+    def test_the_live_default_is_on(self):
+        import inspect
+        default = inspect.signature(WheelEngine.__init__).parameters[
+            'emit_quote_samples'].default
+        assert default is True
