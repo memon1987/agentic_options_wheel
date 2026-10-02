@@ -1514,10 +1514,26 @@ survives only until the next merge) and frozen in
 
 `OPERATORS` holds **two** entries: `zeshan@tkzmgroup.com` and
 `claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com`. The
-service account is not a convenience. `POST /sims/run`, `POST /sims/pins` and
-`DELETE /sims/pins/{id}` have **no frontend caller** — they are curl-only
-surfaces — so once the bearer token is retired an impersonated id-token for that
-SA is the only credential that can reach them.
+service account is not a convenience: the bearer token is retired (Phase D
+PR-2), so an impersonated id-token for that SA is the supported way any
+programmatic caller reaches the four write routes (recipe: the **Pins**
+paragraphs above), and one of the three sim writes has no browser path at all.
+By route (files under `dashboard/frontend/src/`):
+
+- **`POST /sims/run` — frontend caller.** `submitSim` in `hooks/useSweeps.ts`,
+  fired by *Run this tweak* on the `/sims` console's tweak bar
+  (`components/v2/console/TweakBar.tsx` → `onTweakSubmit` in
+  `pages/v2/Simulations.tsx`).
+- **`POST /sims/pins` — frontend caller.** `pinSpec` in `hooks/useSweeps.ts`,
+  fired by `components/v2/console/PinButton.tsx`, which the same tweak bar
+  mounts.
+- **`DELETE /sims/pins/{id}` — no frontend caller; curl-only.** Deliberately:
+  `PinButton.tsx`'s header says un-pinning is decided against the pin list, not
+  from one cell.
+
+An earlier revision of this section (`5efe76d`) called all three curl-only; the
+two frontend callers landed two days later in FC-096 Phase E PR-4 (#124,
+`d12a292`).
 
 The value therefore contains a **space**, and the deploy line lives inside an
 unquoted `bash -c` script in `cloudbuild.yaml`, where bash would word-split it
