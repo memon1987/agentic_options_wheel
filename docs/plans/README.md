@@ -110,7 +110,7 @@ _All plan files, regenerated 2026-08-28 (night) from each file's `**Status:**` l
 - [fc-079.md](fc-079.md) — FC-079 — Rewire the last OCC-substring sites on the reconcile paths (absorbs FC-054), status: Done
 - [fc-081.md](fc-081.md) — FC-081 follow-up — merged-vs-deployed freshness check + alert, status: Done
 - [fc-084.md](fc-084.md) — FC-084 — Serialize builds per trigger; pin the smoke test to a build-owned revision; promote with `--to-latest`, status: Done
-- [fc-091.md](fc-091.md) — FC-091 — chain lake merge-on-put, status: Done (code); production verify blocked — the screen Job is still pinned to a pre-merge image (2026-10-01)
+- [fc-091.md](fc-091.md) — FC-091 — chain lake merge-on-put, status: Done — superseded (2026-10-01: refusal path production-verified; the monthly screen is unhealable under the DTE-equal rule since the lake went to DTE 22)
 
 _Plans added since that regeneration are appended below rather than re-sorted into it, so the list above stays comparable with the 2026-08-28 snapshot._
 

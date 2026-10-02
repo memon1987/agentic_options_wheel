@@ -867,22 +867,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
-### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
-
-**Scope:** shared (backtest engine)
-**Status:** Done (code) — merged 2026-08-28 (PR #101, `6d7f6be`), plan `docs/plans/fc-091.md`. **Production verification 2026-10-01: NOT YET EXERCISED — the merge code has never run on the monthly screen.** `backtest-screen` is deliberately SHA-pinned (cloudbuild.yaml step-12 comment: a monthly screen must be reproducible) and still runs image `5e98ff7`, the 08-28 operator update that predates this merge. The 2026-10-01 execution (`backtest-screen-9r9cj`, 06:02–06:57 UTC) reported `lake_hits=3472 lake_misses=42 lake_puts=42 lake_rejected=1144 lake_skipped=1144` and no `lake_merged` / `lake_merge_refused` counters at all (the keys do not exist in that image) — the window-thrashed symbols rebuilt cold again, exactly the FC-060 first-run signature. The 09-01 execution's logs are past the 30-day retention. `backtest-sweep` and `data-backfill` track `main` (`ff8ab85`) and so carry the merge code. **Operator decision + step before the 2026-11-01 screen:** re-pin the Job to current `main` — `gcloud run jobs update backtest-screen --region us-central1 --project gen-lang-client-0607444019 --image us-central1-docker.pkg.dev/gen-lang-client-0607444019/options-wheel/options-wheel-strategy:<main SHA>` (the 08-28 recipe; `claude-operator` lacks `artifactregistry.repositories.downloadArtifacts`) — accepting that November's `backtest_runs` rows come off a different engine identity than Aug–Oct's. Then verify `lake_merged` > 0 for SPY/IWM/PFE once, `lake_skipped` ≈ 0 the month after.
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** `docs/plans/fc-091.md`
-
-**Problem:** FC-060 Layer 1 uploads a rebuilt chain only when its coverage is a superset of the lake object's (the review-mandated guard against clobbering wider data). Strike windows are derived from the run's *window* (`simulator._strike_anchors`), so a symbol whose price range moved can produce a rebuild that is wider on one bound and **narrower on the other**. Observed 2026-08-28: **AMZN** rebuilt cold once and its new files were supersets → uploaded, self-healed (`rejected=231, puts=251`). **SPY** rebuilt cold and every upload was skipped (`chain_lake_overwrite_skipped: would not cover the object it replaces`, 212+ events) → SPY (1,156 rows/day, ~7 s/day on the 1-vCPU Job ≈ 30 min) **IWM and PFE** (same signature `rejected=231 skipped=231`) will be **cold on every monthly run** while the lake keeps the older, differently-bounded files. The guard did its job; the missing piece is the union.
-
-**Fix direction (merge-on-put):** when a downloaded lake file is rejected by `_covers` and the day is rebuilt, `put()` merges the two snapshots — union of `ChainQuote`s keyed by contract symbol (same model fingerprint, same session close; the new build wins on duplicates), provenance = union of the strike windows (`strike_gte = min`, `strike_lte = max`) **with `universe_dte` required EQUAL on both sides** (corrected in review 2026-08-28: `max` would claim longer-dated contracts for strikes only the short-DTE side fetched — a union of two rectangles is not a rectangle); the merge also verifies the two fetches agree on the overlapping strikes — writes the merged file locally and uploads it (now a superset → accepted, `if_generation_match` from the download). If the two strike windows do not overlap (a gap of strikes neither file fetched), skip the merge and log `chain_lake_merge_gap` — never claim coverage the file does not have. Count `lake_merged`. Layer 2's `Materialised` split does not change this path.
-
-**Links:** `docs/plans/fc-060-chain-lake.md` (§Execution first-run notes), `src/backtesting/data/chain_store.py` (`_mirror_to_lake`, `_window_regression`), `docs/plans/fc-060-scenario-runner.md` (Layer 2, in build — merge FC-091 after it to avoid a `chain_store.py` conflict).
-
----
-
 ### FC-093: backtest bars cache — provenance, refresh path, and the next `ChainStore.get` levers
 
 **Scope:** shared (backtest engine)
@@ -1202,6 +1186,22 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
 
 ## Completed
+
+### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
+
+**Scope:** shared (backtest engine)
+**Status:** COMPLETED 2026-10-01 — **Done, superseded** (operator decision: close rather than extend). Code merged 2026-08-28 (PR #101, `6d7f6be`), plan `docs/plans/fc-091.md` Done. **Production run 2026-10-02 UTC** (execution `backtest-screen-p2kkc`, 02:22–03:17; Job re-pinned by the operator from pre-merge `5e98ff7` to `ff8ab85`; `backtest_runs` run `bb702bb98d464a27`, engine `fc-112-wheel-roll-reach`): the merge path executed and its **refusal path is production-verified** — `lake_hits=3500 lake_misses=14 lake_puts=14 lake_merged=0 lake_merge_refused=1138 lake_merge_gaps=0 lake_skipped=1138`; all 1,138 refusals are `dte_mismatch` (existing `universe_dte` 22 vs new 8); `chain_lake_degraded` raised as designed; no ERROR-severity line. **The original target is no longer healable by this rule.** Since FC-096 Phase A (2026-09-01) the weekly backfill stores every chain-day at `universe_dte = 22`; the monthly screen still requests 8; the review-mandated DTE-equal rule correctly refuses that union. The screen therefore rebuilds ~1,138 chain-days cold on every run, permanently (AMD 206, AAPL 191, QQQ 162, IWM 146, SPY 129, VZ 105, PFE 91; 18 each on AMZN/F/GOOGL/MSFT/NVDA/UNH; KMI 0). Sweeps and the battery request the lake's own reach, so they are the callers the merge still serves. History: the 09-01 and 10-01 scheduled screens ran the pre-merge image (the Job is SHA-pinned and was last re-pinned hours before this merged), so neither exercised this code — "verify on the next monthly screen" could not have passed. **Open operator question (not an FC yet):** retire the monthly screen altogether — the weekly battery already writes the same `verdict` / `demote` columns per symbol, and nothing reads `backtest_runs`.
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** `docs/plans/fc-091.md`
+
+**Problem:** FC-060 Layer 1 uploads a rebuilt chain only when its coverage is a superset of the lake object's (the review-mandated guard against clobbering wider data). Strike windows are derived from the run's *window* (`simulator._strike_anchors`), so a symbol whose price range moved can produce a rebuild that is wider on one bound and **narrower on the other**. Observed 2026-08-28: **AMZN** rebuilt cold once and its new files were supersets → uploaded, self-healed (`rejected=231, puts=251`). **SPY** rebuilt cold and every upload was skipped (`chain_lake_overwrite_skipped: would not cover the object it replaces`, 212+ events) → SPY (1,156 rows/day, ~7 s/day on the 1-vCPU Job ≈ 30 min) **IWM and PFE** (same signature `rejected=231 skipped=231`) will be **cold on every monthly run** while the lake keeps the older, differently-bounded files. The guard did its job; the missing piece is the union.
+
+**Fix direction (merge-on-put):** when a downloaded lake file is rejected by `_covers` and the day is rebuilt, `put()` merges the two snapshots — union of `ChainQuote`s keyed by contract symbol (same model fingerprint, same session close; the new build wins on duplicates), provenance = union of the strike windows (`strike_gte = min`, `strike_lte = max`) **with `universe_dte` required EQUAL on both sides** (corrected in review 2026-08-28: `max` would claim longer-dated contracts for strikes only the short-DTE side fetched — a union of two rectangles is not a rectangle); the merge also verifies the two fetches agree on the overlapping strikes — writes the merged file locally and uploads it (now a superset → accepted, `if_generation_match` from the download). If the two strike windows do not overlap (a gap of strikes neither file fetched), skip the merge and log `chain_lake_merge_gap` — never claim coverage the file does not have. Count `lake_merged`. Layer 2's `Materialised` split does not change this path.
+
+**Links:** `docs/plans/fc-060-chain-lake.md` (§Execution first-run notes), `src/backtesting/data/chain_store.py` (`_mirror_to_lake`, `_window_regression`), `docs/plans/fc-060-scenario-runner.md` (Layer 2, in build — merge FC-091 after it to avoid a `chain_store.py` conflict).
+
+---
 
 ### FC-107: Cloud Run `--timeout=300` on both bot services vs the roller's 1500 s cycle budget
 
