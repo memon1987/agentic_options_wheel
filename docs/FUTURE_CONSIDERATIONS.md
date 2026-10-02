@@ -1292,6 +1292,43 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-126: replace the sweep form's JSON arms editor with a field-based sweep builder
+
+**Status:** Consideration — design signed off by the operator 2026-10-02 (wireframe below); plan not yet drafted.
+**Scope:** shared (dashboard sweep submit form; serves both strategies through the spec's `strategy` field)
+**Size estimate:** M (rewrites `components/v2/sims/SubmitSweep.tsx`'s layout and arms region, extends `specValidation.ts`, adds the group and combination editors; L if the server wording change and a Pin action land in the same plan)
+**Owner:** zeshan + Claude
+**Plan file:** `docs/plans/fc-126.md` (not yet drafted)
+
+**Problem / opportunity:** the `/sims` submit form takes its arms as a hand-typed JSON array (`SubmitSweep.tsx` `scenariosText` textarea). Everything else in the form already has fields. Typing JSON hides each parameter's base value and allowed range, and the sweep's cost is only checked at submit.
+
+**Design (signed off 2026-10-02):** wireframe canvas https://claude.ai/artifact/JJS4EB35pet9Ja7Fu7gRLP, page "Round 3", artboard **G** (`Groups.dc.html`), on the Options Wheel design system (FC-122).
+- **Layout D:** a left Setup panel (strategy, symbols as removable tags, window, holdout, starting cash; then the backtest budget, Run sweep, Pin weekly) and the arms on the right.
+- **Arms grouped by what they test:** one card per parameter, with its base value stated once in the header and the tested values listed under it. "+ Add value" adds one arm per value, each changing only that parameter. A "Combinations" group holds arms that change several parameters together; a "Fill assumptions" group holds arms that change only how fills are priced.
+- **Live budget** "Backtests: N of 240" = (arms + base) × symbols × windows against `MAX_CELLS`; inline validation from the allowlist (e.g. DTE 1–21); an override equal to base is flagged and not sent; JSON stays available as Import / Copy spec.
+
+**Decisions already made (operator, 2026-10-02):**
+- **Arms are explicit; no automatic cross-product.** Each arm is built from base on its own (`runner.py:904`, `apply_overrides(base_config, s.overrides)`), so a grid would have to be expanded client-side; the caps make most grids unrunnable (`MAX_CELLS = 240`, `MAX_SCENARIOS = 20`; 6 symbols × 2 windows = 12 backtests per arm); and the best of many arms on a few symbols is mostly luck. Workflow: sweep single changes first, then a few hand-built combinations of the winners.
+- Rejected on the canvas: variants-per-parameter table (A), setup bar + card grid (C), arms as columns (E), arms × parameters table (F), list + editor (H).
+
+**Findings the plan must honour:**
+- **Fill assumptions are per arm, never sweep-wide.** `fill_haircut` / `roll_fill_mode` are scenario fields (`services/sweeps.py` `SCENARIO_FIELDS`); there is no top-level spec field, and `runner._with_base_first` refuses a `base` that carries either. Today's form stamps its form-level fill controls onto every declared arm but not base (`SubmitSweep.tsx:102-120`), so every arm's delta vs base silently includes the fill-model change. The builder drops the form-level controls.
+- **Arm IDs are not labels.** `identity.SCENARIO_NAME_RE` is `^[A-Za-z0-9][A-Za-z0-9_.-]*$`, at most 40 characters, and `__` is forbidden. The UI leads with the change ("Call delta 0.10–0.20Δ") and generates the ID.
+- **Pins over 60 backtests are refused by the battery** (`main.BATTERY_MAX_PIN_CELLS = 60`). The console's existing `PinButton` (`hooks/useSweeps.ts` `pinSpec`) never needed that check, because a tweak is one arm (at most 48 backtests); a multi-arm builder does.
+- **Controls come from `/allowlist`** (`allowed[].key` × `value_types`), never a hard-coded list: the TweakBar rule (`console/tweakSpec.ts`).
+
+**Open questions (for the plan):**
+- **"Cells" vs "backtests":** the server's 422 says "cells" and the form shows refusals verbatim by design. Change the server string, or accept the mismatch.
+- **The "+ Combination" flow** and its ID rule (at most 40 characters, no `+`).
+- **A value control for the one `symbols`-typed key** (`universe.excluded_symbols`).
+- **Covered call:** does the allowlist expose put parameters for a covered-call sweep, and should the builder hide them?
+- **Pin scope:** reuse `pinSpec` / `PinButton` from the builder, or leave pinning in the console.
+- **Styling:** build on FC-122's tokens, or ship on today's Tailwind classes and migrate with FC-122.
+
+**Links:** FC-060 (sweep API, allowlist), FC-096 (console, TweakBar, pins, battery), FC-116 (roll fill mode), FC-122 (design-system migration).
+
+---
+
 ## Completed
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
