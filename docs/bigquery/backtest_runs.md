@@ -1,5 +1,33 @@
 # `options_wheel.backtest_runs`
 
+> **SERIES ENDED 2026-10-02.** The monthly screen was retired by operator decision
+> (`monthly-performance-review` scheduler PAUSED; rationale in `docs/BACKTEST_ENGINE.md`
+> §Track D). The last full run is `bb702bb98d464a27` (2026-10-02 03:17 UTC, engine
+> `fc-112-wheel-roll-reach`). The table is kept as history and is not written by anything
+> scheduled. October 2026 carries **two** full runs (`6e025206a2a647d0` scheduled on the old
+> pinned image, `bb702bb98d464a27` manual on `ff8ab85`) — filter by `run_id`, not by month.
+>
+> **For current symbol fitness, read the weekly battery instead:**
+>
+> ```sql
+> SELECT DATE(s.submitted_at) AS battery_day, r.symbol, r.split,
+>        r.verdict, r.demote, r.insufficient, r.measured,
+>        r.annualized_return_on_collateral, r.excess_return,
+>        r.days_in_position_fraction, r.engine_version
+> FROM `options_wheel.scenario_runs` r
+> JOIN `options_wheel.scenario_sweeps` s USING (run_id)
+> WHERE s.submitted_via = 'battery' AND s.status = 'done'
+>   AND r.scenario_name = 'base'
+>   AND IFNULL(JSON_VALUE(s.spec_json, '$.strategy'), 'wheel') = 'wheel'
+>   AND s.submitted_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 35 DAY)
+> ORDER BY r.symbol, battery_day, r.split
+> ```
+>
+> The battery reports a `fit` (~9 months) and a `holdout` (90 days) row per symbol, never a
+> full-year row, and has no `verdict_reasons` / `binding_constraint` columns. A symbol near
+> the risk-free hurdle flips week to week (AMZN, September 2026) — read several Saturdays
+> and both splits before treating `demote` as a finding.
+
 One row per **symbol per screening run** (FC-032 Phase 5). Written by
 `src/backtesting/reporting/bq_writer.py` via the `/backtest/screen` endpoint or
 `python main.py --command screen`.

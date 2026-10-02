@@ -263,6 +263,35 @@ than it is; it refuses to emit a conclusion when the market is closed.
 
 ## Track D — DONE (2026-07-30). The screen is live.
 
+> **RETIRED 2026-10-02 (operator decision).** The `monthly-performance-review` scheduler is
+> **PAUSED**; the monthly screen no longer runs. The `backtest-screen` Job, its image
+> (re-pinned to `ff8ab85` on 2026-10-01) and `options_wheel.backtest_runs` are left in place
+> as history — nothing was deleted, and resuming is one command
+> (`gcloud scheduler jobs resume monthly-performance-review --location us-central1`).
+> The rest of this section describes the screen as it ran from 2026-07-30 to 2026-10-02.
+>
+> **Why.** (1) *Redundant:* the weekly battery (FC-096 Phase B, Saturdays, inside the
+> `data-backfill` Job) replays the same 14 symbols on the base config every week on current
+> `main` and writes the same `verdict` / `demote` / `insufficient` columns to
+> `scenario_runs`. (2) *Never acted on:* seven full runs produced identical verdicts —
+> KMI + MSFT `unfit`, F/PFE/VZ/SPY/QQQ `insufficient`, the rest `marginal`, zero `fit` — and
+> the one change (AMD) followed an engine change, not the market. (3) *Unread:* no dashboard
+> query, no alert on a verdict; the only policy watches for a Job crash. (4) *Unhealable
+> lake cost:* the lake stores `universe_dte = 22` since FC-096 Phase A while the screen
+> builds at 8, so FC-091's DTE-equal merge refuses every union and the screen rebuilt
+> ~1,138 chain-days cold per run, permanently (FC-091 closeout, 2026-10-02).
+> (5) *The pin never bought comparability:* the seven runs span four `engine_version`s.
+>
+> **Where symbol fitness lives now** — the battery's wheel base arm in `scenario_runs`
+> (query in `docs/bigquery/backtest_runs.md`). **Read it knowing one difference:** the
+> battery never evaluates the full trailing year. It splits it into a ~9-month `fit` window
+> and a 90-day `holdout`, and a symbol near the 4 % risk-free hurdle flips between
+> `marginal` and `unfit` from one Saturday to the next (AMZN `fit`: marginal 09-05, unfit
+> 09-12, marginal 09-17 and 09-19, unfit 09-26, on return-on-collateral of +5.3 %, +0.5 %,
+> +5.0 %, +7.9 %, −4.5 %; the screen's full-year read was `marginal` throughout). Treat a
+> single week's `demote` as noise; a verdict that holds across several Saturdays and both
+> splits is the signal.
+
 The engine runs monthly as a **Cloud Run Job**. `/backtest/screen` remains disabled
 (503) and should stay that way — a full screen takes **1h47m**, so no synchronous HTTP
 request can serve it.
@@ -275,7 +304,7 @@ request can serve it.
 | Image | `us-central1-docker.pkg.dev/<PROJECT>/options-wheel/options-wheel-strategy:<SHA>` — **Artifact Registry**, SHA-pinned |
 | Resources | 1 vCPU, 1 GiB, `--task-timeout 10800s`, `--max-retries 0` |
 | Credentials | `--set-secrets` → `alpaca-api-key`, `alpaca-secret-key`, `finnhub-api-key` |
-| Schedule | `monthly-performance-review`, **ENABLED**, `0 6 1 * *` UTC (= 02:00 ET) |
+| Schedule | `monthly-performance-review`, **PAUSED 2026-10-02** (was ENABLED, `0 6 1 * *` UTC = 02:00 ET) |
 | Trigger | Scheduler → **OAuth** → `run.googleapis.com/...jobs/backtest-screen:run` |
 
 ### Verified end to end, 2026-07-30
