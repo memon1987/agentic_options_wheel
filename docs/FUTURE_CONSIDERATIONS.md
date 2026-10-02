@@ -945,7 +945,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-098: `stock_metrics_error` ran on 100% of covered-call scans for a week with no alert — map structlog `level` to LogEntry severity, alert on CC scan-zero streaks
 
 **Scope:** shared (logging config, GCP alert policies, `covered-call-engine`)
-**Status:** Filed 2026-09-01 (PR #107 review)
+**Status:** Filed 2026-09-01 (PR #107 review). **2026-10-02 — second instance, Jobs:** the FC-121 PR-1 review measured that Cloud Run JOB output carries no LogEntry severity either (`data-backfill` 09-26: 1,178 `level=warning` entries, all severity-unset), so the Job-failure policy (`severity>=ERROR`) has only ever matched the platform's execution-failed audit entry — a Job that logs a structlog error and exits 0 is invisible. The `level → severity` mapping belongs here and covers services AND Jobs.
 **Size estimate:** S
 **Owner:** zeshan
 
@@ -1239,6 +1239,24 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 - **Account chip data:** where the UI learns LIVE vs PAPER (today `isPaperTrading` in `LayoutV2.tsx`) and the run ID for SIM chips.
 
 **Links:** FC-022 (dashboard polish), FC-028 (`fmtDate` calendar-date rule the system keeps), FC-096 (simulation console — the SIM surfaces), FC-113/114/116 (real-money gates — when LIVE chips first appear).
+
+---
+
+### FC-123: `emergency_stop.sh` stops nothing — it pauses three schedulers that do not exist and prints "EMERGENCY STOP COMPLETE"
+
+**Status:** Filed 2026-10-02 (found by the FC-121 PR-1 observability review, verified against the live scheduler list the same day) — **a real-money precondition; the documented emergency procedure is non-functional today**
+**Scope:** shared (both services; operator tooling)
+**Size estimate:** S (script) / S–M if it becomes the FC-074 kill switch
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `tools/monitoring/emergency_stop.sh:26–28` pauses `morning-market-scan`, `midday-strategy-execution` and `afternoon-position-check`. **None exists** — the live project has ~36 schedulers with other names (`scan-10am`…`scan-3pm`, `execute-*`, `monitor-*`, `options-wheel-roll-daily`, `cc-scan-hourly`, `cc-roll-daily`, …). Each line is `gcloud … && echo …`, and a failure on the left of `&&` is exempt from `set -e`, so the script does not abort: it goes on to set `ALPACA_PAPER_TRADING=true` on `options-wheel-strategy` only, lists the schedulers, and prints "EMERGENCY STOP COMPLETE — All trading operations have been stopped" with every live scheduler still ENABLED and `covered-call-engine` untouched. `resume_trading.sh:26–28` carries the same dead names. `README.md:115/180`, `docs/deployment/DEPLOYMENT_SUMMARY.md:45/109` and `tools/README.md:27` advertise both as the emergency procedure (two of them at a `./scripts/` path that does not exist).
+
+**Why it matters:** this is the only "stop everything" an operator can reach for, and it reports success while stopping nothing. On paper it is an embarrassment; on a real-money account it is the failure that turns an incident into a loss.
+
+**Fix direction:** (a) minimum — make the script enumerate live schedulers (`gcloud scheduler jobs list --filter='state=ENABLED'`) and pause every job targeting either bot service, fail loudly (`set -euo pipefail`, no `&& echo`) and verify zero ENABLED trading schedulers before printing success; cover BOTH services; `resume_trading.sh` resumes exactly the set the stop recorded. (b) decide with FC-074 whether the stop belongs in a script at all or in a service-side kill switch the schedulers cannot bypass. Either way: the names a stop script touches are derived, not hardcoded, and a paper drill is recorded in the plan.
+
+**Links:** FC-074 (should an account-level kill switch exist), FC-076 (structural account interlock), FC-114/FC-089/FC-113 (the other real-money preconditions), `docs/plans/fc-121.md` (the review that found it).
 
 ---
 
