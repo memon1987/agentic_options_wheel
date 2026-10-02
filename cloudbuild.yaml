@@ -1363,11 +1363,11 @@ steps:
   #
   # `gcloud run jobs deploy` is create-or-update, so this step both creates the
   # job on the merging build and keeps it on current `main` thereafter. That is
-  # the whole point: `backtest-screen` is deliberately SHA-pinned (a monthly
-  # screen must be reproducible), and nothing in this file used to update a Job
-  # at all — which is how that job sat on a Layer-1 image with no `sweep`
-  # command. An ad-hoc sweep has the opposite requirement: it answers a question
-  # about the code as it is now.
+  # the whole point: an ad-hoc sweep answers a question about the code as it is
+  # now, so the Job must track `main`. (Before this step, nothing in this file
+  # updated a Job at all — the retired, deliberately SHA-pinned monthly screen
+  # Job, deleted 2026-10 by FC-121, sat on a Layer-1 image with no `sweep`
+  # command.)
   #
   # NOT gated by `serialize-builds`: this deploys no traffic and no revision, so
   # two builds racing here simply leaves the newer image on the job — which is
@@ -1390,7 +1390,7 @@ steps:
   # it is half of the sweep dedup key (D4), so a Job that ran without it would
   # key every sweep as if it had no commit.
   #
-  # `--task-timeout=10800` (3h) for the same reason `backtest-screen` needs it:
+  # `--task-timeout=10800` (3h) because cold materialisation is slow:
   # a COLD window materialises at ~5.5 min/symbol (the warm figure is ~50 s), and
   # a 12-symbol sweep over a year of unseeded chains is comfortably over an hour.
   # A task killed at the timeout gets SIGTERM, which `main.py` turns into a

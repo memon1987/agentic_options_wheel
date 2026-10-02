@@ -18,11 +18,14 @@ created from sitting in the tree looking deployed.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 POLICY_DIR = Path(__file__).resolve().parent.parent / "deploy" / "monitoring"
+CLOUDBUILD = Path(__file__).resolve().parent.parent / "cloudbuild.yaml"
 
 # The channel every policy here notifies. Pinned so a typo'd or removed channel
 # is a test failure rather than a policy that creates cleanly and pages nobody.
@@ -34,6 +37,40 @@ NOTIFICATION_CHANNEL = (
 
 def policy_files():
     return sorted(POLICY_DIR.glob("*_alert_policy.json"))
+
+
+def _split_top_level_and(expr: str) -> list:
+    """Split a Logging filter on ` AND ` outside quotes and parentheses."""
+    parts, depth, in_quote, buf, i = [], 0, False, "", 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch == '"' and (i == 0 or expr[i - 1] != "\\"):
+            in_quote = not in_quote
+        elif not in_quote and ch == "(":
+            depth += 1
+        elif not in_quote and ch == ")":
+            depth -= 1
+        if not in_quote and depth == 0 and expr.startswith(" AND ", i):
+            parts.append(buf.strip())
+            buf, i = "", i + len(" AND ")
+            continue
+        buf += ch
+        i += 1
+    parts.append(buf.strip())
+    return parts
+
+
+def _jobs_the_build_deploys() -> set:
+    """Every Job name `cloudbuild.yaml` deploys, read from the build itself.
+
+    The same file `tests/test_cloudbuild_contract.py` pins the sweep and
+    backfill Job steps against, so the two tests cannot disagree.
+    """
+    steps = yaml.safe_load(CLOUDBUILD.read_text())["steps"]
+    text = "\n".join(
+        a for st in steps for a in (st.get("args") or []) if isinstance(a, str)
+    )
+    return set(re.findall(r"gcloud run jobs deploy\s+([A-Za-z0-9-]+)", text))
 
 
 def load(path: Path) -> dict:
@@ -140,16 +177,42 @@ def test_a_log_filter_names_a_resource_type(policy):
 class TestTheFC096Policies:
     """The three this phase adds, and the properties each one exists for."""
 
-    def test_the_job_policy_watches_all_three_jobs(self):
+    def test_the_job_policy_watches_exactly_the_jobs_the_build_deploys(self):
+        """PARSE the filter; a substring check passes on filters that match nothing.
+
+        `NOT resource.labels.job_name=(...)`, `("a" AND "b")` and a typo'd label
+        all contain every job name as a substring, and each one silently stops
+        the policy watching anything. So the filter must be exactly three
+        top-level AND clauses, and the job clause must be a plain OR-list whose
+        set EQUALS the Jobs `cloudbuild.yaml` deploys — a Job added to (or
+        removed from) the build without this policy following it fails here.
+        """
         doc = load(POLICY_DIR / "job_failure_alert_policy.json")
         f = doc["conditions"][0]["conditionMatchedLog"]["filter"]
-        assert 'resource.type="cloud_run_job"' in f, (
-            "no other policy in this directory watches Jobs — they match "
-            "cloud_run_revision or build — which is the gap this closes"
+        clauses = _split_top_level_and(f)
+        assert len(clauses) == 3, f"expected 3 top-level AND clauses, got {clauses}"
+        resource_type, job_clause, severity = clauses
+        assert resource_type == 'resource.type="cloud_run_job"', resource_type
+        assert severity == "severity>=ERROR", severity
+
+        m = re.fullmatch(
+            r'resource\.labels\.job_name=\(\s*("[^"]+"(?:\s+OR\s+"[^"]+")*)\s*\)',
+            job_clause,
         )
-        for job in ("backtest-screen", "backtest-sweep", "data-backfill"):
-            assert job in f, f"{job} is not watched"
-        assert "severity>=ERROR" in f
+        assert m, (
+            "the job clause must be exactly resource.labels.job_name=(\"a\" OR "
+            f"\"b\" ...) — not negated, not AND-joined, label spelled right; "
+            f"got {job_clause!r}"
+        )
+        watched = re.findall(r'"([^"]+)"', m.group(1))
+        assert len(watched) == len(set(watched)), f"duplicate job in {watched}"
+        deployed = _jobs_the_build_deploys()
+        assert deployed, "found no `gcloud run jobs deploy` in cloudbuild.yaml"
+        assert set(watched) == deployed, (
+            f"policy watches {sorted(watched)}, the build deploys "
+            f"{sorted(deployed)}: a Job nobody deploys cannot fail, and a "
+            f"deployed Job missing here fails silently"
+        )
 
     def test_the_stale_policy_matches_the_event_the_check_emits(self):
         """The policy and the check must agree on the event name.

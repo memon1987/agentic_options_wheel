@@ -48,18 +48,6 @@
 
 ---
 
-## Supporting Jobs (Unchanged)
-
-### Daily Maintenance
-- **7:00am UTC** - `daily-cache-maintenance` - Cache cleanup
-- **1:00pm UTC** - `daily-quick-backtest` - Quick backtest analysis
-
-### Weekly/Monthly
-- **Mon 11:00am UTC** - `weekly-comprehensive-backtest` - Full backtest
-- **1st of month 12:00pm UTC** - `monthly-performance-review` - Performance review
-
----
-
 ## Why Hourly Execution?
 
 ### Benefits:
