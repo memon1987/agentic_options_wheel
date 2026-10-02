@@ -1562,12 +1562,17 @@ def _diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
 
 
 def _iso(value: Any) -> Optional[str]:
-    """A broker stamp as an ISO string. A datetime is formatted, a non-empty
-    string passes through, anything else is None."""
+    """A broker stamp as an ISO string. A datetime is formatted, a string that
+    parses as ISO-8601 passes through, anything else (junk included) is None."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, str) and value.strip():
-        return value.strip()
+        text = value.strip()
+        try:
+            datetime.fromisoformat(text.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        return text
     return None
 
 
