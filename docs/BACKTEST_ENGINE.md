@@ -5,7 +5,7 @@ scenario sweeps (the `backtest-sweep` Job), the weekly battery (inside the `data
 Job, writing `scenario_runs`) and the sim service. The monthly screen that wrote
 `options_wheel.backtest_runs` was **retired 2026-10-02** (§Track D). Not wired to any
 automated *action*: `demote` is a column, not a trigger.
-**Last updated:** 2026-08-01 (FC-068 — the replay now drives the production pipeline)
+**Last updated:** 2026-10-02 (FC-121 — the monthly screen retired; Track D is now history)
 
 Programmatic demotion is deliberately **out of scope** — a later motion, once the engine
 has been generating real data for a while. Nothing in this system changes the trading
@@ -270,10 +270,12 @@ than it is; it refuses to emit a conclusion when the market is closed.
 > (`docs/plans/fc-121.md`): the `/backtest/screen` endpoint and the Job-failure policy's
 > `backtest-screen` entry are removed from the tree, and the `backtest-screen` Job and the
 > `monthly-performance-review` scheduler are deleted at that FC's rollout — there is nothing
-> to resume. `options_wheel.backtest_runs` is **kept** as history (no new rows). The Job's
-> attribute table (not a command) survives only in repository history (this file at
-> `fbdb6f9`); its exported spec is recorded in `docs/plans/fc-121.md` §Execution. What
-> remains below is the record of what the screen was.
+> to resume. `options_wheel.backtest_runs` is **kept** as history: nothing **scheduled**
+> writes it, and the `--command screen` CLI that could still persist a row locally is
+> removed by FC-121 PR-2. The Job's attribute table (not a command) survives only in
+> repository history (this file at `fbdb6f9`); its exported spec is recorded in
+> `docs/plans/fc-121.md` §Execution. What remains below is the record of what the screen
+> was.
 >
 > **Why.** (1) *Redundant:* the weekly battery (FC-096 Phase B, Saturdays, inside the
 > `data-backfill` Job) replays the same 14 symbols on the base config every week on current
