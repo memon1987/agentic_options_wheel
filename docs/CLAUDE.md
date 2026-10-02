@@ -482,7 +482,7 @@ this list — not any single plan — is where readiness is judged. Status as of
 | Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open — blocks FC-120's DD-1 gate decision (Q1); the buffer default is feed-specific |
 | Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 (the roller half closes only when FC-120 PR-2 merges — PR-1 is instrumentation and changes no limit) | both | FC-088 | filed |
 | `AlpacaClient` HTTP calls have no socket timeout; a hung lock-holder has no in-session bound (Cloud Run's cut does not stop the thread) | both | FC-089 | filed |
-| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case | both | FC-113 | filed; (a)+(b) land in FC-120 PR-2; (c) remains |
+| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case (699 s when all twelve FC-120 PR-1 diagnostic reads hang to their 2 s cap) | both | FC-113 | filed; (a)+(b) land in FC-120 PR-2; (c) remains |
 | `_is_market_open()` has no holiday calendar — orders can be placed into a closed market (09-07 IWM) | both | FC-114 | filed |
 | Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | PR #128; verify live per §Deploy / CI |
 | Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | merged (#127); policy not yet deployed |
