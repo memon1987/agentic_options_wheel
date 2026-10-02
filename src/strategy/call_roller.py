@@ -26,13 +26,20 @@ emits **exactly one** terminal event, one of:
     call_roll_completed              both legs done
     call_roll_dry_run                ROLLER_DRY_RUN=true; nothing placed
 
+``call_roll_leg_settled`` (FC-120 PR-1) is a per-LEG row — exactly one per
+placed order, at that order's disposition — and is deliberately NOT part of
+this contract: a position that placed a BTC and two STO rungs emits three of
+them and still exactly one terminal. ``call_roll_stc_timeout_canceled`` is
+per-rung for the same reason. Both are informational and never alert-wired.
+
 Events must tell the truth about what filled. A cancel that fails *because the
 order filled* is a fill, not an error — which is why every cancel on this path
 is followed by a re-fetch before anything is reported.
 """
 
+import math
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, Any, Iterator, List, Optional, Set, Tuple
 
 import structlog
@@ -45,7 +52,11 @@ from ..risk.risk_manager import RiskManager
 from ..utils.config import Config
 from ..utils.option_symbols import parse_option_symbol, coerce_expiry_date
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
+from ..utils import clock
 from .cost_basis import CostBasisResolver, SOURCE_DIVERGENT
+# FC-120 PR-1: logging helpers only — the roller's limits are NOT routed through
+# this module (see the docstring of ``_quote_fields``).
+from .limit_pricing import _dec, tick_size, quote_age_seconds
 
 logger = structlog.get_logger(__name__)
 
@@ -128,6 +139,9 @@ class CallRoller:
         self.cost_basis_resolver = CostBasisResolver(
             alpaca_client, config, allow_bigquery=allow_bigquery_cost_basis
         )
+        # FC-120 PR-1: get_order_by_id reads issued by the latest
+        # ``_poll_order_fill`` call. Log-only.
+        self._last_poll_reads = 0
 
     # ------------------------------------------------------------------ #
     # Terminal events
@@ -330,6 +344,10 @@ class CallRoller:
                 current_strike=current_strike,
                 stock_price=current_stock_price, **earnings_info)
             return None
+        # FC-120 PR-1: the same-second second read, for the log ONLY. The limit
+        # below is computed from the FIRST read exactly as before; this one is
+        # never consulted for a price and a failure is logged as None.
+        btc_quote_reread = self._reread_quote(option_symbol)
 
         extrinsic_per_share: Optional[float] = None
         imminent = False
@@ -447,6 +465,15 @@ class CallRoller:
             'min_credit_per_share': min_credit_per_share,
             'earnings_info': earnings_info,
             'candidate': primary['candidate'],
+            # FC-120 PR-1 instrumentation (logging only — no pricing input).
+            # The IEX stock quote this evaluation decided on, as primitives,
+            # and the raw BTC quote pair the limit was priced from.
+            'stock_bid': stock_bid,
+            'stock_ask': stock_ask,
+            'stock_quote_ts': _iso(quote.get('timestamp')),
+            'stock_quote_age_s': _age_s(quote.get('timestamp')),
+            'btc_quote': btc_quote,
+            'btc_quote_reread': btc_quote_reread,
             # The ladder reuses THIS list and never re-queries the chain
             # (DD-1/M-8): a fresh find_suitable_calls at execute time could
             # admit candidates filtered under a different earnings-cache state
@@ -565,10 +592,13 @@ class CallRoller:
         min_credit = opportunity['min_credit_per_share']
 
         if self.config.roller_dry_run:
-            log_trade_event(
-                logger, event_type="call_roll_dry_run",
-                symbol=old_symbol, underlying=underlying,
-                strategy="roll_call", success=True,
+            # FC-120 PR-1: the dry run carries the BTC placement set, so PR-2's
+            # dry-run verification can be read off this one event.
+            payload = self._placement_fields(
+                opportunity, leg='btc', quote=opportunity.get('btc_quote'),
+                reread=opportunity.get('btc_quote_reread'), limit=btc_limit,
+                strike=opportunity.get('old_strike'))
+            payload.update(
                 would_be_btc_symbol=old_symbol,
                 would_be_btc_limit=btc_limit,
                 would_be_stc_symbol=new_symbol,
@@ -576,8 +606,12 @@ class CallRoller:
                 net_credit=opportunity['net_credit_per_contract'],
                 pricing_mode=opportunity['pricing_mode'],
                 contracts=contracts,
-                **earnings_info,
             )
+            payload.update(earnings_info)
+            log_trade_event(
+                logger, event_type="call_roll_dry_run",
+                symbol=old_symbol, underlying=underlying,
+                strategy="roll_call", success=True, **payload)
             return {'success': False, 'reason': 'dry_run',
                     'underlying': underlying}
 
@@ -605,20 +639,40 @@ class CallRoller:
         opportunity['stc_limit'] = fresh_stc_limit
         if opportunity['fallback_candidates']:
             opportunity['fallback_candidates'][0]['stc_limit'] = fresh_stc_limit
+        # FC-120 PR-1: rung 1 is priced from ``fresh``; stash it and its
+        # same-second re-read for rung 1's placement event (log only — the
+        # limit above is already fixed from the first read).
+        opportunity['stc_quote_rung1'] = fresh
+        opportunity['stc_quote_rung1_reread'] = self._reread_quote(new_symbol)
 
         # === LEG 1: Buy-to-close ===
+        # FC-120 PR-1: the quote this limit was priced from (DD-2), computed
+        # at placement so ``quote_age_s`` is the age when the order went out.
+        btc_quote = opportunity.get('btc_quote')
+        btc_fields = self._placement_fields(
+            opportunity, leg='btc', quote=btc_quote,
+            reread=opportunity.get('btc_quote_reread'), limit=btc_limit,
+            strike=opportunity['old_strike'])
+        placed_payload = dict(btc_fields)
+        placed_payload.update(
+            current_strike=opportunity['old_strike'],
+            contracts=contracts, limit_price=btc_limit,
+            pricing_mode=opportunity['pricing_mode'])
         log_trade_event(
             logger, event_type="call_roll_btc_placed",
             symbol=old_symbol, underlying=underlying,
-            strategy="roll_call", success=True,
-            current_strike=opportunity['old_strike'],
-            contracts=contracts, limit_price=btc_limit,
-            pricing_mode=opportunity['pricing_mode'],
-        )
+            strategy="roll_call", success=True, **placed_payload)
 
+        btc_t0 = time.monotonic()
         btc_result = self.alpaca.place_option_order(
             symbol=old_symbol, qty=contracts,
             side='buy', order_type='limit', limit_price=btc_limit)
+
+        def btc_settled(disposition: str, order_id: Optional[str], **kw: Any) -> None:
+            self._log_leg_settled(
+                symbol=old_symbol, underlying=underlying, order_id=order_id,
+                disposition=disposition, placement=btc_fields, limit=btc_limit,
+                requested_qty=contracts, **kw)
 
         if not btc_result or not btc_result.get('success', False):
             error_msg = (btc_result.get('error_message', 'BTC order rejected')
@@ -629,6 +683,8 @@ class CallRoller:
                 recoverable=True, symbol=old_symbol, underlying=underlying,
                 limit_price=btc_limit, contracts=contracts,
             )
+            btc_settled('rejected', (btc_result or {}).get('order_id'),
+                        elapsed=round(time.monotonic() - btc_t0, 3))
             return {'success': False, 'reason': 'btc_rejected',
                     'error': error_msg, 'underlying': underlying}
 
@@ -640,10 +696,19 @@ class CallRoller:
         # reported `btc_unfilled` without ever looking again — a fiction that
         # would have been logged while contracts were being bought.
         btc_order = self._poll_order_fill(btc_order_id)
+        # FC-120 T7: snapshot BEFORE the settle — _cancel_and_settle re-enters
+        # _poll_order_fill and would overwrite the count.
+        btc_polls = self._last_poll_reads
+        btc_settle_polls: Optional[int] = None
         timed_out = btc_order is None
         if timed_out:
             btc_order = self._cancel_and_settle(btc_order_id)
+            btc_settle_polls = self._last_poll_reads
+        btc_elapsed = round(time.monotonic() - btc_t0, 3)
+        if timed_out:
             if btc_order is None:
+                btc_settled('unknown', btc_order_id, elapsed=btc_elapsed,
+                            polls=btc_polls, settle_polls=btc_settle_polls)
                 # The cancel never settled. We do NOT know whether contracts
                 # were bought, so we must not sell a call against a short
                 # position whose size is unknown. Stop, and page.
@@ -669,32 +734,59 @@ class CallRoller:
                     order_id=btc_order_id, limit_price=btc_limit,
                     contracts=contracts, rejected_after_placement=True,
                 )
+                btc_settled('rejected', btc_order_id, order=btc_order,
+                            elapsed=btc_elapsed, polls=btc_polls,
+                            settle_polls=btc_settle_polls)
                 return {'success': False, 'reason': 'btc_rejected',
                         'order_id': btc_order_id, 'underlying': underlying}
+            disposition = ('timeout_canceled' if timed_out else 'terminal_no_fill')
+            # FC-120 PR-1: one fresh quote, AFTER the disposition is final.
+            cancel_fields = self._post_settle_quote(
+                old_symbol, underlying, btc_quote, 'buy')
+            timeout_payload = dict(btc_fields)
+            timeout_payload.update(cancel_fields)
+            timeout_payload.update(
+                order_id=btc_order_id,
+                order_status=btc_status,
+                disposition=disposition,
+                limit_price=btc_limit, contracts=contracts,
+                leg_elapsed_s=btc_elapsed,
+                order_submitted_at=_iso(btc_order.get('submitted_at')),
+                polls=btc_polls, settle_polls=btc_settle_polls,
+            )
+            timeout_payload.update(earnings_info)
             log_trade_event(
                 logger, event_type="call_roll_btc_timeout_canceled",
                 symbol=old_symbol, underlying=underlying,
-                strategy="roll_call", success=False,
-                order_id=btc_order_id,
-                order_status=btc_status,
-                disposition=('timeout_canceled' if timed_out else 'terminal_no_fill'),
-                limit_price=btc_limit, contracts=contracts,
-                **earnings_info,
-            )
+                strategy="roll_call", success=False, **timeout_payload)
+            btc_settled(disposition, btc_order_id, order=btc_order,
+                        cancel=cancel_fields, elapsed=btc_elapsed,
+                        polls=btc_polls, settle_polls=btc_settle_polls)
             return {'success': False, 'reason': 'btc_timeout_canceled',
                     'order_id': btc_order_id, 'underlying': underlying}
 
         btc_filled_price = _as_float(btc_order.get('filled_avg_price')) or btc_limit
 
-        log_trade_event(
-            logger, event_type="call_roll_btc_filled",
-            symbol=old_symbol, underlying=underlying,
-            strategy="roll_call", success=True,
+        filled_payload = dict(btc_fields)
+        filled_payload.update(self._fill_fields(
+            limit=btc_limit, filled_price=btc_filled_price, side='buy',
+            order=btc_order, elapsed=btc_elapsed, polls=btc_polls,
+            settle_polls=btc_settle_polls))
+        filled_payload.update(
             order_id=btc_order_id,
             filled_qty=btc_filled_qty,
             filled_price=btc_filled_price,
             requested_qty=contracts,
         )
+        log_trade_event(
+            logger, event_type="call_roll_btc_filled",
+            symbol=old_symbol, underlying=underlying,
+            strategy="roll_call", success=True, **filled_payload)
+        btc_settled('filled' if btc_filled_qty >= contracts else 'partial',
+                    btc_order_id, filled_qty=btc_filled_qty,
+                    filled_price=btc_filled_price, order=btc_order,
+                    elapsed=btc_elapsed, polls=btc_polls,
+                    settle_polls=btc_settle_polls)
 
         if btc_filled_qty < contracts:
             # Partial-fill truth (DD-1). The remainder is dead — either our
@@ -901,10 +993,12 @@ class CallRoller:
         this method exists to close.
         """
         underlying = opportunity['underlying']
-        # (order_id, symbol, strike, limit)
-        live: Optional[Tuple[str, str, float, float]] = None
+        # (order_id, symbol, strike, limit, leg_ctx) — leg_ctx is FC-120 PR-1's
+        # log-only context (placement fields, clock, poll count).
+        live: Optional[Tuple[str, str, float, float, Dict[str, Any]]] = None
 
-        for symbol, limit, new_strike in self._rungs(opportunity, btc_filled_price):
+        for symbol, limit, new_strike, rung_quote in self._rungs(
+                opportunity, btc_filled_price):
             if live is not None:
                 pending = live
                 live = None
@@ -915,29 +1009,58 @@ class CallRoller:
                     return {'success': False, 'unknown_disposition': True,
                             'order_id': pending[0], 'symbol': pending[1]}
 
-            order_id = self._place_stc(symbol, underlying, qty, limit)
+            rung = rung_quote.get('rung')
+            fields = self._placement_fields(
+                opportunity, leg='stc', quote=rung_quote.get('quote'),
+                reread=rung_quote.get('reread'), limit=limit, strike=new_strike,
+                rung=rung, reused_from_rung=rung_quote.get('reused_from_rung'),
+                chain_quote_age_s=(_age_s(rung_quote.get('chain_stamp'))
+                                   if rung == 1 else None))
+            ctx: Dict[str, Any] = {'placement': fields, 'limit': limit,
+                                   'quote': rung_quote.get('quote'),
+                                   'requested_qty': qty,
+                                   't0': time.monotonic(), 'polls': None}
+            order_id = self._place_stc(symbol, underlying, qty, limit,
+                                       rung=rung, quote_fields=fields,
+                                       pricing_mode=opportunity.get('pricing_mode'))
             if order_id is None:
+                self._log_stc_settled(ctx, symbol, underlying, None, 'rejected')
                 continue
 
             order = self._poll_order_fill(order_id)
+            ctx['polls'] = self._last_poll_reads
             if order is None:
                 # Timed out with the order still working — carry it forward so
                 # the NEXT rung cancels-and-verifies before placing anything.
-                live = (order_id, symbol, new_strike, limit)
+                live = (order_id, symbol, new_strike, limit, ctx)
                 continue
+            ctx['elapsed'] = round(time.monotonic() - ctx['t0'], 3)
 
             filled_qty = int(_as_float(order.get('filled_qty')))
             if filled_qty > 0:
                 return self._stc_success(order_id, symbol, underlying, new_strike,
-                                         filled_qty, order, limit)
+                                         filled_qty, order, limit, ctx=ctx)
             # Terminal with zero fill (rejected / expired / canceled): nothing
             # is live, so the next rung may be placed directly.
+            status = order.get('status')
+            cancel = self._post_settle_quote(symbol, underlying, ctx['quote'],
+                                             'sell')
+            payload = dict(fields)
+            payload.update(cancel)
+            payload.update(order_status=status, limit_price=limit,
+                           leg_elapsed_s=ctx['elapsed'], polls=ctx['polls'],
+                           order_submitted_at=_iso(order.get('submitted_at')))
             log_error_event(
                 logger, error_type="call_roll_stc_unfilled",
-                error_message=f"STO order {order_id} status={order.get('status')}",
+                error_message=f"STO order {order_id} status={status}",
                 component="call_roller", recoverable=True,
                 symbol=symbol, underlying=underlying, order_id=order_id,
+                **payload,
             )
+            self._log_stc_settled(
+                ctx, symbol, underlying, order_id,
+                'rejected' if status == 'rejected' else 'terminal_no_fill',
+                order=order, cancel=cancel)
 
         if live is not None:
             resolved, settled = self._settle_live_rung(live, underlying)
@@ -950,8 +1073,18 @@ class CallRoller:
         return None
 
     def _rungs(self, opportunity: Dict[str, Any],
-               btc_filled_price: float) -> Iterator[Tuple[str, float, float]]:
-        """Yield ``(symbol, limit, strike)`` per ladder rung, priced when reached.
+               btc_filled_price: float
+               ) -> Iterator[Tuple[str, float, float, Dict[str, Any]]]:
+        """Yield ``(symbol, limit, strike, rung_quote)`` per ladder rung, priced
+        when reached.
+
+        ``rung_quote`` (FC-120 PR-1, log-only) names the rung by its LADDER
+        POSITION — 1 primary, 2 floor, 3+ the fallback list in order, so a
+        number is never reused for a different kind of rung — and carries the
+        quote that rung was priced from plus its same-second re-read. Rung 2
+        has no quote of its own; it carries rung 1's with
+        ``reused_from_rung=1``. Rung 1 carries the chain row's stamp. Nothing
+        in it feeds a limit.
 
         Rung 1 — the primary candidate at the pre-BTC re-checked limit.
         Rung 2 — the primary at the invariant *minimum* price
@@ -969,14 +1102,22 @@ class CallRoller:
         floor_price = round(btc_filled_price + min_credit, 2)
         primary_symbol = opportunity['new_option_symbol']
         primary_limit = opportunity['stc_limit']
+        rung1_quote = opportunity.get('stc_quote_rung1')
+        rung1_reread = opportunity.get('stc_quote_rung1_reread')
 
-        yield (primary_symbol, primary_limit, opportunity['new_strike'])
+        yield (primary_symbol, primary_limit, opportunity['new_strike'],
+               {'rung': 1, 'quote': rung1_quote, 'reread': rung1_reread,
+                'chain_stamp': (opportunity.get('candidate') or {}).get(
+                    'quote_timestamp')})
 
         if 0 < floor_price < primary_limit:
-            yield (primary_symbol, floor_price, opportunity['new_strike'])
+            yield (primary_symbol, floor_price, opportunity['new_strike'],
+                   {'rung': 2, 'quote': rung1_quote, 'reread': rung1_reread,
+                    'reused_from_rung': 1})
 
         attempts = self.config.rolling_fallback_strike_attempts
-        for entry in opportunity['fallback_candidates'][1:1 + attempts]:
+        for position, entry in enumerate(
+                opportunity['fallback_candidates'][1:1 + attempts], start=3):
             symbol = entry['new_option_symbol']
             quote = self.alpaca.get_option_quote(symbol) or {}
             limit = self._stc_limit_from_quote(
@@ -995,7 +1136,11 @@ class CallRoller:
             if (limit - btc_filled_price) + _CREDIT_EPSILON < min_credit:
                 continue
 
-            yield (symbol, limit, entry['new_strike'])
+            # FC-120 PR-1: the same-second re-read, for the log only — the
+            # limit above is already fixed from ``quote``.
+            yield (symbol, limit, entry['new_strike'],
+                   {'rung': position, 'quote': quote,
+                    'reread': self._reread_quote(symbol)})
 
     def _settle_live_rung(self, live: Tuple[str, str, float, float],
                           underlying: str
@@ -1013,8 +1158,12 @@ class CallRoller:
           working, so the ladder must stop: placing another sell here is the
           two-live-sells window in its purest form.
         """
-        order_id, symbol, new_strike, limit_price = live
+        order_id, symbol, new_strike, limit_price = live[:4]
+        ctx: Optional[Dict[str, Any]] = live[4] if len(live) > 4 else None
         order = self._cancel_and_settle(order_id)
+        if ctx is not None:
+            ctx['settle_polls'] = self._last_poll_reads
+            ctx['elapsed'] = round(time.monotonic() - ctx['t0'], 3)
         if order is None:
             log_error_event(
                 logger, error_type="call_roll_stc_disposition_unknown",
@@ -1024,22 +1173,64 @@ class CallRoller:
                 component="call_roller", recoverable=False,
                 symbol=symbol, underlying=underlying, order_id=order_id,
             )
+            if ctx is not None:
+                self._log_stc_settled(ctx, symbol, underlying, order_id, 'unknown')
             return None, False
         filled_qty = int(_as_float(order.get('filled_qty')))
         if filled_qty > 0:
             return self._stc_success(order_id, symbol, underlying, new_strike,
-                                     filled_qty, order, limit_price), True
+                                     filled_qty, order, limit_price,
+                                     ctx=ctx), True
+        if ctx is not None:
+            # FC-120 PR-1: this zero-fill path used to log nothing for the rung.
+            cancel = self._post_settle_quote(symbol, underlying, ctx['quote'],
+                                             'sell')
+            payload = dict(ctx['placement'])
+            payload.update(cancel)
+            payload.update(
+                order_id=order_id, order_status=order.get('status'),
+                disposition='timeout_canceled', limit_price=limit_price,
+                contracts=ctx['requested_qty'], leg_elapsed_s=ctx['elapsed'],
+                order_submitted_at=_iso(order.get('submitted_at')),
+                polls=ctx['polls'], settle_polls=ctx.get('settle_polls'))
+            log_trade_event(
+                logger, event_type="call_roll_stc_timeout_canceled",
+                symbol=symbol, underlying=underlying,
+                strategy="roll_call", success=False, **payload)
+            self._log_stc_settled(ctx, symbol, underlying, order_id,
+                                  'timeout_canceled', order=order, cancel=cancel)
         return None, True
 
+    def _log_stc_settled(self, ctx: Dict[str, Any], symbol: str,
+                         underlying: str, order_id: Optional[str],
+                         disposition: str, *,
+                         order: Optional[Dict[str, Any]] = None,
+                         cancel: Optional[Dict[str, Any]] = None,
+                         filled_qty: int = 0, filled_price: Any = None) -> None:
+        """The STO rung's ``call_roll_leg_settled`` row, from its leg context."""
+        elapsed = ctx.get('elapsed')
+        if elapsed is None and ctx.get('t0') is not None:
+            elapsed = round(time.monotonic() - ctx['t0'], 3)
+        self._log_leg_settled(
+            symbol=symbol, underlying=underlying, order_id=order_id,
+            disposition=disposition, placement=ctx['placement'],
+            limit=ctx['limit'], requested_qty=ctx['requested_qty'],
+            filled_qty=filled_qty, filled_price=filled_price, order=order,
+            cancel=cancel, elapsed=elapsed, polls=ctx.get('polls'),
+            settle_polls=ctx.get('settle_polls'))
+
     def _place_stc(self, symbol: str, underlying: str, contracts: int,
-                   limit_price: float) -> Optional[str]:
+                   limit_price: float, *, rung: Optional[int] = None,
+                   quote_fields: Optional[Dict[str, Any]] = None,
+                   pricing_mode: Optional[str] = None) -> Optional[str]:
         """Place one STO rung. Returns the order id, or None if it was refused."""
+        payload = dict(quote_fields or {})
+        payload.update(contracts=contracts, limit_price=limit_price,
+                       leg='stc', rung=rung, pricing_mode=pricing_mode)
         log_trade_event(
             logger, event_type="call_roll_stc_placed",
             symbol=symbol, underlying=underlying,
-            strategy="roll_call", success=True,
-            contracts=contracts, limit_price=limit_price,
-        )
+            strategy="roll_call", success=True, **payload)
 
         result = self.alpaca.place_option_order(
             symbol=symbol, qty=contracts,
@@ -1058,18 +1249,30 @@ class CallRoller:
 
     def _stc_success(self, order_id: str, symbol: str, underlying: str,
                      new_strike: float, filled_qty: int, order: Dict[str, Any],
-                     limit_price: Optional[float]) -> Dict[str, Any]:
+                     limit_price: Optional[float], *,
+                     ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         filled_price = _as_float(order.get('filled_avg_price'))
         if filled_price <= 0 and limit_price is not None:
             filled_price = limit_price
+        payload: Dict[str, Any] = {}
+        if ctx is not None:
+            # FC-120 PR-1: the placement set and the fill-quality fields.
+            payload.update(ctx['placement'])
+            payload.update(self._fill_fields(
+                limit=limit_price, filled_price=filled_price, side='sell',
+                order=order, elapsed=ctx.get('elapsed'), polls=ctx.get('polls'),
+                settle_polls=ctx.get('settle_polls')))
+        payload.update(order_id=order_id, filled_qty=filled_qty,
+                       filled_price=filled_price)
         log_trade_event(
             logger, event_type="call_roll_stc_filled",
             symbol=symbol, underlying=underlying,
-            strategy="roll_call", success=True,
-            order_id=order_id,
-            filled_qty=filled_qty,
-            filled_price=filled_price,
-        )
+            strategy="roll_call", success=True, **payload)
+        if ctx is not None:
+            self._log_stc_settled(
+                ctx, symbol, underlying, order_id,
+                'filled' if filled_qty >= ctx['requested_qty'] else 'partial',
+                order=order, filled_qty=filled_qty, filled_price=filled_price)
         return {
             'success': True,
             'order_id': order_id,
@@ -1078,6 +1281,142 @@ class CallRoller:
             'symbol': symbol,
             'new_strike': new_strike,
         }
+
+    # ------------------------------------------------------------------ #
+    # FC-120 PR-1 — per-leg quote instrumentation (logging only)
+    # ------------------------------------------------------------------ #
+    def _reread_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """The same-second second read. Never raises; None on any failure."""
+        try:
+            reread = self.alpaca.get_option_quote(symbol)
+        except Exception:
+            return None
+        return reread if isinstance(reread, dict) and reread else None
+
+    def _placement_fields(self, opportunity: Dict[str, Any], *, leg: str,
+                          quote: Optional[Dict[str, Any]],
+                          reread: Optional[Dict[str, Any]],
+                          limit: Any, strike: Any,
+                          rung: Optional[int] = None,
+                          reused_from_rung: Optional[int] = None,
+                          chain_quote_age_s: Optional[float] = None
+                          ) -> Dict[str, Any]:
+        """The DD-2 placement set for a leg, computed AT placement (so the
+        quote's age is its age when the order went out)."""
+        fields = _quote_fields(
+            quote, reread, limit, 'buy' if leg == 'btc' else 'sell',
+            opportunity.get('underlying', ''), strike,
+            opportunity.get('stock_bid'))
+        fields.update(
+            leg=leg,
+            pricing_mode=opportunity.get('pricing_mode'),
+            placed_at=_now_iso(),
+            stock_bid=_pos(opportunity.get('stock_bid')),
+            stock_ask=_pos(opportunity.get('stock_ask')),
+            stock_quote_ts=_iso(opportunity.get('stock_quote_ts')),
+            stock_quote_age_s=_num(opportunity.get('stock_quote_age_s')),
+        )
+        if leg == 'btc':
+            fields['attempt'] = 0          # PR-1 places exactly one BTC
+        else:
+            fields['rung'] = rung
+            fields['quote_reused_from_rung'] = reused_from_rung
+            fields['chain_quote_age_s'] = chain_quote_age_s
+        return fields
+
+    def _post_settle_quote(self, symbol: str, underlying: str,
+                           placed_quote: Optional[Dict[str, Any]],
+                           side: str) -> Dict[str, Any]:
+        """One fresh quote AFTER a zero-fill leg's disposition is final.
+
+        ``quote_drift`` is ``cancel_ask - quote_ask`` on a buy and
+        ``quote_bid - cancel_bid`` on a sell: positive means the market moved
+        away from the order. On any failure every field is None and one
+        ``call_roll_quote_refresh_failed`` breadcrumb is logged — never a raise,
+        and never anything that could change the disposition already decided.
+        """
+        try:
+            fresh = self.alpaca.get_option_quote(symbol)
+            if not isinstance(fresh, dict) or not fresh:
+                raise ValueError("empty quote")
+        except Exception as exc:
+            try:
+                log_error_event(
+                    logger, error_type="call_roll_quote_refresh_failed",
+                    error_message=str(exc), component="call_roller",
+                    recoverable=True, symbol=symbol, underlying=underlying)
+            except Exception:
+                pass
+            return dict(_EMPTY_CANCEL_FIELDS)
+        placed = placed_quote if isinstance(placed_quote, dict) else {}
+        c_bid, c_ask = _pos(fresh.get('bid')), _pos(fresh.get('ask'))
+        drift = (_diff(c_ask, _pos(placed.get('ask'))) if side == 'buy'
+                 else _diff(_pos(placed.get('bid')), c_bid))
+        return {
+            'cancel_quote_bid': c_bid,
+            'cancel_quote_ask': c_ask,
+            'cancel_quote_ts': _iso(fresh.get('timestamp')),
+            'cancel_quote_age_s': _age_s(fresh.get('timestamp')),
+            'quote_drift': drift,
+        }
+
+    @staticmethod
+    def _fill_fields(*, limit: Any, filled_price: Any, side: str,
+                     order: Optional[Dict[str, Any]], elapsed: Optional[float],
+                     polls: Optional[int],
+                     settle_polls: Optional[int]) -> Dict[str, Any]:
+        """``fill_vs_limit`` (>= 0 by construction: ``limit - fill`` on a buy,
+        ``fill - limit`` on a sell), broker fill latency and leg wall-clock."""
+        lim, fill = _pos(limit), _pos(filled_price)
+        return {
+            'limit_price': lim,
+            'fill_vs_limit': (_diff(lim, fill) if side == 'buy'
+                              else _diff(fill, lim)),
+            'fill_latency_s': _fill_latency_s(order),
+            'leg_elapsed_s': elapsed,
+            'polls': polls,
+            'settle_polls': settle_polls,
+        }
+
+    def _log_leg_settled(self, *, symbol: str, underlying: str,
+                         order_id: Optional[str], disposition: str,
+                         placement: Dict[str, Any], limit: Any,
+                         requested_qty: int, filled_qty: int = 0,
+                         filled_price: Any = None,
+                         order: Optional[Dict[str, Any]] = None,
+                         cancel: Optional[Dict[str, Any]] = None,
+                         elapsed: Optional[float] = None,
+                         polls: Optional[int] = None,
+                         settle_polls: Optional[int] = None) -> None:
+        """``call_roll_leg_settled`` — exactly one row per placed order.
+
+        Per-LEG, informational, never alert-wired, and NOT part of the
+        one-terminal-per-position contract. Logging must never break the roll,
+        so a failure here is swallowed.
+        """
+        try:
+            side = 'buy' if placement.get('leg') == 'btc' else 'sell'
+            payload = dict(placement)
+            payload.update(cancel if cancel else _EMPTY_CANCEL_FIELDS)
+            payload.update(self._fill_fields(
+                limit=limit,
+                filled_price=(filled_price if filled_qty > 0 else None),
+                side=side, order=order, elapsed=elapsed, polls=polls,
+                settle_polls=settle_polls))
+            payload.update(
+                order_id=order_id or None,
+                disposition=disposition,
+                filled_price=(_pos(filled_price) if filled_qty > 0 else None),
+                filled_qty=int(filled_qty),
+                requested_qty=int(requested_qty),
+                order_submitted_at=_iso((order or {}).get('submitted_at')),
+            )
+            log_trade_event(
+                logger, event_type="call_roll_leg_settled",
+                symbol=symbol, underlying=underlying, strategy="roll_call",
+                success=disposition in ('filled', 'partial'), **payload)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Order plumbing
@@ -1103,8 +1442,13 @@ class CallRoller:
         poll_interval = 5
         elapsed = 0
         reported_refetch_failure = False
+        # FC-120 PR-1: reads issued by THIS call, for the log only. Callers
+        # snapshot it immediately after the primary poll returns, because
+        # ``_cancel_and_settle`` re-enters this method and resets it.
+        self._last_poll_reads = 0
 
         while True:
+            self._last_poll_reads += 1
             try:
                 order = self.alpaca.get_order_by_id(order_id)
                 if order and order.get('status', '') in _TERMINAL_ORDER_STATUSES:
@@ -1164,3 +1508,158 @@ def _as_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+# --------------------------------------------------------------------------- #
+# FC-120 PR-1 — quote instrumentation (docs/plans/fc-120.md DD-2).
+#
+# LOGGING ONLY. Nothing below feeds a limit, an order argument or a branch; the
+# roller prices exactly as it did before these helpers existed. Every value they
+# return is a JSON primitive (str / int / float / bool / None) — never a
+# datetime, Decimal or dict — because the log sink turns each field into a
+# BigQuery column and a datetime reaching structlog is a repr, not a value.
+# Differences go through ``_dec`` (exact decimal via str), never
+# ``Decimal(float)``: ``Decimal(6.95) % Decimal("0.05")`` is 1.78e-16, not 0.
+# --------------------------------------------------------------------------- #
+
+#: The post-settle quote set on a leg that did not end zero-fill (or whose
+#: refresh failed). Spelled once so every row carries the same keys.
+_EMPTY_CANCEL_FIELDS: Dict[str, Any] = {
+    'cancel_quote_bid': None, 'cancel_quote_ask': None,
+    'cancel_quote_ts': None, 'cancel_quote_age_s': None, 'quote_drift': None,
+}
+
+
+def _num(value: Any) -> Optional[float]:
+    """A finite float, or None. Never 0.0 for a missing value."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def _pos(value: Any) -> Optional[float]:
+    """A strictly positive finite float, or None (a quote side of 0 is absent)."""
+    out = _num(value)
+    return out if out is not None and out > 0 else None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    out = _num(value)
+    return int(out) if out is not None else None
+
+
+def _diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """``a - b`` exactly (decimal), as a float; None if either side is absent."""
+    if a is None or b is None:
+        return None
+    return float(_dec(a) - _dec(b))
+
+
+def _iso(value: Any) -> Optional[str]:
+    """A broker stamp as an ISO string. A datetime is formatted, a non-empty
+    string passes through, anything else is None."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _age_s(stamp: Any) -> Optional[float]:
+    """Seconds since the BROKER's stamp (not our clock); None if unreadable."""
+    try:
+        return quote_age_seconds(stamp)
+    except Exception:
+        return None
+
+
+def _now_iso() -> str:
+    return clock.now_utc().isoformat()
+
+
+def _limit_on_tick(limit: Any, underlying: str) -> Optional[bool]:
+    """Is ``limit`` on the legal tick grid for ``underlying``? None if no limit."""
+    value = _pos(limit)
+    if value is None:
+        return None
+    exact = _dec(value)
+    return bool(exact % tick_size(exact, underlying) == 0)
+
+
+def _fill_latency_s(order: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Alpaca ``filled_at - submitted_at`` in seconds; None if either is absent."""
+    if not order:
+        return None
+    try:
+        filled = order.get('filled_at')
+        submitted = order.get('submitted_at')
+        if not filled or not submitted:
+            return None
+        parse = (lambda v: v if isinstance(v, datetime) else
+                 datetime.fromisoformat(str(v).strip().replace('Z', '+00:00')))
+        return round((parse(filled) - parse(submitted)).total_seconds(), 3)
+    except Exception:
+        return None
+
+
+def _quote_fields(quote: Optional[Dict[str, Any]],
+                  reread: Optional[Dict[str, Any]],
+                  limit: Any, side: str, underlying: str,
+                  strike: Any, stock_bid: Any) -> Dict[str, Any]:
+    """The DD-2 placement set for one leg: the quote the limit was priced from.
+
+    ``side`` is ``"buy"`` (a BTC) or ``"sell"`` (an STO). ``reread`` is the
+    same-second second read of the same symbol (None if it failed): a
+    ``quote_reread_delta`` of 0.00 on every read says the indicative feed is a
+    deterministic transform of the NBBO, non-zero says per-read noise.
+
+    Sign conventions, so ">= 0" always means the same thing:
+    ``limit_vs_quote`` is ``limit - ask`` on a buy and ``bid - limit`` on a
+    sell (>= 0 = at or through the quoted side); ``quote_reread_delta`` is
+    ``reread_ask - ask`` on a buy and ``bid - reread_bid`` on a sell.
+    ``intrinsic_at_placement`` is ``max(0, stock_bid - strike)`` from the IEX
+    stock bid; a BTC limit below it is one no NBBO ask could match.
+
+    The roller's limits are deliberately NOT priced through ``limit_pricing``
+    (docs/CLAUDE.md); only ``_dec`` / ``tick_size`` / ``quote_age_seconds`` are
+    borrowed here, to describe a limit, never to set one.
+    """
+    q = quote if isinstance(quote, dict) else {}
+    r = reread if isinstance(reread, dict) else {}
+    bid, ask = _pos(q.get('bid')), _pos(q.get('ask'))
+    reread_bid, reread_ask = _pos(r.get('bid')), _pos(r.get('ask'))
+    two_sided = bid is not None and ask is not None
+    lim = _pos(limit)
+    buy = side == 'buy'
+
+    stock = _pos(stock_bid)
+    k = _pos(strike)
+    intrinsic = (max(0.0, float(_dec(stock) - _dec(k)))
+                 if stock is not None and k is not None else None)
+    feed = q.get('feed')
+
+    return {
+        'quote_bid': bid,
+        'quote_ask': ask,
+        'quote_mid': (float((_dec(bid) + _dec(ask)) / 2) if two_sided else None),
+        'quote_spread': (_diff(ask, bid) if two_sided else None),
+        'quote_bid_size': _int_or_none(q.get('bid_size')),
+        'quote_ask_size': _int_or_none(q.get('ask_size')),
+        'quote_ts': _iso(q.get('timestamp')),
+        'quote_age_s': _age_s(q.get('timestamp')),
+        'quote_feed': feed if isinstance(feed, str) else None,
+        'quote_reread_bid': reread_bid,
+        'quote_reread_ask': reread_ask,
+        'quote_reread_delta': (_diff(reread_ask, ask) if buy
+                               else _diff(bid, reread_bid)),
+        'limit_on_tick': _limit_on_tick(lim, underlying),
+        'limit_vs_quote': (_diff(lim, ask) if buy else _diff(bid, lim)),
+        'intrinsic_at_placement': intrinsic,
+        'limit_minus_intrinsic': _diff(lim, intrinsic),
+    }

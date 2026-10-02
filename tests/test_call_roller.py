@@ -1738,6 +1738,15 @@ class TestTheTerminalTaxonomyIsExhaustive:
             # the TERMINAL for that position is call_roll_unknown_disposition,
             # raised by execute_roll once the ladder returns.
             'call_roll_stc_disposition_unknown',
+            # FC-120 PR-1: per-LEG rows, one per placed order — never a
+            # position's terminal (a roll with three placements emits three).
+            'call_roll_leg_settled',
+            # Per-RUNG: an STO rung canceled at its timeout with zero fill.
+            # The ladder moves on, so the position's terminal comes later.
+            'call_roll_stc_timeout_canceled',
+            # Breadcrumb: the post-settle instrumentation quote failed. The
+            # disposition was already final; its fields log as None.
+            'call_roll_quote_refresh_failed',
         }
         unclassified = emitted - TERMINAL_EVENTS - non_terminal
         assert not unclassified, (

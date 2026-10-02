@@ -541,6 +541,9 @@ class AlpacaClient:
                     'ask': ask,
                     'bid_size': bid_size,
                     'ask_size': ask_size,
+                    # FC-120 PR-1: the broker's stamp on this row's quote, so the
+                    # roller can log how old the screened quote was.
+                    'quote_timestamp': getattr(quote, 'timestamp', None),
                     'last_price': last_price,
                     'volume': volume,
                     'open_interest': 0,  # Not available in snapshot data
