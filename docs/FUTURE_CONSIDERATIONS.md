@@ -1187,11 +1187,11 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
 
-**Status:** Consideration — filed 2026-10-02 at operator request, immediately after the screen was retired (scheduler paused; see FC-091 closeout and `docs/BACKTEST_ENGINE.md` §Track D). Inventory below is from a read of the tree at `fbdb6f9`; scope decisions D-1…D-3 are the operator's and are open.
+**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). PR-1 building. Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
 **Scope:** shared (backtest engine + sim stack + deploy/monitoring config)
 **Size estimate:** M (two PRs: one outside `src/**`, one inside it — the second moves `engine_identity`)
 **Owner:** zeshan + Claude
-**Plan file:** not yet
+**Plan file:** `docs/plans/fc-121.md`
 
 **Problem / opportunity:** the monthly screen no longer runs, but its code, endpoint, Job, scheduler and policy references remain. It is not a clean delete: `src/backtesting/screen.py` is also where the LIVE sim stack gets three things it needs.
 
