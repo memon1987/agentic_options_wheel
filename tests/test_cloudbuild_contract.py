@@ -854,8 +854,8 @@ def test_sweep_job_step_honours_the_superseded_marker_first(by_id):
         f"`{SWEEP_JOB_STEP}` is what creates and updates the `{SWEEP_JOB_NAME}` "
         "Cloud Run Job. Without it the job either does not exist (the dashboard's "
         "submit returns 404 forever) or sits on whatever image an operator last "
-        "pinned — which is exactly how `backtest-screen` ended up on a Layer-1 "
-        "image with no `sweep` command."
+        "pinned — which is exactly how the retired monthly screen Job ended up "
+        "on a Layer-1 image with no `sweep` command."
     )
     script = script_of(by_id[SWEEP_JOB_STEP])
     assert script, f"{SWEEP_JOB_STEP} must be a `bash -c` step to carry the marker check"
@@ -889,11 +889,6 @@ def test_sweep_job_step_deploys_this_builds_image_with_the_sweep_command(by_id):
         f"{SWEEP_JOB_STEP} must run `python main.py --command sweep --spec-env "
         "SWEEP_SPEC_JSON`. The spec arrives as a per-execution env override "
         "(D2); a job whose args say otherwise ignores the submission entirely."
-    )
-    # `backtest-screen` is SHA-pinned on purpose and must stay untouched.
-    assert "backtest-screen" not in script, (
-        f"{SWEEP_JOB_STEP} must not touch `backtest-screen`: the monthly screen "
-        "is deliberately pinned so it stays reproducible."
     )
 
 
@@ -1039,7 +1034,7 @@ def test_backfill_job_step_deploys_this_builds_image_with_the_backfill_command(b
     assert "--command=python" in script and "--args=main.py,--command,backfill" in script, (
         f"{BACKFILL_JOB_STEP} must run `python main.py --command backfill`."
     )
-    assert "backtest-screen" not in script and "backtest-sweep" not in script, (
+    assert "backtest-sweep" not in script, (
         f"{BACKFILL_JOB_STEP} must not touch another Job's definition."
     )
 

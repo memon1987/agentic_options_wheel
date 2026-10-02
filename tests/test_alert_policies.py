@@ -140,14 +140,14 @@ def test_a_log_filter_names_a_resource_type(policy):
 class TestTheFC096Policies:
     """The three this phase adds, and the properties each one exists for."""
 
-    def test_the_job_policy_watches_all_three_jobs(self):
+    def test_the_job_policy_watches_both_jobs(self):
         doc = load(POLICY_DIR / "job_failure_alert_policy.json")
         f = doc["conditions"][0]["conditionMatchedLog"]["filter"]
         assert 'resource.type="cloud_run_job"' in f, (
             "no other policy in this directory watches Jobs — they match "
             "cloud_run_revision or build — which is the gap this closes"
         )
-        for job in ("backtest-screen", "backtest-sweep", "data-backfill"):
+        for job in ("backtest-sweep", "data-backfill"):
             assert job in f, f"{job} is not watched"
         assert "severity>=ERROR" in f
 

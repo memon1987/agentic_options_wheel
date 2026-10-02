@@ -261,14 +261,16 @@ than it is; it refuses to emit a conclusion when the market is closed.
 
 ---
 
-## Track D — DONE (2026-07-30). The screen is live.
+## Track D — the monthly screen (history: ran 2026-07-30 → 2026-10-02)
 
-> **RETIRED 2026-10-02 (operator decision).** The `monthly-performance-review` scheduler is
-> **PAUSED**; the monthly screen no longer runs. The `backtest-screen` Job, its image
-> (re-pinned to `ff8ab85` on 2026-10-01) and `options_wheel.backtest_runs` are left in place
-> as history — nothing was deleted, and resuming is one command
-> (`gcloud scheduler jobs resume monthly-performance-review --location us-central1`).
-> The rest of this section describes the screen as it ran from 2026-07-30 to 2026-10-02.
+> **RETIRED 2026-10-02 (operator decision).** The `monthly-performance-review` scheduler was
+> paused that day; the monthly screen no longer runs. **FC-121 decommissions it**
+> (`docs/plans/fc-121.md`): the `/backtest/screen` endpoint and the Job-failure policy's
+> `backtest-screen` entry are removed from the tree, and the `backtest-screen` Job and the
+> `monthly-performance-review` scheduler are deleted at that FC's rollout — there is nothing
+> to resume. `options_wheel.backtest_runs` is **kept** as history (no new rows). The Job's
+> deploy recipe survives only in repository history (this file at `fbdb6f9`). What remains
+> below is the record of what the screen was.
 >
 > **Why.** (1) *Redundant:* the weekly battery (FC-096 Phase B, Saturdays, inside the
 > `data-backfill` Job) replays the same 14 symbols on the base config every week on current
@@ -292,20 +294,10 @@ than it is; it refuses to emit a conclusion when the market is closed.
 > single week's `demote` as noise; a verdict that holds across several Saturdays and both
 > splits is the signal.
 
-The engine runs monthly as a **Cloud Run Job**. `/backtest/screen` remains disabled
-(503) and should stay that way — a full screen takes **1h47m**, so no synchronous HTTP
-request can serve it.
-
-### What is deployed
-
-| | |
-|---|---|
-| Job | `backtest-screen` (us-central1) |
-| Image | `us-central1-docker.pkg.dev/<PROJECT>/options-wheel/options-wheel-strategy:<SHA>` — **Artifact Registry**, SHA-pinned |
-| Resources | 1 vCPU, 1 GiB, `--task-timeout 10800s`, `--max-retries 0` |
-| Credentials | `--set-secrets` → `alpaca-api-key`, `alpaca-secret-key`, `finnhub-api-key` |
-| Schedule | `monthly-performance-review`, **PAUSED 2026-10-02** (was ENABLED, `0 6 1 * *` UTC = 02:00 ET) |
-| Trigger | Scheduler → **OAuth** → `run.googleapis.com/...jobs/backtest-screen:run` |
+The screen ran monthly as a SHA-pinned **Cloud Run Job** (`backtest-screen`, 1 vCPU,
+1 GiB, `--task-timeout 10800s`, `--max-retries 0`), triggered by the
+`monthly-performance-review` scheduler at `0 6 1 * *` UTC (02:00 ET) over OAuth. A full
+screen took **1h47m** cold, which is why it was never served over HTTP.
 
 ### Verified end to end, 2026-07-30
 
@@ -327,6 +319,11 @@ deploy. Recorded because the same mistakes are easy to repeat:
    was false.
 3. **Timeout.** It said `3600s`. The real run takes **1h47m**, so an hour would have timed
    out. Now `10800s`.
+
+## The chain lake, backfill, bars cache and sweeps
+
+These subsections began under Track D (the screen was the lake's first consumer) and are
+current: the sweep Job, the weekly backfill and the battery all depend on them.
 
 ### The chain lake (FC-060 Layer 1)
 
@@ -647,9 +644,9 @@ it uses the REST `jobs.run` body, where the value is a JSON string and nothing
 is delimiter-parsed.
 
 **The Job is auto-deployed by `cloudbuild.yaml`** (`deploy-sweep-job`), so an ad-hoc
-sweep always runs current `main`. `backtest-screen` stays SHA-pinned and untouched: a
-monthly screen must be reproducible, and an ad-hoc sweep must answer a question about
-the code as it is now. Those are opposite requirements, which is why they are two Jobs.
+sweep always runs current `main`: an ad-hoc sweep must answer a question about the code
+as it is now. (The retired monthly screen's Job was the opposite — SHA-pinned so a month's
+screen stayed reproducible — which is why they were two Jobs; FC-121 deleted it.)
 The step runs **last**, behind all three service promotes — it can fail because the
 build service account lacks `run.jobs.create`, and a measurement tool must not be able
 to strand a production deploy.
@@ -711,8 +708,8 @@ anything — for re-running a question whose answer you no longer trust; it supp
 API's informational hint with it. It is excluded from `sweep_key`, so a forced run stays
 comparable with the run it reproduces.
 
-**The Job's `--task-timeout` is 10800s (3h)**, matching `backtest-screen`'s rationale:
-a cold window materialises at ~5.5 min/symbol. A task killed at the timeout receives
+**The Job's `--task-timeout` is 10800s (3h)** because a cold window materialises at
+~5.5 min/symbol. A task killed at the timeout receives
 SIGTERM, which the CLI turns into a recorded `failed` row rather than a sweep that
 sits as `running` for ever.
 
@@ -945,47 +942,6 @@ Single warm pass over one symbol-year, before and after the row-conversion rewri
 of `df.iterrows()` plus a per-cell label lookup. Output is identical, pinned by
 `tests/test_backtest_data.py::TestRowConversionIsIdenticalToTheLegacyLoop`, which keeps a
 verbatim copy of the old converter as its oracle and runs it against real cached files.
-
-### Operating notes
-
-- **~5.5 min/symbol on a cold run.** Before FC-060 the cache never warmed — Cloud Run's
-  filesystem is ephemeral, so every run paid the full ~1h47m. With `CHAIN_LAKE_BUCKET` set
-  and the lake seeded, only the days since the previous run are fetched from Alpaca and the
-  rest are downloaded; the expected steady state is a small fraction of that. **Record the
-  measured runtime of the first warm execution here** — the number above is the cold-run
-  figure and should not be quoted as current once the lake is live.
-- Roughly 16 of those cold minutes are spent building chains for F, PFE and VZ
-  only to discover no put clears the `$0.50` floor: they pass the price band, so the engine
-  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned. The
-  lake removes the *fetch* cost of those days, not the decision cost.
-- **Schedule is 02:00 ET deliberately.** A ~2h run must not overlap the trading session; the
-  previous `0 12 1 * *` (08:00 ET) would have finished ~09:47 ET, on top of the open and
-  contending with the live bot for the same Alpaca quota.
-- **`--max-retries 0` is deliberate.** The default of 3 would mean a failing screen hammering
-  contract discovery three times.
-- **The job name is now a misnomer** — `monthly-performance-review` runs a screen. Left as-is
-  because renaming means delete-and-recreate, losing history.
-
-### If it fails
-
-Logs work now (FC-059 — Cloud Run **Jobs** set `CLOUD_RUN_JOB`, not `K_SERVICE`, so log
-output previously went to a file inside an ephemeral container and vanished):
-
-```bash
-gcloud run jobs executions list --job backtest-screen --region us-central1
-gcloud logging read 'resource.labels.job_name="backtest-screen"' --limit 50 --freshness=3h
-```
-
-A failure writes **zero** rows — persistence is a single batch after the loop — so a partial
-run cannot corrupt `backtest_runs`.
-
-### Before the first *persisted* screen
-
-Persisted rows land in `options_wheel.backtest_runs`, which historically fed demotion
-recommendations. Given the engine is being adopted as a measurement tool only, the useful
-sequence is: run the Job, read the output, and treat the first few months as **data
-collection**. The `demote` column is a recommendation for a human, and the biases above
-are the reason it needs one.
 
 
 ## The covered-call replay (FC-096 Phase C)

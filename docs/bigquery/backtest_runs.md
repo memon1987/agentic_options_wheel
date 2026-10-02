@@ -1,8 +1,9 @@
 # `options_wheel.backtest_runs`
 
 > **SERIES ENDED 2026-10-02.** The monthly screen was retired by operator decision
-> (`monthly-performance-review` scheduler PAUSED; rationale in `docs/BACKTEST_ENGINE.md`
-> §Track D). The last full run is `bb702bb98d464a27` (2026-10-02 03:17 UTC, engine
+> (`monthly-performance-review` scheduler paused that day, then deleted with the
+> `backtest-screen` Job by FC-121; rationale in `docs/BACKTEST_ENGINE.md` §Track D).
+> The last full run is `bb702bb98d464a27` (2026-10-02 03:17 UTC, engine
 > `fc-112-wheel-roll-reach`). The table is kept as history and is not written by anything
 > scheduled. October 2026 carries **two** full runs (`6e025206a2a647d0` scheduled on the old
 > pinned image, `bb702bb98d464a27` manual on `ff8ab85`) — filter by `run_id`, not by month.
@@ -28,9 +29,9 @@
 > the risk-free hurdle flips week to week (AMZN, September 2026) — read several Saturdays
 > and both splits before treating `demote` as a finding.
 
-One row per **symbol per screening run** (FC-032 Phase 5). Written by
-`src/backtesting/reporting/bq_writer.py` via the `/backtest/screen` endpoint or
-`python main.py --command screen`.
+One row per **symbol per screening run** (FC-032 Phase 5). Was written by
+`src/backtesting/reporting/bq_writer.py` via `python main.py --command screen`
+(the `backtest-screen` Job, or locally); nothing writes it now.
 
 Day-partitioned on `timestamp`.
 
@@ -145,49 +146,22 @@ A symbol that failed still gets a row with `error` set and a NULL verdict.
 **A NULL verdict does not mean the symbol is fine — it means it was never
 checked.** Filter explicitly.
 
-## Running a full screen
+## How it was written (history)
 
-**The `/backtest/screen` endpoint is DISABLED by default** (503 unless
-`ENABLE_SCREEN_ENDPOINT=true`), and should stay that way until the Cloud Run Job
-below is deployed.
+From 2026-07-30 to 2026-10-02 the full universe was screened monthly by the
+`backtest-screen` Cloud Run Job (`python main.py --command screen`), fired by the
+`monthly-performance-review` Cloud Scheduler job at 02:00 ET on the 1st. A cold
+full screen took ~1h47m, which is why it was never served over HTTP: the
+`/backtest/screen` endpoint on the trading service shipped disabled (503 unless
+`ENABLE_SCREEN_ENDPOINT=true`, which was never set) and was removed by FC-121.
+The scheduler was paused on 2026-10-02 and FC-121 deletes it and the Job
+(`docs/plans/fc-121.md`); the CLI command and its writer module are removed in
+the same FC. A failed run wrote **zero** rows — persistence was a single write
+after the loop — so the table holds no partial runs from a crash. Ad-hoc subset
+runs are present and carry `run_kind='adhoc'`.
 
-Measured cost is **~25 minutes per symbol** cold — ~50 with the sensitivity pass
-— because `ChainStore` is not yet wired in and Cloud Run's filesystem is
-ephemeral regardless. Against a 300s request timeout, no synchronous request
-finishes even a single symbol. Running it there would burn Alpaca quota the live
-bot shares and time out with no record. (A timeout does not corrupt the table:
-persistence is one write after the loop, so a timeout writes zero rows.)
-
-Run the full universe as a batch job instead:
-
-```bash
-# Locally (writes to options_wheel.backtest_runs):
-python main.py --command screen
-
-# As a Cloud Run Job (the intended monthly path):
-gcloud run jobs create backtest-screen \
-  --image gcr.io/gen-lang-client-0607444019/options-wheel-strategy \
-  --region us-central1 \
-  --task-timeout 3600s \
-  --set-env-vars GCP_PROJECT=gen-lang-client-0607444019 \
-  --command python --args "main.py,--command,screen"
-
-gcloud run jobs execute backtest-screen --region us-central1
-```
-
-Then point a monthly Cloud Scheduler job at the Job's `:run` endpoint rather
-than at the HTTP service.
-
-**Not yet deployed.** Four scheduler jobs are currently PAUSED because they
-target endpoints deleted in Phase 0: `monthly-performance-review`
-(`/backtest/performance-comparison`), `daily-quick-backtest` and
-`weekly-comprehensive-backtest` (`/backtest`), and `daily-cache-maintenance`
-(`/cache/cleanup`). `monthly-performance-review` is the one to re-point at the
-Job; the other three have no replacement and should be deleted.
-
-Before the first real screening run is used for a demotion decision, two gaps
-should close: wire `ChainStore` (turns hours into minutes) and model dividends
-(the bias runs **toward** demoting on income names — see below).
+The Job's deploy recipe is in `docs/BACKTEST_ENGINE.md` at `fbdb6f9` (repository
+history only).
 
 ## Queries
 
