@@ -1189,7 +1189,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
 
-**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 open: #136 — two adversarial reviews both REQUEST_CHANGES on docs/rollout text (code verified safe); fixes in progress, then a confirmation pass.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
+**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 open: #136 — two adversarial reviews both REQUEST_CHANGES on docs/rollout text (code verified safe); fix commit `86d46d3`, confirmation pass CONFIRMED-CLEAN. Merge-ready; awaiting the operator's Job + scheduler deletes and the merge go-ahead.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
 **Scope:** shared (backtest engine + sim stack + deploy/monitoring config)
 **Size estimate:** M (two PRs: one outside `src/**`, one inside it — the second moves `engine_identity`)
 **Owner:** zeshan + Claude
@@ -1278,7 +1278,23 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
-### FC-125: post-hoc truth for roll misses — OPRA trade prints near each placement, and a stock-quote decomposition of every miss
+### FC-125: the build trigger has no path filter — every push to `main`, docs-only included, redeploys both live bot services
+
+**Status:** Filed 2026-10-02 (FC-121 PR-1 confirmation pass; measured the same night)
+**Scope:** shared (deploy/CI)
+**Size estimate:** S (trigger `includedFiles` / `ignoredFiles`, or an early-exit build step) — changes deployment config → plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the Cloud Build trigger fires on `^main$` with no path filter, and the build chain ends in a deploy + promote of `options-wheel-strategy` and `covered-call-engine`. The global workflow sends docs, plan files, FC-index edits and bookkeeping commits **direct to main** — so each of those is a production redeploy of both trading services. Measured 2026-10-02: three docs-only commits ran three full builds (04:19, 04:22, 04:24 UTC) and both services show deploys 04:12–04:34 UTC. Nothing stops a status-flip commit pushed at 15:35 ET from replacing the instance mid-`/roll` ladder — the scale-in residual `docs/CLAUDE.md` calls dangerous (BTC filled, STO never placed).
+
+**Fix direction:** exclude `docs/**`, `*.md` and other non-shipping paths from the trigger (or have the first build step exit 0 when `git diff --name-only $PREV $COMMIT_SHA` touches nothing that ships), keeping the deploy-freshness check (FC-081) honest about "merged vs deployed" when a commit is skipped by design. Until then: batch bookkeeping pushes and keep them outside market hours.
+
+**Links:** FC-081 (deploy freshness), FC-084 (build serialization), FC-107/FC-113 (the roll ladder's timing), `docs/plans/fc-121.md` §Rollout.
+
+---
+
+### FC-126: post-hoc truth for roll misses — OPRA trade prints near each placement, and a stock-quote decomposition of every miss
 
 **Status:** Filed 2026-10-02 (deferred out of FC-120 PR-1 by the program owner at the PR-1 code review; do not build inside FC-120)
 **Scope:** shared (both roll services; analysis + possibly a read-only backfill tool)

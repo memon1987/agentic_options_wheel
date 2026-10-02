@@ -581,9 +581,9 @@ prefix scan per live symbol) and compares the newest stored chain-day against
 `jobs:run` is asynchronous** — it records success when the API call returns, so
 a paused scheduler, a deleted scheduler and a Job that fails every execution
 all leave a clean scheduler history. The Job-failure alert policy
-(`deploy/monitoring/job_failure_alert_policy.json`, which watches all three
-Jobs — the first policy here to match `cloud_run_job` at all; the others match
-`cloud_run_revision` or `build`) catches an execution that runs and fails; this
+(`deploy/monitoring/job_failure_alert_policy.json`, which watches both Jobs —
+`backtest-sweep` and `data-backfill` — and was the first policy here to match
+`cloud_run_job`) catches an execution that runs and fails; this
 catches the one that never runs. Both events have their own policy:
 `lake_freshness_alert_policy.json` on the `fail`, and
 `lake_freshness_degraded_alert_policy.json` as a 24h-rate-limited nag on the
@@ -823,20 +823,24 @@ gcloud scheduler jobs create http backfill-weekly \
   --oauth-service-account-email=799970961417-compute@developer.gserviceaccount.com
 ```
 
-**The URI form is copied from the live `monthly-performance-review` job, not
-from the API reference** — regional host, `apis/run.googleapis.com/v1/namespaces/<PROJECT>`,
-job name, `:run`. Verified 2026-08-31 with
-`gcloud scheduler jobs describe monthly-performance-review --location=us-central1`.
+**The URI form was copied from the then-live `monthly-performance-review` job
+(deleted 2026-10 by FC-121), not from the API reference** — regional host,
+`apis/run.googleapis.com/v1/namespaces/<PROJECT>`, job name, `:run`. Verified
+2026-08-31 with `gcloud scheduler jobs describe` on that job. **`backfill-weekly`
+is now the live reference** — it was created from this recipe, so to re-check
+the form run
+`gcloud scheduler jobs describe backfill-weekly --location=us-central1`.
 The `v2/projects/.../locations/.../jobs/<job>:run` shape that the Cloud Run docs
-show is *not* what the one scheduler in this project known to work actually
-uses, and a scheduler pointed at a URI that 404s still records success — see
+show is *not* what the schedulers in this project known to work actually
+use, and a scheduler pointed at a URI that 404s still records success — see
 below — so this is exactly the wrong place to improvise.
 
 Saturday is deliberate (weekend cadence, an Alpaca-quota courtesy — FC-095), and
-`--max-retry-attempts=3` is too: the live `monthly-performance-review` recipe
-has no `retryCount` at all (verified: its `retryConfig` carries only the backoff
-bounds), so a transient API error there silently skips a month. **Do not "fix"
-the small `attemptDeadline`** (`monthly-performance-review` runs 180s):
+`--max-retry-attempts=3` is too: the `monthly-performance-review` recipe it was
+copied from had no `retryCount` at all (verified 2026-08-31: its `retryConfig`
+carried only the backoff bounds), so a transient API error there would silently
+skip a month. **Do not "fix" the small `attemptDeadline`** (that job ran with
+180s):
 `jobs:run` is asynchronous, so the deadline bounds the API call, not the
 multi-hour execution behind it.
 
