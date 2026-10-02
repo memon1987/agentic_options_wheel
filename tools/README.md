@@ -4,18 +4,10 @@ This directory contains all development, testing, deployment, and monitoring too
 
 ## Directory Structure
 
-### 📊 `/backtesting/`
-**Backtesting and analysis tools**
-- `backtest_runner.py` - Comprehensive backtesting engine with CLI interface
-- `demo_backtest.py` - Simple backtesting demonstration and examples
-- `scheduled_backtest.py` - Automated backtesting for Cloud Scheduler integration
-
 ### 🚀 `/deployment/`
 **Deployment and infrastructure management**
 - `deploy.sh` - Main deployment script for Cloud Run
-- `setup_backtesting_schedule.sh` - Configure automated backtesting jobs
 - `setup_github_deployment.sh` - Configure GitHub Actions CI/CD
-- `setup_scheduled_backtesting.sh` - Legacy scheduler setup (use setup_backtesting_schedule.sh)
 
 ### 🛠️ `/development/`
 **Development and debugging tools**
@@ -58,18 +50,6 @@ python tools/development/monitor_build.py
 ```bash
 # Deploy to Cloud Run
 ./tools/deployment/deploy.sh
-
-# Setup backtesting schedule
-./tools/deployment/setup_backtesting_schedule.sh
-```
-
-**Backtesting:**
-```bash
-# Run comprehensive backtest
-python tools/backtesting/backtest_runner.py --symbol AAPL --days 30
-
-# Demo backtesting
-python tools/backtesting/demo_backtest.py
 ```
 
 **Monitoring:**
