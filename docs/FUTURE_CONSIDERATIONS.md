@@ -1187,7 +1187,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
 
-**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 2 same day (build findings folded in). **PR-1 open: #136, in review.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
+**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 open: #136 — two adversarial reviews both REQUEST_CHANGES on docs/rollout text (code verified safe); fixes in progress, then a confirmation pass.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
 **Scope:** shared (backtest engine + sim stack + deploy/monitoring config)
 **Size estimate:** M (two PRs: one outside `src/**`, one inside it — the second moves `engine_identity`)
 **Owner:** zeshan + Claude
@@ -1257,6 +1257,22 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Fix direction:** (a) minimum — make the script enumerate live schedulers (`gcloud scheduler jobs list --filter='state=ENABLED'`) and pause every job targeting either bot service, fail loudly (`set -euo pipefail`, no `&& echo`) and verify zero ENABLED trading schedulers before printing success; cover BOTH services; `resume_trading.sh` resumes exactly the set the stop recorded. (b) decide with FC-074 whether the stop belongs in a script at all or in a service-side kill switch the schedulers cannot bypass. Either way: the names a stop script touches are derived, not hardcoded, and a paper drill is recorded in the plan.
 
 **Links:** FC-074 (should an account-level kill switch exist), FC-076 (structural account interlock), FC-114/FC-089/FC-113 (the other real-money preconditions), `docs/plans/fc-121.md` (the review that found it).
+
+---
+
+### FC-124: `tools/` and the install docs still name dead endpoints and a hand deploy that bypasses the canary chain
+
+**Status:** Filed 2026-10-02 (FC-121 PR-1 reviews + build; deferred out of FC-121 as unrelated to the retired screen)
+**Scope:** shared (operator tooling, docs)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-121 removed the two scheduler-setup scripts; the same rot continues next door. (1) `tools/deployment/deploy.sh` — listed in `tools/README.md` as "the main deployment script" — runs `gcloud run deploy options-wheel-strategy` by hand with `--timeout=300`, bypassing the Cloud Build canary chain and undoing FC-107's 1800 s real-money precondition. (2) `tools/testing/test_endpoints.sh` calls `/backtest`, `/backtest/history` and `/cache/stats`, none of which exists. (3) `docs/INSTALL.md:168` and `examples/README.md:9,25` reference `demo_backtest.py`, which does not exist. (4) `deploy/cloud_run_server.py` imports `time`, `json` and `timedelta` and uses none (pyflakes, pre-existing).
+
+**Fix direction:** delete or rewrite each against the live route table and the build chain; decide whether `deploy.sh` should exist at all (a hand deploy that silently drops a real-money gate is worse than no script). Pair with FC-123.
+
+**Links:** FC-121 (`docs/plans/fc-121.md` §Execution), FC-123, FC-107.
 
 ---
 
