@@ -1185,6 +1185,38 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
 
+### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
+
+**Status:** Consideration — filed 2026-10-02 at operator request, immediately after the screen was retired (scheduler paused; see FC-091 closeout and `docs/BACKTEST_ENGINE.md` §Track D). Inventory below is from a read of the tree at `fbdb6f9`; scope decisions D-1…D-3 are the operator's and are open.
+**Scope:** shared (backtest engine + sim stack + deploy/monitoring config)
+**Size estimate:** M (two PRs: one outside `src/**`, one inside it — the second moves `engine_identity`)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem / opportunity:** the monthly screen no longer runs, but its code, endpoint, Job, scheduler and policy references remain. It is not a clean delete: `src/backtesting/screen.py` is also where the LIVE sim stack gets three things it needs.
+
+**Inventory (what is screen-only vs shared):**
+- **Screen-only, deletable:** `screen.py` `run_screen` / `ScreenResult` / `SymbolResult` / `render_screen_summary` / `_log_lake_run_summary`; `main.py` `--command screen` + `run_screen_cmd` (`main.py:197`, `:1478`); `deploy/cloud_run_server.py` `/backtest/screen` route + `ENABLE_SCREEN_ENDPOINT` (`:1442–1600`, disabled-by-default 503 since it shipped); `reporting/bq_writer.py` `BacktestRunWriter` / `build_row` / `_schema` / `_binding`; `tests/test_backtest_screen.py` (552 lines, 40 tests) and the screen cases in `test_backtest_simulator.py`, `test_cc_spec_and_stamps.py`.
+- **Shared, must be RE-HOMED not deleted:** `screen.ENGINE_VERSION` (imported by `main.py:1193/1980` and `deploy/sim_service.py:736/1015/1103`; already duplicated in `scenarios/engine_identity.py:85` and `dashboard/backend/services/sweeps.py:104`); `screen.DEFAULT_LOOKBACK_DAYS` (`main.py:824/1980`, `sim_service.py:392`); `screen.accumulate_lake_summary` + `LAKE_COUNTERS` (`main.py:2415`, the backfill/battery lake totals); `bq_writer.config_hash` (`scenarios/runner.py:100`, `sim_service.py:1099`, `main.py:1974`). Every one of the sim-service and `main.py` imports is a LAZY in-function import — a missed one fails at call time, not at import.
+- **Keep (not part of the screen):** `evaluate.py` and `--command backtest` (single-symbol evaluate mode; the scenario runner imports `_score` and the haircut constants from it, and plans use it for no-lake identity proofs).
+- **Config / policy references:** `deploy/monitoring/job_failure_alert_policy.json` filter names `backtest-screen` (pinned by `tests/test_alert_policies.py:150`; live policy needs an operator re-apply); `cloudbuild.yaml:1366/1393` comments and `tests/test_cloudbuild_contract.py:857/893/1042` assert the build never touches `backtest-screen`; `tests/test_logger_cloud_run_detection.py:49` uses the name as a fixture value (harmless).
+- **Live GCP resources (operator-only):** Cloud Run Job `backtest-screen`; scheduler `monthly-performance-review` (PAUSED); table `options_wheel.backtest_runs` (7 full runs, 2026-07-30 → 10-02). Found alongside: scheduler `options-wheel-roll-friday` is PAUSED and superseded by `options-wheel-roll-daily`.
+- **Docs:** `docs/BACKTEST_ENGINE.md` §Track D + screen operating notes, `docs/bigquery/backtest_runs.md`, the `/backtest/screen` docstring, `docs/CLAUDE.md` scheduler-recipe references to `monthly-performance-review`.
+
+**Constraints the plan must honour:**
+- **Any `src/**` change moves `engine_identity`** (it hashes every file under `src/`): every stored `sweep_key` misses once and the next Saturday battery replays cold. FC-112's read requires `engine_identity` single-valued across a read (`fc-112.md` §Uniformity → VOID), so the `src/**` PR must land BEFORE the FC-112 pins are created or be sequenced with FC-120's PRs, which move the identity anyway. The non-`src` PR has no such constraint.
+- `ENGINE_VERSION` must end with ONE engine-side home; the dashboard copy stays a deliberate duplicate (the dashboard image does not import the engine) and its equality test must keep passing.
+- No behaviour change to sweeps, the battery, the sim service or the backfill: the re-home is a pure move, proven by an unchanged golden / no-lake identity hash apart from the expected `engine_identity` move.
+
+**Open questions (operator):**
+- **D-1 — `backtest_runs` table:** keep as history (recommended — it is the evidence base FC-034/FC-055 cite, and deletion is irreversible) or drop.
+- **D-2 — Cloud Run Job + scheduler:** delete both (recommended — recreatable from `docs/BACKTEST_ENGINE.md`; a Job nobody can run code for is a trap) or keep paused.
+- **D-3 — depth:** full code removal (PR-1 non-`src` + PR-2 `src`), or config/endpoint only (PR-1) and leave the dead `src` code until the next deliberate identity move.
+
+**Links:** FC-091 (closeout that triggered the retirement), FC-032 (the screen's origin, Phase 5), FC-096 Phase B (battery — the replacement), FC-112 + FC-120 (identity-move sequencing), FC-069 (the precedent for a decommission sweep).
+
+---
+
 ## Completed
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
