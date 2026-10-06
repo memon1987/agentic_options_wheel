@@ -214,10 +214,14 @@ rolling:
   itm_trigger_ratio: 0.98               # stock/strike >= this is roll-eligible
   max_extension_days: 14                # replacement expiry <= OLD expiry + N
   max_replacement_delta: 0.60           # upper rail only; no lower bound
-  min_net_credit_per_contract: 0.00     # $/contract on the placed limits
+  min_net_credit_per_contract: 0.20     # $/contract on the placed limits; covers the round-trip fee (FC-120 R6-L)
   imminence_extrinsic_threshold: 0.20   # $/share extrinsic -> mid-based pricing
-  btc_fill_timeout_seconds: 120
+  btc_fill_timeout_seconds: 120         # BTC TOTAL poll budget, split over btc_reprice_attempts + 1 windows (FC-120)
   fallback_strike_attempts: 2
+  marketable_buffer_per_share: 0.10     # $/share through the quote on each leg, before the tick snap (FC-120 DD-1 Rule B)
+  btc_reprice_attempts: 2               # BTC re-prices after the roller's own zero-fill cancel: 3 x 40 s (FC-120 DD-4)
+  stc_rung_timeout_seconds: 30          # poll window of every STO rung (FC-120 DD-1 Rule W)
+  stc_escalation_rungs: 0               # STO rungs between rung 1 and the floor; off until Q7 is read live (FC-120 Rule E)
 
 # Earnings Calendar (Finnhub)
 earnings:

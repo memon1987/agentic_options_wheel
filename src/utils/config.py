@@ -342,7 +342,7 @@ class Config:
                 f"rolling.max_replacement_delta must satisfy 0 < x <= 1 "
                 f"(got {max_delta!r})")
 
-        min_credit = rolling.get('min_net_credit_per_contract', 0.00)
+        min_credit = rolling.get('min_net_credit_per_contract', 0.20)
         if not isinstance(min_credit, (int, float)) or isinstance(min_credit, bool) \
                 or min_credit < 0:
             errors.append(
@@ -356,6 +356,8 @@ class Config:
             errors.append(
                 f"rolling.imminence_extrinsic_threshold must be >= 0 "
                 f"(got {imminence!r})")
+
+        errors.extend(self._rolling_execution_errors(rolling))
 
         # FC-069 S1 (card 17) deleted the `monitoring:` block and its
         # `check_interval_minutes` validation — the real cadence is Cloud
@@ -389,6 +391,94 @@ class Config:
         logger.debug("Configuration validation passed",
                     event_category="system",
                     event_type="config_validated")
+
+    @staticmethod
+    def _rolling_execution_errors(rolling: Dict[str, Any]) -> List[str]:
+        """FC-120 PR-2 DD-7: the roller's execution knobs, bounded, plus the
+        cross-key budget bound — fail closed, at load.
+
+        Absent keys validate against their property defaults (in range by
+        construction), so a profile with no ``rolling`` block is valid. ``bool``
+        is refused wherever a number is required (it is an ``int`` subclass).
+        The cross-key bound runs only when all five timing keys are themselves
+        valid: it computes ``roll_budget.per_position_budget_seconds`` on the
+        raw values and refuses a profile whose worst case exceeds
+        ``roll_budget.MAX_PER_POSITION_BUDGET_SECONDS`` — the service then does
+        not start, and the canary's /health smoke fails the build before any
+        traffic shifts. ``roll_budget`` is a leaf module, so there is no cycle.
+        """
+        from ..strategy import roll_budget
+
+        def is_int(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        errors: List[str] = []
+        buffer = rolling.get('marketable_buffer_per_share', 0.10)
+        if isinstance(buffer, bool) or not isinstance(buffer, (int, float)) \
+                or not (0.0 <= buffer <= 0.50):
+            errors.append(
+                f"rolling.marketable_buffer_per_share must be a number with "
+                f"0.00 <= x <= 0.50 (got {buffer!r})")
+
+        reprice = rolling.get('btc_reprice_attempts', 2)
+        reprice_ok = is_int(reprice) and 0 <= reprice <= 2
+        if not reprice_ok:
+            errors.append(
+                f"rolling.btc_reprice_attempts must be an int with 0 <= n <= 2 "
+                f"(got {reprice!r})")
+
+        btc_timeout = rolling.get('btc_fill_timeout_seconds', 120)
+        floor = 5 * ((reprice if reprice_ok else 0) + 1)
+        btc_ok = is_int(btc_timeout) and floor <= btc_timeout <= 600
+        if not btc_ok:
+            errors.append(
+                f"rolling.btc_fill_timeout_seconds must be an int with "
+                f"5 x (btc_reprice_attempts + 1) = {floor} <= s <= 600 — every "
+                f"re-price window needs at least one 5 s poll (got {btc_timeout!r})")
+
+        stc_timeout = rolling.get('stc_rung_timeout_seconds', 30)
+        stc_ok = is_int(stc_timeout) and 5 <= stc_timeout <= 600
+        if not stc_ok:
+            errors.append(
+                f"rolling.stc_rung_timeout_seconds must be an int with "
+                f"5 <= s <= 600 (got {stc_timeout!r})")
+
+        escalation = rolling.get('stc_escalation_rungs', 0)
+        escalation_ok = is_int(escalation) and 0 <= escalation <= 3
+        if not escalation_ok:
+            errors.append(
+                f"rolling.stc_escalation_rungs must be an int with 0 <= n <= 3 "
+                f"(got {escalation!r})")
+
+        fallbacks = rolling.get('fallback_strike_attempts', 2)
+        fallbacks_ok = is_int(fallbacks) and 0 <= fallbacks <= 5
+        if not fallbacks_ok:
+            errors.append(
+                f"rolling.fallback_strike_attempts must be an int with "
+                f"0 <= n <= 5 (got {fallbacks!r}) — the per-position budget "
+                f"reads it")
+
+        if reprice_ok and btc_ok and stc_ok and escalation_ok and fallbacks_ok:
+            budget = roll_budget.per_position_budget_seconds(
+                btc_fill_timeout_seconds=btc_timeout,
+                btc_reprice_attempts=reprice,
+                stc_rung_timeout_seconds=stc_timeout,
+                stc_escalation_rungs=escalation,
+                fallback_strike_attempts=fallbacks)
+            if budget > roll_budget.MAX_PER_POSITION_BUDGET_SECONDS:
+                errors.append(
+                    f"rolling.* keys imply a per-position worst case of "
+                    f"{budget}s (roll_budget.per_position_budget_seconds over "
+                    f"btc_fill_timeout_seconds={btc_timeout}, "
+                    f"btc_reprice_attempts={reprice}, "
+                    f"stc_rung_timeout_seconds={stc_timeout}, "
+                    f"stc_escalation_rungs={escalation}, "
+                    f"fallback_strike_attempts={fallbacks}) > "
+                    f"roll_budget.MAX_PER_POSITION_BUDGET_SECONDS "
+                    f"{roll_budget.MAX_PER_POSITION_BUDGET_SECONDS}s — no "
+                    f"position could ever start inside the "
+                    f"{roll_budget.CYCLE_BUDGET_SECONDS}s roll cycle (FC-120 DD-7)")
+        return errors
 
     # Alpaca API Settings
     @property
@@ -793,13 +883,17 @@ class Config:
 
     @property
     def rolling_min_net_credit_per_contract(self) -> float:
-        """Minimum net credit per contract, in dollars, on the placed limits.
+        """Minimum net credit, in DOLLARS PER CONTRACT, on the placed limits.
 
-        Default 0.00: any non-negative roll at conservative prices executes the
-        day it appears. The knob exists so a churn guard can be added without a
-        code change (FC-078 DD-1).
+        The roller divides by 100 (``min_credit_per_share``). Default 0.20
+        since FC-120 PR-2 (R6-L; was 0.00): on a nickel grid that is one tick
+        after ``snap_up``, so the floor rung is the BTC fill plus one tick, and
+        it covers the ~$0.20/contract round trip of OCC and regulatory fees —
+        "credit-only" stays true after fees on a live account. The literal
+        default moves with the yaml so a profile with no ``rolling`` block is
+        fee-aware too.
         """
-        return self._config.get("rolling", {}).get("min_net_credit_per_contract", 0.00)
+        return self._config.get("rolling", {}).get("min_net_credit_per_contract", 0.20)
 
     @property
     def rolling_imminence_extrinsic_threshold(self) -> float:
@@ -809,13 +903,48 @@ class Config:
 
     @property
     def rolling_btc_fill_timeout_seconds(self) -> int:
-        """Seconds to wait for BTC/STC order fill."""
+        """The buy-to-close leg's TOTAL poll budget, in seconds.
+
+        Since FC-120 PR-2 it is split evenly across ``btc_reprice_attempts + 1``
+        windows (120 / 3 = 40 s each by default). The sell-to-open rungs use
+        ``rolling_stc_rung_timeout_seconds``, never this."""
         return self._config.get("rolling", {}).get("btc_fill_timeout_seconds", 120)
 
     @property
     def rolling_fallback_strike_attempts(self) -> int:
         """Number of fallback strikes to try if first STO fails."""
         return self._config.get("rolling", {}).get("fallback_strike_attempts", 2)
+
+    @property
+    def rolling_marketable_buffer_per_share(self) -> float:
+        """$/share added to the ask (buy-to-close) / taken off the bid
+        (sell-to-open) before the tick snap, so a base-mode roll limit is
+        marketable against an indicative quote that sits off the NBBO
+        (FC-120 PR-2 DD-3; sized by DD-1 Rule B). ``0.00`` leaves the parity
+        floor and the tick snap only."""
+        return self._config.get("rolling", {}).get("marketable_buffer_per_share", 0.10)
+
+    @property
+    def rolling_btc_reprice_attempts(self) -> int:
+        """How many times a buy-to-close is re-priced (base mode, from a fresh
+        quote, ``(n+1) x buffer`` through the ask) after the roller's OWN
+        cancel settled a zero fill — inside ``btc_fill_timeout_seconds``
+        (FC-120 PR-2 DD-4). ``0`` = one placement over the full timeout."""
+        return self._config.get("rolling", {}).get("btc_reprice_attempts", 2)
+
+    @property
+    def rolling_stc_rung_timeout_seconds(self) -> int:
+        """Poll window of EVERY sell-to-open rung (FC-120 PR-2 DD-4; DD-1 Rule
+        W: the longest observed marketable STO fill was 23.0 s)."""
+        return self._config.get("rolling", {}).get("stc_rung_timeout_seconds", 30)
+
+    @property
+    def rolling_stc_escalation_rungs(self) -> int:
+        """Escalation rungs between rung 1 and the floor (FC-120 PR-2; DD-1
+        Rule E). Shipped 0 — "off until Q7 is read on a live account": on paper
+        the floor filled 9/9 at the NBBO bid at once, so an intermediate rung
+        buys no price and only lengthens the uncovered window."""
+        return self._config.get("rolling", {}).get("stc_escalation_rungs", 0)
 
     # Finnhub / Earnings Calendar
     @property
