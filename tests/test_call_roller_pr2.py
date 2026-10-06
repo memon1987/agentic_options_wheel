@@ -409,3 +409,139 @@ class TestBtcReprice:
                                      (7.40, 'base', 'imminence')]
         assert result['success'] is True
 
+
+# --------------------------------------------------------------------------- #
+# T-11 — the poll split: BTC windows from the total; STO rungs their own
+# --------------------------------------------------------------------------- #
+class TestThePollSplit:
+    """*Catches:* the split leaking into the ladder; the STO window defaulting
+    to the BTC total; the settle losing its window or its two-read floor."""
+
+    def _spy(self, roller, monkeypatch):
+        calls = []
+        real = roller._poll_order_fill
+
+        def spy(order_id, timeout=None, *, min_reads=1):
+            calls.append((order_id, timeout, min_reads))
+            return real(order_id, 0, min_reads=min_reads)   # one read, no wait
+        monkeypatch.setattr(roller, '_poll_order_fill', spy)
+        monkeypatch.setattr(cr, '_CANCEL_SETTLE_TIMEOUT_SECONDS', 15)
+        return calls
+
+    @pytest.mark.parametrize("attempts, window", [(2, 40), (1, 60), (0, 120)])
+    def test_the_btc_total_is_split_evenly(self, roller, instrumented,
+                                           rolling_config, monkeypatch,
+                                           attempts, window):
+        rolling_config.rolling_btc_fill_timeout_seconds = 120
+        rolling_config.rolling_btc_reprice_attempts = attempts
+        rolling_config.rolling_stc_rung_timeout_seconds = 30
+        calls = self._spy(roller, monkeypatch)
+        script = {f'btc-{i}': _timeout(f'btc-{i}') for i in (1, 2, 3)}
+        _scripted(roller, instrumented, script)
+
+        primary = [t for oid, t, m in calls if m == 1]
+        settles = [(t, m) for oid, t, m in calls if m != 1]
+        assert primary == [window] * (attempts + 1)
+        assert settles == [(15, 2)] * (attempts + 1)
+
+    def test_every_sto_rung_polls_its_own_window(self, roller, instrumented,
+                                                 rolling_config, monkeypatch):
+        rolling_config.rolling_btc_fill_timeout_seconds = 120
+        rolling_config.rolling_stc_rung_timeout_seconds = 30
+        calls = self._spy(roller, monkeypatch)
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 8.35)},
+                  'sto-1': _timeout('sto-1'), 'sto-2': _timeout('sto-2'),
+                  'sto-3': _timeout('sto-3')}
+        _scripted(roller, instrumented, script)
+
+        by_order = {}
+        for oid, t, m in calls:
+            by_order.setdefault(oid, []).append((t, m))
+        assert by_order['btc-1'] == [(40, 1)]
+        for oid in ('sto-1', 'sto-2', 'sto-3'):
+            assert by_order[oid] == [(30, 1), (15, 2)], oid
+
+
+# --------------------------------------------------------------------------- #
+# T-15 — the monotonic poll and the settle floor (FC-113 (b))
+# --------------------------------------------------------------------------- #
+class TestTheMonotonicPoll:
+    """*Catches:* the RTT-blind loop FC-113 was filed about; the one-poll
+    contract at ``timeout=0``; a settle that reads once and calls it verified."""
+
+    @staticmethod
+    def _rtt(mock_alpaca, clock, rtt, status='new'):
+        def by_id(oid):
+            clock.advance(rtt)
+            return order(oid, status)
+        mock_alpaca.get_order_by_id.side_effect = by_id
+
+    def test_a_window_is_wall_clock_plus_one_trailing_read(
+            self, roller, mock_alpaca, fake_clock):
+        self._rtt(mock_alpaca, fake_clock, 3.0)
+        start = fake_clock.now
+        assert roller._poll_order_fill('o', timeout=30) is None
+        elapsed = fake_clock.now - start
+        assert elapsed <= 30 + 3.0, elapsed      # never 30 s of SLEEPS (48 s)
+        assert elapsed >= 30
+        assert all(s <= 5 for s in fake_clock.sleeps)
+        assert fake_clock.sleeps[-1] == pytest.approx(3.0)   # min(5, remaining)
+
+    def test_timeout_zero_is_one_read_and_no_sleep(self, roller, mock_alpaca,
+                                                   fake_clock):
+        self._rtt(mock_alpaca, fake_clock, 0.0)
+        assert roller._poll_order_fill('o', timeout=0) is None
+        assert roller._last_poll_reads == 1 and fake_clock.sleeps == []
+
+    @pytest.mark.parametrize("rtt, reads, approx", [(2.0, 3, 16), (20.0, 2, 40)])
+    def test_the_settle_floor_binds_on_slow_reads(self, roller, mock_alpaca,
+                                                  fake_clock, rtt, reads,
+                                                  approx):
+        self._rtt(mock_alpaca, fake_clock, rtt)
+        start = fake_clock.now
+        assert roller._poll_order_fill('o', timeout=15, min_reads=2) is None
+        assert roller._last_poll_reads == reads
+        assert fake_clock.now - start == pytest.approx(approx)
+
+    @pytest.mark.parametrize("rtt", [0.0, 2.0, 20.0])
+    def test_cancel_and_settle_reads_at_least_twice(self, roller, mock_alpaca,
+                                                    fake_clock, monkeypatch,
+                                                    rtt):
+        monkeypatch.setattr(cr, '_CANCEL_SETTLE_TIMEOUT_SECONDS', 15)
+        self._rtt(mock_alpaca, fake_clock, rtt, status='pending_cancel')
+        assert roller._cancel_and_settle('o') is None
+        assert roller._last_poll_reads >= 2
+
+    def test_a_terminal_read_still_returns_at_once(self, roller, mock_alpaca,
+                                                   fake_clock):
+        self._rtt(mock_alpaca, fake_clock, 1.0, status='filled')
+        assert roller._poll_order_fill('o', timeout=30)['status'] == 'filled'
+        assert roller._last_poll_reads == 1 and fake_clock.sleeps == []
+
+
+# --------------------------------------------------------------------------- #
+# T-16 — the success dict carries the pricing mode and both symbols
+# --------------------------------------------------------------------------- #
+class TestTheSuccessDict:
+    """*Catches:* the DD-6 pricing-mode split and the sampler's rolled map
+    losing their inputs."""
+
+    def test_it_carries_them_and_the_replay_stamp_keeps_them(self, roller,
+                                                             instrumented):
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 8.35)},
+                  'sto-1': _timeout('sto-1'), 'sto-2': _timeout('sto-2'),
+                  'sto-3': {'poll': _o('sto-3', 'filled', 1, 8.75)}}
+        result, _log, _b = _scripted(roller, instrumented, script)
+        assert result['success'] is True
+        assert result['pricing_mode'] == 'base'
+        assert result['old_option_symbol'] == _O
+        # The ACTUAL replacement — here the C380 fallback, not the primary.
+        assert result['new_option_symbol'] == _F
+
+        from datetime import date
+        from src.backtesting.engine.simulator import Simulator
+        stamped = Simulator._stamp_roll_record(result, day=date(2026, 8, 4),
+                                               close=377.0)
+        for key in ('pricing_mode', 'old_option_symbol', 'new_option_symbol'):
+            assert stamped[key] == result[key], key
+
