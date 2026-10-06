@@ -191,14 +191,26 @@ def is_retryable_error(exception: Exception) -> bool:
     return any(pattern in error_str for pattern in retryable_patterns)
 
 
-def _generate_client_order_id(symbol: str, qty: int, side: str, limit_price: float) -> str:
+def _generate_client_order_id(symbol: str, qty: int, side: str, limit_price: float,
+                              salt: Optional[str] = None) -> str:
     """Generate deterministic client_order_id for idempotent order submission.
 
     Uses a hash of order parameters plus today's date so the same logical order
     on the same day always produces the same ID, preventing duplicate orders
     when HTTP requests are retried.
+
+    ``salt`` (FC-120 PR-2, review finding F1) names WHICH placement this is
+    when one caller deliberately places the same contract, side, size and
+    price more than once in a session — the roller's re-priced attempts and
+    ladder rungs (``<roll_id>:btc:<attempt>`` / ``<roll_id>:stc:<rung>``).
+    Without it the second placement derives the first one's id and Alpaca
+    refuses it as a duplicate ``client_order_id``. ``None`` (every other
+    caller) derives exactly the id it always did; a given salt derives the
+    same id on every call, so retrying one placement stays idempotent.
     """
     raw = f"{symbol}:{date.today().isoformat()}:{side}:{qty}:{limit_price}"
+    if salt is not None:
+        raw = f"{raw}:{salt}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -686,17 +698,22 @@ class AlpacaClient:
             raise
     
     # Trading Operations
-    def place_option_order(self, symbol: str, qty: int, side: str, order_type: str = "limit", 
-                          limit_price: Optional[float] = None) -> Dict[str, Any]:
+    def place_option_order(self, symbol: str, qty: int, side: str, order_type: str = "limit",
+                          limit_price: Optional[float] = None,
+                          client_order_salt: Optional[str] = None) -> Dict[str, Any]:
         """Place an option order.
-        
+
         Args:
             symbol: Option contract symbol
             qty: Quantity to trade
             side: 'buy' or 'sell'
             order_type: 'market' or 'limit'
             limit_price: Limit price for limit orders
-            
+            client_order_salt: Optional idempotency salt mixed into the
+                ``client_order_id`` (FC-120 PR-2 F1; see
+                ``_generate_client_order_id``). Only the roller passes one.
+                ``None`` derives exactly the id this method always derived.
+
         Returns:
             Order response
         """
@@ -706,7 +723,8 @@ class AlpacaClient:
             # Generate a deterministic client_order_id so retried HTTP requests
             # don't create duplicate orders on Alpaca's side.
             effective_price = limit_price if limit_price is not None else 0.0
-            client_order_id = _generate_client_order_id(symbol, qty, side.lower(), effective_price)
+            client_order_id = _generate_client_order_id(
+                symbol, qty, side.lower(), effective_price, salt=client_order_salt)
 
             if order_type.lower() == 'market':
                 order_data = MarketOrderRequest(

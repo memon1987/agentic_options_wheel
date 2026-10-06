@@ -47,13 +47,17 @@ placement; every re-price is base-mode. The credit invariant is tested on the
 buffered, snapped limits at every site, so a filled roll still cannot net a
 debit. A buy-to-close is re-priced (up to ``btc_reprice_attempts`` times,
 inside ``btc_fill_timeout_seconds``) ONLY after the roller's own
-cancel-and-settle returned a terminal zero fill (``canceled``); a ``rejected``
-is terminal, and a terminal zero fill from the PRIMARY poll (``expired``, or
-canceled by another actor) stays terminal — so a replay, whose adapter answers
-``expired`` on the first read, never re-prices. The STO ladder is rung 1 (a
-``stc_rung_timeout_seconds`` window), ``stc_escalation_rungs`` escalation rungs
-(shipped 0; placed only after the roller's own zero-fill settle or a
-synchronous rejection), the floor, then the fallbacks.
+cancel-and-settle returned a terminal zero fill (``canceled``), and a re-price
+STRICTLY improves on the limit it replaces (``max(formula, prior + one tick)``
+— F1); a ``rejected`` is terminal, and a terminal zero fill from the PRIMARY
+poll (``expired``, or canceled by another actor) stays terminal — so a replay,
+whose adapter answers ``expired`` on the first read, never re-prices. The STO
+ladder is rung 1 (a ``stc_rung_timeout_seconds`` window),
+``stc_escalation_rungs`` escalation rungs (shipped 0; placed only after the
+roller's own zero-fill settle or a synchronous rejection), the floor, then the
+fallbacks. Every placement salts its ``client_order_id`` with ``roll_id`` + leg
++ attempt/rung (F1), so no two orders of one roll can collide on Alpaca's
+idempotency key.
 
 Instrumentation never sits on the order path (rev-4 ruling A): the order-path
 broker calls are pricing reads, place, poll and cancel, in that structure. A
@@ -1163,7 +1167,9 @@ class CallRoller:
         cancelled and SETTLED (two reads minimum). Only a settle that returns
         ``canceled`` with zero fill — the roller's own cancel landing — is
         re-priced: fresh reads, the base formula at ``(n+2) x buffer`` (R6-C),
-        the invariant re-run. ``rejected`` is terminal. A terminal zero fill
+        never below the prior limit plus one tick (F1), the invariant re-run.
+        Every attempt's ``client_order_id`` is salted with ``roll_id`` and the
+        attempt index (F1). ``rejected`` is terminal. A terminal zero fill
         from the PRIMARY poll (``expired``; ``canceled`` by another actor) is
         terminal too (R6-B): the roller did not cancel that order and cannot
         know what book it would re-price against — which is also why a replay
@@ -1198,7 +1204,8 @@ class CallRoller:
             t0 = time.monotonic()
             result = self.alpaca.place_option_order(
                 symbol=old_symbol, qty=contracts,
-                side='buy', order_type='limit', limit_price=limit)
+                side='buy', order_type='limit', limit_price=limit,
+                client_order_salt=_client_order_salt(opportunity, 'btc', n))
 
             def settled(disposition: str, order_id: Optional[str], *,
                         _fields: Dict[str, Any] = fields, _limit: float = limit,
@@ -1361,9 +1368,17 @@ class CallRoller:
         Fresh bounded reads of the old option, the stock and the new option.
         The BTC is priced by the BASE formula at ``(n+2) x buffer`` whatever the
         evaluation's mode (R6-C), from the fresh ask (``"reprice"``) or, if that
-        read failed, the prior attempt's ask (``"prior_basis"``); rung 1's limit
-        is re-derived from the fresh new-symbol read and replaces the S9 sites
-        (R6-D — it becomes rung 1's pre-BTC basis). Returns
+        read failed, the prior attempt's ask (``"prior_basis"``) — and it must
+        STRICTLY improve on the limit it replaces (review finding F1):
+        ``max(formula, prior_limit + one tick)``, the tick decided from the
+        unsnapped value (``_strict_step_above``). A falling ask (or a zero
+        buffer) would otherwise re-place the same price — one that just rested
+        a full window — and, before the ``client_order_id`` salt, Alpaca
+        refused it as a duplicate. ``improvement_floor_applied`` says the step,
+        not the formula, set the limit (``parity_floor_applied`` is then
+        false). Rung 1's limit is re-derived from the fresh new-symbol read and
+        replaces the S9 sites (R6-D — it becomes rung 1's pre-BTC basis); the
+        invariant is re-run on the stepped pair. Returns
         ``(next_pricing, None, prefetched)`` to place, or
         ``(None, refusal, prefetched)`` with ``reprice_skipped_reason`` in
         ``{quote_unusable, credit_gone}`` — the leg's terminal is then
@@ -1387,6 +1402,11 @@ class CallRoller:
         if btc is None:
             return None, {'reprice_skipped_reason': 'quote_unusable'}, old_quote
         btc_limit, btc_quote, btc_source, parity_applied = btc
+        # F1: never the same (or a lower) price than the attempt it replaces.
+        step = _strict_step_above(pricing.get('limit'), underlying)
+        improved = step is not None and step > btc_limit
+        if improved:
+            btc_limit, parity_applied = step, False
 
         formula = 'imminence' if opportunity.get('imminent') else 'base'
         stc = self._price_stc_rung1(
@@ -1399,7 +1419,8 @@ class CallRoller:
                 < opportunity['min_credit_per_share']:
             return None, {'reprice_skipped_reason': 'credit_gone',
                           'btc_limit_fresh': btc_limit,
-                          'stc_limit_fresh': stc_limit}, old_quote
+                          'stc_limit_fresh': stc_limit,
+                          'improvement_floor_applied': improved}, old_quote
 
         self._apply_rung1_pricing(opportunity, stc_limit, stc[1], stc[2])
         opportunity['btc_limit'] = btc_limit
@@ -1408,6 +1429,7 @@ class CallRoller:
             'quote_source': btc_source, 'stock_bid': stock_bid,
             'stock_quote_source': stock_source,
             'parity_floor_applied': parity_applied, 'formula': 'base',
+            'improvement_floor_applied': improved,
             'stc_limit': stc_limit,
         }, None, old_quote
 
@@ -1751,9 +1773,10 @@ class CallRoller:
         }
         if rung_quote.get('rung_kind') in ('primary', 'escalation'):
             ladder['last_primary_limit'] = limit   # placed or sync-rejected
-        order_id = self._place_stc(symbol, underlying, qty, limit, rung=rung,
-                                   quote_fields=fields,
-                                   pricing_mode=opportunity.get('pricing_mode'))
+        order_id = self._place_stc(
+            symbol, underlying, qty, limit, rung=rung, quote_fields=fields,
+            pricing_mode=opportunity.get('pricing_mode'),
+            client_order_salt=_client_order_salt(opportunity, 'stc', rung))
         if order_id is None:
             self._log_stc_settled(ctx, symbol, underlying, None, 'rejected')
             _record_prior(ladder, rung, limit, 'rejected', escalation_ok=True)
@@ -1918,8 +1941,11 @@ class CallRoller:
     def _place_stc(self, symbol: str, underlying: str, contracts: int,
                    limit_price: float, *, rung: Optional[int] = None,
                    quote_fields: Optional[Dict[str, Any]] = None,
-                   pricing_mode: Optional[str] = None) -> Optional[str]:
-        """Place one STO rung. Returns the order id, or None if it was refused."""
+                   pricing_mode: Optional[str] = None,
+                   client_order_salt: Optional[str] = None) -> Optional[str]:
+        """Place one STO rung. Returns the order id, or None if it was refused.
+        ``client_order_salt`` keys this rung's ``client_order_id`` to the roll
+        and the rung (F1), so no two rungs of one roll can collide."""
         payload = dict(quote_fields or {})
         payload.update(contracts=contracts, limit_price=limit_price,
                        leg='stc', rung=rung, pricing_mode=pricing_mode)
@@ -1930,7 +1956,8 @@ class CallRoller:
 
         result = self.alpaca.place_option_order(
             symbol=symbol, qty=contracts,
-            side='sell', order_type='limit', limit_price=limit_price)
+            side='sell', order_type='limit', limit_price=limit_price,
+            client_order_salt=client_order_salt)
 
         if not result or not result.get('success', False):
             log_error_event(
@@ -2676,6 +2703,20 @@ def _btc_raw(ask: Any, *, formula: str, mid: Any, stock_bid: Any, strike: Any,
     return base, False
 
 
+def _strict_step_above(prior_limit: Any, underlying: str) -> Optional[float]:
+    """The lowest legal buy limit STRICTLY above ``prior_limit`` (review
+    finding F1 — a BTC re-price must strictly improve): the prior limit plus
+    one tick of its own grid, snapped UP on the grid of that unsnapped value
+    (DD-3's rule: the tick is decided from the unsnapped value), so on a
+    penny-program root 1.33 -> 1.34, 2.99 -> 3.00 and 3.00 -> 3.05. None when
+    the prior limit is unusable (the formula alone then prices)."""
+    p = _pos(prior_limit)
+    if p is None:
+        return None
+    raw = _dec(p) + tick_size(_dec(p), underlying)
+    return float(snap_limit(raw, tick_size(raw, underlying), "up"))
+
+
 def _parity_applied(ask: Any, **kw: Any) -> Optional[bool]:
     """``parity_floor_applied`` for the log; None when unpriceable. Total."""
     try:
@@ -2717,15 +2758,22 @@ def _chain_row_quote(opportunity: Any) -> Optional[Dict[str, Any]]:
 
 
 def _btc_pricing_fields(pricing: Any) -> Dict[str, Any]:
-    """The log-only fields on every BTC row (R6-R): which reads priced it."""
+    """The log-only fields on every BTC row (R6-R): which reads priced it.
+
+    ``improvement_floor_applied`` (F1) is true when a re-price's strict step
+    (prior limit + one tick), not the formula, set the limit; null on attempt
+    0, which replaces nothing."""
     p = pricing if isinstance(pricing, dict) else {}
     applied = p.get('parity_floor_applied')
+    improved = p.get('improvement_floor_applied')
     return {
         'btc_quote_source': _str_or_none(p.get('quote_source')),
         'stock_quote_source': _str_or_none(p.get('stock_quote_source')),
         'parity_floor_applied': applied if isinstance(applied, bool) else None,
         'parity_stock_bid': _pos(p.get('stock_bid')),
         'limit_formula': _str_or_none(p.get('formula')),
+        'improvement_floor_applied': (improved if isinstance(improved, bool)
+                                      else None),
     }
 
 
@@ -2903,7 +2951,8 @@ def _quote_refresh_failed(symbol: str, underlying: Any, why: str) -> None:
 
 def _start_roll_ctx(opportunity: Dict[str, Any]) -> None:
     """Stamp a fresh ``roll_id`` (one per ``execute_roll`` call) on the
-    opportunity. It keys every leg row of this roll together. Log-only."""
+    opportunity. It keys every leg row of this roll together, and (FC-120
+    PR-2, F1) salts every placement's ``client_order_id``."""
     try:
         opportunity['fc120'] = {'roll_id': uuid.uuid4().hex,
                                 'btc_order_id': None}
@@ -2915,6 +2964,17 @@ def _roll_ctx(opportunity: Dict[str, Any]) -> Dict[str, Any]:
     """The opportunity's FC-120 context (a throwaway dict if it is missing)."""
     ctx = opportunity.get('fc120') if isinstance(opportunity, dict) else None
     return ctx if isinstance(ctx, dict) else {}
+
+
+def _client_order_salt(opportunity: Dict[str, Any], leg: str, index: Any) -> str:
+    """One roller placement's idempotency salt (FC-120 PR-2, review finding
+    F1): ``<roll_id>:<leg>:<n>`` — the roll, the leg, and the attempt (BTC,
+    0-based) or the rung (STO, 1-based ladder position). Unique per placement
+    within a roll, so a re-priced attempt or a later rung can never derive an
+    earlier placement's ``client_order_id`` (which Alpaca refuses as a
+    duplicate); the same for every call of one placement, so retrying that
+    placement's HTTP request stays idempotent."""
+    return f"{_roll_ctx(opportunity).get('roll_id')}:{leg}:{index}"
 
 
 def _note_skip(roller: 'CallRoller', option_symbol: Any, reason: Any) -> None:

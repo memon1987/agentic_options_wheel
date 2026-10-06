@@ -131,11 +131,13 @@ class TestThePricingRule:
 # T-8 — the invariant on the BUFFERED, snapped limits at every site
 # --------------------------------------------------------------------------- #
 def _scripted(roller, mock_alpaca, script, opp=None):
-    """Arm a scripted broker and run one ``execute_roll``."""
+    """Arm a scripted broker and run one ``execute_roll``. The broker refuses
+    a repeated ``client_order_id`` (F1), so every test through here also
+    proves no two placements of the roll collide."""
     opp = opp or roller.evaluate_roll_opportunity(call_position(), stock_position())
     broker = _Broker(script)
-    mock_alpaca.place_option_order.side_effect = [
-        accepted(oid) for oid in list(script) + [f'x-{i}' for i in range(6)]]
+    mock_alpaca.place_option_order.side_effect = broker.placer(
+        accepted(oid) for oid in list(script) + [f'x-{i}' for i in range(6)])
     mock_alpaca.get_order_by_id.side_effect = broker.by_id
     mock_alpaca.cancel_order.side_effect = broker.cancel
     with patch('src.strategy.call_roller.logger') as log:
@@ -411,6 +413,77 @@ class TestBtcReprice:
                                      (7.40, 'base', 'imminence')]
         assert result['success'] is True
 
+    @pytest.mark.parametrize("fallen_ask", [
+        8.30,     # formula 8.30 + 0.20 = 8.50 == the prior limit: pre-F1 the
+                  # SAME order again -> Alpaca refused the duplicate id
+        8.25,     # formula 8.45 < the prior limit: pre-F1 a WORSE re-price
+    ])
+    def test_o_a_falling_ask_reprices_strictly_higher_with_a_new_client_id(
+            self, roller, instrumented, fallen_ask):
+        """F1 (both reviews, MEDIUM): a re-price is ``max(formula, prior + one
+        tick)`` — strictly above the limit that just rested a full window —
+        and its ``client_order_id`` differs from the attempt it replaces.
+        *Mutations:* drop the step → [8.50, 8.50] or [8.50, 8.45]; drop the
+        salt → the broker refuses the repeat (it raises)."""
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), _q(8.00, 8.40),
+                             _q(fallen_ask - 0.40, fallen_ask)],
+                 'diag': [_q(8.02, 8.42)]}})
+        script = {'btc-1': _timeout('btc-1'),
+                  'btc-2': {'poll': _o('btc-2', 'filled', 1, 8.40)},
+                  'sto-1': {'poll': _o('sto-1', 'filled', 1, 10.90)}}
+        result, log, broker = _scripted(roller, instrumented, script)
+        assert result['success'] is True
+        assert _limits(instrumented, 'buy') == [8.50, 8.55]   # 8.50 + one nickel
+        rep = _first(log, 'call_roll_btc_repriced')
+        assert (rep['prior_limit'], rep['new_limit']) == (8.50, 8.55)
+        assert rep['improvement_floor_applied'] is True
+        assert rep['parity_floor_applied'] is False
+        placed = _all(log, 'call_roll_btc_placed')
+        assert [p['improvement_floor_applied'] for p in placed] == [None, True]
+        buys = [c.kwargs for c in instrumented.place_option_order.call_args_list
+                if c.kwargs['side'] == 'buy']
+        roll_id = placed[0]['roll_id']
+        assert [b['client_order_salt'] for b in buys] == [
+            f'{roll_id}:btc:0', f'{roll_id}:btc:1']
+        ids = broker.client_order_ids[:2]
+        assert len(set(ids)) == 2
+
+    def test_p_a_zero_buffer_on_a_flat_ask_steps_one_tick_per_attempt(
+            self, roller, instrumented):
+        """F1: ``marketable_buffer_per_share: 0.0`` is legal; on an unchanged
+        ask the formula prices every attempt at ``snap_up(ask)``. The step
+        keeps the ladder strictly rising (and every order distinct)."""
+        roller.config.rolling_marketable_buffer_per_share = 0.0
+        script = {f'btc-{i}': _timeout(f'btc-{i}') for i in (1, 2, 3)}
+        result, log, _b = _scripted(roller, instrumented, script)
+        assert result['reason'] == 'btc_timeout_canceled'
+        assert _limits(instrumented, 'buy') == [8.40, 8.45, 8.50]
+        reps = _all(log, 'call_roll_btc_repriced')
+        assert [r['improvement_floor_applied'] for r in reps] == [True, True]
+
+    def test_q_a_step_that_spends_the_credit_is_credit_gone(self, roller,
+                                                           instrumented):
+        """F1: the invariant is re-tested on the STEPPED limit. Fresh STC
+        rung-1 limit 8.50 clears the formula's 8.45 but not the step's 8.55 —
+        the leg ends in the existing terminal, ``reprice_skipped_reason=
+        "credit_gone"``, never a new one."""
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), _q(8.00, 8.40), _q(7.85, 8.25)],
+                 'diag': [_q(8.02, 8.42)]},
+            _N: {'pricing': [_q(10.90, 11.10), _q(8.60, 8.80)],
+                 'diag': [_q(8.62, 8.82)]}})
+        result, log, _b = _scripted(roller, instrumented,
+                                    {'btc-1': _timeout('btc-1')})
+        assert result['reason'] == 'btc_timeout_canceled'
+        assert terminals(log) == ['call_roll_btc_timeout_canceled']
+        ev = _first(log, 'call_roll_btc_timeout_canceled')
+        assert ev['reprice_skipped_reason'] == 'credit_gone'
+        assert (ev['btc_limit_fresh'], ev['stc_limit_fresh']) == (8.55, 8.50)
+        assert ev['improvement_floor_applied'] is True
+        assert ev['attempts'] == 1
+        assert instrumented.place_option_order.call_count == 1
+
 
 # --------------------------------------------------------------------------- #
 # T-18 — execute-time pricing (the goldens are in tests/test_call_roller.py)
@@ -627,13 +700,13 @@ def _ladder_run(roller, mock_alpaca, script, *, places=None, timeline=False):
     if tl is not None:
         tl.wrap(mock_alpaca)
         mock_alpaca.place_option_order.side_effect = tl._recorder(
-            'place_option_order', 'place', Mock(side_effect=places))
+            'place_option_order', 'place', broker.placer(places))
         mock_alpaca.get_order_by_id.side_effect = tl._recorder(
             'get_order_by_id', 'get_order', broker.by_id)
         mock_alpaca.cancel_order.side_effect = tl._recorder(
             'cancel_order', 'cancel', broker.cancel)
     else:
-        mock_alpaca.place_option_order.side_effect = places
+        mock_alpaca.place_option_order.side_effect = broker.placer(places)
         mock_alpaca.get_order_by_id.side_effect = broker.by_id
         mock_alpaca.cancel_order.side_effect = broker.cancel
     with patch('src.strategy.call_roller.logger') as log:
@@ -852,6 +925,90 @@ class TestStcLadder:
 
 
 # --------------------------------------------------------------------------- #
+# F1 (PR-2 code reviews) — no two placements of one roll share an idempotency
+# key: the roller salts every client_order_id with roll_id + leg + attempt/rung
+# --------------------------------------------------------------------------- #
+class TestNoTwoPlacementsCollide:
+    """*Catches:* a re-priced attempt or a later rung deriving an earlier
+    placement's ``client_order_id`` (Alpaca refuses a duplicate — on a re-price
+    that was a ``btc_rejected`` terminal; on a floor rung, uncovered shares); a
+    salt that is not stable for one placement (HTTP-retry idempotency); a
+    non-roller caller whose id changed."""
+
+    def test_the_derivation_is_unchanged_without_a_salt(self):
+        import hashlib
+        from datetime import date
+        from src.api.alpaca_client import _generate_client_order_id as gen
+        raw = f"{_O}:{date.today().isoformat()}:buy:1:8.5"
+        assert gen(_O, 1, 'buy', 8.5) == hashlib.sha256(
+            raw.encode()).hexdigest()[:32]
+        assert gen(_O, 1, 'buy', 8.5, salt=None) == gen(_O, 1, 'buy', 8.5)
+
+    def test_a_salt_is_stable_and_separates_placements(self):
+        from src.api.alpaca_client import _generate_client_order_id as gen
+        a0 = gen(_O, 1, 'buy', 8.5, salt='r1:btc:0')
+        assert a0 == gen(_O, 1, 'buy', 8.5, salt='r1:btc:0')   # retry-safe
+        assert len({a0, gen(_O, 1, 'buy', 8.5),
+                    gen(_O, 1, 'buy', 8.5, salt='r1:btc:1'),
+                    gen(_O, 1, 'buy', 8.5, salt='r2:btc:0')}) == 4
+
+    def test_place_option_order_sends_the_salted_id(self):
+        from unittest.mock import MagicMock
+        from src.api.alpaca_client import AlpacaClient
+        from src.api.alpaca_client import _generate_client_order_id as gen
+        with patch('src.api.alpaca_client.TradingClient') as trading, \
+                patch('src.api.alpaca_client.StockHistoricalDataClient'), \
+                patch('src.api.alpaca_client.OptionHistoricalDataClient'):
+            trading.return_value.submit_order.return_value = MagicMock(
+                id='o-1', status='new', submitted_at=None)
+            client = AlpacaClient(Mock(alpaca_api_key='k', alpaca_secret_key='s',
+                                       paper_trading=True))
+            salted = client.place_option_order(
+                symbol=_O, qty=1, side='buy', order_type='limit',
+                limit_price=8.5, client_order_salt='r1:btc:1')
+            plain = client.place_option_order(
+                symbol=_O, qty=1, side='buy', order_type='limit', limit_price=8.5)
+            sent = [c.args[0].client_order_id for c in
+                    trading.return_value.submit_order.call_args_list]
+        assert sent == [gen(_O, 1, 'buy', 8.5, salt='r1:btc:1'),
+                        gen(_O, 1, 'buy', 8.5)]
+        assert salted['client_order_id'] == sent[0]
+        assert plain['client_order_id'] == sent[1]
+
+    def test_every_placement_of_a_full_ladder_is_salted_and_distinct(
+            self, roller, instrumented, rolling_config, mock_market_data):
+        """Three BTC attempts (two re-prices), then rung 1, two escalations,
+        the floor and two fallbacks — nine placements, nine distinct ids, each
+        salt ``<roll_id>:<leg>:<attempt|rung>`` matching its own row."""
+        rolling_config.rolling_stc_escalation_rungs = 2
+        mock_market_data.find_suitable_calls.return_value = [
+            dict(C380), dict(C375), dict(C385)]
+        instrumented.get_option_quote.side_effect = _book(**{
+            _G: [_q(8.60, 8.80), _q(8.62, 8.82)]})
+        script = {'btc-1': _timeout('btc-1'), 'btc-2': _timeout('btc-2'),
+                  'btc-3': {'poll': _o('btc-3', 'filled', 1, 8.35)}}
+        script.update({f'sto-{i}': _timeout(f'sto-{i}') for i in range(1, 7)})
+        result, log, broker = _scripted(roller, instrumented, script)
+        assert result['reason'] == 'stc_failed_naked_exposure'
+        calls = [c.kwargs for c in instrumented.place_option_order.call_args_list]
+        assert len(calls) == len(set(broker.client_order_ids)) == 9
+        roll_id = _first(log, 'call_roll_btc_placed')['roll_id']
+        expected = ([f'{roll_id}:btc:{n}' for n in (0, 1, 2)]
+                    + [f'{roll_id}:stc:{p["rung"]}'
+                       for p in _all(log, 'call_roll_stc_placed')])
+        assert [c['client_order_salt'] for c in calls] == expected
+
+    @pytest.mark.parametrize("prior, underlying, step", [
+        (1.33, 'GOOGL', 1.34), (2.99, 'GOOGL', 3.00), (3.00, 'GOOGL', 3.05),
+        (8.50, 'GOOGL', 8.55), (3.00, 'SPY', 3.01), (None, 'GOOGL', None)])
+    def test_the_strict_step_is_the_next_legal_price(self, prior, underlying,
+                                                     step):
+        """F1's step: one tick of the prior limit's grid, snapped UP on the
+        grid of the unsnapped value — never off-tick across $3.00."""
+        assert cr._strict_step_above(prior, underlying) == step
+
+
+# --------------------------------------------------------------------------- #
 # T-19 — the budget is MEASURED: the real ladder on a worst-case fake clock
 # --------------------------------------------------------------------------- #
 class _WorstCaseBroker:
@@ -865,9 +1022,17 @@ class _WorstCaseBroker:
     def __init__(self, clock, btc_attempts, quotes):
         self.clock, self.btc_attempts, self.quotes = clock, btc_attempts, quotes
         self.orders, self.buys, self.placed = {}, 0, []
+        self.client_order_ids = set()
 
-    def place_option_order(self, symbol, qty, side, order_type, limit_price):
+    def place_option_order(self, symbol, qty, side, order_type, limit_price,
+                           client_order_salt=None):
         self.clock.advance(roll_budget.ORDER_ACTION_WORST_SECONDS)
+        # F1: Alpaca refuses a repeated client_order_id; so does this fake.
+        from src.api.alpaca_client import _generate_client_order_id
+        coid = _generate_client_order_id(symbol, qty, side, limit_price,
+                                         salt=client_order_salt)
+        assert coid not in self.client_order_ids, (symbol, side, limit_price)
+        self.client_order_ids.add(coid)
         oid = f'o-{len(self.orders) + 1}'
         if side == 'buy':
             self.buys += 1

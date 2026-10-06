@@ -394,8 +394,14 @@ class BacktestAlpacaClient:
         side: str,
         order_type: str = "limit",
         limit_price: Optional[float] = None,
+        client_order_salt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fill against the day's modeled book. Two rules, by order intent.
+
+        ``client_order_salt`` is accepted for signature parity with
+        `AlpacaClient.place_option_order` (the live roller passes one on every
+        placement — FC-120 PR-2 F1) and ignored: this adapter's order ids are a
+        sequence, unique by construction, so it has no idempotency key to salt.
 
         **Entry legs and the CC monitor leg** (no intent) fill at the broker's
         haircut price and the strategy's `limit_price` is recorded but not

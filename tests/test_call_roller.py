@@ -2110,12 +2110,39 @@ def _o(oid, status, filled=0, price=None, *, latency_s=None, qty=1):
 
 class _Broker:
     """Order state per id: ``poll`` until canceled, ``after_cancel`` after
-    (a list is read in sequence, its last entry repeating)."""
+    (a list is read in sequence, its last entry repeating).
+
+    ``placer(results)`` is its ``place_option_order``: it answers ``results``
+    in order and — as Alpaca does — REFUSES a ``client_order_id`` it has
+    already seen (FC-120 PR-2, review finding F1). The id is derived exactly as
+    ``AlpacaClient.place_option_order`` derives it, from the call's own
+    arguments and its ``client_order_salt``, so any roll driven through this
+    broker fails loudly if two of its placements would collide."""
 
     def __init__(self, script):
         self.script = script
         self.canceled = set()
         self.reads = {}
+        self.client_order_ids = []
+
+    def placer(self, results):
+        results = iter(results)
+
+        def place_option_order(symbol, qty, side, order_type='limit',
+                               limit_price=None, client_order_salt=None):
+            from src.api.alpaca_client import _generate_client_order_id
+            coid = _generate_client_order_id(
+                symbol, qty, side.lower(),
+                limit_price if limit_price is not None else 0.0,
+                salt=client_order_salt)
+            if coid in self.client_order_ids:
+                raise AssertionError(
+                    f"duplicate client_order_id for {symbol} {side} "
+                    f"{limit_price} (salt {client_order_salt!r}): Alpaca "
+                    f"refuses it — the roller must never send one")
+            self.client_order_ids.append(coid)
+            return next(results)
+        return place_option_order
 
     def by_id(self, oid):
         entry = self.script[oid]
@@ -2157,8 +2184,8 @@ def _drive(roller, mock_alpaca, script, n_orders=4):
     opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
     assert opp is not None
     broker = _Broker(script)
-    mock_alpaca.place_option_order.side_effect = [
-        accepted(oid) for oid in _order_ids(script, n_orders)]
+    mock_alpaca.place_option_order.side_effect = broker.placer(
+        accepted(oid) for oid in _order_ids(script, n_orders))
     mock_alpaca.get_order_by_id.side_effect = broker.by_id
     mock_alpaca.cancel_order.side_effect = broker.cancel
     with patch('src.strategy.call_roller.logger') as log:
@@ -2290,9 +2317,10 @@ def _drive_timeline(roller, mock_alpaca, script, *, on_diag=None, n_orders=4):
     opp_timeline = _Timeline(on_diag=on_diag)
     opp_timeline.wrap(mock_alpaca)
     broker = _Broker(script)
+    # The goldens run through the uniqueness-enforcing broker too (F1).
     mock_alpaca.place_option_order.side_effect = opp_timeline._recorder(
-        'place_option_order', 'place', Mock(side_effect=[
-            accepted(oid) for oid in _order_ids(script, n_orders)]))
+        'place_option_order', 'place', broker.placer(
+            accepted(oid) for oid in _order_ids(script, n_orders)))
     mock_alpaca.get_order_by_id.side_effect = opp_timeline._recorder(
         'get_order_by_id', 'get_order', broker.by_id)
     mock_alpaca.cancel_order.side_effect = opp_timeline._recorder(
@@ -3137,39 +3165,62 @@ class TestStcLegFieldsKillTheSurvivingMutants:
             assert by_rung[3]['chain_quote_age_s'] is None, event_type
 
 
+#: FC-120 PR-2 F1: the roller's idempotency salt, ``<roll_id>:<leg>:<n>``.
+_ROLL_SALT = re.compile(r'^([0-9a-f]{32}):((?:btc|stc):\d+)$')
+
+
 def _placements(mock_alpaca):
-    return [dict(c.kwargs) for c in mock_alpaca.place_option_order.call_args_list]
+    """Every placement's order arguments. Since F1 each carries a
+    ``client_order_salt``; its ``roll_id`` is a fresh uuid per roll, so it is
+    normalised to ``<roll>`` — after asserting every placement of the roll
+    shares ONE — and the rest (leg, attempt / rung) is pinned exactly."""
+    out, rolls = [], set()
+    for c in mock_alpaca.place_option_order.call_args_list:
+        kw = dict(c.kwargs)
+        match = _ROLL_SALT.match(str(kw.get('client_order_salt')))
+        if match:
+            rolls.add(match.group(1))
+            kw['client_order_salt'] = f'<roll>:{match.group(2)}'
+        out.append(kw)
+    assert len(rolls) <= 1, f"one roll, one roll_id: {rolls}"
+    return out
 
 
-def _order(symbol, side, limit):
+def _order(symbol, side, limit, salt):
     return {'symbol': symbol, 'qty': 1, 'side': side, 'order_type': 'limit',
-            'limit_price': limit}
+            'limit_price': limit, 'client_order_salt': f'<roll>:{salt}'}
 
 
 #: FC-120 PR-2: every limit buffered 0.10 through its quote and tick-snapped.
 #: BTC 8.40 -> 8.50; rung 1 10.90 -> 10.80; the floor is the 8.35 BTC fill
 #: plus the fixture's $0.00 minimum (on tick already); C380 8.80 -> 8.70.
+#: F1: each order's salt names its leg and attempt (BTC) / rung (STO).
 _LADDER_3_ORDERS = [
-    _order(OLD_SYMBOL, 'buy', 8.50), _order(C375['symbol'], 'sell', 10.80),
-    _order(C375['symbol'], 'sell', 8.35), _order(C380['symbol'], 'sell', 8.70)]
+    _order(OLD_SYMBOL, 'buy', 8.50, 'btc:0'),
+    _order(C375['symbol'], 'sell', 10.80, 'stc:1'),
+    _order(C375['symbol'], 'sell', 8.35, 'stc:2'),
+    _order(C380['symbol'], 'sell', 8.70, 'stc:3')]
 
 #: scenario -> (old book, broker script, the order arguments PR-2 places)
 GOLDEN_PLACEMENTS = {
     'full_fill': ((8.00, 8.40), FULL_FILL, [
-        _order(OLD_SYMBOL, 'buy', 8.50), _order(C375['symbol'], 'sell', 10.80)]),
+        _order(OLD_SYMBOL, 'buy', 8.50, 'btc:0'),
+        _order(C375['symbol'], 'sell', 10.80, 'stc:1')]),
     'ladder_to_rung_3': ((8.00, 8.40), LADDER_TO_RUNG_3, _LADDER_3_ORDERS),
     'ladder_exhausted': ((8.00, 8.40), LADDER_EXHAUSTED, _LADDER_3_ORDERS),
     'all_rungs_time_out': ((8.00, 8.40), ALL_RUNGS_TIME_OUT, _LADDER_3_ORDERS),
     # Two re-prices after the roller's own zero-fill cancels: the ask (8.40)
     # plus (n+1) x 0.10 — 8.50, 8.60, 8.70 (DD-4).
     'btc_timeout': ((8.00, 8.40), BTC_TIMEOUT, [
-        _order(OLD_SYMBOL, 'buy', 8.50), _order(OLD_SYMBOL, 'buy', 8.60),
-        _order(OLD_SYMBOL, 'buy', 8.70)]),
+        _order(OLD_SYMBOL, 'buy', 8.50, 'btc:0'),
+        _order(OLD_SYMBOL, 'buy', 8.60, 'btc:1'),
+        _order(OLD_SYMBOL, 'buy', 8.70, 'btc:2')]),
     # Extrinsic 7.10 - 7.00 = 0.10 <= 0.20: imminence prices each leg's FIRST
     # placement at mid +/- 0.05 (no buffer; the parity floor 6.91 does not
     # bind) — 7.15 and 11.00 - 0.05 = 10.95, both already on tick.
     'imminence_full_fill': ((7.00, 7.20), FULL_FILL, [
-        _order(OLD_SYMBOL, 'buy', 7.15), _order(C375['symbol'], 'sell', 10.95)]),
+        _order(OLD_SYMBOL, 'buy', 7.15, 'btc:0'),
+        _order(C375['symbol'], 'sell', 10.95, 'stc:1')]),
 }
 
 
