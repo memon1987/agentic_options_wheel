@@ -15,8 +15,6 @@ Every test names the regression it catches.
 import random
 import threading
 import time
-import types
-from decimal import Decimal
 from unittest.mock import Mock, patch
 
 import pytest
@@ -24,12 +22,16 @@ import pytest
 from src.strategy import call_roller as cr
 from src.strategy import roll_budget
 from src.strategy.call_roller import CallRoller
-from tests.test_call_roller import (  # noqa: F401 - fixtures are used by name
-    C375, C380, FakeClock, OLD_SYMBOL, TERMINAL_EVENTS, _Broker, _Timeline,
-    _all, _book, _drive, _drive_timeline, _first, _no_settle_sleep, _o, _q,
-    _sequenced, accepted, call_position, candidate, event_types, events,
-    fake_clock, instrumented, mock_alpaca, mock_earnings, mock_market_data,
-    mock_risk_manager, order, roller, rolling_config, stock_position, terminals)
+from tests.test_call_roller import (
+    C375, C380, OLD_SYMBOL, _Broker, _Timeline, _all, _book, _first, _o, _q,
+    accepted, call_position, candidate, event_types, events, order,
+    stock_position, terminals)
+# Fixtures, requested by NAME (and `_no_settle_sleep` is autouse: importing it
+# is what applies it here). Never `import *`: that would collect the source
+# module's test classes a second time.
+from tests.test_call_roller import (  # noqa: F401
+    _no_settle_sleep, fake_clock, instrumented, mock_alpaca, mock_earnings,
+    mock_market_data, mock_risk_manager, roller, rolling_config)
 
 _O, _N, _F = OLD_SYMBOL, C375['symbol'], C380['symbol']
 
