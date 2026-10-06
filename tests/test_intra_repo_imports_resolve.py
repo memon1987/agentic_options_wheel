@@ -5,9 +5,11 @@ service, the sweep CLI/Job and the battery all do — so a module deleted out fr
 under one of those imports fails nothing at import time and nothing at service
 start. It fails the first time that code path runs (a sim submit, a battery
 Saturday), and a test catches it only if some test happens to execute that exact
-path. FC-121 deleted two modules that ten lazy import statements in ``main.py``
-and ``deploy/sim_service.py`` imported from; this test is what makes a missed
-one fail here instead of in production.
+path. FC-121 deleted two modules that eleven lazy import statements in
+``main.py`` and ``deploy/sim_service.py`` imported from: ten were re-pointed,
+and the eleventh, inside the screen's own CLI command, was deleted with that
+function. This test is what makes a missed one fail here instead of in
+production.
 
 Scanned: every ``*.py`` under ``src/``, ``deploy/``, ``tools/``, ``scripts/`` and
 ``dashboard/backend/``, plus every Python file at the repo root (``main.py`` and

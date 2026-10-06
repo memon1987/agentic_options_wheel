@@ -1970,8 +1970,15 @@ class TestWiring:
         summary's own values — and never from ``LAKE_COUNTERS``: iterating the
         tuple here would only prove the helper's loop agrees with itself, and
         that version let a counter deleted from the tuple pass (review round 1,
-        mutation M12). Every counter carries a distinct value, so a key summed
-        into the wrong slot fails too.
+        mutation M12).
+
+        The distinct per-counter values are set on the second store's
+        ATTRIBUTES, not written into the dict ``summary()`` returns, so the
+        test also pins ``summary()``'s wiring: each key must read the
+        attribute of the same name. Writing into the returned dict skipped
+        that wiring, and a ``"lake_puts": self.lake_misses`` mis-wiring passed
+        (confirmation pass, 8 of 10 such mutants). A key summed into the wrong
+        slot fails too.
 
         Re-pointed at ``chain_store`` from the retired screen's run-summary
         test: its aggregation half survives, its log-line half went with the
@@ -1983,12 +1990,12 @@ class TestWiring:
         accumulate_lake_summary(totals, first.summary())
         assert totals["lake_hits"] == 3 and totals["lake_errors"] == 2
 
-        second = ChainStore("y", lake=lake).summary()
-        counters = sorted(_summary_counters(second))
+        second_store = ChainStore("y", lake=lake)
+        counters = sorted(_summary_counters(second_store.summary()))
         assert counters, "the oracle found no counters; this would pass vacuously"
         for i, key in enumerate(counters, start=1):
-            second[key] = 10 * i
-        accumulate_lake_summary(totals, second)
+            setattr(second_store, key, 10 * i)
+        accumulate_lake_summary(totals, second_store.summary())
 
         expected = {key: 10 * i for i, key in enumerate(counters, start=1)}
         expected["lake_hits"] += 3
