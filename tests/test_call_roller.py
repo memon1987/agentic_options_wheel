@@ -38,6 +38,39 @@ def _no_settle_sleep(monkeypatch):
     monkeypatch.setattr(call_roller_module.time, 'sleep', lambda _s: None)
 
 
+class FakeClock:
+    """A monotonic clock that moves only when told to (FC-120 PR-2).
+
+    ``_poll_order_fill`` is a MONOTONIC deadline since FC-113 (b): with
+    ``time.sleep`` stubbed and the real clock, a window that never sees a
+    terminal status would spin for its full length in real time. ``sleep(s)``
+    advances this clock by ``s``; ``advance`` models a read's round trip."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Swap the roller module's ``time`` for a FakeClock-backed namespace."""
+    import types
+    clk = FakeClock()
+    monkeypatch.setattr(call_roller_module, 'time', types.SimpleNamespace(
+        monotonic=clk.monotonic, sleep=clk.sleep))
+    return clk
+
+
 # --------------------------------------------------------------------------- #
 # Fixtures and builders
 # --------------------------------------------------------------------------- #
@@ -75,8 +108,14 @@ def candidate(strike: float, bid: float, ask: float, *, delta: float = 0.45,
 
 # The flagship pair from the plan's DD-8 expectation table: C375 carries far
 # more credit, C380 carries more contingent strike. Credit wins.
+#
+# FC-120 PR-2: every limit is now buffered 0.10 through its quote, so the BTC
+# places at 8.50 (8.40 ask + 0.10) and a candidate is legal only if its
+# BUFFERED bid clears that. C380's book moved from 8.50/8.70 (now a -$10
+# debit at the placed limits) to 8.80/9.00 (+$20) so it stays the legal,
+# smaller-credit fallback every ladder test below exercises. C375 nets +$230.
 C375 = candidate(375.0, bid=10.90, ask=11.10, delta=0.48)
-C380 = candidate(380.0, bid=8.50, ask=8.70, delta=0.35)
+C380 = candidate(380.0, bid=8.80, ask=9.00, delta=0.35)
 
 
 @pytest.fixture
@@ -108,7 +147,7 @@ def mock_alpaca():
     alpaca.get_option_quote.side_effect = _quote_book({
         OLD_SYMBOL: {'bid': 8.00, 'ask': 8.40, 'mid_price': 8.20},
         C375['symbol']: {'bid': 10.90, 'ask': 11.10, 'mid_price': 11.00},
-        C380['symbol']: {'bid': 8.50, 'ask': 8.70, 'mid_price': 8.60},
+        C380['symbol']: {'bid': 8.80, 'ask': 9.00, 'mid_price': 8.90},
     })
     alpaca.cancel_order.return_value = True
     return alpaca
@@ -226,8 +265,9 @@ class TestQuoteKeys:
         assert opp is not None
         # Stock price is the MID of the two-sided quote, not either side.
         assert opp['stock_price'] == pytest.approx(377.00)
-        # BTC prices off `ask`, not `ask_price`.
-        assert opp['btc_limit'] == pytest.approx(8.40)
+        # BTC prices off `ask`, not `ask_price` — 8.40 + the FC-120 PR-2
+        # buffer (0.10), on the nickel grid.
+        assert opp['btc_limit'] == pytest.approx(8.50)
 
     def test_a_raising_stock_quote_emits_a_skip_not_a_crash(self, roller,
                                                             mock_alpaca):
@@ -318,7 +358,8 @@ class TestQuoteQualityGuard:
 
         assert opp['pricing_mode'] == 'base'
         assert opp['extrinsic_per_share'] is None
-        assert opp['btc_limit'] == pytest.approx(7.05)   # the ask, not a mid
+        # The ask + buffer (FC-120 PR-2), not a mid: 7.05 + 0.10.
+        assert opp['btc_limit'] == pytest.approx(7.15)
 
 
 # --------------------------------------------------------------------------- #
@@ -456,10 +497,12 @@ class TestCreditOnly:
     def test_exactly_flat_is_legal_at_the_default_floor(self, roller,
                                                         mock_market_data,
                                                         mock_alpaca):
-        """min_credit defaults to $0.00/contract: any NON-NEGATIVE roll at
-        conservative prices executes the day it appears. A positive default
-        would have deferred the exact trade this FC was expedited to capture."""
-        flat = candidate(375.0, bid=8.40, ask=8.60)
+        """The invariant is ``>=``, not ``>``: a roll EXACTLY at the minimum on
+        the PLACED limits executes. (FC-120 PR-2: the placed limits are the
+        buffered ones — BTC 8.40 + 0.10 = 8.50, STO 8.60 - 0.10 = 8.50 — so
+        this fixture's min of $0.00 is met with nothing to spare; the shipped
+        minimum is $0.20/contract, one tick on these limits.)"""
+        flat = candidate(375.0, bid=8.60, ask=8.80)
         mock_market_data.find_suitable_calls.return_value = [flat]
         mock_alpaca.get_option_quote.side_effect = _quote_book({
             OLD_SYMBOL: {'bid': 8.00, 'ask': 8.40}, flat['symbol']: flat})
@@ -467,6 +510,8 @@ class TestCreditOnly:
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
 
         assert opp is not None
+        assert opp['btc_limit'] == pytest.approx(8.50)
+        assert opp['stc_limit'] == pytest.approx(8.50)
         assert opp['net_credit_per_contract'] == pytest.approx(0.0)
 
     def test_marks_showing_credit_do_not_rescue_limits_that_do_not(
@@ -503,9 +548,10 @@ class TestCreditOnly:
 
 
 class TestMaxCreditSelection:
-    """T-7b (DD-3). Among legal candidates {+$10, +$250} the roller executes
-    +$250 — even though the fixture returns them in ``return_score`` order with
-    the small-credit one FIRST.
+    """T-7b (DD-3). Among legal candidates {+$20, +$230} the roller executes
+    +$230 — even though the fixture returns them in ``return_score`` order with
+    the small-credit one FIRST. (Credits on the FC-120 PR-2 buffered limits:
+    BTC 8.50; C375 10.80; C380 8.70.)
 
     *Mutation:* revert to first-past-the-post on the returned order → this
     fails, exactly as tonight's book would have taken +$13 over +$248.
@@ -516,7 +562,7 @@ class TestMaxCreditSelection:
 
         assert opp['new_option_symbol'] == C375['symbol']
         assert opp['new_strike'] == 375.0
-        assert opp['net_credit_per_contract'] == pytest.approx(250.0)
+        assert opp['net_credit_per_contract'] == pytest.approx(230.0)
 
     def test_the_smaller_credit_candidate_is_still_legal_just_not_chosen(
             self, roller):
@@ -783,7 +829,8 @@ class TestExecutionOrdering:
     def test_the_re_check_reprices_the_sto_leg_when_it_still_clears(
             self, roller, mock_alpaca):
         """It is a re-PRICE, not just a re-test: the placed limit is the fresh
-        one, so the invariant holds against what actually goes on the book."""
+        one, so the invariant holds against what actually goes on the book.
+        (FC-120 PR-2: the fresh bid less the 0.10 buffer, 9.50 -> 9.40.)"""
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
         mock_alpaca.get_option_quote.side_effect = _quote_book({
             C375['symbol']: {'bid': 9.50, 'ask': 9.70}})
@@ -796,7 +843,7 @@ class TestExecutionOrdering:
         roller.execute_roll(opp)
 
         sto = mock_alpaca.place_option_order.call_args_list[1]
-        assert sto.kwargs['limit_price'] == pytest.approx(9.50)
+        assert sto.kwargs['limit_price'] == pytest.approx(9.40)
 
 
 # --------------------------------------------------------------------------- #
@@ -813,9 +860,14 @@ class TestBtcTimeoutDisposition:
 
     *Mutations:* drop the cancel → case (a) fails; drop the post-cancel re-fetch
     → case (b) fails.
+
+    FC-120 PR-2: these pin ONE attempt's disposition, so re-pricing is off
+    here (``btc_reprice_attempts = 0`` — one placement over the full window,
+    the exhausted-attempts terminal). The re-price state machine is T-10.
     """
 
     def _armed(self, roller, mock_alpaca, refetch):
+        roller.config.rolling_btc_reprice_attempts = 0
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
         mock_alpaca.place_option_order.side_effect = [
             accepted('btc-1'), accepted('sto-1')]
@@ -1030,18 +1082,26 @@ class TestQueuedCancelsOnTheBtcLeg:
         read wearing a loop.
         """
         import inspect
-        source = inspect.getsource(call_roller_module)
-        # Read the literal from source, not the module attribute — the fixture
-        # has already replaced the latter.
-        literal = re.search(r'^_CANCEL_SETTLE_TIMEOUT_SECONDS = (\d+)',
-                            source, re.M)
+        from src.strategy import roll_budget
+        # FC-120 PR-2: the constant lives in the leaf `roll_budget` and the
+        # roller re-exports it. Read the literal from source, not the module
+        # attribute — the fixture has already replaced the latter.
+        literal = re.search(r'^CANCEL_SETTLE_TIMEOUT_SECONDS = (\d+)',
+                            inspect.getsource(roll_budget), re.M)
         assert literal, "the settle bound constant is gone"
         assert int(literal.group(1)) >= 5, (
             "the shipped cancel-settle bound is below the 5s poll interval, so "
             "it performs a single read — the H-1 defect, restored")
+        assert re.search(
+            r'^_CANCEL_SETTLE_TIMEOUT_SECONDS = '
+            r'roll_budget\.CANCEL_SETTLE_TIMEOUT_SECONDS$',
+            inspect.getsource(call_roller_module), re.M), (
+            "the roller no longer re-exports roll_budget's settle bound")
+        # And the settle reads at least twice whatever the window (R6-I).
+        assert roll_budget.CANCEL_SETTLE_MIN_READS == 2
 
     def test_the_refetch_breadcrumb_is_emitted_once_not_per_read(
-            self, roller, mock_alpaca, monkeypatch):
+            self, roller, mock_alpaca, monkeypatch, fake_clock):
         monkeypatch.setattr(call_roller_module,
                             '_CANCEL_SETTLE_TIMEOUT_SECONDS', 20)
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
@@ -1363,7 +1423,8 @@ class TestStoLadder:
         sells = [c.kwargs['limit_price']
                  for c in mock_alpaca.place_option_order.call_args_list
                  if c.kwargs['side'] == 'sell']
-        assert sells[0] == pytest.approx(10.90)   # rung 1: the re-checked bid
+        # rung 1: the re-checked bid less the FC-120 PR-2 buffer (10.90 - 0.10)
+        assert sells[0] == pytest.approx(10.80)
         assert sells[1] == pytest.approx(8.00)    # rung 2: the invariant floor
         assert all(p >= 8.00 for p in sells), "a rung priced below the invariant"
 
@@ -1510,24 +1571,47 @@ class TestStoLadder:
 
         assert not hasattr(roller, 'wheel_state')
 
-    def test_the_ladders_fixed_rungs_are_exactly_two(self, roller):
-        """FC-107: `LADDER_FIXED_LEGS = 3` is 1 BTC + these, derived not pinned.
+    @pytest.mark.parametrize("escalations", [0, 1, 3])
+    def test_the_primary_ladder_has_two_plus_e_rungs(self, roller, mock_alpaca,
+                                                     escalations):
+        """T-17(e) (replaces FC-107's `test_the_ladders_fixed_rungs_are_exactly_two`
+        — `LADDER_FIXED_LEGS` is gone; the per-position budget is
+        `roll_budget.per_position_budget_seconds`, which counts these rungs).
 
-        With no fallback candidates to draw on, `_rungs` yields the primary at
-        its re-checked limit and the primary at the invariant floor — two — and
-        the seam arithmetic in tests/test_cloudbuild_contract.py counts on that
-        being the config-independent part. A third unconditional rung would
-        lengthen every ladder by 135 s without failing any timeout test.
+        With no fallback candidates, a ladder whose every rung times out and
+        settles zero-fill after the roller's own cancel places exactly
+        `roll_budget.PRIMARY_LADDER_RUNGS(E)` sells on the primary: rung 1,
+        E escalation rungs, the floor. Shipped E = 0 is the pre-PR-2 shape, 2.
+        Counted through the ladder driver, because `_rungs` yields only rung 1,
+        the floor and the fallbacks — the escalation rungs are placed between
+        them by `_attempt_stc` (PR-2 item 3).
         """
-        from tests.test_cloudbuild_contract import LADDER_FIXED_LEGS
+        from src.strategy import roll_budget
 
-        opp = {'min_credit_per_share': 0.25, 'new_option_symbol': 'X',
-               'stc_limit': 5.00, 'new_strike': 380.0, 'imminent': False,
-               'fallback_candidates': [{'new_option_symbol': 'X'}]}
-        rungs = list(roller._rungs(opp, 4.00))  # BTC beat its limit -> floor rung
+        roller.config.rolling_stc_escalation_rungs = escalations
+        roller.config.rolling_fallback_strike_attempts = 0
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        script = {'btc-1': {'poll': order('btc-1', 'filled', 1, 8.00)}}
+        for i in range(1, 6):
+            script[f'sto-{i}'] = {'poll': order(f'sto-{i}', 'new'),
+                                  'after_cancel': order(f'sto-{i}', 'canceled')}
+        broker = _Broker(script)
+        mock_alpaca.place_option_order.side_effect = (
+            [accepted('btc-1')] + [accepted(f'sto-{i}') for i in range(1, 6)])
+        mock_alpaca.get_order_by_id.side_effect = broker.by_id
+        mock_alpaca.cancel_order.side_effect = broker.cancel
 
-        assert len(rungs) == 2, [r[0] for r in rungs]
-        assert LADDER_FIXED_LEGS == 1 + len(rungs)
+        result = roller.execute_roll(opp)
+
+        sells = [c.kwargs for c in mock_alpaca.place_option_order.call_args_list
+                 if c.kwargs['side'] == 'sell']
+        assert result['reason'] == 'stc_failed_naked_exposure'
+        assert {s['symbol'] for s in sells} == {C375['symbol']}
+        assert len(sells) == roll_budget.PRIMARY_LADDER_RUNGS(escalations)
+        limits = [s['limit_price'] for s in sells]
+        assert limits == sorted(limits, reverse=True), (
+            "the primary ladder must only ever step DOWN toward the floor")
+        assert limits[-1] == pytest.approx(8.00), "the last rung is the floor"
 
 
 
@@ -1685,8 +1769,12 @@ class TestTheTerminalTaxonomyIsExhaustive:
         assert terminals(log) == ['call_roll_btc_rejected']
 
     def test_btc_timeout_canceled(self, roller, mock_alpaca):
+        """FC-120 PR-2: every attempt times out and settles zero-fill after the
+        roller's own cancel — two re-prices, three placements, and still
+        exactly ONE terminal (the re-price rows are per-attempt)."""
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
-        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        mock_alpaca.place_option_order.side_effect = [
+            accepted(f'btc-{i}') for i in (1, 2, 3)]
         polls = {}
 
         def by_id(oid):
@@ -1698,6 +1786,55 @@ class TestTheTerminalTaxonomyIsExhaustive:
         with patch('src.strategy.call_roller.logger') as log:
             roller.execute_roll(opp)
         assert terminals(log) == ['call_roll_btc_timeout_canceled']
+        assert event_types(log).count('call_roll_btc_repriced') == 2
+        assert mock_alpaca.place_option_order.call_count == 3
+
+    def test_quote_unusable_at_execution(self, roller, mock_alpaca):
+        """FC-120 PR-2 (R6-E): both BTC quotes unusable before any order — the
+        execute-time read empty AND the evaluation quote ask <= 0 — is a TRUE
+        skip: no order was ever placed."""
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        opp['btc_quote'] = {'bid': 0.0, 'ask': 0.0}
+        mock_alpaca.get_option_quote.side_effect = _quote_book(
+            {C375['symbol']: {'bid': 10.90, 'ask': 11.10}})
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_skipped']
+        assert result['reason'] == 'quote_unusable'
+        mock_alpaca.place_option_order.assert_not_called()
+
+    def test_a_refused_reprice_is_one_timeout_terminal_never_a_skip(
+            self, roller, mock_alpaca):
+        """R6-E: a BTC was placed and canceled, so a refused re-price is
+        ``call_roll_btc_timeout_canceled`` with ``reprice_skipped_reason`` —
+        ``call_roll_skipped`` means "no order was ever placed"."""
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        seen = {'n': 0, 'q': 0}
+
+        def by_id(oid):
+            seen['n'] += 1
+            return order(oid, 'new' if seen['n'] == 1 else 'canceled', 0)
+
+        mock_alpaca.get_order_by_id.side_effect = by_id
+        base = mock_alpaca.get_option_quote.side_effect
+
+        def quotes(symbol):
+            if symbol == C375['symbol']:
+                seen['q'] += 1
+                if seen['q'] > 1:          # the credit is gone at re-price
+                    return {'bid': 1.00, 'ask': 1.20}
+            return base(symbol)
+
+        mock_alpaca.get_option_quote.side_effect = quotes
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_btc_timeout_canceled']
+        assert result['reason'] == 'btc_timeout_canceled'
+        ev = [k for e, k in events(log)
+              if e == 'call_roll_btc_timeout_canceled'][0]
+        assert ev['reprice_skipped_reason'] == 'credit_gone'
+        assert 'call_roll_skipped' not in event_types(log)
 
     def test_naked_exposure(self, roller, mock_alpaca):
         opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
@@ -1762,6 +1899,10 @@ class TestTheTerminalTaxonomyIsExhaustive:
             # FC-120 ruling D: the read-only end-of-cycle quote sample, one
             # row per held short call AFTER every terminal of the cycle.
             'call_roll_quote_sample',
+            # FC-120 PR-2: per-ATTEMPT — a BTC re-priced after the roller's own
+            # zero-fill cancel. The leg's terminal comes later (fill → the
+            # ladder; refusal/exhaustion → call_roll_btc_timeout_canceled).
+            'call_roll_btc_repriced',
         }
         unclassified = emitted - TERMINAL_EVENTS - non_terminal
         assert not unclassified, (
@@ -1784,12 +1925,16 @@ class TestDryRun:
             result = roller.execute_roll(opp)
 
         mock_alpaca.place_option_order.assert_not_called()
+        mock_alpaca.cancel_order.assert_not_called()
         assert result['success'] is False
         dry = [k for e, k in events(log) if e == 'call_roll_dry_run']
         assert len(dry) == 1
-        assert dry[0]['would_be_btc_limit'] == pytest.approx(8.40)
-        assert dry[0]['would_be_stc_limit'] == pytest.approx(10.90)
+        # FC-120 PR-2: the EXECUTE-TIME-priced limits (DD-5) — buffered.
+        assert dry[0]['would_be_btc_limit'] == pytest.approx(8.50)
+        assert dry[0]['would_be_stc_limit'] == pytest.approx(10.80)
         assert dry[0]['would_be_stc_symbol'] == C375['symbol']
+        assert dry[0]['btc_quote_source'] == 'execution'
+        assert dry[0]['net_credit'] == pytest.approx(230.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1900,26 +2045,46 @@ def _q(bid, ask, *, age_s=40.0, stamp='auto', bid_size=10, ask_size=12):
             'timestamp': _stamp(age_s) if stamp == 'auto' else stamp}
 
 
+def _is_diag_thread():
+    """True on a bounded INSTRUMENTATION read's worker (FC-120 PR-1 ruling B).
+    PR-2's bounded PRICING reads run on their own worker, named apart."""
+    return threading.current_thread().name == 'fc120-diag-read'
+
+
 def _sequenced(seqs):
-    """get_option_quote stub with a per-SYMBOL call counter: call n returns
-    ``seqs[symbol][n]`` (the last entry repeats); an Exception entry raises.
-    Call 1 is the read a limit is priced from, call 2 the re-read taken
-    right after that leg is placed, call 3 the post-settle read."""
+    """get_option_quote stub with a per-SYMBOL counter.
+
+    Entry 0 is the PRICED quote: every pricing read of the symbol returns it
+    (the evaluation's main-thread read and, since FC-120 PR-2, the bounded
+    execute-time / rung-basis / re-quote reads). Entries 1, 2, ... are the
+    DIAGNOSTIC reads in order — 1 the re-read taken right after that leg is
+    placed, 2 the post-settle read — the last entry repeating. An Exception
+    entry raises. ``seqs[symbol]`` may instead be ``{'pricing': [...],
+    'diag': [...]}`` to script the two independently (each list in call
+    order, last entry repeating)."""
     counts = {}
 
-    def quote(symbol):
-        n = counts.get(symbol, 0)
-        counts[symbol] = n + 1
-        seq = seqs.get(symbol, [{}])
+    def pick(seq, n):
         item = seq[min(n, len(seq) - 1)]
         if isinstance(item, Exception):
             raise item
         return dict(item)
+
+    def quote(symbol):
+        seq = seqs.get(symbol, [{}])
+        diag = _is_diag_thread()
+        key = (symbol, 'diag' if diag else 'pricing')
+        n = counts.get(key, 0)
+        counts[key] = n + 1
+        counts[symbol] = counts.get(symbol, 0) + 1
+        if isinstance(seq, dict):
+            return pick(seq['diag' if diag else 'pricing'], n)
+        return pick(seq, n + 1 if diag else 0)
     quote.counts = counts
     return quote
 
 
-def _book(old=(8.00, 8.40), c375=(10.90, 11.10), c380=(8.50, 8.70),
+def _book(old=(8.00, 8.40), c375=(10.90, 11.10), c380=(8.80, 9.00),
           shift=0.02, **overrides):
     """The instrumented book: each symbol's re-read is shifted by ``shift``
     on both sides; every later read returns the base quote again."""
@@ -1978,13 +2143,22 @@ def instrumented(mock_alpaca, mock_market_data):
     return mock_alpaca
 
 
+def _order_ids(script, n_orders):
+    """Placement ids in placement order: the script's own keys first (it
+    lists its orders in the order they are placed — `btc-1`, `btc-2`, ... for
+    re-priced attempts, then `sto-1`, ...), padded with unscripted ids."""
+    ids = list(script)
+    ids += [f'unscripted-{i}' for i in range(len(ids), max(n_orders, len(ids)) + 4)]
+    return ids
+
+
 def _drive(roller, mock_alpaca, script, n_orders=4):
     """Evaluate + execute one roll against a scripted broker."""
     opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
     assert opp is not None
     broker = _Broker(script)
-    mock_alpaca.place_option_order.side_effect = (
-        [accepted('btc-1')] + [accepted(f'sto-{i}') for i in range(1, n_orders)])
+    mock_alpaca.place_option_order.side_effect = [
+        accepted(oid) for oid in _order_ids(script, n_orders)]
     mock_alpaca.get_order_by_id.side_effect = broker.by_id
     mock_alpaca.cancel_order.side_effect = broker.cancel
     with patch('src.strategy.call_roller.logger') as log:
@@ -2019,10 +2193,14 @@ LADDER_TO_RUNG_3 = {
     'sto-3': {'poll': _o('sto-3', 'filled', 1, 8.55, latency_s=3)},
 }
 
-#: The BTC never fills: the poll sees `new`, the cancel settles zero-fill.
+#: The BTC never fills: every attempt's poll sees `new` and its cancel settles
+#: zero-fill. FC-120 PR-2: the shipped `btc_reprice_attempts = 2` re-prices
+#: twice, so three attempts are scripted; a test that pins ONE attempt's
+#: timeout path sets the attempts to 0 and only `btc-1` is ever placed.
 BTC_TIMEOUT = {
-    'btc-1': {'poll': _o('btc-1', 'new'),
-              'after_cancel': _o('btc-1', 'canceled')},
+    f'btc-{i}': {'poll': _o(f'btc-{i}', 'new'),
+                 'after_cancel': _o(f'btc-{i}', 'canceled')}
+    for i in (1, 2, 3)
 }
 
 
@@ -2073,14 +2251,23 @@ class _Timeline:
 
     def _recorder(self, name, kind, inner):
         def call_(*args, **kwargs):
-            diag = threading.get_ident() != self.main
+            # FC-120 PR-2: the bounded PRICING reads also run off the main
+            # thread, on a worker named apart from the diagnostic one — they
+            # are order-path reads (``pricing_quote`` / ``pricing_stock_quote``)
+            # and are never poisoned; only ``diag`` reads are.
+            if threading.get_ident() == self.main:
+                tag = kind
+            elif threading.current_thread().name == 'fc120-pricing-read':
+                tag = f'pricing_{kind}'
+            else:
+                tag = 'diag'
             if kind == 'place':
                 key = (kwargs.get('symbol'), kwargs.get('side'),
                        kwargs.get('limit_price'))
             else:
                 key = args[0] if args else None
-            self.entries.append(('diag' if diag else kind, key))
-            if diag and self.on_diag is not None:
+            self.entries.append((tag, key))
+            if tag == 'diag' and self.on_diag is not None:
                 return self.on_diag(name, args, lambda: inner(*args, **kwargs))
             return inner(*args, **kwargs)
         return call_
@@ -2104,9 +2291,8 @@ def _drive_timeline(roller, mock_alpaca, script, *, on_diag=None, n_orders=4):
     opp_timeline.wrap(mock_alpaca)
     broker = _Broker(script)
     mock_alpaca.place_option_order.side_effect = opp_timeline._recorder(
-        'place_option_order', 'place', Mock(side_effect=(
-            [accepted('btc-1')]
-            + [accepted(f'sto-{i}') for i in range(1, n_orders)])))
+        'place_option_order', 'place', Mock(side_effect=[
+            accepted(oid) for oid in _order_ids(script, n_orders)]))
     mock_alpaca.get_order_by_id.side_effect = opp_timeline._recorder(
         'get_order_by_id', 'get_order', broker.by_id)
     mock_alpaca.cancel_order.side_effect = opp_timeline._recorder(
@@ -2120,17 +2306,23 @@ def _drive_timeline(roller, mock_alpaca, script, *, on_diag=None, n_orders=4):
 
 
 #: fixture name -> broker script (all on the instrumented base book)
+#: fixture name -> (broker script, btc_reprice_attempts). ``btc_timeout_single``
+#: is the one-attempt timeout (re-pricing off) — the shape main ran, so its
+#: STRUCTURE can be compared with main's golden one-for-one.
 ORDER_PATH_FIXTURES = {
-    'full_fill': FULL_FILL,
-    'btc_timeout': BTC_TIMEOUT,
-    'ladder_to_rung_3': LADDER_TO_RUNG_3,
-    'ladder_exhausted': LADDER_EXHAUSTED,
+    'full_fill': (FULL_FILL, 2),
+    'btc_timeout': (BTC_TIMEOUT, 2),
+    'btc_timeout_single': (BTC_TIMEOUT, 0),
+    'ladder_to_rung_3': (LADDER_TO_RUNG_3, 2),
+    'ladder_exhausted': (LADDER_EXHAUSTED, 2),
 }
 
-#: MAIN's ordered broker calls of kind {place, cancel, get_order, quote,
-#: stock_quote} per fixture — derived by running this class against
+#: MAIN's (PR-1's) ordered broker calls of kind {place, cancel, get_order,
+#: quote, stock_quote} per fixture — derived by running this class against
 #: ``git show origin/main:src/strategy/call_roller.py`` with
-#: FC120_PRINT_GOLDEN=1 (which prints instead of asserting), then pinned.
+#: FC120_PRINT_GOLDEN=1 (which prints instead of asserting). Kept as the
+#: record FC-120 PR-2's goldens are diffed against (T-18). Its C380 limit is
+#: main's book (8.50/8.70); the structure comparison ignores limits.
 _O, _N, _F = OLD_SYMBOL, C375['symbol'], C380['symbol']
 _PRELUDE = [('stock_quote', 'GOOGL'), ('quote', _O), ('quote', _N),
             ('place', (_O, 'buy', 8.4)), ('get_order', 'btc-1')]
@@ -2151,6 +2343,79 @@ MAIN_ORDER_PATH = {
         ('cancel', 'sto-2'), ('get_order', 'sto-2'),
         ('place', (_F, 'sell', 8.5)), ('get_order', 'sto-3')],
 }
+MAIN_ORDER_PATH['btc_timeout_single'] = MAIN_ORDER_PATH['btc_timeout']
+
+#: FC-120 PR-2's goldens (T-18), derived with FC120_PRINT_GOLDEN=1 and checked
+#: by hand against DD-3/DD-4. The differences from main's, and ONLY these:
+#:   * the three bounded execute-time PRICING reads (old option, stock, new
+#:     option) replace main's one main-thread pre-BTC re-check read;
+#:   * one bounded pricing read of the new symbol right after the BTC fill —
+#:     rung 1's fresh basis (DD-3: ``min(pre_btc_bid, fresh_bid)``);
+#:   * the fallback re-quote is the same read, now bounded (same position);
+#:   * btc_timeout: three bounded pricing reads between attempts — each
+#:     re-price, placed only after the roller's own cancel settled zero-fill;
+#:   * the limits: buffered + snapped (BTC 8.40 -> 8.50, re-priced 8.60 / 8.70
+#:     at (n+2) x buffer; rung 1 10.90 -> 10.80; C380 8.80 -> 8.70; the floor
+#:     8.35 is the BTC fill + the fixture's $0.00 minimum, already on tick).
+#: Place / poll / cancel / settle order and the order arguments' structure are
+#: main's (asserted by test_the_structure_is_mains_but_for_the_pricing_reads).
+_PRICED = [('pricing_quote', _O), ('pricing_stock_quote', 'GOOGL'),
+           ('pricing_quote', _N)]
+_EVAL = [('stock_quote', 'GOOGL'), ('quote', _O)]
+PR2_ORDER_PATH = {
+    'btc_timeout': _EVAL + _PRICED + [
+        ('place', (_O, 'buy', 8.5)), ('get_order', 'btc-1'),
+        ('cancel', 'btc-1'), ('get_order', 'btc-1')] + _PRICED + [
+        ('place', (_O, 'buy', 8.6)), ('get_order', 'btc-2'),
+        ('cancel', 'btc-2'), ('get_order', 'btc-2')] + _PRICED + [
+        ('place', (_O, 'buy', 8.7)), ('get_order', 'btc-3'),
+        ('cancel', 'btc-3'), ('get_order', 'btc-3')],
+    'btc_timeout_single': _EVAL + _PRICED + [
+        ('place', (_O, 'buy', 8.5)), ('get_order', 'btc-1'),
+        ('cancel', 'btc-1'), ('get_order', 'btc-1')],
+    'full_fill': _EVAL + _PRICED + [
+        ('place', (_O, 'buy', 8.5)), ('get_order', 'btc-1'),
+        ('pricing_quote', _N),
+        ('place', (_N, 'sell', 10.8)), ('get_order', 'sto-1')],
+    'ladder_exhausted': _EVAL + _PRICED + [
+        ('place', (_O, 'buy', 8.5)), ('get_order', 'btc-1'),
+        ('pricing_quote', _N),
+        ('place', (_N, 'sell', 10.8)), ('get_order', 'sto-1'),
+        ('place', (_N, 'sell', 8.35)), ('get_order', 'sto-2'),
+        ('pricing_quote', _F),
+        ('place', (_F, 'sell', 8.7)), ('get_order', 'sto-3')],
+    'ladder_to_rung_3': _EVAL + _PRICED + [
+        ('place', (_O, 'buy', 8.5)), ('get_order', 'btc-1'),
+        ('pricing_quote', _N),
+        ('place', (_N, 'sell', 10.8)), ('get_order', 'sto-1'),
+        ('cancel', 'sto-1'), ('get_order', 'sto-1'),
+        ('place', (_N, 'sell', 8.35)), ('get_order', 'sto-2'),
+        ('pricing_quote', _F),
+        ('cancel', 'sto-2'), ('get_order', 'sto-2'),
+        ('place', (_F, 'sell', 8.7)), ('get_order', 'sto-3')],
+}
+
+
+def _structure(path, *, drop_main_thread_quotes_after_eval=False):
+    """An order path with the pricing reads and the limits taken out: what is
+    left — places (symbol, side), polls, cancels, settles and their order —
+    is what PR-2 must keep identical to main."""
+    out = []
+    seen_place = False
+    for i, (kind, key) in enumerate(path):
+        if kind.startswith('pricing_'):
+            continue
+        if kind == 'place':
+            seen_place = True
+            out.append((kind, key[:2]))
+            continue
+        # Main's pre-BTC re-check (the third prelude entry) and its fallback
+        # re-quotes were MAIN-THREAD pricing reads; PR-2 bounds them.
+        if drop_main_thread_quotes_after_eval and kind == 'quote' and (
+                seen_place or i >= 2):
+            continue
+        out.append((kind, key))
+    return out
 
 
 class TestTheOrderPathIsMains:
@@ -2168,24 +2433,43 @@ class TestTheOrderPathIsMains:
     fails; take the post-settle quote before ``call_roll_btc_timeout_canceled``
     → (iv) fails; flush the rung's post-settle work before the next placement
     → (iii) fails.
+
+    FC-120 PR-2 (T-18): the goldens are re-pinned (``PR2_ORDER_PATH``) and
+    their STRUCTURE is asserted equal to main's but for the bounded pricing
+    reads; the pricing reads are order-path reads (``pricing_*``), never diag.
     """
+
+    @staticmethod
+    def _run(roller, instrumented, name):
+        script, attempts = ORDER_PATH_FIXTURES[name]
+        roller.config.rolling_btc_reprice_attempts = attempts
+        return _drive_timeline(roller, instrumented, script)
 
     @pytest.mark.parametrize('name', sorted(ORDER_PATH_FIXTURES))
     def test_order_path_is_mains(self, roller, instrumented, name):
-        _r, _log, timeline = _drive_timeline(
-            roller, instrumented, ORDER_PATH_FIXTURES[name])
+        _r, _log, timeline = self._run(roller, instrumented, name)
         if os.environ.get('FC120_PRINT_GOLDEN'):
             print(f"\nGOLDEN {name}: {timeline.order_path()!r}")
             return
-        assert timeline.order_path() == MAIN_ORDER_PATH[name]
+        assert timeline.order_path() == PR2_ORDER_PATH[name]
+
+    @pytest.mark.parametrize('name', sorted(set(ORDER_PATH_FIXTURES) - {'btc_timeout'}))
+    def test_the_structure_is_mains_but_for_the_pricing_reads(
+            self, roller, instrumented, name):
+        """Every single-attempt scenario: drop the pricing reads and the limits
+        from PR-2's golden and from main's, and what is left — every place,
+        poll, cancel and settle, in order — is identical. (The 3-attempt
+        ``btc_timeout`` differs from main exactly by its two re-priced
+        attempts, pinned in full above.)"""
+        assert _structure(PR2_ORDER_PATH[name]) == _structure(
+            MAIN_ORDER_PATH[name], drop_main_thread_quotes_after_eval=True)
 
     @pytest.mark.parametrize('name', sorted(ORDER_PATH_FIXTURES))
     def test_no_diag_read_inside_a_forbidden_window(self, roller, instrumented,
                                                     name):
         if os.environ.get('FC120_PRINT_GOLDEN'):
             pytest.skip('golden derivation run')
-        _r, _log, timeline = _drive_timeline(
-            roller, instrumented, ORDER_PATH_FIXTURES[name])
+        _r, _log, timeline = self._run(roller, instrumented, name)
         entries = timeline.entries
         assert any(kind == 'diag' for kind, _ in entries), entries
         for i, (kind, _key) in enumerate(entries):
@@ -2218,7 +2502,8 @@ class TestQuoteFieldsOnRollEvents:
 
         assert btc['leg'] == 'btc' and btc['attempt'] == 0
         assert btc['pricing_mode'] == 'base'
-        assert btc['limit_price'] == 8.40
+        # FC-120 PR-2: the execute-time ask + the 0.10 buffer, on the grid.
+        assert btc['limit_price'] == 8.50
         assert btc['quote_bid'] == 8.00 and btc['quote_ask'] == 8.40
         assert btc['quote_mid'] == 8.20 and btc['quote_spread'] == 0.40
         assert btc['quote_bid_size'] == 10 and btc['quote_ask_size'] == 12
@@ -2231,9 +2516,16 @@ class TestQuoteFieldsOnRollEvents:
         assert btc['stock_bid_ts'] == btc['stock_quote_ts']
         assert btc['stock_quote_age_s'] == pytest.approx(1, abs=3)
         assert btc['intrinsic_at_placement'] == 6.90  # 376.90 - 370
-        assert btc['limit_minus_intrinsic'] == 1.50
-        assert btc['limit_on_tick'] is True           # 8.40 on the nickel grid
-        assert btc['limit_vs_quote'] == 0.0           # base mode: at the ask
+        assert btc['limit_minus_intrinsic'] == 1.60
+        assert btc['limit_on_tick'] is True           # 8.50 on the nickel grid
+        # PR-1's meaning kept: how far through the quoted ask — now >= buffer.
+        assert btc['limit_vs_quote'] == 0.10
+        # PR-2's log-only provenance (R6-R): which reads priced it.
+        assert btc['btc_quote_source'] == 'execution'
+        assert btc['stock_quote_source'] == 'execution'
+        assert btc['parity_floor_applied'] is False   # 6.91 < 8.50
+        assert btc['parity_stock_bid'] == 376.90
+        assert btc['limit_formula'] == 'base'
         assert isinstance(btc['placed_at'], str)
         assert isinstance(btc['roll_id'], str) and len(btc['roll_id']) == 32
         # The re-read is NOT read yet when this event is written (ruling A).
@@ -2270,15 +2562,23 @@ class TestQuoteFieldsOnRollEvents:
 
         assert stc['leg'] == 'stc' and stc['rung'] == 1
         assert stc['pricing_mode'] == 'base'
-        assert stc['limit_price'] == 10.90
+        # FC-120 PR-2: min(pre-BTC 10.90, fresh 10.90) - 0.10.
+        assert stc['limit_price'] == 10.80
         assert stc['quote_bid'] == 10.90 and stc['quote_ask'] == 11.10
-        assert stc['limit_vs_quote'] == 0.0          # base mode: at the bid
+        assert stc['limit_vs_quote'] == 0.10         # through the bid by the buffer
         assert stc['quote_age_s'] == pytest.approx(40, abs=3)
         assert stc['chain_quote_age_s'] == pytest.approx(100, abs=3)
         assert stc['chain_quote_feed'] is None       # the chain call names none
         assert stc['quote_reused_from_rung'] is None
         assert stc['intrinsic_at_placement'] == 1.90  # 376.90 - 375
-        assert stc['limit_minus_intrinsic'] == 9.00
+        assert stc['limit_minus_intrinsic'] == 8.90
+        # PR-2's ladder fields (DD-3).
+        assert stc['rung_kind'] == 'primary' and stc['escalation_index'] == 0
+        assert stc['basis_bid'] == 10.90 and stc['stc_quote_source'] == 'fresh'
+        assert stc['pre_btc_bid'] == 10.90
+        assert stc['pre_btc_quote_source'] == 'execution'
+        assert stc['primary_limit'] == 10.80 and stc['limit_formula'] == 'base'
+        assert 'prior_rung_limit' not in stc       # the first rung has no prior
         # The roll key, on every STO row (T-MEDIUM-4).
         btc = _first(log, 'call_roll_btc_placed')
         assert stc['roll_id'] == btc['roll_id']
@@ -2299,16 +2599,21 @@ class TestQuoteFieldsOnRollEvents:
         assert rung2['quote_bid'] == 10.90
         assert rung2['limit_price'] == 8.35          # btc fill + $0.00 floor
         assert rung2['limit_vs_quote'] == 2.55       # 10.90 - 8.35
+        assert rung2['rung_kind'] == 'floor' and rung2['limit_formula'] is None
+        assert rung2['prior_rung_limit'] == 10.80
+        assert rung2['prior_rung_disposition'] == 'timeout_canceled'
         # Rung 3 is the C380 fallback, priced from its own per-rung read.
-        assert rung3['quote_bid'] == 8.50
+        assert rung3['quote_bid'] == 8.80
+        assert rung3['limit_price'] == 8.70          # 8.80 - the buffer
         assert rung3['intrinsic_at_placement'] == 0.0  # OTM: 376.90 < 380
-        assert rung3['limit_minus_intrinsic'] == 8.50
+        assert rung3['limit_minus_intrinsic'] == 8.70
         assert rung3['quote_age_s'] == pytest.approx(40, abs=3)
+        assert rung3['rung_kind'] == 'fallback'
         rows = {r['rung']: r for r in _all(log, 'call_roll_leg_settled')
                 if r['leg'] == 'stc'}
         # Rung 2 reuses rung 1's re-read too; rung 3 has its own.
         assert rows[2]['quote_reread_bid'] == rows[1]['quote_reread_bid'] == 10.92
-        assert rows[3]['quote_reread_bid'] == 8.52
+        assert rows[3]['quote_reread_bid'] == 8.82
         assert rows[3]['quote_reread_delta'] == -0.02
 
     def test_the_dry_run_carries_both_legs_quote_sets(
@@ -2319,19 +2624,24 @@ class TestQuoteFieldsOnRollEvents:
             roller.execute_roll(opp)
         dry = _first(log, 'call_roll_dry_run')
 
-        assert dry['would_be_btc_limit'] == 8.40
+        # FC-120 PR-2: the dry run returns AFTER execute-time pricing, so it
+        # carries the limits that would be placed and the quotes behind them.
+        assert dry['would_be_btc_limit'] == 8.50
         assert dry['quote_ask'] == 8.40
         assert dry['quote_age_s'] == pytest.approx(40, abs=3)
         assert dry['limit_on_tick'] is True and dry['stock_bid'] == 376.90
-        # The STO candidate's set, from the chain row it was screened on.
+        assert dry['btc_quote_source'] == 'execution'
+        # The STO rung-1 set: the execute-time read of the new symbol.
         assert dry['stc_quote_bid'] == 10.90 and dry['stc_quote_ask'] == 11.10
-        assert dry['stc_limit_vs_quote'] == 0.0
-        assert dry['stc_quote_age_s'] == pytest.approx(100, abs=3)
-        assert dry['stc_quote_feed'] is None
+        assert dry['stc_limit_vs_quote'] == 0.10
+        assert dry['stc_quote_age_s'] == pytest.approx(40, abs=3)
+        assert dry['stc_quote_feed'] == 'indicative'
+        assert dry['stc_quote_source'] == 'execution'
         assert dry['stc_intrinsic_at_placement'] == 1.90
         instrumented.place_option_order.assert_not_called()
-        # The dry run reads nothing beyond evaluation's pricing reads.
-        assert instrumented.get_option_quote.call_count == 1
+        # Evaluation's read plus the execute-time old + new option reads;
+        # nothing diagnostic (no order exists to diagnose).
+        assert instrumented.get_option_quote.call_count == 3
 
     @pytest.mark.parametrize('limit,underlying,expected', [
         (6.94, 'GOOGL', False),   # off the nickel grid above $3.00
@@ -2439,7 +2749,8 @@ class TestTheEvaluationQuoteSetOnSkips:
         _opp, log = self._eval(roller, instrumented)
         skip = _first(log, 'call_roll_skipped')
         assert skip['skip_reason'] == 'no_suitable_replacement'
-        assert skip['quote_ask'] == 8.40 and skip['limit_minus_intrinsic'] == 1.50
+        # The screening limit is buffered (FC-120 PR-2): 8.50 - 6.90.
+        assert skip['quote_ask'] == 8.40 and skip['limit_minus_intrinsic'] == 1.60
 
     def test_earnings_unknown_carries_it(self, roller, instrumented,
                                          mock_earnings):
@@ -2506,16 +2817,26 @@ class TestMissingQuoteDataLogsNone:
             kw = _first(log, event_type)
             assert kw['quote_reread_delta'] is None, event_type
             assert kw['quote_reread_ask'] is None, event_type
-        # The limits are the first read's, exactly as without the re-read.
+        # The limits are the priced reads', exactly as without the re-read
+        # (FC-120 PR-2's buffered ones).
         assert [c.kwargs['limit_price'] for c in
-                instrumented.place_option_order.call_args_list] == [8.40, 10.90]
+                instrumented.place_option_order.call_args_list] == [8.50, 10.80]
 
 
 class TestTheTimeoutPathReadsAfterTheTerminal:
     """T-3 under ruling A. The terminal goes out first with the fields in
     hand; one option quote and one stock quote follow it; their fields ride on
     the leg_settled row ONLY. *Catches:* a refresh before the settle or before
-    the terminal; ``polls`` overwritten by the settle's re-entry."""
+    the terminal; ``polls`` overwritten by the settle's re-entry.
+
+    FC-120 PR-2: this is the timeout of the LAST attempt — the only one that
+    reads its own post-settle option quote — so re-pricing is off here (one
+    attempt). A re-priced attempt's cancel quote is the re-price read (T-10(k)).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _one_attempt(self, roller):
+        roller.config.rolling_btc_reprice_attempts = 0
 
     def test_call_and_event_order(self, roller, instrumented):
         result, _log, timeline = _drive_timeline(roller, instrumented,
@@ -2525,7 +2846,7 @@ class TestTheTimeoutPathReadsAfterTheTerminal:
                 if e[0] != 'log' or e[1] in ('call_roll_btc_timeout_canceled',
                                              'call_roll_leg_settled')]
         assert tail[-9:] == [
-            ('place', (OLD_SYMBOL, 'buy', 8.4)),
+            ('place', (OLD_SYMBOL, 'buy', 8.5)),
             ('diag', OLD_SYMBOL),                   # the re-read, AFTER placing
             ('get_order', 'btc-1'),                 # the poll
             ('cancel', 'btc-1'),
@@ -2543,11 +2864,15 @@ class TestTheTimeoutPathReadsAfterTheTerminal:
         _result, log = _drive(roller, instrumented, BTC_TIMEOUT)
         ev = _first(log, 'call_roll_btc_timeout_canceled')
         assert ev['disposition'] == 'timeout_canceled'
-        assert ev['pricing_mode'] == 'base' and ev['limit_price'] == 7.38
+        # FC-120 PR-2: 7.38 + 0.10 = 7.48, snapped UP to the nickel grid.
+        assert ev['pricing_mode'] == 'base' and ev['limit_price'] == 7.50
         assert ev['order_status'] == 'canceled'
         assert ev['order_submitted_at'] == '2026-09-28T19:30:00+00:00'
         assert isinstance(ev['leg_elapsed_s'], float)
-        assert ev['limit_on_tick'] is False   # 7.38 is off the nickel grid
+        # PR-1 logged this limit off-grid (7.38); PR-2's are on tick by
+        # construction — the off-grid case is in TestQuoteFieldsOnRollEvents.
+        assert ev['limit_on_tick'] is True
+        assert ev['attempts'] == 1
         # Ruling A: no post-settle field on the terminal itself.
         assert 'quote_drift' not in ev and 'cancel_quote_ask' not in ev
 
@@ -2607,8 +2932,9 @@ LEG_SCENARIOS = {
         FULL_FILL,
         [('btc', None, 'filled'), ('stc', 1, 'filled')],
         'call_roll_completed'),
+    # FC-120 PR-2: two re-prices, so three placed attempts — three rows.
     'btc_timeout': (
-        BTC_TIMEOUT, [('btc', None, 'timeout_canceled')],
+        BTC_TIMEOUT, [('btc', None, 'timeout_canceled')] * 3,
         'call_roll_btc_timeout_canceled'),
     'rung1_timeout_then_rung2_fill': (
         {'btc-1': BTC_FILLED, 'sto-1': _times_out('sto-1'),
@@ -2691,20 +3017,22 @@ class TestOneSettledRowPerPlacedOrder:
         _result, log = _drive(roller, instrumented, FULL_FILL)
         btc, stc = _all(log, 'call_roll_leg_settled')
 
-        assert btc['fill_vs_limit'] == 0.05      # limit 8.40 - fill 8.35
+        # FC-120 PR-2: the limits sit a buffer through the quote, so a fill at
+        # the same NBBO price reads 0.10 further through them.
+        assert btc['fill_vs_limit'] == 0.15      # limit 8.50 - fill 8.35
         assert btc['fill_price_source'] == 'broker'
         assert btc['fill_latency_s'] == 5.0      # filled_at - submitted_at
         assert btc['filled_price'] == 8.35 and btc['filled_qty'] == 1
         assert btc['polls'] == 1 and btc['settle_polls'] is None
         assert btc['order_status'] == 'filled'
-        assert stc['fill_vs_limit'] == 0.05      # fill 10.95 - limit 10.90
+        assert stc['fill_vs_limit'] == 0.15      # fill 10.95 - limit 10.80
         assert stc['fill_latency_s'] == 4.0
         assert stc['order_id'] == 'sto-1' and btc['order_id'] == 'btc-1'
         filled = _first(log, 'call_roll_btc_filled')
-        assert filled['limit_price'] == 8.40 and filled['fill_vs_limit'] == 0.05
+        assert filled['limit_price'] == 8.50 and filled['fill_vs_limit'] == 0.15
         assert filled['fill_latency_s'] == 5.0 and filled['polls'] == 1
         stc_filled = _first(log, 'call_roll_stc_filled')
-        assert stc_filled['rung'] == 1 and stc_filled['fill_vs_limit'] == 0.05
+        assert stc_filled['rung'] == 1 and stc_filled['fill_vs_limit'] == 0.15
 
     def test_an_absent_fill_price_is_a_fallback_not_a_measurement(
             self, roller, instrumented):
@@ -2726,10 +3054,14 @@ class TestOneSettledRowPerPlacedOrder:
         _result, log = _drive(roller, instrumented, script)
         filled = _first(log, 'call_roll_stc_filled')
         assert filled['rung'] == 2
-        assert filled['prior_rung_miss_offset'] == 2.50   # 10.90 - 8.40
+        assert filled['prior_rung_miss_offset'] == 2.40   # 10.80 - 8.40
+        # FC-120 PR-2: the DD-1 Rule B measurement, and the prior's disposition.
+        assert filled['primary_miss_offset'] == 2.40
+        assert filled['prior_rung_disposition'] == 'timeout_canceled'
         row = [r for r in _all(log, 'call_roll_leg_settled')
                if r.get('rung') == 2][0]
-        assert row['prior_rung_miss_offset'] == 2.50
+        assert row['prior_rung_miss_offset'] == 2.40
+        assert row['primary_miss_offset'] == 2.40
         rung1 = [r for r in _all(log, 'call_roll_leg_settled')
                  if r.get('rung') == 1][0]
         assert 'prior_rung_miss_offset' not in rung1
@@ -2746,8 +3078,9 @@ class TestOneSettledRowPerPlacedOrder:
         assert [(r['leg'], r['disposition'], r['order_id']) for r in rows] == [
             ('btc', 'rejected', None)]
         assert terminals(log) == ['call_roll_btc_rejected']
-        # Nothing was live, so nothing was re-read.
-        assert instrumented.get_option_quote.call_count == 2
+        # Nothing was live, so nothing was re-read: evaluation's read and the
+        # two execute-time pricing reads (FC-120 PR-2) only.
+        assert instrumented.get_option_quote.call_count == 3
 
 
 class TestStcLegFieldsKillTheSurvivingMutants:
@@ -2813,21 +3146,28 @@ def _order(symbol, side, limit):
             'limit_price': limit}
 
 
+#: FC-120 PR-2: every limit buffered 0.10 through its quote and tick-snapped.
+#: BTC 8.40 -> 8.50; rung 1 10.90 -> 10.80; the floor is the 8.35 BTC fill
+#: plus the fixture's $0.00 minimum (on tick already); C380 8.80 -> 8.70.
 _LADDER_3_ORDERS = [
-    _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90),
-    _order(C375['symbol'], 'sell', 8.35), _order(C380['symbol'], 'sell', 8.50)]
+    _order(OLD_SYMBOL, 'buy', 8.50), _order(C375['symbol'], 'sell', 10.80),
+    _order(C375['symbol'], 'sell', 8.35), _order(C380['symbol'], 'sell', 8.70)]
 
-#: scenario -> (old book, broker script, the order arguments main places)
+#: scenario -> (old book, broker script, the order arguments PR-2 places)
 GOLDEN_PLACEMENTS = {
     'full_fill': ((8.00, 8.40), FULL_FILL, [
-        _order(OLD_SYMBOL, 'buy', 8.40), _order(C375['symbol'], 'sell', 10.90)]),
+        _order(OLD_SYMBOL, 'buy', 8.50), _order(C375['symbol'], 'sell', 10.80)]),
     'ladder_to_rung_3': ((8.00, 8.40), LADDER_TO_RUNG_3, _LADDER_3_ORDERS),
     'ladder_exhausted': ((8.00, 8.40), LADDER_EXHAUSTED, _LADDER_3_ORDERS),
     'all_rungs_time_out': ((8.00, 8.40), ALL_RUNGS_TIME_OUT, _LADDER_3_ORDERS),
+    # Two re-prices after the roller's own zero-fill cancels: the ask (8.40)
+    # plus (n+1) x 0.10 — 8.50, 8.60, 8.70 (DD-4).
     'btc_timeout': ((8.00, 8.40), BTC_TIMEOUT, [
-        _order(OLD_SYMBOL, 'buy', 8.40)]),
-    # Extrinsic 7.10 - 7.00 = 0.10 <= 0.20: imminence prices both legs at
-    # mid +/- 0.05 — 7.15 and 11.00 - 0.05 = 10.95.
+        _order(OLD_SYMBOL, 'buy', 8.50), _order(OLD_SYMBOL, 'buy', 8.60),
+        _order(OLD_SYMBOL, 'buy', 8.70)]),
+    # Extrinsic 7.10 - 7.00 = 0.10 <= 0.20: imminence prices each leg's FIRST
+    # placement at mid +/- 0.05 (no buffer; the parity floor 6.91 does not
+    # bind) — 7.15 and 11.00 - 0.05 = 10.95, both already on tick.
     'imminence_full_fill': ((7.00, 7.20), FULL_FILL, [
         _order(OLD_SYMBOL, 'buy', 7.15), _order(C375['symbol'], 'sell', 10.95)]),
 }
@@ -2843,12 +3183,15 @@ def _diag_raises(_name, _args, _real):
 
 
 class TestNoBehaviourChange:
-    """FC-120 PR-1 is instrumentation with NO behaviour change: same order
-    arguments, same result dict, same terminals in the same order — when the
-    instrumentation reads are clean, return garbage, raise, or never return.
+    """FC-120's instrumentation changes NOTHING: same order arguments, same
+    result dict, same terminals in the same order — when the instrumentation
+    reads are clean, return garbage, raise, or never return. (PR-1 pinned this
+    against main; PR-2 pins it against its own goldens, whose limits are the
+    buffered, snapped ones.)
 
-    Diagnostic reads are told apart by THREAD (``_Timeline``): only reads made
-    off the roller's own thread are poisoned, so every pricing read is real.
+    Diagnostic reads are told apart by THREAD NAME (``_Timeline``): only
+    ``fc120-diag-read`` workers are poisoned, so every pricing read — main
+    thread or a PR-2 bounded ``fc120-pricing-read`` worker — is real.
     """
 
     def _clean(self, roller, instrumented, name):
@@ -2913,13 +3256,21 @@ class TestNoBehaviourChange:
         assert terminals(log) == clean_terminals
         assert _placements(instrumented) == golden
         assert wall < 5.0, wall
-        # The rows still exist, with the unreadable fields null.
+        # The rows still exist, with the unreadable fields null. (FC-120
+        # PR-2: a re-priced BTC attempt's cancel quote IS the re-price's
+        # bounded PRICING read — one read, two uses — which this test does
+        # not hang; only the final attempt reads its own, and that one hung.)
         rows = _all(log, 'call_roll_leg_settled')
         assert len(rows) == len(golden)
-        assert all(r.get('cancel_quote_ask') is None for r in rows)
+        own_read = [r for r in rows
+                    if not (r.get('leg') == 'btc' and r.get('attempt', 0) < 2
+                            and name == 'btc_timeout')]
+        assert all(r.get('cancel_quote_ask') is None for r in own_read)
         if name == 'btc_timeout':
             crumb = _first(log, 'call_roll_quote_refresh_failed')
             assert crumb['reason'] == 'timeout'
+            prefetched = [r for r in rows if r.get('attempt', 0) < 2]
+            assert all(r.get('cancel_quote_ask') == 8.40 for r in prefetched)
 
 
 _JUNK = [10 ** 400, 1e308, -1e308, float('nan'), float('inf'),
