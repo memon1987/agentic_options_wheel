@@ -1,8 +1,10 @@
 """Alpaca API client wrapper for options wheel strategy."""
 
+from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta
 import hashlib
+import threading
 import time
 import pandas as pd
 import structlog
@@ -57,12 +59,19 @@ class CircuitBreaker:
         half_open - After reset_timeout, one test request is allowed through.
     """
 
-    def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60):
+    def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60,
+                 name: Optional[str] = None):
         self.failure_threshold = failure_threshold
         self.reset_timeout = reset_timeout
         self.failure_count = 0
         self.last_failure_time: Optional[float] = None
         self.state = 'closed'  # closed=normal, open=failing, half_open=testing
+        # FC-120 PR-2: a named breaker says so on its own log rows; the
+        # unnamed order-plane breaker logs exactly what it always did.
+        self.name = name
+
+    def _named(self) -> Dict[str, Any]:
+        return {'breaker': self.name} if self.name else {}
 
     def record_failure(self) -> None:
         self.failure_count += 1
@@ -75,6 +84,7 @@ class CircuitBreaker:
                     event_type="circuit_breaker_opened",
                     failure_count=self.failure_count,
                     threshold=self.failure_threshold,
+                    **self._named(),
                 )
             self.state = 'open'
 
@@ -85,6 +95,7 @@ class CircuitBreaker:
                 event_category="system",
                 event_type="circuit_breaker_closed",
                 previous_state=self.state,
+                **self._named(),
             )
         self.failure_count = 0
         self.state = 'closed'
@@ -98,6 +109,7 @@ class CircuitBreaker:
                 "Circuit breaker half-open — allowing test request",
                 event_category="system",
                 event_type="circuit_breaker_half_open",
+                **self._named(),
             )
             self.state = 'half_open'
             return True
@@ -111,6 +123,56 @@ class CircuitBreakerOpen(Exception):
 
 # Module-level circuit breaker shared across all Alpaca API calls
 _circuit_breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
+
+
+# --------------------------------------------------------------------------- #
+# FC-120 PR-2 (R6-J) — the QUIET DATA PLANE.
+#
+# The roller's bounded quote reads (instrumentation AND pricing) run in daemon
+# worker threads (`call_roller._bounded_read`), and each worker enters
+# `quiet_data_plane()` before it calls the client. Inside it, `api_retry`:
+#
+#   * gates and records on `_data_plane_breaker`, never on `_circuit_breaker`
+#     — so a quote-endpoint outage can open the data-plane breaker and leave
+#     `get_order_by_id` (the settle's read) unblocked;
+#   * logs `circuit_breaker_blocked` / `api_retry_exhausted` at DEBUG with
+#     `event_category="data"` and `quiet=True` — never an error-category row,
+#     because a missing diagnostic is not an error and must not count as one.
+#
+# The flag is THREAD-LOCAL: main-thread calls (the evaluation's reads,
+# `place_option_order`, `get_order_by_id`, `cancel_order`) are unaffected and
+# behave byte-for-byte as before. A quiet call counts a failure only when its
+# retries were exhausted on a RETRYABLE error (an outage), not on a request the
+# broker refused outright.
+#
+# Note on the order plane, recorded rather than changed: tenacity's
+# `reraise=True` re-raises the last attempt's exception, never `RetryError`,
+# so `api_retry`'s `except RetryError` branch is unreachable and the
+# order-plane breaker has never recorded a failure (nor logged
+# `api_retry_exhausted`). FC-120 PR-2 leaves the order plane exactly as it was
+# (DD-5); making that breaker live is a separate decision with its own review.
+# --------------------------------------------------------------------------- #
+_data_plane = threading.local()
+
+#: The quiet data plane's own breaker — same thresholds as the order plane's.
+_data_plane_breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60,
+                                     name='data_plane')
+
+
+@contextmanager
+def quiet_data_plane():
+    """Run the enclosed client calls on the quiet data plane (this thread only)."""
+    prior = getattr(_data_plane, 'quiet', False)
+    _data_plane.quiet = True
+    try:
+        yield
+    finally:
+        _data_plane.quiet = prior
+
+
+def in_quiet_data_plane() -> bool:
+    """True inside ``quiet_data_plane()`` on THIS thread."""
+    return bool(getattr(_data_plane, 'quiet', False))
 
 
 def is_rate_limit_error(exception: Exception) -> bool:
@@ -159,12 +221,25 @@ def api_retry(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # FC-120 PR-2 (R6-J): a call made inside `quiet_data_plane()` on this
+        # thread gates and records on the data-plane breaker and never logs an
+        # error-category row. Every other call is exactly as before.
+        quiet = in_quiet_data_plane()
+        breaker = _data_plane_breaker if quiet else _circuit_breaker
+
         # Check circuit breaker before attempting the call
-        if not _circuit_breaker.can_execute():
-            logger.error("API call blocked by circuit breaker",
-                        event_category="error",
-                        event_type="circuit_breaker_blocked",
-                        function=func.__name__)
+        if not breaker.can_execute():
+            if quiet:
+                logger.debug("API call blocked by the data-plane circuit breaker",
+                             event_category="data",
+                             event_type="circuit_breaker_blocked",
+                             function=func.__name__, quiet=True,
+                             breaker='data_plane')
+            else:
+                logger.error("API call blocked by circuit breaker",
+                            event_category="error",
+                            event_type="circuit_breaker_blocked",
+                            function=func.__name__)
             raise CircuitBreakerOpen(
                 f"Circuit breaker is open — API call to {func.__name__} blocked"
             )
@@ -186,19 +261,55 @@ def api_retry(func):
 
         try:
             result = inner()
-            _circuit_breaker.record_success()
+            breaker.record_success()
             return result
         except RetryError as e:
-            _circuit_breaker.record_failure()
-            # Log final failure after all retries exhausted
-            logger.error("API call failed after all retries",
-                        event_category="error",
-                        event_type="api_retry_exhausted",
-                        function=func.__name__,
-                        error=str(e.last_attempt.exception()) if e.last_attempt else str(e))
+            # Unreachable while `reraise=True` (see the data-plane note above);
+            # kept as it was for the order plane.
+            breaker.record_failure()
+            if quiet:
+                logger.debug("API call failed after all retries",
+                             event_category="data",
+                             event_type="api_retry_exhausted",
+                             function=func.__name__, quiet=True,
+                             breaker='data_plane',
+                             error=str(e.last_attempt.exception()) if e.last_attempt else str(e))
+            else:
+                # Log final failure after all retries exhausted
+                logger.error("API call failed after all retries",
+                            event_category="error",
+                            event_type="api_retry_exhausted",
+                            function=func.__name__,
+                            error=str(e.last_attempt.exception()) if e.last_attempt else str(e))
             raise e.last_attempt.exception() if e.last_attempt else e
+        except Exception as exc:
+            # The path every exhausted retry actually takes (`reraise=True`
+            # re-raises the last attempt's exception). The order plane re-raises
+            # untouched, exactly as before; the quiet data plane counts an
+            # exhausted RETRYABLE failure on its own breaker, at debug.
+            if quiet and _is_retryable_exception(exc):
+                _data_plane_breaker.record_failure()
+                logger.debug("API call failed after all retries",
+                             event_category="data",
+                             event_type="api_retry_exhausted",
+                             function=func.__name__, quiet=True,
+                             breaker='data_plane', error=str(exc))
+            raise
 
     return wrapper
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    """The same predicate ``api_retry``'s ``@retry`` uses: True means the call
+    was retried to exhaustion (an outage), not refused outright."""
+    if isinstance(exc, (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        ConnectionError, TimeoutError)):
+        return True
+    try:
+        return is_retryable_error(exc)
+    except Exception:
+        return False
 
 
 class AlpacaClient:
@@ -371,11 +482,21 @@ class AlpacaClient:
                 'timestamp': quote.timestamp
             }
         except Exception as e:
-            logger.error("Failed to get stock quote",
-                        event_category="error",
-                        event_type="stock_quote_error",
-                        symbol=symbol,
-                        error=str(e))
+            if in_quiet_data_plane():
+                # FC-120 PR-2 (R6-J): a bounded roller read (diagnostic or
+                # pricing) has a stated fallback; its failure is data, not an
+                # error, and must not count in the error views.
+                logger.debug("Failed to get stock quote (quiet data plane)",
+                             event_category="data",
+                             event_type="stock_quote_failed",
+                             symbol=symbol, quiet=True,
+                             error=str(e))
+            else:
+                logger.error("Failed to get stock quote",
+                            event_category="error",
+                            event_type="stock_quote_error",
+                            symbol=symbol,
+                            error=str(e))
             raise
 
     def get_option_quote(self, option_symbol: str) -> Dict[str, Any]:
