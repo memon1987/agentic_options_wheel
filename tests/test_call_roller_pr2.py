@@ -484,6 +484,23 @@ class TestBtcReprice:
         assert ev['attempts'] == 1
         assert instrumented.place_option_order.call_count == 1
 
+    def test_r_a_settle_that_returns_expired_is_never_repriced(self, roller,
+                                                             instrumented):
+        """F2 (SRE MEDIUM-2): our cancel was sent, but the SETTLE read
+        ``expired`` (the DAY close landed first) — not our cancel landing — so
+        the leg is ``terminal_no_fill`` with no re-price and no re-price read.
+        *Mutation:* re-price on any zero-fill settle → a second BUY."""
+        script = {'btc-1': _timeout('btc-1', after='expired')}
+        result, log, _b = _scripted(roller, instrumented, script)
+        assert result['reason'] == 'btc_timeout_canceled'
+        ev = _first(log, 'call_roll_btc_timeout_canceled')
+        assert ev['disposition'] == 'terminal_no_fill' and ev['attempts'] == 1
+        assert 'call_roll_btc_repriced' not in event_types(log)
+        assert instrumented.place_option_order.call_count == 1
+        instrumented.cancel_order.assert_called_once_with('btc-1')
+        counts = instrumented.get_option_quote.side_effect.counts
+        assert counts[(_O, 'pricing')] == 2     # evaluation + execute time only
+
 
 # --------------------------------------------------------------------------- #
 # T-18 — execute-time pricing (the goldens are in tests/test_call_roller.py)
@@ -930,6 +947,29 @@ class TestStcLadder:
         assert 'call_roll_stc_unfilled' in event_types(log)
         counts = instrumented.get_option_quote.side_effect.counts
         assert counts[(_N, 'pricing')] == 2   # no escalation basis read
+
+    def test_l2_a_settle_that_returns_expired_goes_straight_to_the_floor(
+            self, roller, instrumented, rolling_config):
+        """F2 (SRE MEDIUM-2): with ``stc_escalation_rungs=2``, rung 1 times
+        out and the roller cancels it — but the SETTLE reads ``expired``, not
+        ``canceled``: our cancel did not land, so no escalation rung follows.
+        The next rung is the floor, with no basis read in between.
+        *Mutation:* allow escalation on any zero-fill settle → an
+        ``escalation`` rung at 10.70 and a third pricing read of the new
+        symbol."""
+        rolling_config.rolling_stc_escalation_rungs = 2
+        script = {'btc-1': BTC_FILL_835,
+                  'sto-1': _timeout('sto-1', after='expired'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.90)}}
+        result, log, _t = _ladder_run(roller, instrumented, script)
+        assert result['success'] is True
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 8.35)]
+        timed_out = _first(log, 'call_roll_stc_timeout_canceled')
+        assert timed_out['disposition'] == 'terminal_no_fill'
+        floor = _all(log, 'call_roll_stc_placed')[1]
+        assert floor['prior_rung_disposition'] == 'terminal_no_fill'
+        counts = instrumented.get_option_quote.side_effect.counts
+        assert counts[(_N, 'pricing')] == 2   # execute time + rung-1 fresh only
 
     def test_m_imminence_pads_rung_1_and_escalates_in_base_mode(
             self, roller, instrumented, rolling_config):
