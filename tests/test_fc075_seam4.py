@@ -488,6 +488,8 @@ class TestWheelConstructionValues:
 # T7 — repo-wide lint gate
 # --------------------------------------------------------------------------- #
 
+#: Intentionally empty since FC-121: its only entry (the retired screen's
+#: BigQuery writer) was deleted with the screen.
 T7_DATASET_DEFAULT_ALLOWLIST = set()
 
 T7_ROOTS = ("src", "deploy", "tools", "scripts")

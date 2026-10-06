@@ -5,21 +5,33 @@ service, the sweep CLI/Job and the battery all do — so a module deleted out fr
 under one of those imports fails nothing at import time and nothing at service
 start. It fails the first time that code path runs (a sim submit, a battery
 Saturday), and a test catches it only if some test happens to execute that exact
-path. FC-121 deleted two modules that ten such lazy sites in ``main.py`` and
-``deploy/sim_service.py`` imported from; this test is what makes a missed one
-fail here instead of in production.
+path. FC-121 deleted two modules that ten lazy import statements in ``main.py``
+and ``deploy/sim_service.py`` imported from; this test is what makes a missed
+one fail here instead of in production.
 
-How: every ``*.py`` under ``src/``, ``deploy/`` and ``tools/``, plus ``main.py``,
-is PARSED, never executed. Every ``import`` / ``from ... import ...`` node at
-any nesting depth (module level, function bodies, ``try`` blocks, class bodies)
-whose target is a ``src.*`` module — a relative import is resolved against the
-file's own package first — must name a module that imports, and every name it
-imports must exist on that module, as an attribute or as a submodule (which is
-how ``from pkg import mod`` resolves).
+Scanned: every ``*.py`` under ``src/``, ``deploy/``, ``tools/``, ``scripts/`` and
+``dashboard/backend/``, plus every Python file at the repo root (``main.py`` and
+the root scripts beside it). Each is PARSED, never executed. Every ``import`` /
+``from ... import ...`` statement at any depth — module level, function bodies,
+``try``/``except ImportError`` arms (the dashboard's repo-side imports are
+written that way), ``if TYPE_CHECKING:`` blocks, class bodies — whose target is
+a ``src.*`` module must name a module that imports, and every name it binds must
+exist on that module, as an attribute or as a submodule (which is how
+``from pkg import mod`` resolves). A relative import is resolved against the
+file's own package first.
 
-Not checked: tests (they import what they test and fail on their own), imports
-of anything outside ``src`` (stdlib and third-party are pip's concern), and
-imports spelled as strings (``importlib.import_module(...)``, ``patch(...)``).
+What it cannot see:
+
+- ``tests/``: tests import what they test and fail on their own.
+- Imports spelled as strings: ``importlib.import_module("src...")``,
+  ``patch("src...")``, ``monkeypatch.setattr("src...", ...)``.
+- Attribute access on a module object an import bound, e.g. ``cli.run_x()``
+  after ``import main as cli``, or ``evaluate.something`` after
+  ``from src.backtesting import evaluate``. Only the names an import
+  statement binds are checked, never what the code later reads off them.
+- A ``src`` name that appears only in a string annotation (a forward
+  reference) with no import statement behind it.
+- Anything outside ``src``: stdlib and third-party imports are pip's concern.
 """
 
 from __future__ import annotations
@@ -32,8 +44,7 @@ from typing import Dict, List, Optional, Tuple
 
 REPO = Path(__file__).resolve().parents[1]
 
-SCANNED_ROOTS = ("src", "deploy", "tools")
-SCANNED_FILES = ("main.py",)
+SCANNED_ROOTS = ("src", "deploy", "tools", "scripts", "dashboard/backend")
 
 #: ``{file: the one src module it may fail to resolve}`` — exactly two entries.
 #:
@@ -61,7 +72,10 @@ class SrcImport:
 
 
 def _scanned_files() -> List[Path]:
-    files = [REPO / name for name in SCANNED_FILES]
+    # Every Python file at the repo root (`main.py` and the root scripts) —
+    # globbed rather than listed, so a new root script is checked without
+    # anyone remembering to add it here.
+    files = sorted(REPO.glob("*.py"))
     for root in SCANNED_ROOTS:
         files.extend(sorted((REPO / root).rglob("*.py")))
     return [path for path in files if "__pycache__" not in path.parts]
@@ -179,7 +193,12 @@ class TestIntraRepoImportsResolve:
         nested_in = {imp.rel for imp in imports if imp.nested}
         assert "deploy/sim_service.py" in nested_in
         assert "main.py" in nested_in
+        # The dashboard's repo-side imports sit in a `try` arm with an
+        # `except ImportError` fallback for the image — still checked.
+        assert "dashboard/backend/services/sweeps.py" in nested_in
         assert any(imp.relative for imp in imports), (
             "no relative import was resolved; src/ uses them throughout")
         for root in SCANNED_ROOTS:
             assert any(imp.rel.startswith(f"{root}/") for imp in imports), root
+        root_scripts = {imp.rel for imp in imports if "/" not in imp.rel}
+        assert {"main.py", "test_execution.py"} <= root_scripts, root_scripts
