@@ -94,20 +94,21 @@ so a one-tick book prices **at the bid** and logs ``one_tick_book=True``.
 
 ## What is deliberately NOT priced here
 
-``CallRoller`` prices its sell-to-open **at the bid** (or mid - $0.05 when the
-roll is imminent) and is not routed through this module. That asymmetry is
-intentional: a defensive roll is credit-only and must actually execute in the
-same session as its buy-to-close leg, so it pays the spread to guarantee the
-fill. Opening writes have the opposite priority -- they can afford to rest.
-The roller's limits, and ``/monitor``'s ``ask x 0.95`` buy-to-close, are
-therefore **still un-snapped above $3.00** (paper-only today; its own FC).
+``CallRoller`` is not routed through ``sell_limit_price``: it prices its legs
+**marketable** -- ``ask + buffer`` on the buy-to-close, ``bid - buffer`` on the
+sell-to-open (or the imminence pad around mid) -- because a defensive roll is
+credit-only and must actually execute in the same session as its buy-to-close
+leg. Opening writes have the opposite priority -- they can afford to rest.
+Since FC-120 PR-2 the roller borrows ``tick_size`` and ``snap_limit`` for tick
+LEGALITY (snapping toward marketable on both legs); ``/monitor``'s
+``ask x 0.95`` buy-to-close is still un-snapped above $3.00 (FC-088).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Literal, NamedTuple, Optional, Tuple
 
 import structlog
 
@@ -218,6 +219,9 @@ def tick_size(price: Decimal, underlying: str = "") -> Decimal:
     Always-penny roots are $0.01 everywhere. Everything else -- verified
     penny-program roots and, with a warning, anything unrecognised -- is $0.01
     below $3.00 and $0.05 at and above.
+
+    Also the roller's tick lookup (FC-120): PR-1 logs ``limit_on_tick`` against
+    it, and PR-2 snaps every roll limit to it via ``snap_limit``.
     """
     if _root(underlying) in ALWAYS_PENNY_SYMBOLS:
         return _PENNY
@@ -423,9 +427,37 @@ def refresh_quote(alpaca: Any, option_symbol: str,
     )
 
 
+def snap_limit(price: Decimal, tick: Decimal,
+               direction: Literal["up", "down"]) -> Decimal:
+    """Ceiling (``"up"``) or floor (``"down"``) ``price`` to the ``tick`` grid.
+
+    The roller's tick-legality primitive (FC-120 PR-2, DD-3). Pure arithmetic:
+    no tick lookup, no warning, no float — ``Decimal`` in, ``Decimal`` out. The
+    caller decides the tick (``tick_size`` of the UNSNAPPED value, so the $3.00
+    boundary is decided once) and the direction: a buy-to-close snaps **up**
+    (a limit below the true ask does not fill), a sell-to-open snaps **down**
+    (a limit above the true bid does not fill) — both toward marketable.
+
+    Not ``round_to_tick``: that one rounds the ENTRY leg's sell limit **up**
+    (resting at mid, bounded by the ask) because an opening write can afford to
+    rest; a roll's legs must execute in one session. Each docstring names the
+    other so neither gets "fixed" into the other.
+    """
+    if tick <= 0:
+        raise ValueError(f"tick must be positive (got {tick})")
+    if direction not in ("up", "down"):
+        raise ValueError(f"direction must be 'up' or 'down' (got {direction!r})")
+    rounding = ROUND_CEILING if direction == "up" else ROUND_FLOOR
+    ticks = (price / tick).to_integral_value(rounding=rounding)
+    return (ticks * tick).quantize(_PENNY)
+
+
 def round_to_tick(value: Decimal, underlying: str = "",
                   not_above: Optional[Decimal] = None) -> Tuple[float, bool]:
     """Round a SELL limit to a legal increment. Returns ``(price, snapped)``.
+
+    For the ENTRY legs only. The roller's limits snap through ``snap_limit``
+    instead (toward marketable on both legs, FC-120 PR-2) — see that docstring.
 
     Always-penny roots round to the cent, half-up, at every price level.
     Everything else rounds to the cent below $3.00 and **UP** to the next $0.05

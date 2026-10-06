@@ -785,3 +785,65 @@ class TestHistoricalPutFormulaSweepFC072Confirm:
                 bid, ask = bid_c / 100.0, (bid_c + spread_c) / 100.0
                 priced = sell_limit_price(bid, ask, (bid + ask) / 2, 0.10, "NVDA")
                 assert priced.tick_snapped is False
+
+
+# --------------------------------------------------------------------------- #
+# FC-120 PR-2 T-6 — snap_limit, the roller's tick-legality primitive.
+# --------------------------------------------------------------------------- #
+class TestSnapLimitFC120:
+    """The roller snaps toward MARKETABLE on both legs: a buy-to-close UP (a
+    limit below the true ask does not fill), a sell-to-open DOWN. Decimal in,
+    Decimal out — a float round-trip is how ``Decimal(6.95) % 0.05`` reads
+    1.78e-16 instead of 0.
+
+    *Catches:* rounding a buy down; a float sneaking in; the tick decided from
+    the snapped value instead of the raw one (the $3.00 boundary decided twice).
+    """
+
+    NICKEL, PENNY = Decimal("0.05"), Decimal("0.01")
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("6.94", "6.95"), ("11.76", "11.80"), ("3.00", "3.00"), ("8.50", "8.50"),
+        ("8.501", "8.55")])
+    def test_up_on_the_nickel_grid(self, raw, expected):
+        out = limit_pricing.snap_limit(Decimal(raw), self.NICKEL, "up")
+        assert out == Decimal(expected)
+        assert isinstance(out, Decimal)
+
+    @pytest.mark.parametrize("raw, tick, expected", [
+        ("9.03", "0.05", "9.00"), ("7.33", "0.05", "7.30"),
+        ("2.982", "0.01", "2.98"), ("10.80", "0.05", "10.80")])
+    def test_down(self, raw, tick, expected):
+        out = limit_pricing.snap_limit(Decimal(raw), Decimal(tick), "down")
+        assert out == Decimal(expected)
+
+    def test_a_buy_is_never_rounded_down_and_a_sell_never_up(self):
+        for cents in range(300, 1200, 7):
+            raw = Decimal(cents) / 100 + Decimal("0.003")
+            up = limit_pricing.snap_limit(raw, self.NICKEL, "up")
+            down = limit_pricing.snap_limit(raw, self.NICKEL, "down")
+            assert down <= raw <= up
+            assert up - down == self.NICKEL
+            assert up % self.NICKEL == 0 and down % self.NICKEL == 0
+
+    def test_the_tick_is_decided_from_the_unsnapped_value(self):
+        """2.98 + 0.10 = 3.08 -> tick 0.05 (from 3.08, not 2.98) -> 3.10."""
+        raw = Decimal("2.98") + Decimal("0.10")
+        tick = tick_size(raw, "GOOGL")
+        assert tick == self.NICKEL
+        assert limit_pricing.snap_limit(raw, tick, "up") == Decimal("3.10")
+        # An always-penny root ticks a cent at every level.
+        assert limit_pricing.snap_limit(
+            raw, tick_size(raw, "IWM"), "up") == Decimal("3.08")
+
+    def test_the_result_is_on_tick_by_exact_decimal(self):
+        out = limit_pricing.snap_limit(Decimal("6.94"), self.NICKEL, "up")
+        assert out % self.NICKEL == 0
+        assert float(out) == 6.95
+
+    @pytest.mark.parametrize("tick, direction", [
+        (Decimal("0"), "up"), (Decimal("-0.05"), "down"),
+        (Decimal("0.05"), "sideways")])
+    def test_nonsense_is_refused_loudly(self, tick, direction):
+        with pytest.raises(ValueError):
+            limit_pricing.snap_limit(Decimal("1.00"), tick, direction)
