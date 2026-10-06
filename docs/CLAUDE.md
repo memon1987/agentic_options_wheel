@@ -52,7 +52,7 @@ cp .env.example .env
 ## Commands
 
 **CLI** (`main.py` — `--command` accepts exactly `scan`, `status`, `report`,
-`backtest`, `screen`, `sweep`, `backfill`, `battery`):
+`backtest`, `sweep`, `backfill`, `battery`):
 ```bash
 python main.py --command scan    # Scan for opportunities (same OptionsScanner as production)
 python main.py --command status  # Portfolio status  (PortfolioTracker — CLI only)
@@ -63,6 +63,11 @@ python main.py --command report  # Performance report (PortfolioTracker — CLI 
 engine decision path that placed real orders against the live account and had
 diverged from what production does. There is no CLI trade-execution entry point
 by design — trading happens through the Cloud Run endpoints below.
+
+`--command screen` **no longer exists either** (deleted by FC-121 PR-2, with
+`src/backtesting/screen.py` and its BigQuery writer). It was the retired monthly
+universe screen that wrote `options_wheel.backtest_runs`; the table is kept as
+history and nothing writes it.
 
 **Testing:**
 ```bash
@@ -792,7 +797,6 @@ code over historical Alpaca data and needs no cloud round-trip.
 
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01
-python main.py --command screen            # whole universe -> options_wheel.backtest_runs
 python main.py --command sweep --scenarios examples/scenarios_example.yaml \
     --symbols AAPL,AMZN,GOOGL,IWM,NVDA,UNH --start 2025-08-01 --end 2026-07-31
 python main.py --command sweep --scenarios s.yaml --persist   # -> scenario_sweeps/runs
@@ -963,8 +967,9 @@ scheduler needed no change. Four properties are worth knowing:
   dedup key is a content hash of `src/**`, so any merge touching the engine
   invalidates every stored result exactly once.
   **A merge that changes what a number MEANS must also bump `ENGINE_VERSION`**
-  in all three byte-pinned copies (`screen.py`, `scenarios/engine_identity.py`,
-  `dashboard/backend/services/sweeps.py`). The identity hash already
+  in both byte-pinned copies — `scenarios/engine_identity.py` (the engine-side
+  declaration since FC-121 deleted `screen.py`'s) and
+  `dashboard/backend/services/sweeps.py`. The identity hash already
   invalidates dedup; the version is what makes the boundary *queryable* after
   the fact — FC-048 did not bump, and the docs still call that boundary
   "timestamp-only" as the regret. The most recent one is
@@ -1129,7 +1134,8 @@ measurements — a `backtest_runs` row is not comparable across any of them:
   **put-only** engine (FC-048 — every backtest before that misrouted covered
   calls to the put seller).
 
-Screening results *are* persisted to BigQuery and are cloud-first like
+Screening results *were* persisted to BigQuery (`backtest_runs`, kept as
+history since the screen's retirement; FC-121) and are cloud-first like
 everything else. A local `--command backtest` run is a simulation, never
 evidence of what the bot did — for that, always go to
 `trades_from_activities`.
