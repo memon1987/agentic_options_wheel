@@ -1189,7 +1189,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
 
-**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 MERGED 2026-10-02 (#136, squash `4d6a611`), deployed and verified** — two adversarial reviews (both REQUEST_CHANGES on docs/rollout text; code verified safe), fix commit, confirmation pass CONFIRMED-CLEAN. Operator deleted Job `backtest-screen` and schedulers `monthly-performance-review` / `options-wheel-roll-friday` before the merge. **PR-1 rollout complete 2026-10-06 (R-1 policy re-apply verified; R-0 passed over the Fri 10-02 + Mon 10-05 sessions, 261 scheduler requests, zero non-2xx). Next: PR-2 (`src/**` removal, moves `engine_identity`) — ready to cut, not started.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
+**Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 MERGED 2026-10-02 (#136, squash `4d6a611`), deployed and verified** — two adversarial reviews (both REQUEST_CHANGES on docs/rollout text; code verified safe), fix commit, confirmation pass CONFIRMED-CLEAN. Operator deleted Job `backtest-screen` and schedulers `monthly-performance-review` / `options-wheel-roll-friday` before the merge. **PR-1 rollout complete 2026-10-06 (R-1 policy re-apply verified; R-0 passed over the Fri 10-02 + Mon 10-05 sessions, 261 scheduler requests, zero non-2xx). **PR-2 #137 open 2026-10-06, in review: A APPROVE, B REQUEST_CHANGES (T-4 test contract); fix round, then confirmation, then merge outside market hours.** Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
 **Scope:** shared (backtest engine + sim stack + deploy/monitoring config)
 **Size estimate:** M (two PRs: one outside `src/**`, one inside it — the second moves `engine_identity`)
 **Owner:** zeshan + Claude
@@ -1346,6 +1346,54 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Why deferred:** PR-1 is instrumentation-only and must not grow an analysis surface; the entitlement is an operator purchase not yet made.
 
 **Links:** FC-120 (`docs/plans/fc-120.md` §Amendments rev 4, rulings D/E), FC-072 (`quote_feed`), FC-113.
+
+---
+
+### FC-128: `sim-service` has no working post-deploy check — `smoke-test-sim`'s authenticated half has never run
+
+**Status:** Filed 2026-10-06 (FC-121 PR-2 review A; verified against three build logs)
+**Scope:** shared (deploy/CI)
+**Size estimate:** S (an IAM grant + minting the identity token in the build step, or a token-free in-container probe) — changes deployment config → plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `cloudbuild.yaml`'s `smoke-test-sim` step degrades to `SMOKE_SIM_HTTP_UNAVAILABLE` when it cannot mint an OIDC identity token for the sim service — and it never can: builds `3047f351` (10-02), `7bd41c12` and `435a1e6f` (10-06) all log it, and the sim-service request logs for 14 days hold only the unauthenticated `/health` 403 probes. So the step never exercises `/simulate`, nor the authenticated `/health` that calls `engine_identity()`. The degradation is documented (`docs/CLAUDE.md` §sim smoke: "a capability this project has never exercised") and a rollout step tells the operator to grep the build log for `PASS: /health` — but nothing fails when the marker is absent, and FC-121's plan credited the step as a safety net until a reviewer read the logs. Production effect: a sim-stack regression (e.g. a lazy import of a deleted module) surfaces at the first console submit or the next Saturday battery, not at deploy.
+
+**Fix direction:** grant the build SA `roles/run.invoker` on `sim-service` and mint the token in-step (`gcloud auth print-identity-token --audiences=<url>` works for the compute SA via the metadata server), or run the probe inside the freshly built container (`python -c "from deploy.sim_service import …"` + an in-process `/health` call) so no token is needed; either way the step must FAIL, not degrade, when the authenticated half cannot run. Add the engine_identity assertion (`/health` identity == `compute-engine-identity` step output).
+
+**Links:** FC-121 (`docs/plans/fc-121.md` §Rollout R-3), FC-096 Phase B (the step's origin), FC-084 (build chain), `docs/CLAUDE.md` §sim smoke.
+
+---
+
+### FC-129: `engine_identity` hashes comment bytes, and `ENGINE_VERSION` is still byte-pinned in two places
+
+**Status:** Filed 2026-10-06 (FC-121 PR-2 reviews A + B, plan critiques)
+**Scope:** shared (backtest engine identity; dashboard image)
+**Size estimate:** S–M (digest change = a deliberate one-time invalidation; dashboard copy = a Dockerfile `COPY` + test deletions)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem (two related):** (1) `engine_identity` is `sha256` over the raw bytes of every file under `src/` plus `requirements.txt` (`scenarios/engine_identity.py`). Correct for data files and code, but it also moves on a comment or docstring edit — so FC-121 PR-2 had to bundle every `src/` comment fix into its one unavoidable identity move, and any later `src/` doc sweep costs a cold Saturday battery and a dedup miss on every stored sweep. (2) `ENGINE_VERSION` is declared in `scenarios/engine_identity.py` and duplicated byte-for-byte in `dashboard/backend/services/sweeps.py` because "the dashboard image does not ship the engine" — yet `engine_identity.py` is stdlib-only by design and `dashboard/Dockerfile` already flat-copies two stdlib-only modules from the same package; a third `COPY` would single-source it and delete the byte-pin tests and the "bump in all N copies" instruction that FC-120's plan just got wrong.
+
+**Fix direction:** (1) a `tokenize`-stripped digest for `*.py` (comments and docstrings removed; all non-`.py` files still byte-hashed), versioned via `DIGEST_SCHEME` so the switch is one deliberate invalidation; (2) flat-copy `engine_identity.py` into the dashboard image and import `ENGINE_VERSION` from it. Evaluate (1) carefully: a docstring that is read at runtime (none known) would be invisible to the hash.
+
+**Links:** FC-096 Phase B (dedup re-key), FC-121 (`docs/plans/fc-121.md` DD-2 and §Execution), FC-120 (plan rev 6's "every byte-pinned copy" wording), `docs/bigquery/scenario_runs.md` §`engine_identity`.
+
+---
+
+### FC-130: the sweep/battery path has no run-level "lake degraded" warning — FC-121 deleted the only emitter
+
+**Status:** Filed 2026-10-06 (FC-121 PR-2 review A, plan critique of DD-4)
+**Scope:** shared (backtest data layer; monitoring)
+**Size estimate:** S (~15 lines + one alert policy)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the retired screen's `_log_lake_run_summary` was the only code that emitted `chain_lake_run_summary` / `chain_lake_degraded` (a WARNING when the lake was disabled, errored, or refused/gapped a merge). FC-121 PR-2 deleted it with the screen (DD-4: nothing consumed the events). What remains for the sweep and battery paths is `scenario_sweeps.lake_summary_json` — a column nobody reads — and `battery_degraded`, which keys on missing trend points, not lake health. A lake that silently errors on every call now produces a green Saturday that simply took longer.
+
+**Fix direction:** re-home the summary/warning beside `accumulate_lake_summary` in `data/chain_store.py`, call it from `main._finalise_sweep_status` (sweep Job, sim service, battery) and from the backfill's exit path, and add a log-match alert policy on `chain_lake_degraded` for `data-backfill` / `backtest-sweep` (same channel as the Job-failure policy; mind the 4000-byte runbook cap). Moves `engine_identity` (it is `src/`) — batch with another identity move.
+
+**Links:** FC-121 DD-4, FC-091 (the merge-refusal counters), FC-096 Phase A (backfill exit-code rule), FC-098 (Job logs carry no severity — the policy must match on `jsonPayload.event_type`, not severity).
 
 ---
 
