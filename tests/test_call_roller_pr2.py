@@ -545,3 +545,245 @@ class TestTheSuccessDict:
         for key in ('pricing_mode', 'old_option_symbol', 'new_option_symbol'):
             assert stamped[key] == result[key], key
 
+
+# --------------------------------------------------------------------------- #
+# T-17 — the STO ladder: the shipped shape (E = 0) and the escalation knob
+# --------------------------------------------------------------------------- #
+C385 = candidate(385.0, bid=8.60, ask=8.80, delta=0.30)
+_G = C385['symbol']
+
+
+def _ladder_run(roller, mock_alpaca, script, *, places=None, timeline=False):
+    """Evaluate + execute against a scripted broker. ``places`` overrides the
+    placement results in order (a dict refuses that placement)."""
+    opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+    assert opp is not None
+    broker = _Broker(script)
+    places = places or [accepted(oid) for oid in script]
+    tl = _Timeline() if timeline else None
+    if tl is not None:
+        tl.wrap(mock_alpaca)
+        mock_alpaca.place_option_order.side_effect = tl._recorder(
+            'place_option_order', 'place', Mock(side_effect=places))
+        mock_alpaca.get_order_by_id.side_effect = tl._recorder(
+            'get_order_by_id', 'get_order', broker.by_id)
+        mock_alpaca.cancel_order.side_effect = tl._recorder(
+            'cancel_order', 'cancel', broker.cancel)
+    else:
+        mock_alpaca.place_option_order.side_effect = places
+        mock_alpaca.get_order_by_id.side_effect = broker.by_id
+        mock_alpaca.cancel_order.side_effect = broker.cancel
+    with patch('src.strategy.call_roller.logger') as log:
+        if tl is not None:
+            tl.log_sink(log)
+        result = roller.execute_roll(opp)
+    return result, log, tl
+
+
+def _stos(log):
+    return [(p['rung'], p['rung_kind'], p['limit_price'])
+            for p in _all(log, 'call_roll_stc_placed')]
+
+
+BTC_FILL_835 = {'poll': _o('btc-1', 'filled', 1, 8.35)}
+
+
+class TestStcLadder:
+    """*Mutations:* escalate before the settle → (a'); escalate after a
+    primary-poll terminal → (l); price from the fresh bid alone → (b); place a
+    floor after a rung-1-at-floor → T-8; drop ``max(..., floor)`` → T-8."""
+
+    def test_a_shipped_e0_the_floor_follows_with_no_read_in_between(
+            self, roller, instrumented):
+        script = {'btc-1': BTC_FILL_835, 'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.90)}}
+        result, log, tl = _ladder_run(roller, instrumented, script,
+                                      timeline=True)
+        assert result['success'] is True
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 8.35)]
+        path = tl.order_path()
+        settle = path.index(('get_order', 'sto-1'), path.index(('cancel', 'sto-1')))
+        floor = path.index(('place', (_N, 'sell', 8.35)))
+        assert path[settle + 1:floor] == [], path[settle + 1:floor]
+
+    def test_a2_e2_one_basis_read_after_our_settle_then_rung_2(
+            self, roller, instrumented, rolling_config):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.90, 11.10), _q(10.70, 10.90)],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': BTC_FILL_835, 'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.80)}}
+        result, log, tl = _ladder_run(roller, instrumented, script,
+                                      timeline=True)
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'escalation', 10.50)]
+        path = tl.order_path()
+        settle = path.index(('get_order', 'sto-1'), path.index(('cancel', 'sto-1')))
+        assert path[settle + 1:settle + 3] == [
+            ('pricing_quote', _N), ('place', (_N, 'sell', 10.5))]
+        rung2 = _all(log, 'call_roll_stc_placed')[1]
+        assert rung2['escalation_index'] == 1
+        assert rung2['basis_bid'] == 10.70 and rung2['stc_quote_source'] == 'fresh'
+        assert rung2['prior_rung_disposition'] == 'timeout_canceled'
+        # The basis read doubled as rung 1's cancel quote: one read, two uses.
+        rung1_row = [r for r in _all(log, 'call_roll_leg_settled')
+                     if r.get('rung') == 1][0]
+        assert rung1_row['cancel_quote_bid'] == 10.70
+
+    @pytest.mark.parametrize("fresh, source, limit", [
+        (_q(11.20, 11.40), 'fresh', 10.70),     # (b) min keeps the basis
+        ({}, 'prior_basis', 10.70),              # (c) the read failed
+    ])
+    def test_b_c_the_escalation_basis(self, roller, instrumented,
+                                      rolling_config, fresh, source, limit):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.90, 11.10), fresh],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': BTC_FILL_835, 'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.80)}}
+        _r, log, _t = _ladder_run(roller, instrumented, script)
+        rung2 = _all(log, 'call_roll_stc_placed')[1]
+        assert rung2['limit_price'] == limit
+        assert rung2['stc_quote_source'] == source and rung2['basis_bid'] == 10.90
+
+    def test_d_an_escalation_at_or_below_the_floor_is_the_floor(
+            self, roller, instrumented, rolling_config):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.90, 11.10), _q(10.65, 10.85)],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 10.50)},
+                  'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.60)}}
+        _r, log, _t = _ladder_run(roller, instrumented, script)
+        # 10.65 - 0.20 = 10.45 <= floor 10.50: the floor, in rung 2's slot.
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 10.50)]
+
+    def test_f_a_synchronous_rejection_escalates_from_a_fresh_read(
+            self, roller, instrumented, rolling_config):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.90, 11.10), _q(10.80, 11.00)],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': BTC_FILL_835,
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.70)}}
+        places = [accepted('btc-1'), {'success': False, 'error_message': 'no'},
+                  accepted('sto-2')]
+        result, log, _t = _ladder_run(roller, instrumented, script,
+                                      places=places)
+        assert result['success'] is True
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'escalation', 10.60)]
+        filled = _first(log, 'call_roll_stc_filled')
+        assert filled['prior_rung_disposition'] == 'rejected'
+        assert filled['prior_rung_miss_offset'] is None    # a refusal, not a miss
+        assert filled['primary_miss_offset'] is None
+
+    def test_g_an_unknown_settle_stops_the_ladder_with_no_basis_read(
+            self, roller, instrumented, rolling_config):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        script = {'btc-1': BTC_FILL_835,
+                  'sto-1': _timeout('sto-1', after='pending_cancel')}
+        result, log, _t = _ladder_run(roller, instrumented, script)
+        assert result['reason'] == 'stc_disposition_unknown'
+        assert len(_all(log, 'call_roll_stc_placed')) == 1
+        counts = instrumented.get_option_quote.side_effect.counts
+        assert counts[(_N, 'pricing')] == 2   # execute-time + rung-1 fresh only
+
+    @pytest.fixture
+    def three_candidates(self, instrumented, mock_market_data):
+        """C375 primary; C380 (+$20) and C385 (+$0) as the two fallbacks."""
+        mock_market_data.find_suitable_calls.return_value = [
+            dict(C380), dict(C375), dict(C385)]
+        instrumented.get_option_quote.side_effect = _book(**{
+            _G: [_q(8.60, 8.80), _q(8.62, 8.82)]})
+        return instrumented
+
+    @pytest.mark.parametrize("escalations, expected", [
+        (2, [(1, 'primary', 0), (2, 'escalation', 1), (3, 'escalation', 2),
+             (4, 'floor', None), (5, 'fallback', None), (6, 'fallback', None)]),
+        (0, [(1, 'primary', 0), (2, 'floor', None), (3, 'fallback', None),
+             (4, 'fallback', None)]),
+    ])
+    def test_i_j_every_rung_by_position_and_the_floors_reused_quote(
+            self, roller, three_candidates, rolling_config, escalations,
+            expected):
+        rolling_config.rolling_stc_escalation_rungs = escalations
+        script = {'btc-1': BTC_FILL_835}
+        script.update({f'sto-{i}': _timeout(f'sto-{i}') for i in range(1, 7)})
+        result, log, _t = _ladder_run(roller, three_candidates, script)
+        assert result['reason'] == 'stc_failed_naked_exposure'
+        placed = _all(log, 'call_roll_stc_placed')
+        assert [(p['rung'], p['rung_kind'], p['escalation_index'])
+                for p in placed] == expected
+        floor = [p for p in placed if p['rung_kind'] == 'floor'][0]
+        assert floor['quote_reused_from_rung'] == (3 if escalations else 1)
+        assert floor['limit_price'] == 8.35
+        assert [p['primary_limit'] for p in placed] == [10.80] * len(placed)
+        assert all(p['limit_price'] >= 8.35 for p in placed)
+        rows = [r for r in _all(log, 'call_roll_leg_settled') if r['leg'] == 'stc']
+        assert len(rows) == len(placed)
+
+    def test_k_rung_1_is_the_lower_of_two_reads_aged_by_the_fresh_stamp(
+            self, roller, instrumented):
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.86, 11.06, age_s=2.0)],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': BTC_FILL_835,
+                  'sto-1': {'poll': _o('sto-1', 'filled', 1, 10.86)}}
+        _r, log, _t = _ladder_run(roller, instrumented, script)
+        rung1 = _first(log, 'call_roll_stc_placed')
+        assert rung1['basis_bid'] == 10.86 and rung1['pre_btc_bid'] == 10.90
+        assert rung1['limit_price'] == 10.75          # snap_down(10.76)
+        assert rung1['quote_age_s'] == pytest.approx(2, abs=2)
+
+    @pytest.mark.parametrize("status", ['expired', 'canceled'])
+    def test_l_a_primary_poll_terminal_goes_straight_to_the_floor(
+            self, roller, instrumented, rolling_config, status):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        script = {'btc-1': BTC_FILL_835, 'sto-1': {'poll': _o('sto-1', status)},
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.90)}}
+        _r, log, _t = _ladder_run(roller, instrumented, script)
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 8.35)]
+        assert 'call_roll_stc_unfilled' in event_types(log)
+        counts = instrumented.get_option_quote.side_effect.counts
+        assert counts[(_N, 'pricing')] == 2   # no escalation basis read
+
+    def test_m_imminence_pads_rung_1_and_escalates_in_base_mode(
+            self, roller, instrumented, rolling_config):
+        rolling_config.rolling_stc_escalation_rungs = 2
+        instrumented.get_option_quote.side_effect = _book(old=(7.00, 7.20))
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 7.15)},
+                  'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.90)}}
+        _r, log, _t = _ladder_run(roller, instrumented, script)
+        placed = _all(log, 'call_roll_stc_placed')
+        assert [(p['limit_price'], p['limit_formula']) for p in placed] == [
+            (10.95, 'imminence'), (10.70, 'base')]
+
+    @pytest.mark.parametrize("fresh_bid, kinds", [
+        # 10.65 - 0.20 = 10.45 <= floor 10.50: rung 2 IS the floor; refused,
+        # the ladder goes to the fallback — never a second floor.
+        (10.65, [(1, 'primary'), (2, 'floor'), (3, 'fallback')]),
+        # 10.90 - 0.20 = 10.70 > floor: an escalation; refused, the floor next.
+        (10.90, [(1, 'primary'), (2, 'escalation'), (3, 'floor')]),
+    ])
+    def test_n_the_floor_guard_against_a_refused_rung(
+            self, roller, instrumented, rolling_config, fresh_bid, kinds):
+        rolling_config.rolling_stc_escalation_rungs = 1
+        # C380 rich enough (10.70 buffered) to clear the 10.50 fill as a
+        # fallback, still behind C375 on credit.
+        instrumented.get_option_quote.side_effect = _book(c380=(10.80, 11.00), **{
+            _N: {'pricing': [_q(10.90, 11.10), _q(10.90, 11.10),
+                             _q(fresh_bid, fresh_bid + 0.20)],
+                 'diag': [_q(10.92, 11.12)]}})
+        script = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 10.50)},
+                  'sto-1': _timeout('sto-1'),
+                  'sto-3': {'poll': _o('sto-3', 'filled', 1, 10.90)}}
+        places = [accepted('btc-1'), accepted('sto-1'),
+                  {'success': False, 'error_message': 'price protection'},
+                  accepted('sto-3')]
+        _r, log, _t = _ladder_run(roller, instrumented, script, places=places)
+        assert [(r, k) for r, k, _l in _stos(log)] == kinds
+        assert sum(1 for _r2, k, _l in _stos(log) if k == 'floor') == 1
+
