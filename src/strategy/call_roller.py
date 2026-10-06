@@ -45,19 +45,21 @@ the sell-to-open at ``snap_down(bid - buffer)``, never below the floor
 ``snap_up(btc_fill + min_credit)``. Imminence keeps its pad on each leg's FIRST
 placement; every re-price is base-mode. The credit invariant is tested on the
 buffered, snapped limits at every site, so a filled roll still cannot net a
-debit. A buy-to-close is re-priced (up to ``btc_reprice_attempts`` times,
-inside ``btc_fill_timeout_seconds``) ONLY after the roller's own
-cancel-and-settle returned a terminal zero fill (``canceled``), and a re-price
-STRICTLY improves on the limit it replaces (``max(formula, prior + one tick)``
-— F1); a ``rejected`` is terminal, and a terminal zero fill from the PRIMARY
-poll (``expired``, or canceled by another actor) stays terminal — so a replay,
-whose adapter answers ``expired`` on the first read, never re-prices. The STO
-ladder is rung 1 (a ``stc_rung_timeout_seconds`` window),
-``stc_escalation_rungs`` escalation rungs (shipped 0; placed only after the
-roller's own zero-fill settle or a synchronous rejection), the floor, then the
-fallbacks. Every placement salts its ``client_order_id`` with ``roll_id`` + leg
-+ attempt/rung (F1), so no two orders of one roll can collide on Alpaca's
-idempotency key.
+debit. Before any order exists, both limits come from fresh execute-time reads;
+an unusable new-symbol read is ``credit_gone_at_execution``, as on main — the
+pre-BTC screen is never priced off the chain row (review finding F5). A
+buy-to-close is re-priced (up to ``btc_reprice_attempts`` times, inside
+``btc_fill_timeout_seconds``) ONLY after the roller's own cancel-and-settle
+returned a terminal zero fill (``canceled``), and a re-price STRICTLY improves
+on the limit it replaces (``max(formula, prior + one tick)`` — F1); a
+``rejected`` is terminal, and a terminal zero fill from the PRIMARY poll
+(``expired``, or canceled by another actor) stays terminal — so a replay, whose
+adapter answers ``expired`` on the first read, never re-prices. The STO ladder
+is rung 1 (a ``stc_rung_timeout_seconds`` window), ``stc_escalation_rungs``
+escalation rungs (shipped 0; placed only after the roller's own zero-fill
+settle or a synchronous rejection), the floor, then the fallbacks. Every
+placement salts its ``client_order_id`` with ``roll_id`` + leg + attempt/rung
+(F1), so no two orders of one roll can collide on Alpaca's idempotency key.
 
 Instrumentation never sits on the order path (rev-4 ruling A): the order-path
 broker calls are pricing reads, place, poll and cancel, in that structure. A
@@ -1082,10 +1084,17 @@ class CallRoller:
         (``btc_quote_source="execution"``), else from the evaluation-time quote
         (``"evaluation"``); when BOTH are unusable the position is a true skip,
         ``quote_unusable`` (no order exists). A failed or insane stock read
-        omits the parity term (``stock_quote_source="none"``). Rung 1's limit
-        comes from the fresh new-symbol quote, else from the chain row it was
-        screened on (``"chain"``). The invariant is re-run on the buffered pair
-        (``credit_gone_at_execution``). On success the S9 sites are replaced.
+        omits the parity term (``stock_quote_source="none"``). Rung 1's screen
+        limit comes from the fresh new-symbol quote ONLY: an empty or
+        unpriceable read is ``credit_gone_at_execution``, exactly as main
+        skipped on an empty re-check read — no order exists yet, so skipping
+        costs nothing, and the chain row is minutes old (review finding F5:
+        the pre-BTC screen is never priced off it). The invariant is re-run on
+        the buffered pair (``credit_gone_at_execution``; the skip names both
+        BTC limits and ``btc_quote_source``). On success the S9 sites are
+        replaced. (After the BTC has filled, rung 1 MAY fall back — to the
+        pre-BTC read — because the alternative is uncovered shares; see
+        ``_rungs``.)
 
         Returns False after emitting the terminal skip (its reason is on the
         roll context); True to proceed. Places nothing.
@@ -1118,8 +1127,9 @@ class CallRoller:
             return False
         btc_limit, btc_quote, btc_source, parity_applied = btc
 
+        # F5: the fresh read ONLY — never the chain row before any order.
         stc = self._price_stc_rung1(
-            [(new_quote, 'execution'), (_chain_row_quote(opportunity), 'chain')],
+            [(new_quote, 'execution')],
             formula=formula, buffer=buffer, underlying=underlying)
         stc_limit = stc[0] if stc else None
         if stc_limit is None or (stc_limit - btc_limit) + _CREDIT_EPSILON \
@@ -1130,6 +1140,7 @@ class CallRoller:
                 current_strike=opportunity['old_strike'],
                 target_strike=opportunity['new_strike'],
                 btc_limit=btc_limit, btc_limit_fresh=btc_limit,
+                btc_quote_source=btc_source,
                 evaluated_btc_limit=opportunity.get('btc_limit'),
                 evaluated_stc_limit=opportunity['stc_limit'],
                 recheck_stc_limit=stc_limit,
@@ -2056,9 +2067,10 @@ class CallRoller:
 
         FC-120 PR-2: the dry run returns AFTER execute-time pricing, so this is
         the quote ``stc_limit`` was actually priced from — the execute-time
-        read of the new symbol, or the chain row it was screened on when that
-        read failed (``stc_quote_source``). PR-1, which priced nothing at
-        execute time, used the chain row always."""
+        read of the new symbol (``stc_quote_source="execution"``); since F5 an
+        unusable read skips before the dry run is reached, so the chain-row
+        branch below is defensive only. PR-1, which priced nothing at execute
+        time, used the chain row always."""
         try:
             quote = opportunity.get('stc_quote_rung1')
             source = opportunity.get('stc_quote_rung1_source')
@@ -2779,11 +2791,14 @@ def _btc_pricing_fields(pricing: Any) -> Dict[str, Any]:
 
 def _rung1_basis(pre_quote: Any, pre_source: Any, fresh: Any,
                  formula: str) -> Dict[str, Any]:
-    """Rung 1's basis: ``min(pre_btc_bid, fresh_bid)`` in base mode; in
-    imminence, the lower of the two-sided mids. ``quote`` (whose stamp is the
-    row's ``quote_age_s``) is the fresh read when it was usable, else the
-    pre-BTC quote. ``source``: ``fresh`` / ``pre_btc`` / ``chain`` (the pre-BTC
-    quote was the screened chain row)."""
+    """Rung 1's basis, AFTER the BTC filled: ``min(pre_btc_bid, fresh_bid)``
+    in base mode; in imminence, the lower of the two-sided mids. ``quote``
+    (whose stamp is the row's ``quote_age_s``) is the fresh read when it was
+    usable, else the pre-BTC quote — the post-BTC fallback F5 keeps, because
+    the alternative is uncovered shares. ``source``: ``fresh`` / ``pre_btc`` /
+    ``chain`` (the pre-BTC quote was the screened chain row — unreachable
+    through ``execute_roll`` since F5, which never prices the pre-BTC screen
+    off the chain; kept so the label stays honest if it ever is)."""
     pre = pre_quote if isinstance(pre_quote, dict) else {}
     fr = fresh if isinstance(fresh, dict) and fresh else {}
     pre_label = 'chain' if pre_source == 'chain' else 'pre_btc'

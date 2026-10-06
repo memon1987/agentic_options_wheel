@@ -521,14 +521,59 @@ class TestExecuteTimePricing:
         assert (placed['limit_price'], placed['btc_quote_source']) == (
             8.50, 'evaluation')
 
-    def test_an_unusable_new_symbol_read_prices_rung_1_from_the_chain_row(
-            self, roller, instrumented):
+    @pytest.mark.parametrize("fresh", [
+        {},                                  # empty / failed read
+        {'bid': 0.0, 'ask': 0.0},            # a read with no bid
+        {'bid': 0.05, 'ask': 0.10},          # a bid the buffer prices to <= 0
+    ])
+    def test_an_unusable_new_symbol_read_skips_exactly_as_main_did(
+            self, roller, instrumented, fresh):
+        """F5 (review, trader MEDIUM-2): before any order exists, an empty or
+        unpriceable execute-time read of the NEW symbol is
+        ``credit_gone_at_execution`` — main's skip on an empty re-check read —
+        and the chain row (minutes old) never prices the pre-BTC screen.
+        *Mutation:* restore the chain-row fallback in
+        ``_price_legs_at_execution`` → a BTC is placed and this fails."""
         instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [fresh], 'diag': [{}]}})
+        result, log, _b = _scripted(roller, instrumented, self.FILLS)
+        assert result['reason'] == 'credit_gone_at_execution'
+        assert terminals(log) == ['call_roll_skipped']
+        instrumented.place_option_order.assert_not_called()
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['skip_reason'] == 'credit_gone_at_execution'
+        assert skip['recheck_stc_limit'] is None
+        # F7: the skip row says which read priced the BTC it compared.
+        assert skip['btc_quote_source'] == 'execution'
+        assert skip['btc_limit_fresh'] == 8.50
+
+    def test_both_btc_quotes_unusable_is_quote_unusable_even_with_no_new_read(
+            self, roller, instrumented):
+        """F5's other half: with BOTH BTC quotes unusable (R6-E) the skip is
+        ``quote_unusable`` — the BTC is priced first — whatever the new-symbol
+        read says."""
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), {}], 'diag': [{}]},
             _N: {'pricing': [{}], 'diag': [{}]}})
-        _r, log, _b = _scripted(roller, instrumented, self.FILLS)
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        opp['btc_quote'] = {'bid': 0.0, 'ask': 0.0}
+        result, log, _b = _scripted(roller, instrumented, self.FILLS, opp=opp)
+        assert result['reason'] == 'quote_unusable'
+        assert terminals(log) == ['call_roll_skipped']
+        instrumented.place_option_order.assert_not_called()
+
+    def test_after_the_btc_fill_rung_1_falls_back_to_the_pre_btc_read(
+            self, roller, instrumented):
+        """F5 keeps the post-BTC fallback: once the BTC has filled the shares
+        are uncovered, so a failed rung-1 fresh read prices rung 1 from the
+        pre-BTC read (``stc_quote_source="pre_btc"``) rather than skipping."""
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [_q(10.90, 11.10), {}], 'diag': [{}]}})
+        result, log, _b = _scripted(roller, instrumented, self.FILLS)
+        assert result['success'] is True
         rung1 = _first(log, 'call_roll_stc_placed')
-        assert rung1['limit_price'] == 10.80        # chain row bid 10.90 - 0.10
-        assert rung1['stc_quote_source'] == 'chain'
+        assert (rung1['limit_price'], rung1['stc_quote_source']) == (10.80, 'pre_btc')
+        assert rung1['pre_btc_quote_source'] == 'execution'
 
     def test_credit_gone_at_execution_names_both_btc_limits(self, roller,
                                                            instrumented):
@@ -543,6 +588,7 @@ class TestExecuteTimePricing:
         skip = _first(log, 'call_roll_skipped')
         assert skip['btc_limit_fresh'] == 9.50 and skip['evaluated_btc_limit'] == 8.50
         assert skip['recheck_stc_limit'] == 9.20
+        assert skip['btc_quote_source'] == 'execution'          # F7
         instrumented.place_option_order.assert_not_called()
 
 
@@ -1106,13 +1152,25 @@ class TestTheBudgetIsMeasured:
     bounded read awaited past its cap; a budget the ladder can exceed; a read
     added to the path without the budget following."""
 
-    def _measure(self, config, fake_clock, monkeypatch, *, reads_return):
+    def _measure(self, config, fake_clock, monkeypatch, *, reads='all'):
+        """Every bounded read hangs to EXACTLY its cap. ``reads`` says which
+        ones then return: ``"all"``; ``"execute_time"`` — only the three
+        execute-time pricing reads (old, stock, new), every later read is
+        abandoned, so the post-BTC fallbacks price (prior basis, the pre-BTC
+        read) and the fallback rungs drop out; ``"none"`` — no read ever
+        returns, which F5 makes a skip before any order exists."""
         from src.utils.config import Config  # noqa: F401 - type of `config`
+        pricing_reads = {'n': 0}
 
         def bounded(fn, *args, timeout=None, kind='diag'):
             fake_clock.advance(cr._DIAG_READ_TIMEOUT_SECONDS if timeout is None
                                else timeout)       # hangs to EXACTLY its cap
-            if not reads_return:
+            if kind == 'pricing':
+                pricing_reads['n'] += 1
+            returns = reads == 'all' or (
+                reads == 'execute_time' and kind == 'pricing'
+                and pricing_reads['n'] <= 3)
+            if not returns:
                 return None, 'timeout'
             value = fn(*args)
             return (value, 'ok') if value else (None, 'empty')
@@ -1132,24 +1190,43 @@ class TestTheBudgetIsMeasured:
         return fake_clock.now - start, result, broker
 
     @pytest.mark.parametrize("profile", ['settings.yaml', 'covered_call.yaml'])
-    @pytest.mark.parametrize("reads_return", [True, False])
-    def test_the_shipped_profiles(self, profile, reads_return, tmp_path,
+    @pytest.mark.parametrize("reads", ['all', 'execute_time'])
+    def test_the_shipped_profiles(self, profile, reads, tmp_path,
                                   fake_clock, monkeypatch, no_dry_run):
         from src.utils.config import Config
         config = Config(_profile(tmp_path, profile))
         budget = roll_budget.from_config(config)
         measured, result, broker = self._measure(
-            config, fake_clock, monkeypatch, reads_return=reads_return)
+            config, fake_clock, monkeypatch, reads=reads)
         assert result['reason'] == 'stc_failed_naked_exposure', result
         assert budget == 567
         assert measured <= budget, (profile, measured, budget)
         buys = [p for p in broker.placed if p[1] == 'buy']
         assert len(buys) == config.rolling_btc_reprice_attempts + 1
-        if reads_return:
+        sells = [p[0] for p in broker.placed if p[1] == 'sell']
+        if reads == 'all':
             # The full worst path: every rung placed, and the model is tight.
-            assert [p[0] for p in broker.placed if p[1] == 'sell'] == [
-                _N, _N, _F, _G]
+            assert sells == [_N, _N, _F, _G]
             assert measured >= budget - 20, (measured, budget)
+        else:
+            # Re-prices from the prior basis, rung 1 from the pre-BTC read,
+            # the floor; the fallback re-quotes hang, so the fallbacks drop.
+            assert sells == [_N, _N]
+
+    @pytest.mark.parametrize("profile", ['settings.yaml', 'covered_call.yaml'])
+    def test_no_read_ever_returning_skips_before_any_order(
+            self, profile, tmp_path, fake_clock, monkeypatch, no_dry_run):
+        """F5: no execute-time read of the new symbol → the pre-BTC screen is
+        not priced off the chain row; the position is
+        ``credit_gone_at_execution`` with no order placed, and the three
+        bounded pricing reads (3 x 3.0 s) are all it cost."""
+        from src.utils.config import Config
+        config = Config(_profile(tmp_path, profile))
+        measured, result, broker = self._measure(
+            config, fake_clock, monkeypatch, reads='none')
+        assert result['reason'] == 'credit_gone_at_execution', result
+        assert broker.placed == []
+        assert measured == 3 * roll_budget.PRICING_READ_TIMEOUT_SECONDS
 
     @pytest.mark.parametrize("escalations", [2, 3])
     def test_the_escalation_knob_on(self, escalations, tmp_path, fake_clock,
@@ -1159,7 +1236,7 @@ class TestTheBudgetIsMeasured:
                                  stc_escalation_rungs=escalations))
         budget = roll_budget.from_config(config)
         measured, result, broker = self._measure(
-            config, fake_clock, monkeypatch, reads_return=True)
+            config, fake_clock, monkeypatch, reads='all')
         assert result['reason'] == 'stc_failed_naked_exposure'
         sells = [p for p in broker.placed if p[1] == 'sell']
         assert len(sells) == roll_budget.PRIMARY_LADDER_RUNGS(escalations) + 2
@@ -1168,31 +1245,48 @@ class TestTheBudgetIsMeasured:
 
 class TestReadsThatNeverReturn:
     """Rev 5's cases on the REAL ``_bounded_read`` (real daemon threads; the
-    caps shrunk to 50 ms): every read made off the roller's thread — pricing
-    AND diagnostic — blocks until teardown. Each is abandoned at its cap and
-    the leg falls back: the BTC still re-prices (prior basis), rung 1 still
-    prices (pre-BTC basis), the floor is still placed, every terminal fires,
-    and the wall clock stays inside the sum of the caps."""
+    caps shrunk to 50 ms). The three execute-time pricing reads return; every
+    LATER read made off the roller's thread — pricing AND diagnostic — blocks
+    until teardown. Each is abandoned at its cap and the leg falls back: the
+    BTC still re-prices (prior basis), rung 1 still prices (the pre-BTC read —
+    the post-BTC fallback F5 keeps), the floor is still placed, every terminal
+    fires, and the wall clock stays inside the sum of the caps. When NOTHING
+    returns, F5: the pre-BTC screen has no new-symbol read, so the position is
+    skipped before any order exists."""
 
-    def test_the_ladder_completes_on_its_fallbacks(self, roller, instrumented,
-                                                   monkeypatch):
+    @staticmethod
+    def _hang_after(instrumented, monkeypatch, returning):
+        """Off-thread reads block until the returned event is set — except the
+        first ``returning`` PRICING reads, which answer at once."""
         monkeypatch.setattr(cr, '_PRICING_READ_TIMEOUT_SECONDS', 0.05)
         monkeypatch.setattr(cr, '_DIAG_READ_TIMEOUT_SECONDS', 0.05)
-        release = threading.Event()
-        main = threading.get_ident()
-        book = _book()
+        release, lock = threading.Event(), threading.Lock()
+        main, seen, book = threading.get_ident(), {'pricing': 0}, _book()
+
+        def gate():
+            if threading.get_ident() == main:
+                return
+            with lock:
+                if threading.current_thread().name == 'fc120-pricing-read':
+                    seen['pricing'] += 1
+                    if seen['pricing'] <= returning:
+                        return
+            release.wait(30)
 
         def quote(symbol):
-            if threading.get_ident() != main:
-                release.wait(30)
+            gate()
             return book(symbol)
 
         def stock(symbol):
-            if threading.get_ident() != main:
-                release.wait(30)
+            gate()
             return {'bid': 376.90, 'ask': 377.10}
         instrumented.get_option_quote.side_effect = quote
         instrumented.get_stock_quote.side_effect = stock
+        return release
+
+    def test_the_ladder_completes_on_its_fallbacks(self, roller, instrumented,
+                                                   monkeypatch):
+        release = self._hang_after(instrumented, monkeypatch, returning=3)
         script = {'btc-1': _timeout('btc-1'),
                   'btc-2': {'poll': _o('btc-2', 'filled', 1, 8.40)},
                   'sto-1': _timeout('sto-1'),
@@ -1207,14 +1301,31 @@ class TestReadsThatNeverReturn:
         assert result['success'] is True
         assert terminals(log) == ['call_roll_completed']
         placed = _all(log, 'call_roll_btc_placed')
-        assert [(p['limit_price'], p['btc_quote_source']) for p in placed] == [
-            (8.50, 'evaluation'), (8.60, 'prior_basis')]
-        assert all(p['stock_quote_source'] == 'none' for p in placed)
+        assert [(p['limit_price'], p['btc_quote_source'], p['stock_quote_source'])
+                for p in placed] == [(8.50, 'execution', 'execution'),
+                                     (8.60, 'prior_basis', 'none')]
         assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 8.40)]
         rung1 = _all(log, 'call_roll_stc_placed')[0]
-        assert rung1['stc_quote_source'] == 'chain'   # no read came back at all
-        # ~18 bounded reads x 50 ms, plus thread overhead.
+        assert rung1['stc_quote_source'] == 'pre_btc'   # the fresh read hung
+        # ~15 abandoned bounded reads x 50 ms, plus thread overhead.
         assert wall < 3.0, wall
+
+    def test_nothing_returning_skips_before_any_order(self, roller,
+                                                      instrumented, monkeypatch):
+        release = self._hang_after(instrumented, monkeypatch, returning=0)
+        try:
+            started = time.monotonic()
+            result, log, _b = _scripted(roller, instrumented, {})
+            wall = time.monotonic() - started
+        finally:
+            release.set()
+        assert result['reason'] == 'credit_gone_at_execution'
+        assert terminals(log) == ['call_roll_skipped']
+        instrumented.place_option_order.assert_not_called()
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['btc_quote_source'] == 'evaluation'
+        assert skip['recheck_stc_limit'] is None
+        assert wall < 1.0, wall                 # three abandoned 50 ms reads
 
 
 # --------------------------------------------------------------------------- #
