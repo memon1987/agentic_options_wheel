@@ -393,10 +393,12 @@ verified 2026-08-04:
     prices a real-money order.** The feed is echoed back on every quote and
     logged as `quote_feed` so that precondition is auditable rather than
     remembered.
-  - **Only the opening writes are tick-correct.** The roller's STO/BTC limits
-    and `/monitor`'s `ask × 0.95` buy-to-close still round to the cent and are
-    therefore **off-tick above $3.00**. Harmless on paper (the simulator does
-    not enforce increments), a rejected order on a live account — its own FC.
+  - **The opening writes and the roller are tick-correct; `/monitor` is not.**
+    Since FC-120 PR-2 the roller snaps every limit to the grid (toward
+    marketable: buys up, sells down). `/monitor`'s `ask × 0.95` buy-to-close
+    still rounds to the cent and is therefore **off-tick above $3.00**.
+    Harmless on paper (the simulator does not enforce increments), a rejected
+    order on a live account — FC-088.
   - **Economics, corrected** (rev 1 of the plan got this wrong and the reviews
     caught it): the call leg's old `premium × 0.95` was **not** a 5% donation.
     On this book 5% of mid ≈ half a spread, so the limit sat about **at the
@@ -407,9 +409,13 @@ verified 2026-08-04:
     "5% donated" framing. `docs/plans/fc-072.md` holds the two-week readout
     that decides whether the trade was worth it.
   - **The roller is deliberately not routed through this module.** `CallRoller`
-    prices its sell-to-open **at the bid** (or `mid − $0.05` on imminence)
-    because a credit-only defensive roll must execute in the same session as
-    its buy-to-close leg. Opening writes can afford to rest; rolls cannot.
+    prices its sell-to-open **marketable** — through the bid (or `mid − $0.05`
+    on imminence) — because a credit-only defensive roll must execute in the
+    same session as its buy-to-close leg. Opening writes can afford to rest;
+    rolls cannot.
+    Since FC-120 PR-2 it borrows `snap_limit` / `tick_size` for legality only
+    and prices at `bid − buffer` / `ask + buffer` (plus a parity floor on the
+    buy), never at mid, because a roll's two legs must execute in one session.
 - **Universe**: 14 symbols in `stocks.symbols`. The **effective** universe is
   smaller: the `$400` price ceiling and the premium floors exclude several
   symbols entirely, so a symbol that never trades is a *filter* result, not a
@@ -485,23 +491,22 @@ this list — not any single plan — is where readiness is judged. Status as of
 | Gate | Profile | Owner | Status |
 |---|---|---|---|
 | Sign the OPRA agreement; quotes are `indicative`, not NBBO (§Trading APIs, the `quote_feed` note) | both | operator | open — blocks FC-120's DD-1 gate decision (Q1); the buffer default is feed-specific |
-| Roller STO/BTC limits and `/monitor`'s buy-to-close are off-tick above $3.00 (the roller half closes only when FC-120 PR-2 merges — PR-1 is instrumentation and changes no limit) | both | FC-088 | filed |
+| `/monitor`'s buy-to-close is off-tick above $3.00 (the roller's limits are tick-legal from FC-120 PR-2) | both | FC-088 | filed |
 | `AlpacaClient` HTTP calls have no socket timeout; a hung lock-holder has no in-session bound (Cloud Run's cut does not stop the thread) | both | FC-089 | filed |
-| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case (699 s when all twelve FC-120 PR-1 diagnostic reads hang to their 2 s cap) | both | FC-113 | filed; (a)+(b) land in FC-120 PR-2; (c) remains |
+| Roller deadline accounting: RTT-blind `_poll_order_fill`, the admission-time deadline / lock-wait blind spot, the 600 s per-position constant against a 675 s true worst case (699 s when all twelve FC-120 PR-1 diagnostic reads hang to their 2 s cap) | both | FC-113 | filed; (a)+(b) landed in FC-120 PR-2 (`roll_budget.per_position_budget_seconds`, measured by test; monotonic poll with a two-read settle floor); (c) remains |
 | `_is_market_open()` has no holiday calendar — orders can be placed into a closed market (09-07 IWM) | both | FC-114 | filed |
 | Cloud Run request timeout 1800 s on the rolling service, verified live | both | FC-107 | PR #128; verify live per §Deploy / CI |
 | Covered-call roll alert twin (`cc_roll_executed_alert_policy.json`) live before `cc-roll-daily` runs unsupervised | covered_call | FC-100 DD-6 | merged (#127); policy not yet deployed |
-| Rung-2 exchange price protection: rung 2 (`btc_fill + min_credit`) sits 20–60 % through the NBBO; Cboe / NOM limit-order price protection can reject or re-price a limit that far through — on paper it filled 5/5, live it may come back `stc_rejected` and the ladder falls to rung 3 | both | FC-120 (verify on the first live roll; do not assume the floor rung exists) | open |
-| Live `btc_rejected` / `stc_rejected` handling — never observed on paper; live, a tick or price-protection rejection is the terminal. Confirm the rejected paths (`execute_roll`'s synchronous and after-placement `call_roll_btc_rejected`, and `_place_stc`'s `call_roll_stc_rejected`) leave the position covered and page | both | FC-120 | open |
+| Exchange limit-order price protection on the roll ladder: on paper every rung filled (the floor 9/9, 18–59 % through the fill price); live, Cboe / NOM price protection can reject ANY rung priced far enough through the NBBO — the floor first, but a buffered rung on a sub-$1 contract too (sub-$1 bands are absolute-dollar and narrower; read both regimes). A live rejection is `stc_rejected` → fallback rungs → `call_roll_naked_exposure`, and the shares stay uncovered until the next `/run`. Pre-committed response on the first live `stc_rejected` on any rung (a code change under FC-120's rollback, NOT built now): re-place once at `fresh_bid − buffer`; then a %-of-fresh-bid cap knob set from the exchange band. Read the Alpaca support article and the Cboe / NOM rule text and record the band here before the first real-money roll (FC-120 Q7) | both | FC-120 (verify on the first live roll; do not assume any rung is accepted live) | open |
+| Live `btc_rejected` / `stc_rejected` handling — never observed on paper; live, a tick or price-protection rejection is the terminal. Confirm the rejected paths (`execute_roll`'s synchronous and after-placement `call_roll_btc_rejected`, and `_place_stc`'s `call_roll_stc_rejected`) leave the position covered and page, and an STO rung rejected by price protection moves to the next rung (a synchronous rejection → the next priced rung re-quotes) | both | FC-120 | open |
 | Periodic `ppind` re-verification of `VERIFIED_PENNY_PROGRAM_ROOTS` (penny-program membership changes; a root that leaves it prices at nickels below $3 and is rejected) | both | operator, quarterly | open |
 
-**The fee note.** `rolling.min_net_credit_per_contract: 0.00` makes the roller
-credit-only on the *placed limit prices* — gross. A live account pays roughly
-$0.10/contract in OCC and regulatory fees on each leg, so a roll priced at
-exactly the floor is a small net **debit** once filled, and "credit-only" is
-false on real money in a way it is not on paper. This is **not** a gate: it does
-not block trading, it changes what the floor means, and the fix is a pricing
-decision owned by FC-088 / FC-100, not a readiness precondition.
+**The fee note.** `rolling.min_net_credit_per_contract: 0.20` (FC-120 PR-2; was
+0.00) makes the roller credit-only on the placed limits *after* the
+~$0.20/contract round trip of OCC and regulatory fees (roughly $0.10/contract
+per leg) — the floor rung is the BTC fill plus one tick ($1–$5/contract), so a
+roll priced exactly at the floor is a small net credit, not a debit. Still not a
+gate: it does not block trading, it changes what the floor means.
 
 The same goes for the §Accepted amnesia items below (`_closed_today` and its
 siblings, and the FC-009 duplicate buy-to-close they permit): they are known,
@@ -973,6 +978,14 @@ scheduler needed no change. Four properties are worth knowing:
   invalidates dedup; the version is what makes the boundary *queryable* after
   the fact — FC-048 did not bump, and the docs still call that boundary
   "timestamp-only" as the regret. The most recent one is
+  `fc-120-marketable-roll-limits` (FC-120 PR-2): roll limits are buffered,
+  parity-floored and tick-snapped and the credit invariant is screened on them
+  (`min_net_credit_per_contract` $0.20), so a marginal roll is no longer
+  eligible — base-mode fills are unchanged (a buffered limit is still at or
+  through the replay's book), `rolls_executed` can fall, and the replay never
+  re-prices or escalates (see `docs/BACKTEST_ENGINE.md` §5). It is in both
+  append-only era sets (`POST_FC116_ENGINE_VERSIONS`, `POST_FC112_ENGINE_VERSIONS`
+  in `dashboard/backend/services/sweeps.py`). Before it,
   `fc-112-wheel-roll-reach` (FC-112 PR-1, 2026-09-12): the WHEEL replay's
   materialisation moved from 7 DTE to its roll horizon (7 + 14 = 21), so its
   roller finally sees the ladder the live roller searches. Wheel rows before
@@ -1719,9 +1732,11 @@ exceeds **1000 s**, raise `timeout:` to 1800 s AND `BUILD_TIMEOUT_SECONDS` in
 `--timeout=1800` — Cloud Run's *request* timeout on the two bot services, a
 different thing from the build `timeout:` above (1500 s, the serialize-builds
 budget; the two never need to agree). It is 1800 because `/roll`'s cycle budget
-is `_CYCLE_BUDGET_SECONDS = 1500` (`src/strategy/wheel_engine.py`), sized by
+is `_CYCLE_BUDGET_SECONDS = 1500` (`src/strategy/wheel_engine.py`, defined in
+`src/strategy/roll_budget.py`), sized by
 FC-078 against the daily roll job's 1800 s `attemptDeadline`, a position may
-*start* at 900 s and run five 135 s legs, and measured cycles already reach
+*start* at 933 s and run a 567 s modeled worst case (`src/strategy/roll_budget.py`,
+FC-120 PR-2 — measured by test), and measured cycles already reach
 259 s with STO rung-1 timeouts in half of the executed rolls. What a cut does,
 measured 2026-08-13: Cloud Run returns 504 to the scheduler (a silent job
 failure) and does **not** kill the thread — the ladder keeps running roughly on

@@ -828,7 +828,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-088: the roller's and `/monitor`'s limit prices are still off-tick above $3 — rejected on a live account
 
 **Scope:** shared
-**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews)
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews). **Narrowed by FC-120 PR-2 (done when it merges): the roller's STO and BTC limits are tick-legal** (`limit_pricing.snap_limit`, toward marketable — buys up, sells down); what remains is `/monitor`'s buy-to-close.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1112,6 +1112,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Measurement (FC-120 PR-1):** `call_roll_leg_settled.leg_elapsed_s` (FC-120 PR-1) is the measured per-leg wall-clock the proposal asks for; (a)+(b) are built by FC-120 PR-2.
 
+**Built by FC-120 PR-2 (branch `fc-120-pr2-marketable-roll-limits`; done when it merges):** (a) `src/strategy/roll_budget.per_position_budget_seconds` — 567 s at the shipped keys, MEASURED against the real ladder by `tests/test_call_roller_pr2.py::TestTheBudgetIsMeasured` (552 s on both profiles), reserved by `run_rolling_cycle`, bounded by `Config` at load, consumed by the cloudbuild seam test; (b) `_poll_order_fill` is a monotonic deadline (reads count against the window) with a two-read floor on the settle. (c) stays here.
+
 **Links:** FC-107 (D1, D4), FC-078 §4, FC-089.
 
 ### FC-114: `_is_market_open()` has no holiday calendar — orders placed into a closed market
@@ -1129,7 +1131,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-115: `Config` validates no bound on `rolling.itm_trigger_ratio` (or `enabled`, `btc_fill_timeout_seconds`, `fallback_strike_attempts`)
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-100 PR review)
+**Status:** Filed 2026-09-08 (found by the FC-100 PR review). **Narrowed by FC-120 PR-2 (done when it merges): `btc_fill_timeout_seconds` (`5 x (btc_reprice_attempts + 1)` .. 600) and `fallback_strike_attempts` (0 .. 5) are bounded at load, with PR-2's four new keys and a cross-key budget bound** (FC-120 DD-7); `itm_trigger_ratio` and `enabled` remain here.
 **Size estimate:** S
 
 **Problem:** `src/utils/config.py` validates four rolling knobs and not the trigger: a `10.0` typo silently makes every position `not_itm_enough` (the roller looks alive and never rolls); `0.5` makes every call eligible. The only guard today is the shipped-value test (`test_config.py` T-1), which catches drift in the repo, not a live `--update-env-vars` or a hand-edited profile.
