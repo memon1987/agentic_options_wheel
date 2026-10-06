@@ -37,8 +37,8 @@ import pytest
 
 import main as cli
 from src.backtesting.scenarios import persist as store
+from src.backtesting.scenarios.engine_identity import ENGINE_VERSION
 from src.backtesting.scenarios.runner import ScenarioResult, SweepResult
-from src.backtesting.screen import ENGINE_VERSION
 
 
 # --------------------------------------------------------------------------
@@ -245,7 +245,7 @@ _FROZEN_WHEEL_STANDING_SET_2026_09_05 = (
 # ==========================================================================
 class TestTheStandingSet:
     def test_one_spec_per_live_symbol_over_the_trailing_year(self):
-        from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+        from src.backtesting.scenarios.identity import DEFAULT_LOOKBACK_DAYS
 
         config = _config()
         specs = cli.battery_standing_specs(config, today=date(2026, 9, 5))

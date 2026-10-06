@@ -16,8 +16,8 @@ rather than documented and hoped for:
   the specific reason — see that module's docstring.
 * **Replays make zero provider calls** (``runner.py``). Asserted on a counter,
   because a regression here would still produce correct numbers.
-* **Nothing is persisted.** ``backtest_runs`` stays the production screen's
-  table; Layer 3 owns a store for sweeps.
+* **Nothing is persisted.** ``backtest_runs`` stays the retired production
+  screen's table, kept as history (FC-121); Layer 3 owns a store for sweeps.
 """
 
 from .overrides import (

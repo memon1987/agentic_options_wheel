@@ -488,10 +488,7 @@ class TestWheelConstructionValues:
 # T7 — repo-wide lint gate
 # --------------------------------------------------------------------------- #
 
-#: Deliberately cross-strategy and out of Seam 4's scope: a local measurement
-#: tool run under operator credentials, writing one shared `backtest_runs`
-#: table keyed by engine_version. No service endpoint reaches it.
-T7_DATASET_DEFAULT_ALLOWLIST = {"src/backtesting/reporting/bq_writer.py"}
+T7_DATASET_DEFAULT_ALLOWLIST = set()
 
 T7_ROOTS = ("src", "deploy", "tools", "scripts")
 

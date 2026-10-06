@@ -553,11 +553,12 @@ class TestNoProductionSideEffects:
         mock_client.assert_not_called()
 
     def test_the_live_failed_symbol_set_is_restored_after_a_replay(self, falling_then_flat):
-        """`/backtest/screen` lives on the LIVE trading server (disabled by
-        default, opt-in via ENABLE_SCREEN_ENDPOINT). ExecutionEngine's
-        `_failed_symbols` is a module global, so an in-server replay clearing it
-        would wipe the non-retryable set `/run` depends on — and it also leaked
-        across the 14 sequential per-symbol runs of a screen.
+        """ExecutionEngine's `_failed_symbols` is a module global. The guard was
+        written while the retired screen's endpoint lived on the LIVE trading
+        server (deleted by FC-121), where an in-server replay clearing it would
+        have wiped the non-retryable set `/run` depends on. It still matters:
+        without the restore the set leaks across the sequential replays of one
+        process — a sweep's arms and symbols, the battery's sweeps.
 
         The set is also NOT the replay's to inherit: a live non-retryable symbol
         must not suppress a simulated one."""
@@ -834,6 +835,47 @@ class TestAnalyticsIsolationIsReal:
 
         assert analytics_module._instance is before
         assert not clock.is_frozen()
+
+
+class TestAnalyticsIsolationIsThreadLocal:
+    """A replay must never redirect a concurrent LIVE cycle's telemetry.
+
+    cloud_run_server runs Flask threaded=True at containerConcurrency 10 with
+    maxScale 1 — one process, ten concurrent requests. A process-global swap
+    discarded live analytics rows, including the error that warns of
+    re-execution risk.
+    """
+
+    def test_a_concurrent_thread_never_sees_the_replay_writer(self):
+        import threading
+        import time
+
+        from src.backtesting.engine.no_op_analytics import NoOpAnalyticsWriter
+        from src.data import analytics_writer as aw
+
+        seen, stop = [], threading.Event()
+
+        def live():
+            while not stop.is_set():
+                seen.append(type(aw.get_analytics_writer()).__name__)
+                time.sleep(0.005)
+
+        t = threading.Thread(target=live)
+        t.start()
+        try:
+            time.sleep(0.03)
+            prev = aw.set_analytics_writer(NoOpAnalyticsWriter())
+            time.sleep(0.05)
+            aw.set_analytics_writer(prev)
+            time.sleep(0.02)
+        finally:
+            stop.set()
+            t.join()
+
+        assert seen, "probe thread never ran"
+        assert "NoOpAnalyticsWriter" not in seen, (
+            "a replay redirected a concurrent thread's analytics"
+        )
 
 
 class TestStrikeWindowCoversAssignedPositions:

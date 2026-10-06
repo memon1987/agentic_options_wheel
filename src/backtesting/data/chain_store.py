@@ -22,14 +22,15 @@ exactly like a day on which those strikes did not trade.
 Today's session is excluded from the cache upstream — see
 ``chain_builder._is_cacheable``.
 
-**The lake (FC-060 Layer 1).** The local cache is thrown away every month: the
-``backtest-screen`` Cloud Run Job runs on an ephemeral filesystem, so every
-monthly screen is cold. ``ChainLake`` mirrors each file to a GCS object at
+**The lake (FC-060 Layer 1).** The local cache is thrown away after every Cloud
+Run Job execution: the Jobs run on an ephemeral filesystem, so without the lake
+every execution starts cold (the retired monthly screen, the lake's first
+consumer, was cold every month). ``ChainLake`` mirrors each file to a GCS object at
 ``gs://<bucket>/<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet``, and ``ChainStore``
 uses it write-through: a local miss tries the lake before the provider, and a
 newly built chain is uploaded after it lands on disk. The lake is optional and
 purely additive — a lake failure is logged and degraded to local-only, never
-raised, because a GCS hiccup must not turn a two-hour screen into a failed
+raised, because a GCS hiccup must not turn a two-hour cold run into a failed
 execution. With no ``CHAIN_LAKE_BUCKET`` configured, no GCS client is ever
 constructed and behaviour is byte-identical to the pre-lake store.
 
@@ -792,6 +793,29 @@ class _RemoteState:
     generation: Optional[int] = None
     window: Optional[_Window] = None
     probed: bool = False
+
+
+# PUBLIC (FC-060 Layer 3): the per-store lake counters, and how a run-level
+# total sums them. The sweep finaliser (`main._finalise_sweep_status`) folds
+# them into `scenario_sweeps.lake_summary_json`. They sit beside
+# `ChainStore.summary()` because those are the keys they must track: a counter
+# renamed there and not here would be summed as a silent 0
+# (`summary.get(key, 0)`), and a second copy of this tuple in
+# `scenarios/persist.py` would drift the same way the day a counter is added.
+# Moved here from the deleted `screen.py` (FC-121), which summed them across
+# its per-symbol stores.
+LAKE_COUNTERS = (
+    "lake_hits", "lake_misses", "lake_rejected",
+    "lake_puts", "lake_skipped", "lake_skipped_unreadable_remote",
+    "lake_merged", "lake_merge_gaps", "lake_merge_refused",
+    "lake_errors",
+)
+
+
+def accumulate_lake_summary(totals: Dict[str, int], summary: Dict) -> None:
+    """Add one ``ChainStore.summary()`` into a run-level total, in place."""
+    for key in LAKE_COUNTERS:
+        totals[key] = totals.get(key, 0) + int(summary.get(key, 0))
 
 
 class ChainStore:

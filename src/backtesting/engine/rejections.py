@@ -29,14 +29,16 @@ logger = structlog.get_logger(__name__)
 # every day the wheel is doing exactly what it exists to do — holding a position
 # on the underlying it already sold a put against. On a healthy deployment it is
 # the *most common* bucket by a wide margin (a golden-path fixture puts it at
-# 40 of 45 days), so ranking it with the real blockers would stamp "the strategy
-# was working" as `backtest_runs.binding_constraint` and lead the "why the
-# strategy stood down" table with it. That is the FC-057 dishonest-metric class
-# the tally exists to end, reintroduced from the other side.
+# 40 of 45 days), so ranking it with the real blockers would have stamped "the
+# strategy was working" as `backtest_runs.binding_constraint` (the retired
+# screen's column) and would lead the "why the strategy stood down" table with
+# it. That is the FC-057 dishonest-metric class the tally exists to end,
+# reintroduced from the other side.
 #
 # It stays counted and stays visible — deployment density is real information —
-# but it is reported as deployment, never ranked as a constraint. Consumers:
-# `reporting/bq_writer._binding` and `reporting/report.render_markdown`.
+# but it is reported as deployment, never ranked as a constraint. Consumer:
+# `reporting/report.render_markdown` (the screen's `binding_constraint` stamp
+# was the other, until FC-121 deleted it).
 HOLDS_UNDERLYING_REASON = "already holds this underlying (scan, put)"
 
 # Reasons that must be excluded from binding-constraint selection and from the

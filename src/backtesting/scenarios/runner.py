@@ -40,9 +40,10 @@ measured cost does not justify the work: the sweep already fits inside a coffee
 break.
 
 **No BigQuery.** A sweep never writes to ``backtest_runs``. That table's
-documented "current demotion candidates" query takes the latest ``run_kind='full'``
-row, so a persisted full-universe sweep would displace the production screen with
-a hypothetical. Layer 3 owns a store that cannot do that.
+documented "current demotion candidates" query took the latest ``run_kind='full'``
+row, so a persisted full-universe sweep would have displaced the production
+screen with a hypothetical. The screen is retired (FC-121) and the table is
+kept as history; Layer 3 owns a store that cannot do that.
 
 **No ``binding_constraint`` column — still, and still deliberately.** The reason
 Layer 2 shipped without one was that only the FIRST replay in a process got a
@@ -97,7 +98,7 @@ from ..engine.simulator import (
 )
 from ..evaluate import BID_FILL_HAIRCUT, DEFAULT_FILL_HAIRCUT, _score
 from ..metrics.fitness import MIN_COVERED_FRACTION, MIN_DAYS_IN_POSITION
-from ..reporting.bq_writer import config_hash
+from ..reporting.config_hash import config_hash
 from .identity import DEFAULT_ROLL_FILL_MODE, scenario_arm_hash
 from .overrides import (
     DTE_OVERRIDE_KEYS, MAX_SWEEPABLE_DTE, apply_overrides, validate_overrides,
@@ -190,8 +191,9 @@ class Scenario:
         SAME ``config_hash`` and are indistinguishable in any stored record.
 
         Both hashes are reported. ``config_hash`` keeps a sweep row comparable
-        with a ``backtest_runs`` row; ``scenario_hash`` is what makes two rows of
-        this sweep distinguishable from each other.
+        with the retired screen's historical ``backtest_runs`` rows;
+        ``scenario_hash`` is what makes two rows of this sweep distinguishable
+        from each other.
 
         **The bytes are produced by ``identity.scenario_arm_hash``**, which is
         stdlib-only and copied into the dashboard image (FC-060 Layer 3): the
@@ -701,9 +703,10 @@ def _row_from_report(
         scenario=scenario, symbol=symbol, start=start, end=end, split=split,
         config_hash=cfg_hash, scenario_hash=scenario_hash,
         verdict=verdict,
-        # Same rule as `bq_writer.build_row`: 'insufficient' is a statement about
-        # the window and a verdict that flips on the fill assumption is not a
-        # verdict, so neither sets the flag.
+        # Same rule the retired screen's `backtest_runs` rows followed (FC-121
+        # deleted their writer): 'insufficient' is a statement about the window
+        # and a verdict that flips on the fill assumption is not a verdict, so
+        # neither sets the flag.
         demote=(verdict == "unfit"
                 and not (sensitivity or {}).get("verdict_flips", False)),
         total_return=report.total_return,

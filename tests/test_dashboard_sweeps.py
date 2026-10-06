@@ -53,7 +53,7 @@ from src.backtesting.scenarios.overrides import (  # noqa: E402
     ALLOWED_OVERRIDES, REJECTED_OVERRIDES, OverrideError, validate_override_key,
 )
 from src.backtesting.scenarios.runner import ScenarioResult, SweepResult  # noqa: E402
-from src.backtesting.screen import ENGINE_VERSION  # noqa: E402
+from src.backtesting.scenarios.engine_identity import ENGINE_VERSION  # noqa: E402
 
 
 # A stand-in for what `cloudbuild.yaml`'s `compute-engine-identity` step bakes
@@ -274,7 +274,7 @@ class TestTheReportProseIsNotAFork:
 
 
 class TestTheEngineVersionIsNotAFork:
-    def test_matches_screen_py(self):
+    def test_matches_the_engine_declaration(self):
         """`ENGINE_VERSION` is half of `sweep_key` (D4). A dashboard that
         disagreed would compute a key nothing ever matches, so the dedup would
         never fire — silently, at the cost of a full replay every time."""

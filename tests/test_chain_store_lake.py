@@ -40,11 +40,13 @@ from src.backtesting.data import chain_store as chain_store_module
 from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
 from src.backtesting.data.chain_store import (
     DEFAULT_LAKE_PREFIX,
+    LAKE_COUNTERS,
     MAX_CONSECUTIVE_LAKE_ERRORS,
     ChainLake,
     ChainLakePreconditionFailed,
     ChainLakeUnavailable,
     ChainStore,
+    accumulate_lake_summary,
 )
 
 AS_OF = date(2025, 1, 6)
@@ -1933,7 +1935,7 @@ class TestConfiguration:
 
 
 # --------------------------------------------------------------------------- #
-# Wiring: evaluate + screen
+# Wiring: evaluate, and the run-level lake totals a sweep persists
 # --------------------------------------------------------------------------- #
 class TestWiring:
     def test_evaluate_uses_from_env_and_logs_a_summary(self):
@@ -1945,74 +1947,44 @@ class TestWiring:
         assert "ChainStore.from_env()" in src
         assert "chain_lake_summary" in src
 
-    def test_screen_shares_one_lake_and_logs_a_run_summary(self):
-        import inspect
+    def test_run_totals_aggregate_every_counter_across_stores(self):
+        """T-4 (FC-121): ``accumulate_lake_summary`` sums every
+        ``LAKE_COUNTERS`` key. The sweep finaliser folds these totals into
+        ``scenario_sweeps.lake_summary_json``, so a counter the sum skipped
+        would silently stop being reported.
 
-        from src.backtesting import screen
-
-        src = inspect.getsource(screen)
-        assert "lake_from_env()" in src
-        assert "chain_lake_run_summary" in src
-        assert "chain_lake_degraded" in src
-
-    def test_screen_run_summary_aggregates_and_warns(self, captured_events):
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
-
+        Re-pointed at ``chain_store`` from the retired screen's run-summary
+        test: its aggregation half survives, its log-line half went with the
+        log line."""
         lake = FakeLake()
         totals = {}
-        _accumulate_lake(totals, ChainStore("x", lake=lake).summary())
+        accumulate_lake_summary(totals, ChainStore("x", lake=lake).summary())
         store = ChainStore("y", lake=lake)
         store.lake_hits, store.lake_errors = 3, 2
-        _accumulate_lake(totals, store.summary())
+        accumulate_lake_summary(totals, store.summary())
         assert totals["lake_hits"] == 3 and totals["lake_errors"] == 2
 
-        _log_lake_run_summary(lake, totals, "run-1")
-        assert _events(captured_events, "chain_lake_run_summary")
-        assert _events(captured_events, "chain_lake_degraded"), (
-            "a run that errored must not look clean in the logs"
-        )
+        # Every counter, with a distinct value per key, so a key that was
+        # skipped or summed into the wrong slot cannot pass.
+        other = ChainStore("z", lake=lake)
+        for i, key in enumerate(LAKE_COUNTERS, start=1):
+            setattr(other, key, 10 * i)
+        before = dict(totals)
+        accumulate_lake_summary(totals, other.summary())
+        assert set(totals) == set(LAKE_COUNTERS)
+        for i, key in enumerate(LAKE_COUNTERS, start=1):
+            assert totals[key] == before[key] + 10 * i, key
 
-    def test_a_run_with_refused_merges_is_degraded_even_with_no_errors(
-        self, captured_events
-    ):
-        """A thrashing symbol that failed to heal did not have a clean run.
-
-        `lake_errors == 0` and a green exit is exactly how SPY stayed cold for
-        a month without anyone noticing. A refused merge means the day will be
-        re-fetched cold next month, and every month after, so it belongs in
-        the same warning as an outage.
-        """
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
-
-        lake = FakeLake()
-        store = ChainStore("z", lake=lake)
-        store.lake_merge_gaps, store.lake_merge_refused = 1, 2
-        totals = {}
-        _accumulate_lake(totals, store.summary())
-        _log_lake_run_summary(lake, totals, "run-3")
-
-        degraded = _events(captured_events, "chain_lake_degraded")
-        assert degraded, "a run whose merges were refused must not look clean"
-        assert degraded[0]["lake_merge_gaps"] == 1
-        assert degraded[0]["lake_merge_refused"] == 2
-        assert degraded[0]["lake_errors"] == 0
-
-    def test_a_clean_run_is_still_clean(self, captured_events):
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
-
-        lake = FakeLake()
-        totals = {}
-        _accumulate_lake(totals, ChainStore("w", lake=lake).summary())
-        _log_lake_run_summary(lake, totals, "run-4")
-        assert _events(captured_events, "chain_lake_run_summary")
-        assert not _events(captured_events, "chain_lake_degraded")
-
-    def test_no_run_summary_without_a_lake(self, captured_events):
-        from src.backtesting.screen import _log_lake_run_summary
-
-        _log_lake_run_summary(None, {}, "run-2")
-        assert not [e for e in captured_events
-                    if str(e.get("event_type", "")).startswith("chain_lake")]
+    def test_every_lake_counter_is_a_summary_key(self, tmp_path):
+        """T-4 (FC-121), the half no test made before. ``accumulate_lake_summary``
+        reads ``summary.get(key, 0)``, so a counter renamed in
+        ``ChainStore.summary()`` but not in ``LAKE_COUNTERS`` would be summed as
+        a silent 0 for ever — the sweep would report a lake that never errs."""
+        summary = ChainStore(str(tmp_path), lake=FakeLake()).summary()
+        missing = [key for key in LAKE_COUNTERS if key not in summary]
+        assert missing == [], (
+            f"LAKE_COUNTERS names keys ChainStore.summary() does not produce: "
+            f"{missing}")
 
     def test_summary_shape_is_loggable(self, tmp_path):
         store = ChainStore(str(tmp_path), lake=FakeLake())

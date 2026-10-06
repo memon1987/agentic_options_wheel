@@ -259,6 +259,15 @@ def parse_artifact_object_name(name: str) -> Dict[str, str]:
 # identical submissions differently.
 DEFAULT_STARTING_CASH = 100_000.0
 
+# The window a sim gets when none is given: a sweep spec or ``--command sweep``
+# with no ``start`` replays the trailing ``DEFAULT_LOOKBACK_DAYS`` up to its
+# ``end``, and the weekly battery's standing set spans the same trailing year.
+# Long enough for a meaningful number of cycles, short enough that a symbol's
+# *recent* behavior dominates — a fitness read should not be anchored to how a
+# name traded two years ago. Moved here from the deleted ``screen.py`` (FC-121),
+# where it was the monthly screen's window.
+DEFAULT_LOOKBACK_DAYS = 365
+
 # ``evaluate.DEFAULT_FILL_HAIRCUT``. Duplicated for the same reason as
 # ``BASE_SCENARIO_NAME`` — importing ``evaluate`` would drag the engine in — and
 # pinned equal by a test. It is here rather than in the caller because an arm

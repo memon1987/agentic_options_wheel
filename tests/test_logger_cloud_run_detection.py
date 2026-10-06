@@ -46,8 +46,8 @@ def test_the_job_case_specifically(monkeypatch):
     A Cloud Run Job sets CLOUD_RUN_JOB and CLOUD_RUN_EXECUTION but NOT
     K_SERVICE. That exact combination was the bug.
     """
-    monkeypatch.setenv("CLOUD_RUN_JOB", "backtest-screen")
-    monkeypatch.setenv("CLOUD_RUN_EXECUTION", "backtest-screen-abc12")
+    monkeypatch.setenv("CLOUD_RUN_JOB", "data-backfill")
+    monkeypatch.setenv("CLOUD_RUN_EXECUTION", "data-backfill-abc12")
     assert os.environ.get("K_SERVICE") is None
     assert _is_cloud_run() is True
 
