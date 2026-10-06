@@ -1397,6 +1397,38 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-131: the order-plane circuit breaker has never recorded a failure — `api_retry`'s `except RetryError` branch is unreachable
+
+**Status:** Filed 2026-10-06 (found by the FC-120 PR-2 build; verified by both PR-2 reviews)
+**Scope:** shared (`src/api/alpaca_client.py`; both bot services)
+**Size estimate:** S (decide + one branch + tests) — touches the live order path → plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `api_retry` wraps the broker calls in tenacity with `reraise=True`, which re-raises the LAST exception when attempts are exhausted; tenacity's `RetryError` is therefore never raised, so the `except RetryError` branch that records a failure on the module-global `CircuitBreaker` and logs `api_retry_exhausted` is dead code. Consequence: `circuit_breaker_blocked` / `api_retry_exhausted` have never fired in production and the breaker has never opened — the order plane runs with no breaker at all, while the code and runbooks read as if it had one. FC-120 PR-2 left the order path byte-equivalent to main and PINNED this behaviour (`tests/test_quiet_data_plane.py::test_the_order_plane_is_exactly_as_before`) so the defect is not silently changed by a logging PR; the new data-plane breaker (quote/stock reads) records through an explicit `except Exception` branch and is live.
+
+**Proposal:** decide whether the order-plane breaker should be live at all (a breaker that opens during a ladder turns a slow broker into `*_disposition_unknown` terminals with shares possibly uncovered — FC-120 DD-5's "fail-safe, not fail-closed" argument), and either (a) make it record through the same explicit branch as the data-plane breaker with thresholds argued from the roll ladder's budget, or (b) delete the dead branch and the breaker from the order plane and say so in the runbooks. Either way flip the pinning test deliberately. Also: `CircuitBreaker` has no lock while bounded-read worker threads mutate it (LOW in the PR-2 review).
+
+**Links:** FC-120 (`docs/plans/fc-120.md` §Amendments rev 6 R6-J, PR #138 builder note 1), FC-089 (no socket timeout), FC-113.
+
+---
+
+### FC-132: the bot services' `/health` never constructs `Config`, so an invalid profile deploys GREEN and 500s every trading endpoint
+
+**Status:** Filed 2026-10-06 (FC-120 PR-2 review, SRE persona)
+**Scope:** shared (`deploy/cloud_run_server.py`; the canary smoke in `cloudbuild.yaml`)
+**Size estimate:** S — deploy-path change → plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `Config()` is built lazily and cached in `strategy_config()`; `/health` returns 200 without ever calling it, and the bot canary smoke only polls revision readiness. A profile that `Config` refuses at load (e.g. FC-120's cross-key roll-budget bound, or any future validation) therefore passes the canary, promotes, and then every trading endpoint (`/scan`, `/run`, `/monitor`, `/roll`) raises on its first request — the runtime guards behind `strategy_config()` (incl. `roll_cycle_budget_misconfigured` and its alert clause) are unreachable. Only the scheduler's non-2xx (unwatched) and `/regression`'s hourly endpoint check would show it. FC-120's DD-7 claimed "fails closed before any traffic shifts"; that claim is corrected in PR #138 — the real failure mode is as described here.
+
+**Proposal:** have the bot `/health` (or the canary smoke) construct `strategy_config()` and report its validity, so an invalid profile fails the canary before promote; keep the response shape backward compatible. Under its own plan because it changes what a deploy can fail on.
+
+**Links:** FC-120 (`docs/plans/fc-120.md` DD-7, PR #138 review), FC-081 (deploy freshness), FC-107.
+
+---
+
 ## Completed
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
