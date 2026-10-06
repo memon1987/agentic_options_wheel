@@ -787,3 +787,204 @@ class TestStcLadder:
         assert [(r, k) for r, k, _l in _stos(log)] == kinds
         assert sum(1 for _r2, k, _l in _stos(log) if k == 'floor') == 1
 
+
+# --------------------------------------------------------------------------- #
+# T-19 — the budget is MEASURED: the real ladder on a worst-case fake clock
+# --------------------------------------------------------------------------- #
+class _WorstCaseBroker:
+    """Every broker call costs its MODELED worst on the fake clock: an order
+    read ``ORDER_READ_WORST_SECONDS`` (9 s: three 2 s attempts + 3 s of
+    backoff), a place / cancel ``ORDER_ACTION_WORST_SECONDS`` (2 s). Every
+    poll window times out; every settle needs both of its reads; the LAST
+    buy-to-close attempt fills inside its settle, so the full STO ladder
+    follows — and every STO rung times out to ``call_roll_naked_exposure``."""
+
+    def __init__(self, clock, btc_attempts, quotes):
+        self.clock, self.btc_attempts, self.quotes = clock, btc_attempts, quotes
+        self.orders, self.buys, self.placed = {}, 0, []
+
+    def place_option_order(self, symbol, qty, side, order_type, limit_price):
+        self.clock.advance(roll_budget.ORDER_ACTION_WORST_SECONDS)
+        oid = f'o-{len(self.orders) + 1}'
+        if side == 'buy':
+            self.buys += 1
+        self.orders[oid] = {'canceled': False, 'settle_reads': 0,
+                            'fills': side == 'buy' and self.buys == self.btc_attempts}
+        self.placed.append((symbol, side, limit_price))
+        return {'success': True, 'order_id': oid}
+
+    def cancel_order(self, oid):
+        self.clock.advance(roll_budget.ORDER_ACTION_WORST_SECONDS)
+        self.orders[oid]['canceled'] = True
+        return True
+
+    def get_order_by_id(self, oid):
+        self.clock.advance(roll_budget.ORDER_READ_WORST_SECONDS)
+        o = self.orders[oid]
+        if not o['canceled']:
+            return order(oid, 'new')
+        o['settle_reads'] += 1
+        if o['settle_reads'] < roll_budget.CANCEL_SETTLE_MIN_READS:
+            return order(oid, 'pending_cancel')
+        return (order(oid, 'canceled', 1, 8.40) if o['fills']
+                else order(oid, 'canceled'))
+
+    def get_option_quote(self, symbol):
+        return dict(self.quotes.get(symbol, {}))
+
+    def get_stock_quote(self, symbol):
+        return {'bid': 376.90, 'ask': 377.10}
+
+
+def _worst_case_opportunity(config):
+    fallbacks = [dict(C380, bid=9.50, ask=9.70), dict(C385, bid=9.20, ask=9.40)]
+    legal = [{'candidate': c, 'new_option_symbol': c['symbol'],
+              'new_strike': c['strike_price'], 'stc_limit': 10.80}
+             for c in [dict(C375)] + fallbacks]
+    return {
+        'underlying': 'GOOGL', 'old_option_symbol': _O, 'new_option_symbol': _N,
+        'old_strike': 370.0, 'new_strike': 375.0, 'contracts': 1,
+        'btc_limit': 8.50, 'stc_limit': 10.80, 'net_credit_per_contract': 230.0,
+        'min_credit_per_share': config.rolling_min_net_credit_per_contract / 100,
+        'pricing_mode': 'base', 'imminent': False, 'earnings_info': {},
+        'candidate': dict(C375), 'btc_quote': {'bid': 8.00, 'ask': 8.40},
+        'fallback_candidates': legal, 'cost_basis_per_share': 300.0,
+        'max_expiry': None, 'stock_bid': 376.90, 'stock_ask': 377.10,
+        'stock_quote_ts': None,
+    }
+
+
+@pytest.fixture
+def no_dry_run(monkeypatch):
+    monkeypatch.delenv('ROLLER_DRY_RUN', raising=False)
+
+
+def _profile(tmp_path, name, **rolling):
+    import yaml
+    from pathlib import Path
+    src = Path(__file__).resolve().parent.parent / 'config' / name
+    if not rolling:
+        return str(src)
+    data = yaml.safe_load(src.read_text())
+    data.setdefault('rolling', {}).update(rolling)
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+class TestTheBudgetIsMeasured:
+    """R6-G: ``roll_budget.per_position_budget_seconds`` is a CONTRACT the
+    real ladder is measured against, on BOTH shipped profiles. *Catches:* a
+    bounded read awaited past its cap; a budget the ladder can exceed; a read
+    added to the path without the budget following."""
+
+    def _measure(self, config, fake_clock, monkeypatch, *, reads_return):
+        from src.utils.config import Config  # noqa: F401 - type of `config`
+
+        def bounded(fn, *args, timeout=None, kind='diag'):
+            fake_clock.advance(cr._DIAG_READ_TIMEOUT_SECONDS if timeout is None
+                               else timeout)       # hangs to EXACTLY its cap
+            if not reads_return:
+                return None, 'timeout'
+            value = fn(*args)
+            return (value, 'ok') if value else (None, 'empty')
+        monkeypatch.setattr(cr, '_bounded_read', bounded)
+        monkeypatch.setattr(cr, '_CANCEL_SETTLE_TIMEOUT_SECONDS',
+                            roll_budget.CANCEL_SETTLE_TIMEOUT_SECONDS)
+        quotes = {_O: {'bid': 8.00, 'ask': 8.40}, _N: {'bid': 10.90, 'ask': 11.10},
+                  _F: {'bid': 9.50, 'ask': 9.70}, _G: {'bid': 9.20, 'ask': 9.40}}
+        broker = _WorstCaseBroker(fake_clock,
+                                  config.rolling_btc_reprice_attempts + 1, quotes)
+        risk = Mock()
+        risk.validate_roll.return_value = (True, None)
+        roller = CallRoller(broker, Mock(), config, risk, None)
+        start = fake_clock.now
+        with patch('src.strategy.call_roller.logger'):
+            result = roller.execute_roll(_worst_case_opportunity(config))
+        return fake_clock.now - start, result, broker
+
+    @pytest.mark.parametrize("profile", ['settings.yaml', 'covered_call.yaml'])
+    @pytest.mark.parametrize("reads_return", [True, False])
+    def test_the_shipped_profiles(self, profile, reads_return, tmp_path,
+                                  fake_clock, monkeypatch, no_dry_run):
+        from src.utils.config import Config
+        config = Config(_profile(tmp_path, profile))
+        budget = roll_budget.from_config(config)
+        measured, result, broker = self._measure(
+            config, fake_clock, monkeypatch, reads_return=reads_return)
+        assert result['reason'] == 'stc_failed_naked_exposure', result
+        assert budget == 567
+        assert measured <= budget, (profile, measured, budget)
+        buys = [p for p in broker.placed if p[1] == 'buy']
+        assert len(buys) == config.rolling_btc_reprice_attempts + 1
+        if reads_return:
+            # The full worst path: every rung placed, and the model is tight.
+            assert [p[0] for p in broker.placed if p[1] == 'sell'] == [
+                _N, _N, _F, _G]
+            assert measured >= budget - 20, (measured, budget)
+
+    @pytest.mark.parametrize("escalations", [2, 3])
+    def test_the_escalation_knob_on(self, escalations, tmp_path, fake_clock,
+                                    monkeypatch, no_dry_run):
+        from src.utils.config import Config
+        config = Config(_profile(tmp_path, 'covered_call.yaml',
+                                 stc_escalation_rungs=escalations))
+        budget = roll_budget.from_config(config)
+        measured, result, broker = self._measure(
+            config, fake_clock, monkeypatch, reads_return=True)
+        assert result['reason'] == 'stc_failed_naked_exposure'
+        sells = [p for p in broker.placed if p[1] == 'sell']
+        assert len(sells) == roll_budget.PRIMARY_LADDER_RUNGS(escalations) + 2
+        assert measured <= budget, (escalations, measured, budget)
+
+
+class TestReadsThatNeverReturn:
+    """Rev 5's cases on the REAL ``_bounded_read`` (real daemon threads; the
+    caps shrunk to 50 ms): every read made off the roller's thread — pricing
+    AND diagnostic — blocks until teardown. Each is abandoned at its cap and
+    the leg falls back: the BTC still re-prices (prior basis), rung 1 still
+    prices (pre-BTC basis), the floor is still placed, every terminal fires,
+    and the wall clock stays inside the sum of the caps."""
+
+    def test_the_ladder_completes_on_its_fallbacks(self, roller, instrumented,
+                                                   monkeypatch):
+        monkeypatch.setattr(cr, '_PRICING_READ_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(cr, '_DIAG_READ_TIMEOUT_SECONDS', 0.05)
+        release = threading.Event()
+        main = threading.get_ident()
+        book = _book()
+
+        def quote(symbol):
+            if threading.get_ident() != main:
+                release.wait(30)
+            return book(symbol)
+
+        def stock(symbol):
+            if threading.get_ident() != main:
+                release.wait(30)
+            return {'bid': 376.90, 'ask': 377.10}
+        instrumented.get_option_quote.side_effect = quote
+        instrumented.get_stock_quote.side_effect = stock
+        script = {'btc-1': _timeout('btc-1'),
+                  'btc-2': {'poll': _o('btc-2', 'filled', 1, 8.40)},
+                  'sto-1': _timeout('sto-1'),
+                  'sto-2': {'poll': _o('sto-2', 'filled', 1, 10.70)}}
+        try:
+            started = time.monotonic()
+            result, log, _b = _scripted(roller, instrumented, script)
+            wall = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert result['success'] is True
+        assert terminals(log) == ['call_roll_completed']
+        placed = _all(log, 'call_roll_btc_placed')
+        assert [(p['limit_price'], p['btc_quote_source']) for p in placed] == [
+            (8.50, 'evaluation'), (8.60, 'prior_basis')]
+        assert all(p['stock_quote_source'] == 'none' for p in placed)
+        assert _stos(log) == [(1, 'primary', 10.80), (2, 'floor', 8.40)]
+        rung1 = _all(log, 'call_roll_stc_placed')[0]
+        assert rung1['stc_quote_source'] == 'chain'   # no read came back at all
+        # ~18 bounded reads x 50 ms, plus thread overhead.
+        assert wall < 3.0, wall
+
