@@ -988,3 +988,78 @@ class TestReadsThatNeverReturn:
         # ~18 bounded reads x 50 ms, plus thread overhead.
         assert wall < 3.0, wall
 
+
+# --------------------------------------------------------------------------- #
+# T-21 — deferred rows survive an escaped exception (confirmation item 2)
+# --------------------------------------------------------------------------- #
+class TestDeferredRowsSurviveAnEscapedException:
+    """The queue is KEPT when the body raises, and drained by
+    ``flush_deferred`` — which the cycle calls only AFTER its
+    ``call_roll_execution_error`` terminal (ruling A (iv); the cycle half is in
+    tests/test_wheel_engine.py). *Catches:* a ``finally`` flush logging rows
+    before the terminal; rows dropped."""
+
+    def _raise_on(self, instrumented, n_ok, script):
+        broker = _Broker(script)
+        ids = list(script)
+        calls = {'n': 0}
+
+        def place(**kw):
+            calls['n'] += 1
+            if calls['n'] > n_ok:
+                raise RuntimeError("broker 500 on place")
+            return accepted(ids[calls['n'] - 1])
+        instrumented.place_option_order.side_effect = place
+        instrumented.get_order_by_id.side_effect = broker.by_id
+        instrumented.cancel_order.side_effect = broker.cancel
+
+    @pytest.mark.parametrize("n_ok, script, leg", [
+        # The re-priced BTC attempt's placement raises: attempt 0's row is
+        # queued (it runs after the NEXT placement, which never happened).
+        (1, {'btc-1': _timeout('btc-1'), 'btc-2': {}}, 'btc'),
+        # The floor's placement raises after rung 1 settled zero-fill.
+        (2, {'btc-1': BTC_FILL_835, 'sto-1': _timeout('sto-1'), 'sto-2': {}},
+         'stc'),
+    ])
+    def test_the_queued_row_waits_for_flush_deferred(self, roller, instrumented,
+                                                     n_ok, script, leg):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        self._raise_on(instrumented, n_ok, script)
+        with patch('src.strategy.call_roller.logger') as log:
+            with pytest.raises(RuntimeError):
+                roller.execute_roll(opp)
+            queued_before = [r for r in _all(log, 'call_roll_leg_settled')
+                             if r['disposition'] == 'timeout_canceled']
+            assert queued_before == [], "a row was logged before the terminal"
+            assert len(roller._deferred) == 1
+            roller.flush_deferred()
+            rows = [r for r in _all(log, 'call_roll_leg_settled')
+                    if r['disposition'] == 'timeout_canceled']
+        assert [r['leg'] for r in rows] == [leg]
+        assert roller._deferred == []
+
+
+# --------------------------------------------------------------------------- #
+# T-22 — the end-of-cycle sampler on a rolled call (confirmation item 4)
+# --------------------------------------------------------------------------- #
+class TestTheSamplerOnARolledCall:
+    """*Catches:* the replacement unsampled; the old row untagged."""
+
+    def test_the_old_row_is_tagged_and_the_replacement_sampled(self):
+        alpaca = Mock()
+        alpaca.get_option_quote.side_effect = lambda s: _q(1.00, 1.10)
+        alpaca.get_stock_quote.return_value = {'bid': 376.9, 'ask': 377.1}
+        other = OLD_SYMBOL.replace('370', '365')
+        with patch('src.strategy.call_roller.logger') as log:
+            n = cr.sample_short_call_quotes(
+                alpaca, [OLD_SYMBOL, other], {}, time.monotonic(),
+                rolled={OLD_SYMBOL: _N})
+        rows = _all(log, 'call_roll_quote_sample')
+        assert n == 3 and [r['symbol'] for r in rows] == [OLD_SYMBOL, _N, other]
+        assert rows[0]['rolled_this_cycle'] is True
+        assert rows[0]['replacement_symbol'] == _N
+        assert rows[1]['replacement_of'] == OLD_SYMBOL
+        # An un-rolled call's row is unchanged.
+        for key in ('rolled_this_cycle', 'replacement_symbol', 'replacement_of'):
+            assert key not in rows[2], key
+

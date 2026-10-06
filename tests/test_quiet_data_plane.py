@@ -173,3 +173,63 @@ class TestGetStockQuote:
             loud = [c for c in _error_rows(log)
                     if c.kwargs.get('event_type') == 'stock_quote_error']
             assert len(loud) == 3, "the main-thread path must be unchanged"
+
+
+class TestT20ThroughTheRollersBoundedRead:
+    """T-20 proper: the REAL decorated ``get_stock_quote`` driven through the
+    roller's ``_bounded_read`` worker — the path every diagnostic and pricing
+    stock read takes in production."""
+
+    def test_a_failed_bounded_read_is_quiet_and_on_the_data_plane(
+            self, fresh_breakers, stock_client):
+        from src.strategy import call_roller as cr
+        client, iex = stock_client
+        iex.get_stock_latest_quote.side_effect = (
+            requests.exceptions.ConnectionError("conn reset"))
+        with patch('src.api.alpaca_client.logger') as log:
+            value, why = cr._bounded_read(client.get_stock_quote, 'NVDA',
+                                          timeout=5.0)
+        assert (value, why) == (None, 'error')
+        assert iex.get_stock_latest_quote.call_count == 3   # the real retry ran
+        assert not _error_rows(log), "a quiet read logged an error row"
+        assert m._data_plane_breaker.failure_count == 1
+        assert m._circuit_breaker.failure_count == 0
+
+    def test_five_failed_reads_open_the_data_plane_and_never_the_settle(
+            self, fresh_breakers, stock_client):
+        from src.strategy import call_roller as cr
+        client, iex = stock_client
+        iex.get_stock_latest_quote.side_effect = (
+            requests.exceptions.ConnectionError("conn reset"))
+        with patch('src.api.alpaca_client.logger'):
+            for _ in range(5):
+                cr._bounded_read(client.get_stock_quote, 'NVDA', timeout=5.0)
+            assert m._data_plane_breaker.state == 'open'
+            # A sixth quiet read is refused BY THE BREAKER, quietly.
+            assert cr._bounded_read(client.get_stock_quote, 'NVDA',
+                                    timeout=5.0) == (None, 'error')
+            # The settle's read is on the order plane, which is closed.
+            client.trading_client.get_order_by_id.return_value = Mock(
+                id='o-1', symbol='X', status=Mock(value='canceled'), qty=1,
+                filled_qty=0, filled_avg_price=None, filled_at=None,
+                expired_at=None, canceled_at=None, submitted_at=None)
+            assert client.get_order_by_id('o-1')['status'] == 'canceled'
+        assert m._circuit_breaker.state == 'closed'
+
+    def test_a_failed_diagnostic_option_read_leaves_one_breadcrumb(
+            self, fresh_breakers):
+        """``_post_settle_quote``: one ``call_roll_quote_refresh_failed`` per
+        failed diagnostic option read — on the TRADE logger, never an error."""
+        from src.strategy import call_roller as cr
+        roller = object.__new__(cr.CallRoller)
+        roller.alpaca = Mock()
+        roller.alpaca.get_option_quote.side_effect = RuntimeError("down")
+        roller.alpaca.get_stock_quote.side_effect = RuntimeError("down")
+        with patch('src.strategy.call_roller.logger') as log:
+            out = roller._post_settle_quote('X', 'GOOGL', {'ask': 1.0}, 'buy')
+        assert out['cancel_quote_ask'] is None
+        crumbs = [c for c in log.info.call_args_list
+                  if c.kwargs.get('event_type') == 'call_roll_quote_refresh_failed']
+        assert len(crumbs) == 1
+        assert not [c for c in log.error.call_args_list
+                    if c.kwargs.get('event_category') == 'error']

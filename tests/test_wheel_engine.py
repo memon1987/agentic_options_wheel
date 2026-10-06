@@ -1372,3 +1372,54 @@ class TestTheQuoteSamplerRunsLastAndLiveOnly(_CycleFixture):
         default = inspect.signature(WheelEngine.__init__).parameters[
             'emit_quote_samples'].default
         assert default is True
+
+    def test_the_sampler_gets_this_cycles_rolls(self):
+        """FC-120 PR-2 T-22 (cycle half): old -> new symbol for every roll
+        the cycle COMPLETED, read off execute_roll's success dicts."""
+        engine, _ = self._engine(['AAA', 'BBB'])
+        aaa, bbb = _occ('AAA', self.EXPIRY, 100.0), _occ('BBB', self.EXPIRY, 100.0)
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls, \
+                patch('src.strategy.wheel_engine.sample_short_call_quotes') as sampler:
+            roller = roller_cls.return_value
+            roller.skip_reasons = {}
+            roller.evaluate_roll_opportunity.side_effect = (
+                lambda pos, *a, **k: {'symbol': pos['symbol']})
+            roller.execute_roll.side_effect = lambda opp: (
+                {'success': True, 'old_option_symbol': opp['symbol'],
+                 'new_option_symbol': 'AAA-NEW'} if opp['symbol'] == aaa
+                else {'success': False, 'reason': 'btc_timeout_canceled',
+                      'old_option_symbol': opp['symbol']})
+            engine.run_rolling_cycle()
+        assert sampler.call_args.kwargs['rolled'] == {aaa: 'AAA-NEW'}
+        assert bbb not in sampler.call_args.kwargs['rolled']
+
+
+class TestAnEscapedExceptionFlushesAfterItsTerminal(_CycleFixture):
+    """FC-120 PR-2 T-21 (cycle half): ``call_roll_execution_error`` goes out
+    FIRST, then the roller's queued leg rows (``flush_deferred``) — never the
+    other way round (ruling A (iv)), and a failing flush cannot break the
+    cycle."""
+
+    def test_the_terminal_precedes_the_flush(self):
+        engine, _ = self._engine(['AAA', 'BBB'])
+        order = []
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls, \
+                patch('src.strategy.wheel_engine.log_error_event') as err:
+            roller = roller_cls.return_value
+            roller.evaluate_roll_opportunity.return_value = {'x': 1}
+            roller.execute_roll.side_effect = RuntimeError("broker 500")
+            roller.flush_deferred.side_effect = lambda: order.append('flush')
+            err.side_effect = lambda *a, **k: order.append(k['error_type'])
+            results = engine.run_rolling_cycle()
+        assert order == ['call_roll_execution_error', 'flush'] * 2
+        assert results['rolls_skipped'] == 2
+
+    def test_a_failing_flush_cannot_break_the_cycle(self):
+        engine, _ = self._engine(['AAA', 'BBB'])
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls:
+            roller = roller_cls.return_value
+            roller.evaluate_roll_opportunity.return_value = {'x': 1}
+            roller.execute_roll.side_effect = RuntimeError("broker 500")
+            roller.flush_deferred.side_effect = RuntimeError("logging down")
+            results = engine.run_rolling_cycle()
+        assert results['rolls_evaluated'] == 2 and results['rolls_skipped'] == 2
