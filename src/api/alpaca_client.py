@@ -57,6 +57,14 @@ class CircuitBreaker:
         closed  - Normal operation, requests flow through.
         open    - Too many failures; requests are blocked.
         half_open - After reset_timeout, one test request is allowed through.
+
+    Thread-safe (FC-120 PR-2, review finding F6): the roller's bounded reads
+    run in daemon worker threads that can overlap (an abandoned read may still
+    be running when the next one starts), and they all record on the
+    data-plane breaker. Every read-modify-write of the state happens under one
+    lock, and the state TRANSITION is decided there, so two threads crossing
+    the threshold together open the breaker once and log it once. The log
+    calls run after the lock is released.
     """
 
     def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60,
@@ -69,51 +77,61 @@ class CircuitBreaker:
         # FC-120 PR-2: a named breaker says so on its own log rows; the
         # unnamed order-plane breaker logs exactly what it always did.
         self.name = name
+        self._lock = threading.Lock()
 
     def _named(self) -> Dict[str, Any]:
         return {'breaker': self.name} if self.name else {}
 
     def record_failure(self) -> None:
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            if self.state != 'open':
-                logger.warning(
-                    "Circuit breaker opened — API failures exceeded threshold",
-                    event_category="system",
-                    event_type="circuit_breaker_opened",
-                    failure_count=self.failure_count,
-                    threshold=self.failure_threshold,
-                    **self._named(),
-                )
-            self.state = 'open'
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            failure_count = self.failure_count
+            opened = (failure_count >= self.failure_threshold
+                      and self.state != 'open')
+            if failure_count >= self.failure_threshold:
+                self.state = 'open'
+        if opened:
+            logger.warning(
+                "Circuit breaker opened — API failures exceeded threshold",
+                event_category="system",
+                event_type="circuit_breaker_opened",
+                failure_count=failure_count,
+                threshold=self.failure_threshold,
+                **self._named(),
+            )
 
     def record_success(self) -> None:
-        if self.state != 'closed':
+        with self._lock:
+            previous = self.state
+            self.failure_count = 0
+            self.state = 'closed'
+        if previous != 'closed':
             logger.info(
                 "Circuit breaker closed — API recovered",
                 event_category="system",
                 event_type="circuit_breaker_closed",
-                previous_state=self.state,
+                previous_state=previous,
                 **self._named(),
             )
-        self.failure_count = 0
-        self.state = 'closed'
 
     def can_execute(self) -> bool:
-        if self.state == 'closed':
-            return True
-        if self.state == 'open' and self.last_failure_time is not None and \
-                time.time() - self.last_failure_time > self.reset_timeout:
-            logger.info(
-                "Circuit breaker half-open — allowing test request",
-                event_category="system",
-                event_type="circuit_breaker_half_open",
-                **self._named(),
-            )
+        with self._lock:
+            if self.state == 'closed':
+                return True
+            half_open = (self.state == 'open'
+                         and self.last_failure_time is not None
+                         and time.time() - self.last_failure_time > self.reset_timeout)
+            if not half_open:
+                return self.state != 'open'
             self.state = 'half_open'
-            return True
-        return self.state != 'open'
+        logger.info(
+            "Circuit breaker half-open — allowing test request",
+            event_category="system",
+            event_type="circuit_breaker_half_open",
+            **self._named(),
+        )
+        return True
 
 
 class CircuitBreakerOpen(Exception):
@@ -150,7 +168,8 @@ _circuit_breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
 # so `api_retry`'s `except RetryError` branch is unreachable and the
 # order-plane breaker has never recorded a failure (nor logged
 # `api_retry_exhausted`). FC-120 PR-2 leaves the order plane exactly as it was
-# (DD-5); making that breaker live is a separate decision with its own review.
+# (DD-5); making that breaker live is a separate decision with its own review
+# — FC-131 owns it.
 # --------------------------------------------------------------------------- #
 _data_plane = threading.local()
 

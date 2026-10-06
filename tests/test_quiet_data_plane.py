@@ -142,7 +142,8 @@ class TestApiRetryOnTheQuietPlane:
         unreachable: an exhausted main-thread call records NOTHING on the
         order-plane breaker and logs no ``api_retry_exhausted``. PR-2 keeps the
         order plane byte-for-byte (DD-5); making that breaker live is its own
-        decision."""
+        decision — **FC-131** (filed from the PR-2 reviews, F4) owns it, and
+        must flip this test deliberately when it lands."""
         @api_retry
         def flaky():
             raise requests.exceptions.ConnectionError("conn reset")
@@ -173,6 +174,70 @@ class TestGetStockQuote:
             loud = [c for c in _error_rows(log)
                     if c.kwargs.get('event_type') == 'stock_quote_error']
             assert len(loud) == 3, "the main-thread path must be unchanged"
+
+
+class TestTheBreakerIsThreadSafe:
+    """F6 (PR-2 review, SRE LOW-2): the roller's bounded-read workers record
+    on the data-plane breaker CONCURRENTLY — an abandoned read can still be
+    running when the next one starts. *Catches:* the open transition decided
+    outside a lock, so two workers crossing the threshold together both see
+    ``closed``, both log ``circuit_breaker_opened`` and race the state write.
+    *Mutation:* drop the lock (log before setting ``open``, as before F6) →
+    ``opened == ['a', 'b']``."""
+
+    def test_two_threads_crossing_the_threshold_open_it_once(
+            self, fresh_breakers):
+        breaker = m.CircuitBreaker(failure_threshold=2, reset_timeout=60,
+                                   name='data_plane')
+        breaker.record_failure()                      # 1: below the threshold
+        first_in, release, opened = threading.Event(), threading.Event(), []
+
+        def warning(*_args, **kwargs):
+            if kwargs.get('event_type') == 'circuit_breaker_opened':
+                opened.append(threading.current_thread().name)
+                if not first_in.is_set():
+                    first_in.set()
+                    release.wait(5)          # hold the first opener mid-log
+
+        with patch('src.api.alpaca_client.logger') as log:
+            log.warning.side_effect = warning
+            a = threading.Thread(target=breaker.record_failure, name='a')
+            a.start()
+            assert first_in.wait(5), "thread a never crossed the threshold"
+            b = threading.Thread(target=breaker.record_failure, name='b')
+            b.start()
+            b.join(5)
+            release.set()
+            a.join(5)
+        assert opened == ['a']
+        assert breaker.state == 'open' and breaker.failure_count == 3
+
+    def test_a_success_landing_mid_open_leaves_a_consistent_state(
+            self, fresh_breakers):
+        """A success that lands while a failure is opening the breaker must
+        not be overwritten by it: the transition is decided under the lock,
+        so the breaker ends in a state its own count agrees with.
+        *Mutation:* drop the lock → ``open`` with ``failure_count == 0`` —
+        a breaker that blocks every read until the reset timeout although
+        nothing has failed since the success."""
+        breaker = m.CircuitBreaker(failure_threshold=1, reset_timeout=60,
+                                   name='data_plane')
+        in_log, release = threading.Event(), threading.Event()
+
+        def warning(*_args, **kwargs):
+            if kwargs.get('event_type') == 'circuit_breaker_opened':
+                in_log.set()
+                release.wait(5)
+
+        with patch('src.api.alpaca_client.logger') as log:
+            log.warning.side_effect = warning
+            a = threading.Thread(target=breaker.record_failure)
+            a.start()
+            assert in_log.wait(5)
+            breaker.record_success()                  # lands mid-open
+            release.set()
+            a.join(5)
+        assert (breaker.state, breaker.failure_count) == ('closed', 0)
 
 
 class TestT20ThroughTheRollersBoundedRead:
