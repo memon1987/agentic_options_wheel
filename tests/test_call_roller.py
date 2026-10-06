@@ -90,6 +90,12 @@ def rolling_config():
     config.rolling_imminence_extrinsic_threshold = 0.20
     config.rolling_btc_fill_timeout_seconds = 0   # one poll, zero sleeps
     config.rolling_fallback_strike_attempts = 2
+    # FC-120 PR-2 (item 10). Shipped values except the STO window, which is 0
+    # for the same reason as the BTC's: one poll, zero sleeps per rung.
+    config.rolling_btc_reprice_attempts = 2
+    config.rolling_marketable_buffer_per_share = 0.10
+    config.rolling_stc_rung_timeout_seconds = 0
+    config.rolling_stc_escalation_rungs = 0
     config.roller_dry_run = False
     config.earnings_enabled = True
     return config
