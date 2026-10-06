@@ -109,7 +109,12 @@ from typing import Dict, List, Optional, Tuple
 # both `blocked_days_by_reason` and `binding_constraint` semantics, on top of
 # any verdict the un-over-blocking moved. Not bumping would have reproduced the
 # FC-048 timestamp-only wart this very comment criticizes.
-ENGINE_VERSION = "fc-112-wheel-roll-reach"
+#
+# FC-120 PR-2 bumped it to `fc-120-marketable-roll-limits`: roll limits are
+# buffered + parity-floored + tick-snapped and the credit invariant is screened
+# on them, so a marginal roll (raw net < 2 x buffer + 2 ticks + $0.20) is no
+# longer eligible — `rolls_executed` means something different either side.
+ENGINE_VERSION = "fc-120-marketable-roll-limits"
 
 # Versioned so a future change to the digest recipe (a different separator, a
 # different boundary) is a deliberate, visible invalidation rather than a silent

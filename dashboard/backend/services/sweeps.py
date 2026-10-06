@@ -104,7 +104,7 @@ except ImportError:  # dashboard image: the same files, copied flat
 # disagreed with the Job here would compute a key nothing ever matches and the
 # dedup would never fire — costing a full replay every time, silently. Pinned
 # by TestTheEngineVersionIsNotAFork.
-ENGINE_VERSION = "fc-112-wheel-roll-reach"
+ENGINE_VERSION = "fc-120-marketable-roll-limits"
 
 # FC-112. Every `ENGINE_VERSION` at or after `fc-116-roll-limit-fills`, i.e.
 # every engine that filled ROLL legs at the placed limits rather than at the
@@ -115,6 +115,7 @@ ENGINE_VERSION = "fc-112-wheel-roll-reach"
 POST_FC116_ENGINE_VERSIONS = frozenset({
     "fc-116-roll-limit-fills",
     "fc-112-wheel-roll-reach",
+    "fc-120-marketable-roll-limits",
 })
 
 # FC-112, review round 1 (E1). Every `ENGINE_VERSION` at or after
@@ -131,6 +132,7 @@ POST_FC116_ENGINE_VERSIONS = frozenset({
 # `TestTheEngineVersionIsNotAFork` enforces by asserting membership of each.
 POST_FC112_ENGINE_VERSIONS = frozenset({
     "fc-112-wheel-roll-reach",
+    "fc-120-marketable-roll-limits",
 })
 
 logger = logging.getLogger(__name__)

@@ -458,6 +458,9 @@ class TestTheEngineVersionIsNotAFork:
         assert EI.ENGINE_VERSION in S.POST_FC116_ENGINE_VERSIONS
         assert "fc-116-roll-limit-fills" in S.POST_FC116_ENGINE_VERSIONS, (
             "the release the set is named for must stay in it")
+        # APPEND-only: FC-120 PR-2's bump ADDED `fc-120-marketable-roll-limits`
+        # and kept the version it superseded.
+        assert "fc-112-wheel-roll-reach" in S.POST_FC116_ENGINE_VERSIONS
 
     def test_a_rowless_sweep_from_each_era_gets_the_right_footer(self):
         """FC-112, the behaviour the set exists for — asserted, not assumed."""
@@ -494,6 +497,9 @@ class TestTheEngineVersionIsNotAFork:
         assert EI.ENGINE_VERSION in S.POST_FC112_ENGINE_VERSIONS
         assert "fc-112-wheel-roll-reach" in S.POST_FC112_ENGINE_VERSIONS, (
             "the release the set is named for must stay in it")
+        # FC-120 PR-2 changed roll ELIGIBILITY, not the wheel's reach: its
+        # version belongs to both eras (a 21-DTE reach engine, limit fills).
+        assert "fc-120-marketable-roll-limits" in S.POST_FC112_ENGINE_VERSIONS
         assert "fc-116-roll-limit-fills" not in S.POST_FC112_ENGINE_VERSIONS, (
             "FC-116 predates the wheel's reach widening; if it were in the set "
             "every row of the 09-12 battery would be served a 21-DTE reach it "
