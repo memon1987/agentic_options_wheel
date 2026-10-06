@@ -318,10 +318,11 @@ def _install_rate_limit_retry(max_tries: int = 10) -> None:
 # chain — the census, no engine
 # --------------------------------------------------------------------------- #
 
-# One chain lake per process, a fresh ChainStore per use — the same shape
-# `screen.py` uses (FC-060). A lake per call would mean a GCS client, a startup
-# probe and an independent circuit breaker for every simulated arm, so an
-# outage would be rediscovered instead of remembered.
+# One chain lake per process (`ChainStore.lake_from_env()`, called once), a
+# fresh ChainStore per use — the shape the retired monthly screen used (FC-060;
+# deleted by FC-121). `ChainStore.from_env()` would build a lake per call: a GCS
+# client, a startup probe and an independent circuit breaker for every simulated
+# arm, so an outage would be rediscovered instead of remembered.
 _CHAIN_LAKE = None
 _CHAIN_LAKE_RESOLVED = False
 

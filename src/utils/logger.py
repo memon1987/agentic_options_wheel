@@ -20,8 +20,9 @@ from typing import Any, Callable, Dict, Iterator, Optional
 # Services set K_SERVICE. A Cloud Run *Job* sets CLOUD_RUN_JOB and
 # CLOUD_RUN_EXECUTION instead — so checking K_SERVICE alone reports False in a
 # Job, which sends logs to a FILE inside a container whose filesystem is
-# destroyed on exit. The monthly backtest screen runs as a Job: without this,
-# it produces no observable output at all and a failure is undiagnosable.
+# destroyed on exit. The backtest Jobs (`backtest-sweep`, `data-backfill`; the
+# retired monthly screen first) run as Jobs: without this, a Job produces no
+# observable output at all and a failure is undiagnosable.
 _CLOUD_RUN_ENV_VARS = ("K_SERVICE", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION")
 
 
@@ -37,9 +38,9 @@ def _is_cloud_run() -> bool:
 # THE DEFECT, measured on `main` at 7087007: two `evaluate_symbol` calls in one
 # process produced `blocked_days_by_reason={'already holds this underlying…': 16,
 # 'selection: duplicate underlying': 4}` for the first and `{}` for the second.
-# The monthly screen replays 14 symbols in one process, so 13 of every 14
-# `backtest_runs` rows have carried an empty tally and a NULL
-# `binding_constraint` since the screen went live.
+# The monthly screen (retired; FC-121) replayed 14 symbols in one process, so
+# 13 of every 14 `backtest_runs` rows it wrote before this fix carried an empty
+# tally and a NULL `binding_constraint`.
 #
 # THE MECHANISM: `cache_logger_on_first_use=True` (below) makes a
 # `BoundLoggerLazyProxy` cache its whole processor chain the first time it is

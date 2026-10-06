@@ -71,17 +71,44 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ``src.backtesting.screen.ENGINE_VERSION``. DUPLICATED rather than imported,
-# for the same reason ``dashboard/backend/services/sweeps.py`` duplicates it:
-# ``screen.py`` imports the engine (pandas, the Alpaca SDK, the simulator), and
-# this module has to be importable — and runnable — with nothing but the
-# standard library. Pinned byte-equal by
+# THE engine-side declaration of ``ENGINE_VERSION`` (FC-121 PR-2): every
+# engine-side reader imports it from here. It used to live in ``screen.py``,
+# deleted with the retired monthly screen, and this module held a byte-pinned
+# DUPLICATE of it. This is the natural single home: the module already feeds
+# the value into the digest, and it is stdlib-only, so a reader imports it
+# without dragging in the engine. It is stamped on every ``scenario_sweeps`` and
+# ``scenario_runs`` row and is half of ``sweep_key``.
+#
+# One duplicate remains, deliberately: ``dashboard/backend/services/sweeps.py``.
+# The dashboard image does not ship this module (only ``identity.py`` and
+# ``overrides.py`` are copied into it), and a dashboard that disagreed with the
+# Job here would compute a key nothing ever matches. Pinned byte-equal by
 # ``tests/test_engine_identity.py::TestTheEngineVersionIsNotAFork``.
 #
-# It is in the digest even though ``screen.py``'s bytes are already hashed,
+# It is in the digest even though this file's bytes are already hashed,
 # because the two answer different questions: the file hash says "the code
 # changed", this says "the operator declared a new engine generation" — and an
 # operator who bumps it deliberately wants the cache invalidated.
+#
+# Version history, moved verbatim from ``screen.py`` (the screen stamped this
+# string on its ``backtest_runs`` rows, which is what the first sentence means):
+#
+# Stamped on every `backtest_runs` row so a verdict can be traced to the engine
+# that produced it. FC-068 repointed the replay from WheelEngine's dead
+# orchestration path onto the production scan -> select -> execute pipeline and
+# premium-netted the assignment basis: rows either side of this string are NOT
+# comparable. (FC-048 changed the measurement just as much — every backtest
+# before it ran a put-only wheel — and did NOT bump this, so its boundary is
+# timestamp-only, 2026-07-29.)
+#
+# FC-069 item 12 bumped it again. Two things moved under the replay: the
+# scanner's put-side existing-position check stopped substring-matching OCC
+# symbols (a symbol the replay used to skip on a spelling coincidence is now
+# scanned), and the rejection vocabulary gained a bucket that is deliberately
+# excluded from `binding_constraint` selection. So rows either side differ in
+# both `blocked_days_by_reason` and `binding_constraint` semantics, on top of
+# any verdict the un-over-blocking moved. Not bumping would have reproduced the
+# FC-048 timestamp-only wart this very comment criticizes.
 ENGINE_VERSION = "fc-112-wheel-roll-reach"
 
 # Versioned so a future change to the digest recipe (a different separator, a

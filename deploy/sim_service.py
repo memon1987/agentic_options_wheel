@@ -384,12 +384,11 @@ def normalise_spec(spec: Any) -> Dict[str, Any]:
     import main as cli
     from src.backtesting.scenarios import BASE_SCENARIO_NAME
     from src.backtesting.scenarios.identity import (
-        DEFAULT_STARTING_CASH, validate_symbol,
+        DEFAULT_LOOKBACK_DAYS, DEFAULT_STARTING_CASH, validate_symbol,
     )
     from src.backtesting.scenarios.overrides import (
         OverrideError, validate_overrides,
     )
-    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
 
     if not isinstance(spec, dict):
         raise SpecRefused(
@@ -733,7 +732,7 @@ class _Run:
         second implementation would drift from the one the dashboard reads.
         """
         import main as cli
-        from src.backtesting.screen import ENGINE_VERSION
+        from src.backtesting.scenarios.engine_identity import ENGINE_VERSION
 
         with self._terminal_lock:
             if self.terminalised:
@@ -1011,8 +1010,9 @@ def create_app():
         A sync ``def``, like every handler here, so a health check answers while
         the worker thread is mid-replay.
         """
-        from src.backtesting.scenarios.engine_identity import engine_identity
-        from src.backtesting.screen import ENGINE_VERSION
+        from src.backtesting.scenarios.engine_identity import (
+            ENGINE_VERSION, engine_identity,
+        )
 
         with _STATE_LOCK:
             current = _CURRENT
@@ -1096,11 +1096,12 @@ def _simulate(raw_spec: Dict[str, Any], provenance_header: Optional[str] = None)
 
     from src.backtesting.data.chain_store import ChainStore
     from src.backtesting.reporting.artifact_store import ArtifactWriter
-    from src.backtesting.reporting.bq_writer import config_hash
+    from src.backtesting.reporting.config_hash import config_hash
     from src.backtesting.scenarios import persist as sweep_store
-    from src.backtesting.scenarios.engine_identity import engine_identity
+    from src.backtesting.scenarios.engine_identity import (
+        ENGINE_VERSION, engine_identity,
+    )
     from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
-    from src.backtesting.screen import ENGINE_VERSION
 
     global _CURRENT, _WORKER
 

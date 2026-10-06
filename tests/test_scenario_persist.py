@@ -26,13 +26,13 @@ from datetime import date
 import pytest
 
 from src.backtesting.scenarios import persist as store
+from src.backtesting.scenarios.engine_identity import ENGINE_VERSION
 from src.backtesting.scenarios.identity import (
     canonical_spec, scenario_arm_hash, sweep_key,
 )
 from src.backtesting.scenarios.runner import (
     BASE_SCENARIO_NAME, Scenario, ScenarioResult, SweepResult,
 )
-from src.backtesting.screen import ENGINE_VERSION
 
 
 # --------------------------------------------------------------------------

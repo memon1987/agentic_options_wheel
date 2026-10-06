@@ -1003,15 +1003,14 @@ class Simulator:
         no_op = NoOpAnalyticsWriter()
         previous_writer = analytics_module.set_analytics_writer(no_op)
         # ExecutionEngine._failed_symbols is a MODULE-GLOBAL set of
-        # non-retryable option symbols. `/backtest/screen` lives on the live
-        # trading server (disabled by default, opt-in via
-        # ENABLE_SCREEN_ENDPOINT), so an in-server replay clearing it would
-        # wipe the set `/run` depends on. Snapshot here, restore in the same
+        # non-retryable option symbols. Snapshot here, restore in the same
         # `finally` that restores the analytics singleton — the established
-        # swap pattern. (Standing precondition either way: the endpoint stays
-        # disabled on the trading service; the Cloud Run Job is the sanctioned
-        # screen runner.) It also leaks across the 14 sequential per-symbol
-        # runs of a screen today; the restore ends that too.
+        # swap pattern. It was added while the retired screen's endpoint lived
+        # on the live trading server (deleted by FC-121), where an in-server
+        # replay clearing the set would have wiped the one `/run` depends on.
+        # It stays because the set otherwise leaks across the sequential
+        # replays of one process — a sweep's arms and symbols, the battery's
+        # sweeps — and the restore ends that too.
         preserved_failed_symbols = set(get_failed_symbols())
         tally = RejectionTally()
         tally.__enter__()

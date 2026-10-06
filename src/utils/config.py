@@ -673,8 +673,8 @@ class Config:
         covered-call profile, whose universe is holdings-derived) rather than
         raising KeyError. The wheel is unchanged — it always has the section, and
         validation still requires it non-empty for the wheel profile. This makes
-        the read-only callers (`/config`, `/backtest/screen`, `get_market_overview`)
-        safe on a non-wheel profile.
+        the read-only callers (`/config`, `get_market_overview`, and the screen
+        endpoint until FC-121 deleted it) safe on a non-wheel profile.
         """
         return self._config.get("stocks", {}).get("symbols", [])
 

@@ -432,13 +432,6 @@ class TestTheIdentityIsDeterministic:
 
 
 class TestTheEngineVersionIsNotAFork:
-    def test_it_matches_screens_declaration(self):
-        """Duplicated because `screen.py` imports the engine and this module
-        must stay stdlib-only. Pinned, because a fork would make the Job and the
-        dashboard key differently for ever."""
-        from src.backtesting.screen import ENGINE_VERSION
-        assert EI.ENGINE_VERSION == ENGINE_VERSION
-
     def test_the_dashboard_copy_matches_too(self):
         # See tests/_dashboard_path.py: the backend is APPENDED and the repo
         # root kept ahead of it, so `import main` still resolves to the CLI.

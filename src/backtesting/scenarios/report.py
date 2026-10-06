@@ -580,8 +580,8 @@ def _pct(value: Optional[float], width: str = "+.1%") -> str:
     """A missing number renders as an em dash, never as 0%.
 
     "+0.0%" reads as "measured, and exactly flat", which is a different claim
-    from "we have no number here" — the same reason ``render_screen_summary``
-    refuses to print a zero benchmark.
+    from "we have no number here" — the same reason the retired screen's
+    summary refused to print a zero benchmark.
     """
     return "—" if value is None else format(value, width)
 

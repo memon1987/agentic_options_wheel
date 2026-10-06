@@ -40,11 +40,13 @@ from src.backtesting.data import chain_store as chain_store_module
 from src.backtesting.data.chain_builder import ChainQuote, ChainSnapshot
 from src.backtesting.data.chain_store import (
     DEFAULT_LAKE_PREFIX,
+    LAKE_COUNTERS,
     MAX_CONSECUTIVE_LAKE_ERRORS,
     ChainLake,
     ChainLakePreconditionFailed,
     ChainLakeUnavailable,
     ChainStore,
+    accumulate_lake_summary,
 )
 
 AS_OF = date(2025, 1, 6)
@@ -1933,8 +1935,23 @@ class TestConfiguration:
 
 
 # --------------------------------------------------------------------------- #
-# Wiring: evaluate + screen
+# Wiring: evaluate, and the run-level lake totals a sweep persists
 # --------------------------------------------------------------------------- #
+def _summary_counters(summary) -> set:
+    """The counters a ``ChainStore.summary()`` reports, read off its VALUES.
+
+    Independent of ``LAKE_COUNTERS`` by construction — that tuple is what the
+    T-4 tests check, so it cannot also be their oracle. A counter is a
+    ``lake_*`` key holding an ``int``; ``bool`` is excluded explicitly because
+    it is an ``int`` subclass and ``lake_enabled`` / ``lake_disabled`` are
+    flags. The other non-counter keys (``lake_bucket``, ``lake_prefix``,
+    ``lake_disabled_reason``) hold a string or None.
+    """
+    return {key for key, value in summary.items()
+            if key.startswith("lake_") and isinstance(value, int)
+            and not isinstance(value, bool)}
+
+
 class TestWiring:
     def test_evaluate_uses_from_env_and_logs_a_summary(self):
         import inspect
@@ -1945,74 +1962,75 @@ class TestWiring:
         assert "ChainStore.from_env()" in src
         assert "chain_lake_summary" in src
 
-    def test_screen_shares_one_lake_and_logs_a_run_summary(self):
-        import inspect
+    def test_run_totals_sum_every_counter_the_summary_reports(self):
+        """T-4 (FC-121), aggregation half: ``accumulate_lake_summary`` sums,
+        across stores, every counter ``ChainStore.summary()`` reports.
 
-        from src.backtesting import screen
+        The expected counter set comes from ``_summary_counters`` — the
+        summary's own values — and never from ``LAKE_COUNTERS``: iterating the
+        tuple here would only prove the helper's loop agrees with itself, and
+        that version let a counter deleted from the tuple pass (review round 1,
+        mutation M12).
 
-        src = inspect.getsource(screen)
-        assert "lake_from_env()" in src
-        assert "chain_lake_run_summary" in src
-        assert "chain_lake_degraded" in src
+        The distinct per-counter values are set on the second store's
+        ATTRIBUTES, not written into the dict ``summary()`` returns, so the
+        test also pins ``summary()``'s wiring: each key must read the
+        attribute of the same name. Writing into the returned dict skipped
+        that wiring, and a ``"lake_puts": self.lake_misses`` mis-wiring passed
+        (confirmation pass, 8 of 10 such mutants). A key summed into the wrong
+        slot fails too.
 
-    def test_screen_run_summary_aggregates_and_warns(self, captured_events):
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
-
+        Re-pointed at ``chain_store`` from the retired screen's run-summary
+        test: its aggregation half survives, its log-line half went with the
+        log line."""
         lake = FakeLake()
+        first = ChainStore("x", lake=lake)
+        first.lake_hits, first.lake_errors = 3, 2
         totals = {}
-        _accumulate_lake(totals, ChainStore("x", lake=lake).summary())
-        store = ChainStore("y", lake=lake)
-        store.lake_hits, store.lake_errors = 3, 2
-        _accumulate_lake(totals, store.summary())
+        accumulate_lake_summary(totals, first.summary())
         assert totals["lake_hits"] == 3 and totals["lake_errors"] == 2
 
-        _log_lake_run_summary(lake, totals, "run-1")
-        assert _events(captured_events, "chain_lake_run_summary")
-        assert _events(captured_events, "chain_lake_degraded"), (
-            "a run that errored must not look clean in the logs"
-        )
+        second_store = ChainStore("y", lake=lake)
+        counters = sorted(_summary_counters(second_store.summary()))
+        assert counters, "the oracle found no counters; this would pass vacuously"
+        for i, key in enumerate(counters, start=1):
+            setattr(second_store, key, 10 * i)
+        accumulate_lake_summary(totals, second_store.summary())
 
-    def test_a_run_with_refused_merges_is_degraded_even_with_no_errors(
-        self, captured_events
+        expected = {key: 10 * i for i, key in enumerate(counters, start=1)}
+        expected["lake_hits"] += 3
+        expected["lake_errors"] += 2
+        assert totals == expected
+
+    def test_lake_counters_are_exactly_the_counters_the_summary_reports(
+        self, tmp_path
     ):
-        """A thrashing symbol that failed to heal did not have a clean run.
+        """T-4 (FC-121), contract half, in BOTH directions:
+        ``set(LAKE_COUNTERS)`` must EQUAL the counters ``summary()`` reports
+        (``_summary_counters``, an oracle independent of the tuple).
 
-        `lake_errors == 0` and a green exit is exactly how SPY stayed cold for
-        a month without anyone noticing. A refused merge means the day will be
-        re-fetched cold next month, and every month after, so it belongs in
-        the same warning as an outage.
-        """
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
+        - A counter renamed in ``summary()`` but not in the tuple is summed as
+          a silent 0, because the helper reads ``summary.get(key, 0)``.
+        - A counter dropped from the tuple, or added to ``summary()`` and never
+          to the tuple (review round 1, mutations M12 / M11), is left out of
+          every run-level total.
 
-        lake = FakeLake()
-        store = ChainStore("z", lake=lake)
-        store.lake_merge_gaps, store.lake_merge_refused = 1, 2
-        totals = {}
-        _accumulate_lake(totals, store.summary())
-        _log_lake_run_summary(lake, totals, "run-3")
-
-        degraded = _events(captured_events, "chain_lake_degraded")
-        assert degraded, "a run whose merges were refused must not look clean"
-        assert degraded[0]["lake_merge_gaps"] == 1
-        assert degraded[0]["lake_merge_refused"] == 2
-        assert degraded[0]["lake_errors"] == 0
-
-    def test_a_clean_run_is_still_clean(self, captured_events):
-        from src.backtesting.screen import _accumulate_lake, _log_lake_run_summary
-
-        lake = FakeLake()
-        totals = {}
-        _accumulate_lake(totals, ChainStore("w", lake=lake).summary())
-        _log_lake_run_summary(lake, totals, "run-4")
-        assert _events(captured_events, "chain_lake_run_summary")
-        assert not _events(captured_events, "chain_lake_degraded")
-
-    def test_no_run_summary_without_a_lake(self, captured_events):
-        from src.backtesting.screen import _log_lake_run_summary
-
-        _log_lake_run_summary(None, {}, "run-2")
-        assert not [e for e in captured_events
-                    if str(e.get("event_type", "")).startswith("chain_lake")]
+        What drift costs today: the sweep finaliser stores ``dict(summary)``
+        overlaid with these totals. With one store per sweep, a drifted tuple
+        cannot drop a key from ``scenario_sweeps.lake_summary_json``; a tuple
+        key that ``summary()`` no longer reports is stored as a spurious 0
+        next to the renamed key. The totals go wrong once more than one store
+        is summed, which is the job this helper exists for (the retired screen
+        summed fourteen)."""
+        summary = ChainStore(str(tmp_path), lake=FakeLake()).summary()
+        reported = _summary_counters(summary)
+        assert reported, "the oracle found no counters; this would pass vacuously"
+        tuple_only = sorted(set(LAKE_COUNTERS) - reported)
+        summary_only = sorted(reported - set(LAKE_COUNTERS))
+        assert (tuple_only, summary_only) == ([], []), (
+            f"LAKE_COUNTERS names counters summary() does not report: "
+            f"{tuple_only}; summary() reports counters LAKE_COUNTERS lacks: "
+            f"{summary_only}")
 
     def test_summary_shape_is_loggable(self, tmp_path):
         store = ChainStore(str(tmp_path), lake=FakeLake())

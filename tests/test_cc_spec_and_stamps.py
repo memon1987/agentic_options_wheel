@@ -206,7 +206,7 @@ class TestCanonicalisationByOmission:
 
     def test_the_default_mode_is_the_same_string_in_every_copy(self):
         """Three copies that cannot import each other: `identity` (stdlib-only,
-        flat-copied into the dashboard image), `evaluate` (the screen path),
+        flat-copied into the dashboard image), `evaluate` (the `backtest` path),
         and `engine.broker` (which the adapter imports — it cannot reach
         `identity` without a circular import through
         `scenarios/__init__` -> runner -> simulator -> adapter)."""
@@ -340,11 +340,11 @@ class TestProfileResolution:
 
 
 class TestSingleSymbolCommandsRefuseANonWheelProfile:
-    """Review round 1 (LOW). `backtest` and `screen` build a Simulator with NO
-    seeding policy — only `run_sweep` resolves one — so a covered-call profile
-    would replay with no shares and report a verdict about a run it never had
-    the inputs for. `screen` would also PERSIST that verdict to `backtest_runs`
-    in the profile's own dataset."""
+    """Review round 1 (LOW). `backtest` builds a Simulator with NO seeding
+    policy — only `run_sweep` resolves one — so a covered-call profile would
+    replay with no shares and report a verdict about a run it never had the
+    inputs for. (The retired `screen` command shared the guard until FC-121
+    deleted it; it would also have PERSISTED that verdict to `backtest_runs`.)"""
 
     class _Args:
         symbol = "GOOGL"
@@ -358,13 +358,6 @@ class TestSingleSymbolCommandsRefuseANonWheelProfile:
             cli.run_backtest(self._Args(), Config("config/covered_call.yaml"), None)
         assert "does not support the 'covered_call' profile" in str(exc.value)
         assert "--command sweep" in str(exc.value)
-
-    def test_screen_refuses_before_it_can_write_a_row(self):
-        from src.utils.config import Config
-
-        with pytest.raises(SystemExit) as exc:
-            cli.run_screen_cmd(self._Args(), Config("config/covered_call.yaml"), None)
-        assert "does not support the 'covered_call' profile" in str(exc.value)
 
     def test_the_wheel_is_unaffected(self):
         from src.utils.config import Config
@@ -702,13 +695,12 @@ class TestTheEngineVersionMovedAndStayedInSync:
     makes the boundary queryable (`WHERE engine_version = ...`). FC-048 did not
     bump, and the docs call that boundary "timestamp-only" as the regret."""
 
-    def test_all_three_copies_are_the_fc116_version(self):
-        from src.backtesting import screen
+    def test_the_engine_declaration_is_the_current_version(self):
+        """Two copies since FC-121 deleted `screen.py`'s: this declaration and
+        the dashboard's (next test)."""
         from src.backtesting.scenarios import engine_identity
 
-        assert (screen.ENGINE_VERSION
-                == engine_identity.ENGINE_VERSION
-                == "fc-112-wheel-roll-reach")
+        assert engine_identity.ENGINE_VERSION == "fc-112-wheel-roll-reach"
 
     def test_the_dashboard_copy_agrees(self):
         import sys
@@ -719,5 +711,5 @@ class TestTheEngineVersionMovedAndStayedInSync:
             sys.path.insert(0, backend)
         from services import sweeps as dash
 
-        from src.backtesting import screen
-        assert dash.ENGINE_VERSION == screen.ENGINE_VERSION
+        from src.backtesting.scenarios import engine_identity
+        assert dash.ENGINE_VERSION == engine_identity.ENGINE_VERSION

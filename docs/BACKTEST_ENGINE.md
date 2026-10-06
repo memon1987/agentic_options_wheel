@@ -5,7 +5,8 @@ scenario sweeps (the `backtest-sweep` Job), the weekly battery (inside the `data
 Job, writing `scenario_runs`) and the sim service. The monthly screen that wrote
 `options_wheel.backtest_runs` was **retired 2026-10-02** (§Track D). Not wired to any
 automated *action*: `demote` is a column, not a trigger.
-**Last updated:** 2026-10-02 (FC-121 — the monthly screen retired; Track D is now history)
+**Last updated:** 2026-10-05 (FC-121 PR-2 — the screen's code deleted: `--command screen`,
+`screen.py` and its BigQuery writer; Track D is history)
 
 Programmatic demotion is deliberately **out of scope** — a later motion, once the engine
 has been generating real data for a while. Nothing in this system changes the trading
@@ -66,9 +67,10 @@ distinguished by `engine_version` (see "things that will mislead you", item 5).
 
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-11-01 --end 2025-12-01
-python main.py --command screen                    # whole universe -> BigQuery
-python main.py --command screen --no-persist       # analysis only, writes nothing
 ```
+
+`--command screen` (the whole-universe run that wrote `backtest_runs`) was deleted by FC-121
+with the retired monthly screen (§Track D). For many symbols at once, use a sweep.
 
 ## What it is good for
 
@@ -266,13 +268,13 @@ than it is; it refuses to emit a conclusion when the market is closed.
 ## Track D — the monthly screen (history: ran 2026-07-30 → 2026-10-02)
 
 > **RETIRED 2026-10-02 (operator decision).** The `monthly-performance-review` scheduler was
-> paused that day; the monthly screen no longer runs. **FC-121 decommissions it**
-> (`docs/plans/fc-121.md`): the `/backtest/screen` endpoint and the Job-failure policy's
-> `backtest-screen` entry are removed from the tree, and the `backtest-screen` Job and the
-> `monthly-performance-review` scheduler are deleted at that FC's rollout — there is nothing
-> to resume. `options_wheel.backtest_runs` is **kept** as history: nothing **scheduled**
-> writes it, and the `--command screen` CLI that could still persist a row locally is
-> removed by FC-121 PR-2. The Job's attribute table (not a command) survives only in
+> paused that day; the monthly screen no longer runs. **FC-121 decommissioned it**
+> (`docs/plans/fc-121.md`): PR-1 removed the `/backtest/screen` endpoint and the Job-failure
+> policy's `backtest-screen` entry, the `backtest-screen` Job and the
+> `monthly-performance-review` scheduler were deleted on 2026-10-02, and PR-2 removed the
+> `--command screen` CLI with `screen.py` and its BigQuery writer — there is nothing to
+> resume. `options_wheel.backtest_runs` is **kept** as history; nothing writes it. The Job's
+> attribute table (not a command) survives only in
 > repository history (this file at `fbdb6f9`); its exported spec is recorded in
 > `docs/plans/fc-121.md` §Execution. What remains below is the record of what the screen
 > was.
@@ -342,7 +344,7 @@ cache, and `ChainStore` uses it write-through:
 | IAM | **`roles/storage.objectAdmin` on the bucket, and nothing bucket-level.** The lake only lists, reads and writes *objects* — including its startup health probe, which lists one object rather than calling `Bucket.exists()` (that is `storage.buckets.get`, which objectAdmin does **not** grant; using it would 403 and disable the lake on the first call of every run). Do not widen IAM to make a health check work. |
 | Layout | `<prefix>/<UNDERLYING>/<YYYY-MM-DD>.parquet` — one object per local file, same bytes |
 | Env | `CHAIN_LAKE_BUCKET` (unset ⇒ **no lake, no GCS client, behaviour identical to before**), `CHAIN_LAKE_PREFIX` (default `chains/v1`) |
-| Read by | `ChainStore.from_env()` — the Job (`screen.py`, which builds **one** lake for the whole run), `main.py --command backtest` via `evaluate_symbol`, and the `fc034` / `fc036` diagnostics. A `ChainStore()` constructed directly anywhere else bypasses the lake by design. |
+| Read by | `ChainStore.from_env()` — every sweep (`run_sweep`: the `backtest-sweep` Job, `--command sweep`, the sim service, and the weekly battery inside `data-backfill`), the backfill itself, `main.py --command backtest` via `evaluate_symbol`, and the `fc034` / `fc036` diagnostics (which share **one** lake across their per-symbol stores, as the retired screen did). A `ChainStore()` constructed directly anywhere else bypasses the lake by design. |
 | Seed | `python tools/diagnostics/chain_lake_seed.py --cache-dir cache/backtest/chains --bucket options-wheel-chain-lake` |
 
 - **A local miss tries the lake before the provider**; a chain built from the provider is
@@ -429,13 +431,16 @@ cache, and `ChainStore` uses it write-through:
 - **The startup probe lists one object.** A missing bucket surfaces as `NotFound`
   (`bucket_missing`); anything else — 403, DNS, TLS, timeout — is `bucket_unreachable`; zero
   objects is a healthy *empty* lake, which is the day-one state before the seed runs.
-- **Measure it from the logs.** Each symbol emits one `chain_lake_summary`; the run emits
-  one `chain_lake_run_summary` with the totals, plus a `chain_lake_degraded` **warning** if
-  anything errored, the lake was disabled, or a merge was refused (`lake_merge_gaps` /
-  `lake_merge_refused` — a thrashing symbol that failed to heal will be cold again next
-  month, which is exactly the kind of thing that goes unnoticed). The failure mode of this
-  feature is silence —
-  a lake erroring on every call still produces a green run that took the full cold 1h47m.
+- **Measure it from the counters.** A sweep stores its run-level totals on its
+  `scenario_sweeps` row (`lake_summary_json`); the backfill fails its exit code on any
+  `lake_errors` or a disabled lake; a `--command backtest` symbol emits one
+  `chain_lake_summary` log line. Read `lake_merge_gaps` / `lake_merge_refused` as well — a
+  thrashing symbol that failed to heal will be cold again on the next run, which is exactly
+  the kind of thing that goes unnoticed. (The retired screen also logged a run-level
+  `chain_lake_run_summary` and a `chain_lake_degraded` warning; both were deleted with it by
+  FC-121 — no alert, check or dashboard consumed either.) The failure mode of this feature is
+  silence — a lake erroring on every call still produces a green run that took the full cold
+  time (1h47m for the screen).
 
 | counter | meaning |
 |---|---|

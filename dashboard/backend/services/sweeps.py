@@ -22,7 +22,9 @@ suite (Cloud Build runs that suite as step 1, so drift fails the build):
 
 * the report's operator-facing prose (``sweep_report_text.py``) — ``report.py``
   imports ``runner.py`` imports the simulator;
-* ``ENGINE_VERSION`` — lives in ``screen.py``, which imports the engine;
+* ``ENGINE_VERSION`` — declared in ``scenarios/engine_identity.py`` since
+  FC-121; that package's ``__init__`` imports the engine, and the image ships
+  only flat copies of ``identity.py`` and ``overrides.py``;
 * the ``scenario_sweeps`` row shape and the "latest status wins" ORDER BY —
   ``persist.py``'s package ``__init__`` imports the engine.
 """
@@ -97,10 +99,11 @@ except ImportError:  # dashboard image: the same files, copied flat
 # Pinned copies — each has a byte-equality test against its original.
 # ============================================================================ #
 
-# `src.backtesting.screen.ENGINE_VERSION`. It is half of `sweep_key` (D4), so a
-# dashboard that disagreed with the Job here would compute a key nothing ever
-# matches and the dedup would never fire — costing a full replay every time,
-# silently. Pinned by TestTheEngineVersionIsNotAFork.
+# `src.backtesting.scenarios.engine_identity.ENGINE_VERSION` — the engine-side
+# declaration since FC-121. It is half of `sweep_key` (D4), so a dashboard that
+# disagreed with the Job here would compute a key nothing ever matches and the
+# dedup would never fire — costing a full replay every time, silently. Pinned
+# by TestTheEngineVersionIsNotAFork.
 ENGINE_VERSION = "fc-112-wheel-roll-reach"
 
 # FC-112. Every `ENGINE_VERSION` at or after `fc-116-roll-limit-fills`, i.e.

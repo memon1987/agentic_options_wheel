@@ -2,7 +2,7 @@
 
 **Why this file exists.** Round 1 found that every covered-call sweep entry
 point raised ``KeyError: 'put_target_dte'`` before replaying a single day:
-``run_sweep`` → ``bq_writer.config_hash`` → a ``Config`` property that indexes
+``run_sweep`` → ``config_hash`` → a ``Config`` property that indexes
 ``_config["strategy"]`` directly, on a profile with no put leg. Thirty-five
 tests of the covered-call REPLAY passed while the thing an operator would
 actually run was broken end to end, because every one of them drove
@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from src.backtesting.reporting.bq_writer import config_hash
+from src.backtesting.reporting.config_hash import config_hash
 from src.backtesting.scenarios import persist as store
 from src.backtesting.scenarios.runner import (
     Scenario, arm_max_dte, effective_max_dte, roll_horizon_reach, run_sweep,

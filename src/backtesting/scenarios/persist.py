@@ -1,9 +1,9 @@
 """The scenario store — the tables a sweep may write, and none of them is the screen's.
 
-FC-060 Layer 3. Modelled deliberately closely on
-``src/backtesting/reporting/bq_writer.py`` (additive schema reconcile, streaming
-insert, a write whose failure is *reported* rather than swallowed) so an operator
-reading one understands the other. What is emphatically NOT shared is the table:
+FC-060 Layer 3. Modelled deliberately closely on the retired screen's
+``backtest_runs`` writer (deleted by FC-121; it is in git history): additive
+schema reconcile, streaming insert, a write whose failure is *reported* rather
+than swallowed. What is emphatically NOT shared is the table:
 
     **A sweep never writes to ``backtest_runs``.** That table's documented
     "current demotion candidates" query takes the latest ``run_kind='full'`` row
@@ -317,8 +317,8 @@ def _sweeps_schema():
         # refreshed tomorrow would have the same spec and a different answer.
         # Additive; `ensure_tables`' reconcile adds it to an existing table.
         f("earnings_symbols_without_data", "STRING"),
-        # `bq_writer.config_hash` — nine strategy keys plus the scoring
-        # constants. Kept SEPARATE from `base_config_hash` (which is the hash of
+        # `reporting/config_hash.config_hash` — nine strategy keys plus the
+        # scoring constants. Kept SEPARATE from `base_config_hash` (the hash of
         # the whole EFFECTIVE snapshot) because the two answer different
         # questions: this one lines a sweep row up with a `backtest_runs` row;
         # that one decides whether two sweeps ran the same engine configuration.
@@ -502,10 +502,11 @@ def _iso_date(value) -> Optional[str]:
 class ScenarioRunWriter:
     """Writes ``scenario_sweeps`` / ``scenario_runs``. Insert-only, never updates.
 
-    Construction is the same shape as ``BacktestRunWriter``: it never raises, it
-    logs loudly when it disables itself, and ``enabled`` says which it is. A
-    sweep whose store is unavailable must still produce its report — the report
-    was the only artifact before Layer 3 and remains a complete one.
+    Construction is the same shape the retired screen's writer had (deleted by
+    FC-121): it never raises, it logs loudly when it disables itself, and
+    ``enabled`` says which it is. A sweep whose store is unavailable must still
+    produce its report — the report was the only artifact before Layer 3 and
+    remains a complete one.
     """
 
     def __init__(self, dataset_id: str,
@@ -581,7 +582,7 @@ class ScenarioRunWriter:
 
     def _ensure_table(self, dataset_ref, name, schema, *, partition_field,
                       clustering):
-        """Create-or-reconcile, additively. Same hazard as ``BacktestRunWriter``.
+        """Create-or-reconcile, additively. Same hazard the screen's writer had.
 
         ``create_table(exists_ok=True)`` returns the EXISTING table and never
         reconciles its schema. Left alone, the first release that adds a field
@@ -1152,8 +1153,8 @@ def rows_from_sweep(
     """One ``scenario_runs`` row per cell of ``result``.
 
     Every cell gets a row, including errored ones. Dropping them would make a
-    half-run sweep read as a complete one — the same rule ``build_row`` follows
-    for a failed screen symbol, and for the same reason: "this arm was not
+    half-run sweep read as a complete one — the same rule the retired screen's
+    rows followed for a failed symbol, and for the same reason: "this arm was not
     measured" and "this arm was fine" must not look alike.
     """
     written = _now()
@@ -1404,7 +1405,7 @@ def base_config_snapshot(config: Any) -> Dict[str, Any]:
 def base_config_hash(snapshot: Dict[str, Any]) -> str:
     """sha256[:16] of the EFFECTIVE snapshot — the dedup's configuration guard.
 
-    Deliberately not ``bq_writer.config_hash``: that hashes nine strategy keys
+    Deliberately not ``reporting.config_hash``: that hashes nine strategy keys
     plus the scoring constants, so every ``rolling.*`` and ``earnings.*`` knob —
     including the two the environment can flip out from under the yaml — is
     invisible to it. Two sweeps that differed only in ``EARNINGS_ENABLED`` would

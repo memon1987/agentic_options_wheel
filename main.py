@@ -34,7 +34,7 @@ def main():
                              '`strategy` choose the replay profile)')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
-                       choices=['scan', 'status', 'report', 'backtest', 'screen',
+                       choices=['scan', 'status', 'report', 'backtest',
                                 'sweep', 'backfill', 'battery'],
                        help='Command to execute')
 
@@ -48,9 +48,7 @@ def main():
                         help='backtest: 0=mid, 1=bid (default 0.25)')
     parser.add_argument('--no-sensitivity', action='store_true',
                         help='backtest: skip the bid-fill sensitivity replay')
-    parser.add_argument('--no-persist', action='store_true',
-                        help='screen: do not write results to BigQuery')
-    parser.add_argument('--out', help='backtest/screen/sweep: write the markdown report here')
+    parser.add_argument('--out', help='backtest/sweep: write the markdown report here')
     parser.add_argument('--json-out', help='backtest/sweep: write the JSON report here')
 
     # sweep (FC-060 Layer 2 — scenario runner)
@@ -188,14 +186,6 @@ def main():
 
         if args.command == 'battery':
             rc = run_battery_cmd(args, config, logger)
-            logger.info("Command completed",
-                        event_category="system", event_type="command_completed")
-            if rc:
-                sys.exit(rc)
-            return
-
-        if args.command == 'screen':
-            rc = run_screen_cmd(args, config, logger)
             logger.info("Command completed",
                         event_category="system", event_type="command_completed")
             if rc:
@@ -412,14 +402,12 @@ def generate_report(tracker: PortfolioTracker, logger):
 
 
 def _refuse_non_wheel_single_symbol(config: Config, command: str) -> None:
-    """Refuse `backtest`/`screen` on a non-wheel profile (FC-096 Phase C, LOW).
+    """Refuse `backtest` on a non-wheel profile (FC-096 Phase C, LOW).
 
-    These two commands build a ``Simulator`` with NO ``synthetic_lots`` policy —
-    only ``run_sweep`` resolves one — so a covered-call profile would replay
-    with no shares, write no calls, and produce a confident "this symbol is
-    unfit" from a run in which the strategy had nothing to work with. Worse, the
-    screen path WRITES to ``backtest_runs`` in the profile's own dataset, so the
-    verdict would be persisted.
+    It builds a ``Simulator`` with NO ``synthetic_lots`` policy — only
+    ``run_sweep`` resolves one — so a covered-call profile would replay with no
+    shares, write no calls, and produce a confident "this symbol is unfit" from
+    a run in which the strategy had nothing to work with.
 
     Refused loudly rather than silently seeded here: seeding is the sweep's
     decision and carries the premise stamps, the capital base and the footer
@@ -820,8 +808,9 @@ def _standing_specs(config: Config, *, strategy: str, today=None) -> list:
     from datetime import timedelta
 
     from src.backtesting.data.bar_store import last_settled_day
-    from src.backtesting.scenarios.identity import DEFAULT_STARTING_CASH
-    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS
+    from src.backtesting.scenarios.identity import (
+        DEFAULT_LOOKBACK_DAYS, DEFAULT_STARTING_CASH,
+    )
 
     end = last_settled_day(today)
     start = end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
@@ -1189,8 +1178,9 @@ def run_battery_cmd(args, config: Config, logger, *,
     from datetime import datetime, timezone
 
     from src.backtesting.scenarios import persist as sweep_store
-    from src.backtesting.scenarios.engine_identity import engine_identity
-    from src.backtesting.screen import ENGINE_VERSION
+    from src.backtesting.scenarios.engine_identity import (
+        ENGINE_VERSION, engine_identity,
+    )
 
     # `--out` / `--json-out` are neutralised for the whole battery. They name
     # ONE file, and thirty sweeps writing to it in turn would leave the last
@@ -1471,46 +1461,6 @@ def run_battery_cmd(args, config: Config, logger, *,
     # ALWAYS 0, including after a SIGTERM. See the docstring: a stale trend
     # chart is not a page, and the backfill's exit code must not be able to
     # inherit this one's opinion.
-    return 0
-
-
-
-def run_screen_cmd(args, config: Config, logger) -> int:
-    """Screen the whole universe (FC-032 Phase 5). Returns a process exit code."""
-    from datetime import date, datetime
-
-    from src.backtesting.screen import run_screen, render_screen_summary
-
-    _refuse_non_wheel_single_symbol(config, "screen")
-
-    start = datetime.strptime(args.start, '%Y-%m-%d').date() if args.start else None
-    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
-    symbols = [args.symbol.upper()] if args.symbol else None
-
-    result = run_screen(
-        config=config, symbols=symbols, start=start, end=end,
-        starting_cash=args.starting_cash,
-        persist=not args.no_persist,
-        run_sensitivity=not args.no_sensitivity,
-    )
-
-    summary = render_screen_summary(result)
-    print(summary)
-    if args.out:
-        with open(args.out, 'w') as fh:
-            fh.write(summary)
-        print(f"\nSummary -> {args.out}")
-
-    # Exit non-zero when the run is not trustworthy as a record: a symbol that
-    # never got a verdict, or results that never reached BigQuery. A screen that
-    # silently half-ran reads as a complete one.
-    if result.failures:
-        print(f"\nWARNING: {len(result.failures)} symbol(s) produced no verdict: "
-              f"{', '.join(result.failures)}")
-        return 1
-    if not args.no_persist and not result.persisted:
-        print("\nWARNING: results were NOT persisted to BigQuery.")
-        return 1
     return 0
 
 
@@ -1971,13 +1921,15 @@ def run_sweep_cmd(args, config: Config, logger, *,
 
     from src.backtesting.data.chain_store import ChainStore
     from src.backtesting.reporting.artifact_store import ArtifactWriter
-    from src.backtesting.reporting.bq_writer import config_hash
+    from src.backtesting.reporting.config_hash import config_hash
     from src.backtesting.scenarios import run_sweep
     from src.backtesting.scenarios import persist as sweep_store
-    from src.backtesting.scenarios.engine_identity import engine_identity
+    from src.backtesting.scenarios.engine_identity import (
+        ENGINE_VERSION, engine_identity,
+    )
+    from src.backtesting.scenarios.identity import DEFAULT_LOOKBACK_DAYS
     from src.backtesting.scenarios.identity import sweep_key as compute_sweep_key
     from src.backtesting.scenarios.report import render_json, render_markdown
-    from src.backtesting.screen import DEFAULT_LOOKBACK_DAYS, ENGINE_VERSION
 
     spec_env = getattr(args, 'spec_env', None)
     spec = None
@@ -2411,8 +2363,8 @@ def _finalise_sweep_status(*, writer, logger, result, failure, chain_store,
     """
     from datetime import datetime, timezone
 
+    from src.backtesting.data.chain_store import accumulate_lake_summary
     from src.backtesting.scenarios import persist as sweep_store
-    from src.backtesting.screen import accumulate_lake_summary
 
     with ignore_sigterm_while_finalising(logger):
         return _finalise_sweep_status_inner(
