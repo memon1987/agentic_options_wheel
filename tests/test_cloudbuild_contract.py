@@ -639,9 +639,20 @@ def test_every_deploy_flag_matches_frozen_fixture(service, by_id, frozen):
 # `run_rolling_cycle` will still start a position, plus the worst case that
 # position can then take, plus a preamble allowance, must fit inside the
 # service timeout — which must in turn fit inside the roll scheduler's attempt
-# deadline. Every input is read from the code and the config that decide it, so
-# raising `_CYCLE_BUDGET_SECONDS`, `rolling.btc_fill_timeout_seconds` or
-# `rolling.fallback_strike_attempts` without raising the flag fails here.
+# deadline. Every input is read from the code and the config that decide it.
+#
+# FC-120 PR-2: the per-position worst case is no longer re-typed here. It is
+# `src/strategy/roll_budget.per_position_budget_seconds` — the same function
+# `run_rolling_cycle` reserves and `Config` bounds at load, MEASURED against
+# the real ladder by tests/test_call_roller.py T-19 — read through
+# `Config(profile)` exactly as the service reads it. The preamble allowance
+# (`roll_budget.PREAMBLE_ALLOWANCE_SECONDS`, 60 s) covers what runs BEFORE
+# `run_rolling_cycle`'s clock starts: the `strategy_lock` wait,
+# `_is_market_open()`, `strategy_config()` and `WheelEngine(config)` — 3–18 ms
+# warm, one 14.1 s outlier on the 2026-09-07 cold start. It does NOT cover the
+# lock-wait blind spot (FC-113 (c)) or a socket that never returns (FC-089).
+# `LADDER_FIXED_LEGS`, the test-local preamble constant and `rolling_leg_params`
+# were deleted with the formula they fed.
 # --------------------------------------------------------------------------
 BOT_SERVICES = ("options-wheel-strategy", "covered-call-engine")
 
@@ -660,27 +671,6 @@ BOT_PROFILE = {
 #: so the rollout (docs/plans/fc-107.md §Rollout step 3) verifies it live.
 ROLL_SCHEDULER_ATTEMPT_DEADLINE_SECONDS = 1800
 
-#: Everything that runs BEFORE `run_rolling_cycle`'s clock starts. That clock is
-#: `start_time = clock.now()` on the FIRST line of the cycle
-#: (`wheel_engine.py:720`), so the position and open-order fetches at `:740+`
-#: are INSIDE the 1500 s budget, not in this allowance. What is genuinely
-#: outside it: the `strategy_lock` wait, `_is_market_open()`, `strategy_config()`
-#: and `WheelEngine(config)` — 3–18 ms on a warm instance (the 15:30 instance is
-#: warm from the 15:15 `/run`), with one 14.1 s outlier on the 2026-09-07 Labor
-#: Day cold start. 60 s covers that with margin. It does NOT cover two things
-#: that are unbounded in principle: the roller's RTT-blind polling
-#: (`_poll_order_fill` counts sleeps, not round-trips) and a long lock wait
-#: (observed lock-holders 63 s, 79 s, 300 s) — FC-113 and FC-089 own those, and
-#: neither is bought off by raising this number.
-PREAMBLE_ALLOWANCE_SECONDS = 60
-
-#: Ladder rungs that exist regardless of config: the BTC, rung 1 (the primary at
-#: its re-checked limit) and rung 2 (the primary at the invariant floor price,
-#: conditional on the BTC filling better than its limit). `CallRoller._rungs`
-#: yields rungs 3+ from `fallback_strike_attempts`.
-LADDER_FIXED_LEGS = 3
-
-
 def service_timeout_seconds(step):
     """The `--timeout=` seconds on this deploy step, as an int."""
     found = [f for f in deploy_flags(step) if f.startswith("--timeout=")]
@@ -688,34 +678,6 @@ def service_timeout_seconds(step):
         f"{step.get('id')} must pass exactly one --timeout flag; got {found}."
     )
     return int(found[0].split("=", 1)[1])
-
-
-def rolling_leg_params(profile_path):
-    """`(btc_fill_timeout_seconds, fallback_strike_attempts)` as PRODUCTION reads them.
-
-    Through `Config`, not raw yaml, because the two disagree on the case that
-    matters. `Config` loads exactly ONE file and does NOT layer
-    `config/settings.yaml` underneath a profile: a profile that omits a rolling
-    key gets a HARD-CODED literal — `Config.rolling_btc_fill_timeout_seconds`
-    defaults to 120 and `.rolling_fallback_strike_attempts` to 2
-    (`src/utils/config.py`). Reading the wheel's yaml as the fallback would
-    under-count the covered-call seam the moment those literals and the wheel's
-    values diverge — e.g. raising the literal default to 4 would run a 7-leg
-    ladder on a profile with no `rolling` block while this test read the wheel's
-    2 and passed.
-
-    Hermetic: `Config(path)` reads the yaml and substitutes env vars, and
-    conftest pins ALPACA_API_KEY / ALPACA_SECRET_KEY / FINNHUB_API_KEY
-    unconditionally in autouse fixtures, so `_load_secret` never reaches Secret
-    Manager. Precedent: `tests/test_config.py`'s
-    `test_the_shipped_wheel_config_reads_back_both_knobs` builds a real `Config`
-    from the shipped profile the same way.
-    """
-    from src.utils.config import Config
-
-    config = Config(str(REPO_ROOT / profile_path))
-    return (config.rolling_btc_fill_timeout_seconds,
-            config.rolling_fallback_strike_attempts)
 
 
 def test_the_bot_steps_select_the_profiles_this_section_reasons_about(by_id):
@@ -746,47 +708,50 @@ def test_bot_service_timeout_covers_the_roll_seam_invariant(service, by_id):
 
     latest_start + per_position_worst + PREAMBLE_ALLOWANCE <= --timeout, where
     latest_start is the last elapsed second at which `run_rolling_cycle` still
-    STARTS a position (wheel_engine's budget guard) and per_position_worst is the
-    full ladder at this profile's fill timeout. The seam this protects is a filled
-    buy-to-close with no sell-to-open: at the old 300 s the request was cut
-    mid-ladder as soon as a rung timed out on a busy day.
+    STARTS a position (wheel_engine's budget guard) and per_position_worst is
+    `roll_budget.from_config(Config(profile))` — the function the guard
+    reserves, MEASURED against the real ladder by T-19. The seam this protects
+    is a filled buy-to-close with no sell-to-open: at the old 300 s the request
+    was cut mid-ladder as soon as a rung timed out on a busy day.
 
-    Imports are function-local by the module's convention: both modules are
-    import-safe (module-level constants; the `Config` class is imported, never
-    instantiated), but nothing else in this file needs `src/` at collection time.
+    Read through `Config(profile)`, not raw yaml: `Config` loads exactly ONE
+    file and does NOT layer `config/settings.yaml` underneath a profile, so a
+    profile that omits a rolling key gets Config's hard-coded default — the
+    value the service runs. Hermetic: conftest pins the secret env vars, so
+    `Config(path)` never reaches Secret Manager.
+
+    Imports are function-local by the module's convention: nothing else in this
+    file needs `src/` at collection time.
     """
-    from src.strategy.call_roller import _CANCEL_SETTLE_TIMEOUT_SECONDS
-    from src.strategy.wheel_engine import (_CYCLE_BUDGET_SECONDS,
-                                           _PER_POSITION_BUDGET_SECONDS)
+    from src.strategy import roll_budget
+    from src.strategy.wheel_engine import _CYCLE_BUDGET_SECONDS
+    from src.utils.config import Config
 
     step_id = CHAINS[service]["deploy"]
     timeout = service_timeout_seconds(by_id[step_id])
     profile = BOT_PROFILE[step_id]
-    btc_poll, fallbacks = rolling_leg_params(profile)
+    per_position_worst = roll_budget.from_config(Config(str(REPO_ROOT / profile)))
 
-    latest_start = _CYCLE_BUDGET_SECONDS - _PER_POSITION_BUDGET_SECONDS
-    legs = LADDER_FIXED_LEGS + fallbacks
-    per_position_worst = legs * (btc_poll + _CANCEL_SETTLE_TIMEOUT_SECONDS)
-    needed = latest_start + per_position_worst + PREAMBLE_ALLOWANCE_SECONDS
+    assert per_position_worst <= roll_budget.MAX_PER_POSITION_BUDGET_SECONDS, (
+        f"{profile} implies a {per_position_worst}s per-position worst case — "
+        f"over roll_budget.MAX_PER_POSITION_BUDGET_SECONDS; Config refuses it")
+    latest_start = _CYCLE_BUDGET_SECONDS - per_position_worst
+    needed = (latest_start + per_position_worst
+              + roll_budget.PREAMBLE_ALLOWANCE_SECONDS)
 
     assert needed <= timeout, (
         f"{step_id} (--timeout={timeout}) cannot cover the roll seam for "
         f"{profile}: a position may START at {latest_start}s "
-        f"(_CYCLE_BUDGET_SECONDS {_CYCLE_BUDGET_SECONDS} - "
-        f"_PER_POSITION_BUDGET_SECONDS {_PER_POSITION_BUDGET_SECONDS}) and then "
-        f"run {legs} legs x ({btc_poll}s poll + "
-        f"{_CANCEL_SETTLE_TIMEOUT_SECONDS}s cancel settle) = "
-        f"{per_position_worst}s, plus {PREAMBLE_ALLOWANCE_SECONDS}s of preamble "
-        f"= {needed}s > {timeout}s. Cloud Run would return 504 mid-ladder: the "
-        "thread is NOT killed and keeps trading unobserved, and if the instance "
-        "scales in the buy-to-close stands with no sell-to-open (uncovered long "
-        f"stock). Raise --timeout on {step_id} in cloudbuild.yaml AND re-freeze "
-        f"tests/fixtures/cloudbuild_contract.json, or lower the inputs. The two "
-        f"leg inputs are read through Config({profile}), which is what the "
-        "service does: btc_fill_timeout_seconds and fallback_strike_attempts "
-        "come from that file's `rolling` block, or from Config's hard-coded "
-        "defaults (120 / 2) when the block omits them — never from another "
-        "profile."
+        f"(_CYCLE_BUDGET_SECONDS {_CYCLE_BUDGET_SECONDS} - the per-position "
+        f"budget) and then run its {per_position_worst}s modeled worst case "
+        f"(src/strategy/roll_budget.per_position_budget_seconds over this "
+        f"profile's rolling.* keys, read through Config({profile})), plus "
+        f"{roll_budget.PREAMBLE_ALLOWANCE_SECONDS}s of preamble = {needed}s > "
+        f"{timeout}s. Cloud Run would return 504 mid-ladder: the thread is NOT "
+        "killed and keeps trading unobserved, and if the instance scales in the "
+        "buy-to-close stands with no sell-to-open (uncovered long stock). Raise "
+        f"--timeout on {step_id} in cloudbuild.yaml AND re-freeze "
+        "tests/fixtures/cloudbuild_contract.json, or lower _CYCLE_BUDGET_SECONDS."
     )
 
 

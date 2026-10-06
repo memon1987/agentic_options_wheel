@@ -385,10 +385,16 @@ steps:
   # --timeout=1800  Cloud Run's REQUEST timeout on this service — not the build
   #                 `timeout:` at the bottom of this file, which is the
   #                 serialize-builds budget and is unchanged. /roll's cycle
-  #                 budget is 1500 s (src/strategy/wheel_engine.py
-  #                 _CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
-  #                 attempt-deadline, and a position may START at 900 s and run
-  #                 5 legs x 135 s. At the old 300 s Cloud Run returned 504 to
+  #                 budget is 1500 s (src/strategy/roll_budget.py
+  #                 CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
+  #                 attempt-deadline, and a position may START at 933 s and
+  #                 run a 567 s MODELED worst case: BTC 3 x (40 s window + 9 s
+  #                 trailing read + 26 s cancel-and-settle + 11 s of bounded
+  #                 reads + 2 s placement) + STO primary, floor and 2
+  #                 fallbacks at 30 s windows — src/strategy/roll_budget
+  #                 .per_position_budget_seconds, measured by
+  #                 tests/test_call_roller.py T-19; the seam test consumes
+  #                 the function (FC-120 PR-2). At the old 300 s Cloud Run returned 504 to
   #                 the scheduler mid-ladder; the thread kept trading unobserved
   #                 (the response and duration were lost) and died if the
   #                 instance scaled in. FC-107. Pinned as a seam invariant from
@@ -575,10 +581,16 @@ steps:
   # --timeout=1800  Cloud Run's REQUEST timeout on this service — not the build
   #                 `timeout:` at the bottom of this file, which is the
   #                 serialize-builds budget and is unchanged. /roll's cycle
-  #                 budget is 1500 s (src/strategy/wheel_engine.py
-  #                 _CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
-  #                 attempt-deadline, and a position may START at 900 s and run
-  #                 5 legs x 135 s. At the old 300 s Cloud Run returned 504 to
+  #                 budget is 1500 s (src/strategy/roll_budget.py
+  #                 CYCLE_BUDGET_SECONDS) against the daily roll job's 1800 s
+  #                 attempt-deadline, and a position may START at 933 s and
+  #                 run a 567 s MODELED worst case: BTC 3 x (40 s window + 9 s
+  #                 trailing read + 26 s cancel-and-settle + 11 s of bounded
+  #                 reads + 2 s placement) + STO primary, floor and 2
+  #                 fallbacks at 30 s windows — src/strategy/roll_budget
+  #                 .per_position_budget_seconds, measured by
+  #                 tests/test_call_roller.py T-19; the seam test consumes
+  #                 the function (FC-120 PR-2). At the old 300 s Cloud Run returned 504 to
   #                 the scheduler mid-ladder; the thread kept trading unobserved
   #                 (the response and duration were lost) and died if the
   #                 instance scaled in. FC-107. Pinned as a seam invariant from
