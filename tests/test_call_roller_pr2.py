@@ -411,6 +411,67 @@ class TestBtcReprice:
 
 
 # --------------------------------------------------------------------------- #
+# T-18 — execute-time pricing (the goldens are in tests/test_call_roller.py)
+# --------------------------------------------------------------------------- #
+class TestExecuteTimePricing:
+    """*Catches:* a limit priced from the stale evaluation quote; a skip that
+    is not a true skip; a fallback that hides which quote priced the order."""
+
+    FILLS = {'btc-1': {'poll': _o('btc-1', 'filled', 1, 8.40)},
+             'sto-1': {'poll': _o('sto-1', 'filled', 1, 10.90)}}
+
+    def test_the_btc_is_priced_from_the_fresh_read(self, roller, instrumented):
+        """Evaluation saw ask 8.40 (40 s old); the execute-time read says 8.60
+        (1 s old). The order is priced off the fresh one."""
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), _q(8.20, 8.60, age_s=1.0)],
+                 'diag': [_q(8.22, 8.62)]}})
+        _r, log, _b = _scripted(roller, instrumented, self.FILLS)
+        placed = _first(log, 'call_roll_btc_placed')
+        assert placed['limit_price'] == 8.70
+        assert placed['btc_quote_source'] == 'execution'
+        assert placed['quote_ask'] == 8.60
+        assert placed['quote_age_s'] == pytest.approx(1, abs=2)
+        assert placed['limit_vs_quote'] >= 0.10 - 1e-9
+        assert placed['limit_on_tick'] is True
+        assert placed['stock_quote_source'] == 'execution'
+
+    def test_an_unusable_fresh_read_falls_back_to_the_evaluation_quote(
+            self, roller, instrumented):
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), {'bid': 0.0, 'ask': 0.0}],
+                 'diag': [_q(8.02, 8.42)]}})
+        _r, log, _b = _scripted(roller, instrumented, self.FILLS)
+        placed = _first(log, 'call_roll_btc_placed')
+        assert (placed['limit_price'], placed['btc_quote_source']) == (
+            8.50, 'evaluation')
+
+    def test_an_unusable_new_symbol_read_prices_rung_1_from_the_chain_row(
+            self, roller, instrumented):
+        instrumented.get_option_quote.side_effect = _book(**{
+            _N: {'pricing': [{}], 'diag': [{}]}})
+        _r, log, _b = _scripted(roller, instrumented, self.FILLS)
+        rung1 = _first(log, 'call_roll_stc_placed')
+        assert rung1['limit_price'] == 10.80        # chain row bid 10.90 - 0.10
+        assert rung1['stc_quote_source'] == 'chain'
+
+    def test_credit_gone_at_execution_names_both_btc_limits(self, roller,
+                                                           instrumented):
+        instrumented.get_option_quote.side_effect = _book(**{
+            _O: {'pricing': [_q(8.00, 8.40), _q(9.00, 9.40)],
+                 'diag': [_q(9.02, 9.42)]},
+            _N: {'pricing': [_q(9.30, 9.50)], 'diag': [_q(9.30, 9.50)]}})
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+        assert result['reason'] == 'credit_gone_at_execution'
+        skip = _first(log, 'call_roll_skipped')
+        assert skip['btc_limit_fresh'] == 9.50 and skip['evaluated_btc_limit'] == 8.50
+        assert skip['recheck_stc_limit'] == 9.20
+        instrumented.place_option_order.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
 # T-11 — the poll split: BTC windows from the total; STO rungs their own
 # --------------------------------------------------------------------------- #
 class TestThePollSplit:
