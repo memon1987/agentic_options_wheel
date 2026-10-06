@@ -27,7 +27,10 @@ The two methods production actually calls are exercised elsewhere:
 this FC either — noted, not introduced by it.
 """
 
+from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
 
 from src.strategy.wheel_engine import WheelEngine
 from src.utils.config import Config
@@ -127,6 +130,19 @@ TERMINAL_EVENTS = {
 }
 
 
+def _with_roll_budget_keys(config):
+    """FC-120 PR-2: ``run_rolling_cycle`` derives the per-position budget from
+    the five ``rolling.*`` timing keys (``roll_budget.from_config``). A
+    ``Mock(spec=Config)`` that reaches the cycle must carry them as ints — a
+    Mock there is a loud ``TypeError`` by design. Shipped values (567 s)."""
+    config.rolling_btc_fill_timeout_seconds = 120
+    config.rolling_btc_reprice_attempts = 2
+    config.rolling_stc_rung_timeout_seconds = 30
+    config.rolling_stc_escalation_rungs = 0
+    config.rolling_fallback_strike_attempts = 2
+    return config
+
+
 def _occ(underlying, expiry, strike):
     return (f"{underlying}{expiry.strftime('%y%m%d')}C"
             f"{int(round(strike * 1000)):08d}")
@@ -148,7 +164,7 @@ class _CycleFixture:
         return positions
 
     def _engine(self, symbols, *, open_orders=None, roller_factory=None):
-        config = Mock(spec=Config)
+        config = _with_roll_budget_keys(Mock(spec=Config))
         config.rolling_enabled = True
         config.earnings_enabled = False
 
@@ -346,17 +362,23 @@ class TestTheCycleBudgetGuard(_CycleFixture):
 
         roller.evaluate_roll_opportunity.assert_called_once()
 
-    def test_an_exhausted_budget_defers_the_position(self, monkeypatch):
+    @pytest.mark.parametrize("second_check, deferred", [
+        (933, False),    # exactly 567 s left: the full worst case fits
+        (934, True),     # 566 s left < 567 s: deferred, never squeezed
+    ])
+    def test_an_exhausted_budget_defers_the_position(self, monkeypatch,
+                                                     second_check, deferred):
+        """FC-120 PR-2: re-timed to the DERIVED budget (567 s at the shipped
+        keys), and pinned at its edge."""
         engine, _ = self._engine(['AAA', 'BBB'])
 
-        # Clock: start, then far enough past that only the worst case of one
-        # position fits, then past the budget entirely.
+        # Clock: start, position 1's check, position 2's check at the edge.
         start = date(2026, 8, 4)
         times = iter([
-            _dt(start, 0),       # cycle start
-            _dt(start, 10),      # position 1 budget check — fine
-            _dt(start, 1200),    # position 2 budget check — 300s left < 600s
-            _dt(start, 1201),    # cycle duration
+            _dt(start, 0),               # cycle start
+            _dt(start, 10),              # position 1 budget check — fine
+            _dt(start, second_check),    # position 2 budget check
+            _dt(start, 1201),            # cycle duration
         ])
         monkeypatch.setattr(wheel_engine_module.clock, 'now', lambda: next(times))
 
@@ -366,17 +388,62 @@ class TestTheCycleBudgetGuard(_CycleFixture):
             results = engine.run_rolling_cycle()
 
         assert results['rolls_evaluated'] == 2
-        assert roller.evaluate_roll_opportunity.call_count == 1
-        skips = [c.args[2] for c in roller.log_terminal_skip.call_args_list]
-        assert skips == ['cycle_budget_exhausted']
+        assert roller.evaluate_roll_opportunity.call_count == (1 if deferred else 2)
+        skips = [c for c in roller.log_terminal_skip.call_args_list]
+        if deferred:
+            assert [c.args[2] for c in skips] == ['cycle_budget_exhausted']
+            assert skips[0].kwargs['per_position_budget_seconds'] == 567
+        else:
+            assert skips == []
 
     def test_the_guard_reserves_the_full_per_position_worst_case(self):
-        """1500 s budget, 600 s per position — the constants are the contract,
-        so they are asserted rather than left to drift."""
+        """1500 s cycle, and a per-position reservation that is the DERIVED
+        worst case — `roll_budget.from_config` — not a literal (FC-113 (a)):
+        567 s on the shipped wheel profile. The constants are the contract, so
+        they are asserted rather than left to drift."""
+        from src.strategy import roll_budget
+
         assert wheel_engine_module._CYCLE_BUDGET_SECONDS == 1500
-        assert wheel_engine_module._PER_POSITION_BUDGET_SECONDS == 600
+        assert not hasattr(wheel_engine_module, '_PER_POSITION_BUDGET_SECONDS')
+        settings = Path(__file__).resolve().parent.parent / 'config' / 'settings.yaml'
+        assert roll_budget.from_config(Config(str(settings))) == 567
         # The scheduler attempt-deadline is 1800s; the budget must leave room.
         assert wheel_engine_module._CYCLE_BUDGET_SECONDS < 1800
+
+    def test_roll_cycle_started_carries_the_derived_budget(self):
+        engine, _ = self._engine(['AAA'])
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls, \
+                patch('src.strategy.wheel_engine.log_system_event') as sys_ev:
+            roller_cls.return_value.evaluate_roll_opportunity.return_value = None
+            engine.run_rolling_cycle()
+        started = [c for c in sys_ev.call_args_list
+                   if c.kwargs.get('event_type') == 'roll_cycle_started']
+        assert started[0].kwargs['per_position_budget_seconds'] == 567
+
+    def test_a_budget_over_the_bound_pages_and_evaluates_nothing(
+            self, monkeypatch):
+        """R6-H: Config refuses such a profile at load, so this guard is
+        reachable only if code and config disagree at runtime — and then it
+        is an alert-wired error, never a silent cycle that defers everything."""
+        monkeypatch.setattr(wheel_engine_module,
+                            'MAX_PER_POSITION_BUDGET_SECONDS', 500)
+        engine, _ = self._engine(['AAA', 'BBB'])
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls, \
+                patch('src.strategy.wheel_engine.log_error_event') as err:
+            results = engine.run_rolling_cycle()
+
+        assert results == {'skipped': 'budget_misconfigured',
+                           'per_position_budget_seconds': 567}
+        roller_cls.return_value.evaluate_roll_opportunity.assert_not_called()
+        event = err.call_args.kwargs
+        assert event['error_type'] == 'roll_cycle_budget_misconfigured'
+        assert event['per_position_budget_seconds'] == 567
+        assert event['max_per_position_budget_seconds'] == 500
+        assert event['stc_rung_timeout_seconds'] == 30
+        assert set(event['budget_keys']) == {
+            'btc_fill_timeout_seconds', 'btc_reprice_attempts',
+            'stc_rung_timeout_seconds', 'stc_escalation_rungs',
+            'fallback_strike_attempts'}
 
 
 def _dt(day, seconds):
@@ -1178,7 +1245,7 @@ class TestClassShareCallsReachTheRoller(_CycleFixture):
         ]
 
     def _run(self, positions):
-        config = Mock(spec=Config)
+        config = _with_roll_budget_keys(Mock(spec=Config))
         config.rolling_enabled = True
         config.earnings_enabled = False
 
