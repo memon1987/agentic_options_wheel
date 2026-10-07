@@ -233,7 +233,7 @@ failure mode: it cannot flatter a symbol into looking tradeable.
      re-prices a buy-to-close or places an escalation rung — a contract, not an
      accident**: the adapter answers a non-marketable order `expired` on the PRIMARY
      poll, and a primary-poll terminal is terminal (only the roller's own
-     cancel-and-settle returning a zero fill may be re-priced), so
+     cancel-and-settle returning `canceled` with zero fill may be re-priced), so
      `reprice_skipped_reason` rows read 0 on every lake chain by construction.
      **Imminence-mode fills move by at most one tick** per leg (the pad is now snapped
      to the grid, which can flip a `limit_resting` leg to `limit_marketable`). Roll
