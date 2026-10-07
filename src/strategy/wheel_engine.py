@@ -14,22 +14,28 @@ from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import (
     occ_root, parse_option_symbol, strict_option_type)
 from .call_roller import CallRoller, sample_short_call_quotes
+from .roll_budget import (CYCLE_BUDGET_SECONDS as _CYCLE_BUDGET_SECONDS,
+                          MAX_PER_POSITION_BUDGET_SECONDS, BUDGET_KEYS,
+                          from_config)
 from .wheel_state_manager import WheelStateManager
 from ..risk.risk_manager import RiskManager
 from ..api.earnings_calendar import EarningsCalendarService
 
 logger = structlog.get_logger(__name__)
 
-# FC-078 §4 — roll-cycle time budget, in seconds.
+# FC-078 §4 — roll-cycle time budget, in seconds; FC-120 PR-2 (FC-113 (a))
+# derives the per-position half.
 #
-# The daily scheduler job is created with --attempt-deadline 1800s. The budget
-# is that minus headroom, and no position is *started* unless the full
-# per-position worst case remains: BTC 120 s poll + cancel/verify + up to four
-# STO rungs x 120 s. Realistic load is 0-1 executable roll per day; this guard
-# exists for the pathological day, where the alternative is a request killed
-# between a filled BTC and an unplaced STO.
-_CYCLE_BUDGET_SECONDS = 1500
-_PER_POSITION_BUDGET_SECONDS = 600
+# The daily scheduler job is created with --attempt-deadline 1800s. The cycle
+# budget (`_CYCLE_BUDGET_SECONDS`, re-exported from `roll_budget`) is that
+# minus headroom, and no position is *started* unless the full per-position
+# worst case remains. That worst case is no longer a literal:
+# `roll_budget.per_position_budget_seconds` counts every broker call on
+# `execute_roll`'s path at its modeled worst for this profile's `rolling.*`
+# values (567 s at the shipped ones), and tests/test_call_roller.py T-19
+# MEASURES the real ladder against it. Realistic load is 0-1 executable roll
+# per day; this guard exists for the pathological day, where the alternative
+# is a request killed between a filled BTC and an unplaced STO.
 
 
 class WheelEngine:
@@ -732,7 +738,36 @@ class WheelEngine:
         if not self.config.rolling_enabled:
             return {'skipped': 'rolling_disabled'}
 
-        log_system_event(logger, event_type="roll_cycle_started", status="starting")
+        # FC-120 PR-2 (FC-113 (a)): the per-position worst case, derived once
+        # from this profile's rolling.* values. Config refuses a profile whose
+        # budget exceeds the bound at load (DD-7), so this second guard is
+        # reachable only if code and config disagree at runtime (a patched
+        # constant, a hand-built Config) — and it pages rather than running a
+        # cycle whose guard would refuse every position.
+        per_position_budget = from_config(self.config)
+        if per_position_budget > MAX_PER_POSITION_BUDGET_SECONDS:
+            log_error_event(
+                logger, error_type="roll_cycle_budget_misconfigured",
+                error_message=(
+                    f"rolling.* keys imply a per-position worst case of "
+                    f"{per_position_budget}s > the {MAX_PER_POSITION_BUDGET_SECONDS}s "
+                    f"bound; no position was evaluated"),
+                component="wheel_engine", recoverable=False,
+                per_position_budget_seconds=per_position_budget,
+                max_per_position_budget_seconds=MAX_PER_POSITION_BUDGET_SECONDS,
+                cycle_budget_seconds=_CYCLE_BUDGET_SECONDS,
+                budget_keys=list(BUDGET_KEYS),
+                btc_fill_timeout_seconds=self.config.rolling_btc_fill_timeout_seconds,
+                btc_reprice_attempts=self.config.rolling_btc_reprice_attempts,
+                stc_rung_timeout_seconds=self.config.rolling_stc_rung_timeout_seconds,
+                stc_escalation_rungs=self.config.rolling_stc_escalation_rungs,
+                fallback_strike_attempts=self.config.rolling_fallback_strike_attempts,
+            )
+            return {'skipped': 'budget_misconfigured',
+                    'per_position_budget_seconds': per_position_budget}
+
+        log_system_event(logger, event_type="roll_cycle_started", status="starting",
+                         per_position_budget_seconds=per_position_budget)
 
         # Initialize rolling components
         risk_manager = RiskManager(self.config)
@@ -819,18 +854,17 @@ class WheelEngine:
                 results['rolls_skipped'] += 1
                 continue
 
-            # FC-078 §4: cycle time budget. Worst case per position is ~600 s
-            # (BTC 120 s poll + cancel/verify + up to 4 STO rungs x 120 s), and
-            # a kill BETWEEN the BTC fill and the STO placement is the worst
-            # seam there is — shares uncovered, no event, no alert. So a
-            # position is never *started* without the full worst case left.
+            # FC-078 §4: cycle time budget. A kill BETWEEN the BTC fill and the
+            # STO placement is the worst seam there is — shares uncovered, no
+            # event, no alert. So a position is never *started* without the
+            # full derived per-position worst case left (FC-120 PR-2).
             elapsed = (clock.now() - start_time).total_seconds()
-            if _CYCLE_BUDGET_SECONDS - elapsed < _PER_POSITION_BUDGET_SECONDS:
+            if _CYCLE_BUDGET_SECONDS - elapsed < per_position_budget:
                 roller.log_terminal_skip(
                     option_symbol, underlying, "cycle_budget_exhausted",
                     elapsed_seconds=round(elapsed, 1),
                     cycle_budget_seconds=_CYCLE_BUDGET_SECONDS,
-                    per_position_budget_seconds=_PER_POSITION_BUDGET_SECONDS)
+                    per_position_budget_seconds=per_position_budget)
                 results['rolls_skipped'] += 1
                 continue
 
@@ -872,6 +906,13 @@ class WheelEngine:
                     recoverable=False, symbol=option_symbol,
                     underlying=underlying,
                 )
+                # FC-120 PR-2 (confirmation item 2): a leg already placed keeps
+                # its call_roll_leg_settled row — flushed AFTER the terminal
+                # above, never before it (ruling A (iv)).
+                try:
+                    roller.flush_deferred()
+                except Exception:
+                    pass   # instrumentation only; the terminal is already out
                 results['rolls_skipped'] += 1
                 continue
 
@@ -897,11 +938,20 @@ class WheelEngine:
         if self._emit_quote_samples:
             try:
                 skip_reasons = getattr(roller, 'skip_reasons', None)
+                # FC-120 PR-2 (confirmation item 4): old -> new symbol for every
+                # roll this cycle completed, so the sampler tags the old row
+                # and samples the replacement too.
+                rolled = {
+                    r['old_option_symbol']: r['new_option_symbol']
+                    for r in results['roll_details']
+                    if isinstance(r, dict) and r.get('success')
+                    and isinstance(r.get('old_option_symbol'), str)
+                    and isinstance(r.get('new_option_symbol'), str)}
                 sample_short_call_quotes(
                     self.alpaca,
                     [p.get('symbol', '') for p, _ in short_calls + uncovered_calls],
                     skip_reasons if isinstance(skip_reasons, dict) else {},
-                    start_monotonic)
+                    start_monotonic, rolled=rolled)
             except Exception:
                 pass   # the sampler is total; this guards only its arguments
 

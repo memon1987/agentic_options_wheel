@@ -328,22 +328,30 @@ COVERAGE_NOT_A_STAND_DOWN = frozenset(
 #: and are folded into `roll_skips` from `execute_roll`'s return value.
 #:
 #: The allowlist is explicit rather than "any failed record's reason" for one
-#: concrete reason: `credit_gone_at_execution` is ALREADY tallied — it goes out
-#: through `log_terminal_skip` -> `call_roll_skipped` BEFORE `execute_roll`
-#: returns it (`call_roller.py:594-603`) — so folding it here would count it
-#: TWICE. What has no `call_roll_skipped` event, and therefore no tally entry,
-#: is every failure AFTER an order was placed:
+#: concrete reason: `credit_gone_at_execution` and (FC-120 PR-2)
+#: `quote_unusable` are ALREADY tallied — both go out through
+#: `CallRoller.log_terminal_skip` -> `call_roll_skipped` inside
+#: `_execute_roll` / `_price_legs_at_execution`, BEFORE `execute_roll` returns
+#: them — so folding them here would count them TWICE. What has no
+#: `call_roll_skipped` event, and therefore no tally entry, is every failure
+#: AFTER an order was placed:
 #:
-#:   btc_rejected             `:632`, `:672`  (log_error_event)
-#:   btc_timeout_canceled     `:684`          (call_roll_btc_timeout_canceled)
-#:   partial_naked_exposure   `:792`
-#:   stc_failed_naked_exposure`:852`
-#:   btc_disposition_unknown  `:879`
-#:   stc_disposition_unknown  `:879`
+#:   btc_rejected              `_place_and_settle_btc`: the synchronous
+#:                             refusal and the after-placement `rejected`
+#:                             (both `call_roll_btc_rejected`)
+#:   btc_timeout_canceled      `_place_and_settle_btc`: the exhausted timeout,
+#:                             the primary-poll terminal zero fill, and a
+#:                             refused re-price (`reprice_skipped_reason`) —
+#:                             all `call_roll_btc_timeout_canceled`
+#:   partial_naked_exposure    `_execute_roll` (`call_roll_partial_naked_exposure`)
+#:   stc_failed_naked_exposure `_execute_roll` (`call_roll_naked_exposure`)
+#:   btc_disposition_unknown   `_unknown_disposition` (`call_roll_unknown_disposition`)
+#:   stc_disposition_unknown   `_unknown_disposition` (`call_roll_unknown_disposition`)
 #:
-#: `dry_run` (`:581`, emitted as `call_roll_dry_run`) is DELIBERATELY excluded
-#: and named here rather than omitted silently: it never occurs in a replay,
-#: and if it ever did it would be a configuration mistake, not a roll outcome.
+#: `dry_run` (`_execute_roll`, emitted as `call_roll_dry_run`) is DELIBERATELY
+#: excluded and named here rather than omitted silently: it never occurs in a
+#: replay, and if it ever did it would be a configuration mistake, not a roll
+#: outcome.
 #:
 #: A reason outside this set is logged at WARNING and NOT counted — a future
 #: roller reason must be classified deliberately, not silently double-counted
@@ -361,6 +369,7 @@ _POST_PLACEMENT_ROLL_FAILURES = frozenset({
 #: these would double-count. Kept as a named set so the WARNING below can say
 #: "already tallied" rather than "unknown".
 _ALREADY_TALLIED_ROLL_FAILURES = frozenset({"credit_gone_at_execution",
+                                            "quote_unusable",
                                             "dry_run"})
 
 
@@ -1366,6 +1375,12 @@ class Simulator:
         ``CallRoller`` ever emits its own ``day``, ``itm_ratio`` or ``roll_kind``,
         the producer's value wins rather than being silently overwritten by the
         replay's reconstruction.
+
+        Everything else on the record passes through untouched — since FC-120
+        PR-2 that includes ``pricing_mode``, ``old_option_symbol`` and
+        ``new_option_symbol`` (the success dict carries them), which is what
+        lets a before/after over the replay split base-mode rolls (fills
+        identical but for the parity term) from imminence ones (<= 1 tick).
         """
         stamped: Dict[str, Any] = {'day': day.isoformat(), **record}
         old_strike = float(record.get('old_strike') or 0.0)

@@ -828,7 +828,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-088: the roller's and `/monitor`'s limit prices are still off-tick above $3 — rejected on a live account
 
 **Scope:** shared
-**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews)
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews). **Narrowed by FC-120 PR-2 (done when it merges): the roller's STO and BTC limits are tick-legal** (`limit_pricing.snap_limit`, toward marketable — buys up, sells down); what remains is `/monitor`'s buy-to-close.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1112,6 +1112,8 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Measurement (FC-120 PR-1):** `call_roll_leg_settled.leg_elapsed_s` (FC-120 PR-1) is the measured per-leg wall-clock the proposal asks for; (a)+(b) are built by FC-120 PR-2.
 
+**Built by FC-120 PR-2 (branch `fc-120-pr2-marketable-roll-limits`; done when it merges):** (a) `src/strategy/roll_budget.per_position_budget_seconds` — 567 s at the shipped keys, MEASURED against the real ladder by `tests/test_call_roller_pr2.py::TestTheBudgetIsMeasured` (552 s on both profiles), reserved by `run_rolling_cycle`, bounded by `Config` at load, consumed by the cloudbuild seam test; (b) `_poll_order_fill` is a monotonic deadline (reads count against the window) with a two-read floor on the settle. (c) stays here.
+
 **Links:** FC-107 (D1, D4), FC-078 §4, FC-089.
 
 ### FC-114: `_is_market_open()` has no holiday calendar — orders placed into a closed market
@@ -1129,7 +1131,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-115: `Config` validates no bound on `rolling.itm_trigger_ratio` (or `enabled`, `btc_fill_timeout_seconds`, `fallback_strike_attempts`)
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-100 PR review)
+**Status:** Filed 2026-09-08 (found by the FC-100 PR review). **Narrowed by FC-120 PR-2 (done when it merges): `btc_fill_timeout_seconds` (`5 x (btc_reprice_attempts + 1)` .. 600) and `fallback_strike_attempts` (0 .. 5) are bounded at load, with PR-2's four new keys and a cross-key budget bound** (FC-120 DD-7); `itm_trigger_ratio` and `enabled` remain here.
 **Size estimate:** S
 
 **Problem:** `src/utils/config.py` validates four rolling knobs and not the trigger: a `10.0` typo silently makes every position `not_itm_enough` (the roller looks alive and never rolls); `0.5` makes every call eligible. The only guard today is the shipped-value test (`test_config.py` T-1), which catches drift in the repo, not a live `--update-env-vars` or a hand-edited profile.
@@ -1407,7 +1409,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Problem:** `api_retry` wraps the broker calls in tenacity with `reraise=True`, which re-raises the LAST exception when attempts are exhausted; tenacity's `RetryError` is therefore never raised, so the `except RetryError` branch that records a failure on the module-global `CircuitBreaker` and logs `api_retry_exhausted` is dead code. Consequence: `circuit_breaker_blocked` / `api_retry_exhausted` have never fired in production and the breaker has never opened — the order plane runs with no breaker at all, while the code and runbooks read as if it had one. FC-120 PR-2 left the order path byte-equivalent to main and PINNED this behaviour (`tests/test_quiet_data_plane.py::test_the_order_plane_is_exactly_as_before`) so the defect is not silently changed by a logging PR; the new data-plane breaker (quote/stock reads) records through an explicit `except Exception` branch and is live.
 
-**Proposal:** decide whether the order-plane breaker should be live at all (a breaker that opens during a ladder turns a slow broker into `*_disposition_unknown` terminals with shares possibly uncovered — FC-120 DD-5's "fail-safe, not fail-closed" argument), and either (a) make it record through the same explicit branch as the data-plane breaker with thresholds argued from the roll ladder's budget, or (b) delete the dead branch and the breaker from the order plane and say so in the runbooks. Either way flip the pinning test deliberately. Also: `CircuitBreaker` has no lock while bounded-read worker threads mutate it (LOW in the PR-2 review).
+**Proposal:** decide whether the order-plane breaker should be live at all (a breaker that opens during a ladder turns a slow broker into `*_disposition_unknown` terminals with shares possibly uncovered — FC-120 DD-5's "fail-safe, not fail-closed" argument), and either (a) make it record through the same explicit branch as the data-plane breaker with thresholds argued from the roll ladder's budget, or (b) delete the dead branch and the breaker from the order plane and say so in the runbooks. Either way flip the pinning test deliberately. ~~Also: `CircuitBreaker` has no lock while bounded-read worker threads mutate it (LOW in the PR-2 review).~~ **Done in FC-120 PR-2 (#138, review fix F6):** every state mutation is under a per-breaker lock, the transition decided inside it.
 
 **Links:** FC-120 (`docs/plans/fc-120.md` §Amendments rev 6 R6-J, PR #138 builder note 1), FC-089 (no socket timeout), FC-113.
 
@@ -1421,7 +1423,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem:** `Config()` is built lazily and cached in `strategy_config()`; `/health` returns 200 without ever calling it, and the bot canary smoke only polls revision readiness. A profile that `Config` refuses at load (e.g. FC-120's cross-key roll-budget bound, or any future validation) therefore passes the canary, promotes, and then every trading endpoint (`/scan`, `/run`, `/monitor`, `/roll`) raises on its first request — the runtime guards behind `strategy_config()` (incl. `roll_cycle_budget_misconfigured` and its alert clause) are unreachable. Only the scheduler's non-2xx (unwatched) and `/regression`'s hourly endpoint check would show it. FC-120's DD-7 claimed "fails closed before any traffic shifts"; that claim is corrected in PR #138 — the real failure mode is as described here.
+**Problem:** `Config()` is built lazily and cached in `strategy_config()`; the liveness route `/` never builds it, and `/health` builds it but catches the failure and still answers **200** (`checks.config: "error: …"`, `status: "unhealthy"` in the body — corrected 2026-10-06 in PR #138's F3 check: this entry first said `/health` never calls it); the bot canary smoke (`smoke-test-bot` / `smoke-test-cc`) only polls revision readiness and makes no HTTP request at all. A profile that `Config` refuses at load (e.g. FC-120's cross-key roll-budget bound, or any future validation) therefore passes the canary, promotes, and then every trading endpoint (`/scan`, `/run`, `/monitor`, `/roll`) raises on its first request — the runtime guards behind `strategy_config()` (incl. `roll_cycle_budget_misconfigured` and its alert clause) are unreachable. Only the scheduler's non-2xx (unwatched) and `/regression`'s hourly endpoint check would show it. FC-120's DD-7 claimed "fails closed before any traffic shifts"; that claim is corrected in PR #138 — the real failure mode is as described here.
 
 **Proposal:** have the bot `/health` (or the canary smoke) construct `strategy_config()` and report its validity, so an invalid profile fails the canary before promote; keep the response shape backward compatible. Under its own plan because it changes what a deploy can fail on.
 

@@ -152,7 +152,7 @@ earnings:
 # its strike), so the roller would re-write the engine's own fresh call,
 # bypassing every entry gate. 1.00 makes this a true-ITM-only defence: it acts
 # when the stock is through the strike and assignment is the alternative. The
-# other seven keys mirror the wheel and tests/test_config.py T-1 pins each one
+# other eleven keys mirror the wheel and tests/test_config.py T-1 pins each one
 # per profile, so a retune on either side is a reviewed edit on both files.
 #
 # Kill switch without a deploy: ROLLER_ENABLED=false (env wins over this key)
@@ -172,10 +172,14 @@ rolling:
   itm_trigger_ratio: 1.00               # DIFFERS from the wheel (0.98) — fc-100 DD-1
   max_extension_days: 14                # replacement expiry <= OLD expiry + N
   max_replacement_delta: 0.60           # upper rail only; no lower bound
-  min_net_credit_per_contract: 0.00     # $/contract on the placed limits
+  min_net_credit_per_contract: 0.20     # $/contract on the placed limits; covers the round-trip fee (FC-120 R6-L)
   imminence_extrinsic_threshold: 0.20   # $/share extrinsic -> mid-based pricing
-  btc_fill_timeout_seconds: 120
+  btc_fill_timeout_seconds: 120         # BTC TOTAL poll budget, split over btc_reprice_attempts + 1 windows (FC-120)
   fallback_strike_attempts: 2
+  marketable_buffer_per_share: 0.10     # $/share through the quote on each leg, before the tick snap (FC-120 DD-1 Rule B)
+  btc_reprice_attempts: 2               # BTC re-prices after the roller's own zero-fill cancel: 3 x 40 s (FC-120 DD-4)
+  stc_rung_timeout_seconds: 30          # poll window of every STO rung (FC-120 DD-1 Rule W)
+  stc_escalation_rungs: 0               # STO rungs between rung 1 and the floor; off until Q7 is read live (FC-120 Rule E)
 
 risk:
   # `max_portfolio_allocation` and `min_cash_reserve` deleted by FC-069 S1

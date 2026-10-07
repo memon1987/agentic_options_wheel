@@ -214,6 +214,34 @@ failure mode: it cannot flatter a symbol into looking tradeable.
      consequence for readers: every wheel run now carries the `DTE_REACH_BIAS` footer,
      which applies to its **roll candidates only**.
 
+   - `engine_version = 'fc-120-marketable-roll-limits'` (FC-120 PR-2) changes roll
+     ELIGIBILITY, on both strategies. The live roller's base-mode limits are now
+     buffered and tick-snapped toward marketable — the buy-to-close at
+     `snap_up(max(ask + buffer, parity + 0.01))`, the sell-to-open at
+     `snap_down(bid - buffer)` (`rolling.marketable_buffer_per_share`, 0.10) — re-derived
+     at execute time, and the credit invariant is screened on THOSE limits with
+     `min_net_credit_per_contract` now $0.20. What that means in a replay:
+     **base-mode fills are unchanged** — a buffered limit is still at or through the
+     day's quantised book, so it fills AT the book (`limit_marketable`) exactly as
+     before — but **a marginal roll** (raw net < `2 x buffer + 2 ticks + $0.20`) is no
+     longer eligible, so `rolls_executed` can fall and `roll_skips.no_credit_candidate`
+     (or `credit_gone_at_execution`) rise by the same count. **The parity term is live in
+     the replay**: `BacktestAlpacaClient.get_stock_quote` returns the close as both
+     sides, so on a deep-ITM modeled chain whose ask sits at or below `close - strike`
+     the buy limit is lifted to parity — the fill is still the book's ask, but the
+     screen tests the higher limit and may refuse the roll. **The replay never
+     re-prices a buy-to-close or places an escalation rung — a contract, not an
+     accident**: the adapter answers a non-marketable order `expired` on the PRIMARY
+     poll, and a primary-poll terminal is terminal (only the roller's own
+     cancel-and-settle returning `canceled` with zero fill may be re-priced), so
+     `reprice_skipped_reason` rows read 0 on every lake chain by construction.
+     **Imminence-mode fills move by at most one tick** per leg (the pad is now snapped
+     to the grid, which can flip a `limit_resting` leg to `limit_marketable`). Roll
+     records gained `pricing_mode`, `old_option_symbol` and `new_option_symbol`, so a
+     before/after splits the two modes. The version is in BOTH append-only era sets
+     (`POST_FC116_ENGINE_VERSIONS`, `POST_FC112_ENGINE_VERSIONS`): limit fills and the
+     21-DTE wheel reach both hold.
+
    Do not compare across any of these boundaries. Old rows are never mutated —
    provenance is `engine_version` + `timestamp` + `config_hash`.
 6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2

@@ -697,10 +697,13 @@ class TestTheEngineVersionMovedAndStayedInSync:
 
     def test_the_engine_declaration_is_the_current_version(self):
         """Two copies since FC-121 deleted `screen.py`'s: this declaration and
-        the dashboard's (next test)."""
+        the dashboard's (next test). Pinned to the CURRENT version: FC-112's
+        bump, then FC-120 PR-2's (roll limits buffered + parity-floored +
+        tick-snapped — eligibility on roll-bearing rows changed). Each bump
+        re-pins this literal."""
         from src.backtesting.scenarios import engine_identity
 
-        assert engine_identity.ENGINE_VERSION == "fc-112-wheel-roll-reach"
+        assert engine_identity.ENGINE_VERSION == "fc-120-marketable-roll-limits"
 
     def test_the_dashboard_copy_agrees(self):
         import sys

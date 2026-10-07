@@ -22,6 +22,21 @@ from src.strategy.wheel_engine import WheelEngine
 from src.strategy.wheel_state_manager import WheelStateManager
 
 
+def _cycle_config():
+    """A Mock config that can reach ``run_rolling_cycle``. FC-120 PR-2: the
+    cycle derives its per-position budget from the five ``rolling.*`` timing
+    keys (``roll_budget.from_config``), and a Mock there is a TypeError."""
+    config = Mock()
+    config.rolling_enabled = True
+    config.earnings_enabled = False
+    config.rolling_btc_fill_timeout_seconds = 120
+    config.rolling_btc_reprice_attempts = 2
+    config.rolling_stc_rung_timeout_seconds = 30
+    config.rolling_stc_escalation_rungs = 0
+    config.rolling_fallback_strike_attempts = 2
+    return config
+
+
 class TestAlpacaClientInjection:
     def test_injected_client_reaches_every_component(self):
         sentinel = Mock(name="BacktestAlpacaClient")
@@ -37,9 +52,7 @@ class TestAlpacaClientInjection:
         the replay (Fridays)."""
         sentinel = Mock(name="BacktestAlpacaClient")
         sentinel.get_positions.return_value = []
-        config = Mock()
-        config.rolling_enabled = True
-        config.earnings_enabled = False
+        config = _cycle_config()
         engine = WheelEngine(config, alpaca_client=sentinel,
                              wheel_state=WheelStateManager())
 
@@ -83,9 +96,7 @@ class TestWheelStateInjection:
         alpaca = Mock()
         alpaca.get_positions.return_value = []
         alpaca.get_orders.return_value = []
-        config = Mock()
-        config.rolling_enabled = True
-        config.earnings_enabled = False
+        config = _cycle_config()
         engine = WheelEngine(config, alpaca_client=alpaca, wheel_state=state)
         # The engine still keeps it — reconcile_positions is a real consumer.
         assert engine.wheel_state is state

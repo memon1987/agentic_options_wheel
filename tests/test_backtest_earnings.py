@@ -134,6 +134,13 @@ class TestRollingSeam:
         config = Mock()
         config.rolling_enabled = True
         config.earnings_enabled = True
+        # FC-120 PR-2: the cycle derives its per-position budget from these
+        # five keys (roll_budget.from_config); a Mock there is a TypeError.
+        config.rolling_btc_fill_timeout_seconds = 120
+        config.rolling_btc_reprice_attempts = 2
+        config.rolling_stc_rung_timeout_seconds = 30
+        config.rolling_stc_escalation_rungs = 0
+        config.rolling_fallback_strike_attempts = 2
         engine = WheelEngine(config, alpaca_client=Mock(),
                              wheel_state=WheelStateManager())
         assert engine._injected_earnings_calendar is None

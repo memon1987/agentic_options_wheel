@@ -251,8 +251,9 @@ nor `universe.excluded_symbols` (FC-110).
 | 23 | Cost-basis floor | — | shared `CostBasisResolver`, **fails closed** (FC-065 P2), alert-wired since FC-078 |
 | 24 | Earnings span on the **replacement** | `earnings.enabled` | `next_earnings_info` tri-state → `exclude_expiry_on_or_after`; `unknown` (or a missing calendar) skips the whole roll. **Fails closed** |
 | 25 | `RiskManager.validate_roll` | `rolling.max_replacement_delta: 0.60`, `rolling.max_extension_days: 14` | strike > old; strike >= basis; delta upper rail only; expiry <= **old expiry** + N |
-| 26 | Credit invariant | `rolling.min_net_credit_per_contract: 0.00` | checked at the candidate screen, pre-BTC re-check, order construction, and every ladder rung |
-| 27 | Cycle time budget | — | a position is not *started* without 600 s of remaining budget → `cycle_budget_exhausted` |
+| 26 | Credit invariant | `rolling.min_net_credit_per_contract: 0.20` ($/contract; FC-120 PR-2, was 0.00) | checked on the BUFFERED, tick-snapped limits (FC-120 PR-2: `rolling.marketable_buffer_per_share: 0.10` through each quote, a parity floor on the buy) at the candidate screen, the execute-time re-price (`credit_gone_at_execution`), every BTC re-price (refused → `call_roll_btc_timeout_canceled` with `reprice_skipped_reason`), and every ladder rung (never below `snap_up(btc_fill + min_credit)`) |
+| 27 | Cycle time budget | `rolling.{btc_fill_timeout_seconds, btc_reprice_attempts, stc_rung_timeout_seconds, stc_escalation_rungs, fallback_strike_attempts}` | a position is not *started* without `roll_budget.per_position_budget_seconds` left (567 s at the shipped keys; FC-120 PR-2 / FC-113 (a), measured by test) → `cycle_budget_exhausted`. A budget over 1440 s is refused by `Config` at load; if code and config disagree at runtime the cycle emits `roll_cycle_budget_misconfigured` (alert-wired) and evaluates nothing |
+| 28 | Execute-time quote | — | FC-120 PR-2: both BTC quotes (the execute-time read AND the evaluation quote) unusable before any order → **true skip** `quote_unusable`. A failed execute-time read otherwise falls back (evaluation quote / chain row) and says so on the placement (`btc_quote_source`, `stc_quote_source`) |
 
 **Deleted by FC-078** (see the plan's DD-6 table for each fate):
 `rolling.max_current_dte` (the DTE ≤ 1 eligibility trap),
@@ -296,8 +297,14 @@ and a *missing* calendar while earnings are enabled fails the roll closed
 | `rolling.enabled` | `true` | roller master switch | **`ROLLER_ENABLED`** — same semantics as `EARNINGS_ENABLED` (FC-078) |
 | `rolling.max_extension_days` | `14` | roll horizon, measured from the **old expiry** | — |
 | `rolling.max_replacement_delta` | `0.60` | replacement delta upper rail | — |
-| `rolling.min_net_credit_per_contract` | `0.00` | the credit invariant | — |
+| `rolling.min_net_credit_per_contract` | `0.20` ($/contract; FC-120 PR-2) | the credit invariant | — |
 | `rolling.imminence_extrinsic_threshold` | `0.20` | assignment-imminence pricing override | — |
+| `rolling.marketable_buffer_per_share` | `0.10` | roll limits through the quote, before the tick snap (FC-120 PR-2) | — |
+| `rolling.btc_reprice_attempts` | `2` | BTC re-prices after the roller's own zero-fill cancel (FC-120 PR-2) | — |
+| `rolling.btc_fill_timeout_seconds` | `120` | the BTC leg's TOTAL poll budget, split over `btc_reprice_attempts + 1` windows | — |
+| `rolling.stc_rung_timeout_seconds` | `30` | every STO rung's poll window (FC-120 PR-2) | — |
+| `rolling.stc_escalation_rungs` | `0` | STO rungs between rung 1 and the floor — off until Q7 is read live (FC-120 PR-2) | — |
+| `rolling.fallback_strike_attempts` | `2` | fallback strikes after the primary ladder | — |
 | — | `false` | roller evaluates but places neither leg | **`ROLLER_DRY_RUN`** — env-only, no yaml key |
 | ~~`risk.gap_risk_controls.earnings_avoidance_days`~~ | — | **deleted 2026-08-04 by FC-069 S1**, with the whole `gap_risk_controls` block and `GapDetector`. It never gated anything and is unrelated to `earnings.blackout_days`, which is this gate's live knob. | — |
 

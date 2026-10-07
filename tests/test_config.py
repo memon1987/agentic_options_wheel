@@ -161,7 +161,8 @@ class TestTheRollingKnobs:
         config = Config(str(REPO / 'config' / 'settings.yaml'))
         assert config.rolling_max_extension_days == 14
         assert config.rolling_max_replacement_delta == 0.60
-        assert config.rolling_min_net_credit_per_contract == 0.00
+        # 0.00 -> 0.20 $/contract by FC-120 PR-2 (R6-L).
+        assert config.rolling_min_net_credit_per_contract == 0.20
         assert config.rolling_imminence_extrinsic_threshold == 0.20
         # Kept knobs.
         assert config.rolling_itm_trigger_ratio == 0.98
@@ -357,17 +358,24 @@ class TestTheRollingBlockOnBothProfilesFC100:
     KEYS = ('enabled', 'itm_trigger_ratio', 'max_extension_days',
             'max_replacement_delta', 'min_net_credit_per_contract',
             'imminence_extrinsic_threshold', 'btc_fill_timeout_seconds',
-            'fallback_strike_attempts')
+            'fallback_strike_attempts',
+            # FC-120 PR-2 (DD-7): identical on both profiles.
+            'marketable_buffer_per_share', 'btc_reprice_attempts',
+            'stc_rung_timeout_seconds', 'stc_escalation_rungs')
 
     EXPECTED_WHEEL = {
         'enabled': True,
         'itm_trigger_ratio': 0.98,
         'max_extension_days': 14,
         'max_replacement_delta': 0.60,
-        'min_net_credit_per_contract': 0.00,
+        'min_net_credit_per_contract': 0.20,
         'imminence_extrinsic_threshold': 0.20,
         'btc_fill_timeout_seconds': 120,
         'fallback_strike_attempts': 2,
+        'marketable_buffer_per_share': 0.10,
+        'btc_reprice_attempts': 2,
+        'stc_rung_timeout_seconds': 30,
+        'stc_escalation_rungs': 0,
     }
     EXPECTED_CC = dict(EXPECTED_WHEEL, itm_trigger_ratio=1.00)
 
@@ -409,10 +417,14 @@ class TestTheRollingBlockOnBothProfilesFC100:
         assert config.rolling_itm_trigger_ratio == 1.00
         assert config.rolling_max_extension_days == 14
         assert config.rolling_max_replacement_delta == 0.60
-        assert config.rolling_min_net_credit_per_contract == 0.00
+        assert config.rolling_min_net_credit_per_contract == 0.20
         assert config.rolling_imminence_extrinsic_threshold == 0.20
         assert config.rolling_btc_fill_timeout_seconds == 120
         assert config.rolling_fallback_strike_attempts == 2
+        assert config.rolling_marketable_buffer_per_share == 0.10
+        assert config.rolling_btc_reprice_attempts == 2
+        assert config.rolling_stc_rung_timeout_seconds == 30
+        assert config.rolling_stc_escalation_rungs == 0
 
     def test_the_wheel_profile_is_untouched_by_fc100(self):
         """T-5, the neutrality pin at the config layer. FC-100 is a CC-scope
@@ -423,10 +435,14 @@ class TestTheRollingBlockOnBothProfilesFC100:
         assert config.rolling_itm_trigger_ratio == 0.98
         assert config.rolling_max_extension_days == 14
         assert config.rolling_max_replacement_delta == 0.60
-        assert config.rolling_min_net_credit_per_contract == 0.00
+        assert config.rolling_min_net_credit_per_contract == 0.20
         assert config.rolling_imminence_extrinsic_threshold == 0.20
         assert config.rolling_btc_fill_timeout_seconds == 120
         assert config.rolling_fallback_strike_attempts == 2
+        assert config.rolling_marketable_buffer_per_share == 0.10
+        assert config.rolling_btc_reprice_attempts == 2
+        assert config.rolling_stc_rung_timeout_seconds == 30
+        assert config.rolling_stc_escalation_rungs == 0
 
 
 def _profile_copy(tmp_path, profile, **rolling_overrides):
@@ -495,3 +511,104 @@ class TestTheRollerEnvLeversOnBothProfilesFC100:
 
         monkeypatch.setenv("ROLLER_DRY_RUN", "sometimes")
         assert Config(path).roller_dry_run is False
+
+
+# =========================================================================== #
+# FC-120 PR-2 T-13 — the roller's execution knobs: bounds, defaults, and the
+# cross-key budget bound (docs/plans/fc-120.md DD-7). Both profiles.
+#
+# *Catches:* a hand-edited profile silently disabling the buffer, lengthening
+# the ladder, or turning the escalation rungs on by accident; a yaml whose
+# worst case no position could ever fit reaching production.
+# =========================================================================== #
+
+@pytest.mark.parametrize("profile", ['settings.yaml', 'covered_call.yaml'])
+class TestTheRollerExecutionKnobsFC120:
+
+    @pytest.mark.parametrize("overrides, key", [
+        ({'marketable_buffer_per_share': -0.01}, 'marketable_buffer_per_share'),
+        ({'marketable_buffer_per_share': 0.51}, 'marketable_buffer_per_share'),
+        ({'marketable_buffer_per_share': "0.10"}, 'marketable_buffer_per_share'),
+        ({'marketable_buffer_per_share': True}, 'marketable_buffer_per_share'),
+        ({'btc_reprice_attempts': -1}, 'btc_reprice_attempts'),
+        ({'btc_reprice_attempts': 3}, 'btc_reprice_attempts'),
+        ({'btc_reprice_attempts': 1.0}, 'btc_reprice_attempts'),
+        ({'btc_reprice_attempts': True}, 'btc_reprice_attempts'),
+        ({'btc_fill_timeout_seconds': 14}, 'btc_fill_timeout_seconds'),
+        ({'btc_fill_timeout_seconds': 601}, 'btc_fill_timeout_seconds'),
+        ({'stc_rung_timeout_seconds': 4}, 'stc_rung_timeout_seconds'),
+        ({'stc_rung_timeout_seconds': 601}, 'stc_rung_timeout_seconds'),
+        ({'stc_rung_timeout_seconds': True}, 'stc_rung_timeout_seconds'),
+        ({'stc_escalation_rungs': -1}, 'stc_escalation_rungs'),
+        ({'stc_escalation_rungs': 4}, 'stc_escalation_rungs'),
+        ({'stc_escalation_rungs': 1.0}, 'stc_escalation_rungs'),
+        ({'fallback_strike_attempts': 6}, 'fallback_strike_attempts'),
+    ])
+    def test_out_of_bounds_values_are_refused_at_load(self, tmp_path, profile,
+                                                      overrides, key):
+        with pytest.raises(ValueError, match=f"rolling.{key}"):
+            Config(_profile_copy(tmp_path, profile, **overrides))
+
+    def test_the_inclusive_bounds_load(self, tmp_path, profile):
+        config = Config(_profile_copy(
+            tmp_path, profile, marketable_buffer_per_share=0.0,
+            btc_reprice_attempts=2, btc_fill_timeout_seconds=15,
+            stc_rung_timeout_seconds=5, stc_escalation_rungs=3,
+            fallback_strike_attempts=0))
+        assert config.rolling_marketable_buffer_per_share == 0.0
+        assert config.rolling_btc_fill_timeout_seconds == 15
+        assert config.rolling_stc_rung_timeout_seconds == 5
+        assert config.rolling_stc_escalation_rungs == 3
+        assert config.rolling_fallback_strike_attempts == 0
+        config = Config(_profile_copy(
+            tmp_path, profile, marketable_buffer_per_share=0.50,
+            btc_reprice_attempts=0, btc_fill_timeout_seconds=5))
+        assert config.rolling_marketable_buffer_per_share == 0.50
+        assert config.rolling_btc_reprice_attempts == 0
+
+    def test_the_cross_key_budget_bound_is_refused_at_load(self, tmp_path,
+                                                           profile):
+        """R6-H: each key is in bounds, together they are not — the worst case
+        (4785 s) could never start inside the 1500 s cycle. The refusal names
+        the number, the five keys and ``roll_budget``'s bound."""
+        with pytest.raises(ValueError) as exc:
+            Config(_profile_copy(tmp_path, profile, stc_rung_timeout_seconds=600,
+                                 fallback_strike_attempts=5))
+        message = str(exc.value)
+        assert '4785s' in message
+        assert 'roll_budget.MAX_PER_POSITION_BUDGET_SECONDS 1440s' in message
+        for key in ('btc_fill_timeout_seconds', 'btc_reprice_attempts',
+                    'stc_rung_timeout_seconds', 'stc_escalation_rungs',
+                    'fallback_strike_attempts'):
+            assert key in message, key
+
+    def test_the_largest_legal_ladder_still_loads(self, tmp_path, profile):
+        """The bound is a ceiling, not a reflex: E = 3 at the shipped windows
+        (789 s) is legal."""
+        config = Config(_profile_copy(tmp_path, profile, stc_escalation_rungs=3))
+        assert config.rolling_stc_escalation_rungs == 3
+
+    def test_a_profile_with_no_rolling_block_gets_every_default(self, tmp_path,
+                                                                profile):
+        with open(REPO / 'config' / profile) as fh:
+            data = yaml.safe_load(fh)
+        data.pop('rolling', None)
+        path = tmp_path / profile
+        path.write_text(yaml.safe_dump(data))
+        config = Config(str(path))
+        assert config.rolling_marketable_buffer_per_share == 0.10
+        assert config.rolling_btc_reprice_attempts == 2
+        assert config.rolling_btc_fill_timeout_seconds == 120
+        assert config.rolling_stc_rung_timeout_seconds == 30
+        assert config.rolling_stc_escalation_rungs == 0
+        assert config.rolling_fallback_strike_attempts == 2
+        # The literal default moved with the yaml (R6-L): fee-aware everywhere.
+        assert config.rolling_min_net_credit_per_contract == 0.20
+
+    def test_the_shipped_values(self, profile):
+        config = Config(str(REPO / 'config' / profile))
+        assert config.rolling_stc_escalation_rungs == 0
+        assert config.rolling_min_net_credit_per_contract == 0.20
+        assert config.rolling_marketable_buffer_per_share == 0.10
+        assert config.rolling_btc_reprice_attempts == 2
+        assert config.rolling_stc_rung_timeout_seconds == 30

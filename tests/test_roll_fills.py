@@ -104,13 +104,19 @@ def no_sleep(monkeypatch):
 @pytest.fixture
 def roller_for():
     """Build a `CallRoller` whose `alpaca` IS the backtest adapter."""
-    def build(client, *, min_credit=0.05, fallback_attempts=0):
+    def build(client, *, min_credit=0.05, fallback_attempts=0, escalations=0):
         config = Mock()
         config.roller_dry_run = False
         config.rolling_min_net_credit_per_contract = min_credit
         config.rolling_fallback_strike_attempts = fallback_attempts
-        config.rolling_order_poll_seconds = 120
-        config.rolling_order_poll_interval_seconds = 5
+        # FC-120 PR-2 (item 10): the keys the roller actually reads, at the
+        # shipped values. (The stale rolling_order_poll_* keys it never read
+        # are gone.) A Mock left in their place is `Mock() // 3` -> TypeError.
+        config.rolling_btc_fill_timeout_seconds = 120
+        config.rolling_btc_reprice_attempts = 2
+        config.rolling_marketable_buffer_per_share = 0.10
+        config.rolling_stc_rung_timeout_seconds = 30
+        config.rolling_stc_escalation_rungs = escalations
         config.earnings_enabled = False
         risk = Mock()
         risk.validate_roll.return_value = (True, None)
@@ -178,14 +184,23 @@ def events():
 
 # --------------------------------------------------------------------------- #
 class TestABtcThatNeverFills:
-    def test_a_btc_below_the_bid_is_a_terminal_no_fill(self, roller_for, events):
+    def test_a_btc_below_the_bid_is_a_terminal_no_fill(self, roller_for, events,
+                                                       monkeypatch):
         """(a) The BTC limit sits below the bid, so nothing fills.
 
         The roller must report `btc_timeout_canceled` with
         `disposition=terminal_no_fill`, place NO sell-to-open (the shares are
         still covered by the old call — an STO here would be the naked-call
         window `_attempt_stc` exists to close), and leave the ledger untouched.
+
+        FC-120 PR-2: execute-time pricing re-derives the BTC limit from a fresh
+        read, so `_opportunity(btc_limit=1.50)` no longer reaches the order —
+        the non-marketable limit is injected on the named SEAM (R6-B), and
+        `btc_reprice_attempts` stays at its default (2): the adapter's
+        `expired` is a PRIMARY-poll terminal, so attempts do not matter.
         """
+        monkeypatch.setattr(CallRoller, "_btc_limit_from_quote",
+                            staticmethod(lambda *a, **k: 1.50))
         broker = _covered_broker()
         ledger_before = len(broker.ledger)
         client = _client(broker, [
@@ -213,6 +228,11 @@ class TestABtcThatNeverFills:
         # second one against the same 100 shares is the naked-call window
         # `_attempt_stc` exists to close.
         assert not [o for o in client.get_orders() if o["side"] == "sell"]
+        # And no re-price: one BTC order, attempts=1 on the terminal.
+        assert len(client.get_orders()) == 1
+        assert cancels[-1]["attempts"] == 1
+        assert not [e for e in events
+                    if e.get("event_type") == "call_roll_btc_repriced"]
 
     def test_the_simulator_fold_counts_it(self):
         """D5. Before this, the record was dropped and the failure vanished."""
@@ -302,11 +322,12 @@ class TestTheLadderHasExactlyOneReachableRung:
             f"for fallback_strike_attempts is no longer true: "
             f"{[(o['limit_price'], o['status']) for o in sells]}")
         assert sells[0]["status"] == "filled"
-        assert sells[0]["limit_price"] == pytest.approx(2.60), (
-            "round(bid=2.596, 2) — the re-derived limit, not the stale 2.60 "
-            "that happens to equal it")
+        assert sells[0]["limit_price"] == pytest.approx(2.49), (
+            "FC-120 PR-2: snap_down(bid 2.596 - buffer 0.10) — the re-derived "
+            "limit, not the stale 2.60")
         assert sells[0]["filled_avg_price"] == pytest.approx(2.60), (
-            "a sell limit at the quantised bid is marketable and fills there")
+            "a sell limit at or below the quantised bid is marketable and "
+            "fills AT the bid — the buffer costs nothing on the fill")
 
         closes = [e for e in broker.ledger if e.kind == "buy_to_close"]
         assert closes[-1].price == pytest.approx(2.20), (
@@ -317,12 +338,23 @@ class TestTheLadderHasExactlyOneReachableRung:
         assert len(opens) == 1, "exactly one STO may ever fill"
         assert opens[0].price - closes[-1].price >= 0.05 - 1e-9
 
-    def test_a_base_mode_sto_limit_is_the_quantised_bid_by_construction(self):
-        """The one line the whole refusal rests on, pinned directly."""
-        for bid, ask in ((2.4815, 2.55), (0.031, 0.049), (12.3349, 12.99)):
-            limit = CallRoller._stc_limit_from_quote(bid, ask, False)
-            assert limit == round(bid, 2), (bid, ask)
-            assert limit <= round(bid, 2), "marketable against the quantised bid"
+    def test_a_base_mode_sto_limit_is_marketable_by_construction(self):
+        """The one line the whole refusal rests on, pinned directly.
+
+        FC-120 PR-2: the base-mode STO limit is ``snap_down(bid - buffer)`` —
+        strictly below the quantised bid by at least the buffer, so it is
+        marketable against the book it was priced from; a bid under the buffer
+        prices to nothing and the candidate is dropped, never placed."""
+        for bid, ask, expected in ((2.4815, 2.55, 2.38), (12.3349, 12.99, 12.20),
+                                   (0.031, 0.049, None)):
+            limit = CallRoller._stc_limit_from_quote(
+                bid, ask, 'base', buffer_multiple=1, buffer=0.10, floor=None,
+                underlying='XYZ')
+            assert limit == (pytest.approx(expected) if expected else None), (
+                bid, ask)
+            if limit is not None:
+                assert limit <= round(bid, 2) - 0.10 + 1e-9, (
+                    "marketable against the quantised bid")
 
 
 class TestCreditGoneIsCountedExactlyOnce:
@@ -406,3 +438,148 @@ class TestTheAllowlistIsTheRollersOwnVocabulary:
             'btc_timeout_canceled', 'not_itm_enough', 'no_credit_candidate',
             'btc_rejected',
         ]
+
+
+# --------------------------------------------------------------------------- #
+# FC-120 PR-2 T-12 — the replay never re-prices, never escalates, never sleeps.
+# --------------------------------------------------------------------------- #
+def _fold(reason):
+    """`Simulator._count_roll_failure` on one result reason: the replay's
+    `roll_skips` fold, exactly as the day loop runs it."""
+    from src.backtesting.engine.simulator import Simulator
+    sim = object.__new__(Simulator)
+    sim._roll_failures = {}
+    sim._count_roll_failure(reason, DAY)
+    return sim._roll_failures
+
+
+def _settled(events, leg=None):
+    return [e for e in events if e.get("event_type") == "call_roll_leg_settled"
+            and (leg is None or e.get("leg") == leg)]
+
+
+class TestTheReplayNeverRepricesOrEscalates:
+    """DD-6 / R6-B, a CONTRACT: the adapter answers a non-marketable order with
+    ``expired`` from the PRIMARY poll, a primary-poll terminal is terminal, so
+    no re-price or escalation rung is ever placed in a replay — whatever
+    ``btc_reprice_attempts`` / ``stc_escalation_rungs`` say. The non-marketable
+    limits are injected on the named static seam (a rule-priced base-mode limit
+    is marketable by construction). ``time.sleep`` raises (the autouse
+    fixture); wall clock is bounded too.
+
+    *Catches:* a non-terminal status making the Saturday battery sleep per
+    leg; a re-price or escalation reaching the replay; a bounded read awaited
+    in a replay; leg counters counting placements; an unclassified reason.
+    """
+
+    BOOK = [_q(OLD, 100.0, bid=2.00, ask=2.20, expiration=EXP_OLD),
+            _q(NEW, 102.0, bid=2.50, ask=2.70)]
+
+    def _run(self, roller_for, *, escalations=0, opportunity=None):
+        import time as _time
+        broker = _covered_broker()
+        before = len(broker.ledger)
+        client = _client(broker, list(self.BOOK))
+        roller = roller_for(client, escalations=escalations)
+        started = _time.monotonic()
+        with _frozen(), client.order_intent("roll"):
+            result = roller.execute_roll(
+                opportunity or _opportunity(btc_limit=2.30, stc_limit=2.40))
+        assert _time.monotonic() - started < 1.0, "a replay waited on a read"
+        return result, client, broker.ledger[before:]
+
+    def test_a_non_marketable_btc_is_terminal_with_attempts_left(
+            self, roller_for, events, monkeypatch):
+        monkeypatch.setattr(CallRoller, "_btc_limit_from_quote",
+                            staticmethod(lambda *a, **k: 1.50))
+        result, client, new_ledger = self._run(roller_for)
+
+        assert result['reason'] == 'btc_timeout_canceled'
+        assert len(client.get_orders()) == 1, "a re-price reached the replay"
+        assert new_ledger == []
+        assert _fold(result['reason']) == {'btc_timeout_canceled': 1}
+        assert not [e for e in events
+                    if e.get("event_type") == "call_roll_btc_repriced"]
+        rows = _settled(events)
+        assert [r['disposition'] for r in rows] == ['terminal_no_fill']
+
+    @pytest.mark.parametrize("escalations", [0, 3])
+    def test_a_non_marketable_rung_1_goes_straight_to_the_floor(
+            self, roller_for, events, monkeypatch, escalations):
+        """Rung 1 above the ask expires on its first read; the floor
+        ``snap_up(btc_fill + min_credit)`` — 2.20 + 0.05 = 2.25 <= bid 2.50 —
+        fills at the bid. With E = 3 still no escalation rung: the contract."""
+        monkeypatch.setattr(CallRoller, "_stc_limit_from_quote",
+                            staticmethod(lambda *a, **k: 2.95))
+        result, client, new_ledger = self._run(roller_for,
+                                               escalations=escalations)
+
+        assert result['success'] is True
+        sells = [o for o in client.get_orders() if o["side"] == "sell"]
+        assert [(o['limit_price'], o['status']) for o in sells] == [
+            (2.95, 'expired'), (2.25, 'filled')]
+        assert [e.kind for e in new_ledger] == ['buy_to_close', 'sell_call_open']
+        assert new_ledger[-1].price == pytest.approx(2.50)
+        rows = _settled(events, 'stc')
+        assert [(r['rung'], r['rung_kind'], r['disposition']) for r in rows] == [
+            (1, 'primary', 'terminal_no_fill'), (2, 'floor', 'filled')]
+        assert rows[1]['prior_rung_disposition'] == 'terminal_no_fill'
+        assert rows[1]['primary_miss_offset'] == pytest.approx(0.45)
+        assert len([e for e in events
+                    if e.get("event_type") == "call_roll_stc_unfilled"]) == 1
+
+    def test_quote_unusable_at_execution_is_counted_once(
+            self, roller_for, events, caplog, monkeypatch):
+        """Both BTC quotes unusable before any order: a true skip, already in
+        the tally via `call_roll_skipped` — the fold adds nothing and does NOT
+        warn `roll_failure_unclassified`."""
+        broker = _covered_broker()
+        client = _client(broker, list(self.BOOK))
+        real = client.get_option_quote
+        monkeypatch.setattr(client, "get_option_quote", lambda s: (
+            {} if s == OLD else real(s)))
+        roller = roller_for(client)
+        opp = _opportunity(btc_limit=2.30, stc_limit=2.40)
+        opp['btc_quote'] = {}
+        with _frozen(), client.order_intent("roll"):
+            result = roller.execute_roll(opp)
+
+        assert result['reason'] == 'quote_unusable'
+        assert client.get_orders() == []
+        assert result['reason'] in _ALREADY_TALLIED_ROLL_FAILURES
+        assert _fold(result['reason']) == {}
+        assert not [r for r in caplog.records
+                    if 'roll_failure_unclassified' in r.getMessage()]
+        skips = [e for e in events if e.get("event_type") == "call_roll_skipped"]
+        assert [s['skip_reason'] for s in skips] == ['quote_unusable']
+
+    def test_a_parity_bound_btc_still_fills_at_the_book(self, roller_for,
+                                                        events):
+        """R6-N: the adapter's stock quote is the close on both sides, so the
+        parity term is live in a replay. Close 110 over strike 100 puts parity
+        at 10.01 > ask 9.50 + 0.10: the BTC limit is snap_up(10.01) = 10.05,
+        and it fills at the quantised ask, 9.50, tagged marketable."""
+        broker = _covered_broker()
+        client = BacktestAlpacaClient(
+            broker,
+            chains={"XYZ": {DAY: ChainSnapshot("XYZ", DAY, 110.0, [], [
+                _q(OLD, 100.0, bid=9.30, ask=9.50, expiration=EXP_OLD,
+                   spot=110.0),
+                _q(NEW, 105.0, bid=11.00, ask=11.20, spot=110.0)])}},
+            stock_bars={"XYZ": [StockBar(symbol="XYZ", bar_date=DAY, open=110.0,
+                                         high=110.0, low=110.0, close=110.0,
+                                         volume=1_000_000)]},
+        )
+        roller = roller_for(client)
+        opp = _opportunity(btc_limit=10.05, stc_limit=10.90)
+        opp['new_strike'] = 105.0
+        with _frozen(), client.order_intent("roll"):
+            result = roller.execute_roll(opp)
+
+        assert result['success'] is True, result
+        buys = [o for o in client.get_orders() if o["side"] == "buy"]
+        assert buys[0]['limit_price'] == pytest.approx(10.05)
+        assert buys[0]['filled_avg_price'] == pytest.approx(9.50)
+        placed = [e for e in events if e.get("event_type") == "call_roll_btc_placed"]
+        assert placed[0]['parity_floor_applied'] is True
+        assert placed[0]['stock_quote_source'] == 'execution'

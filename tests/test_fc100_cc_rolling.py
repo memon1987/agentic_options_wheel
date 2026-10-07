@@ -176,9 +176,12 @@ class TestTheCCRollCycle:
         assert "call_roll_evaluated" in book.types(events)
 
         dry = book.event(events, "call_roll_dry_run")
-        assert dry["would_be_btc_limit"] == 10.00   # the old call's ask
-        assert dry["would_be_stc_limit"] == 10.50   # the candidate's bid
-        assert dry["net_credit"] == 50.0            # ($10.50 - $10.00) x 100
+        # FC-120 PR-2 on the shipped CC profile: each leg 0.10 through its
+        # quote (marketable), on the nickel grid — and the dry run carries the
+        # EXECUTE-time-priced limits.
+        assert dry["would_be_btc_limit"] == 10.10   # the old call's ask + 0.10
+        assert dry["would_be_stc_limit"] == 10.40   # the candidate's bid - 0.10
+        assert dry["net_credit"] == 30.0            # ($10.40 - $10.10) x 100
 
         # Dry run means NOTHING is placed. Asserted on the client, not on the
         # return value: a return of `dry_run` with an order behind it is the
@@ -496,32 +499,57 @@ class TestTheCCAlertPolicies:
     @pytest.mark.parametrize("name", ("cc_roll_executed_alert_policy.json",
                                       "roll_executed_alert_policy.json"))
     def test_the_runbooks_name_the_fc120_diagnostics_not_the_filters(self, name):
-        """FC-120 T-14 (PR-1 half). Both roll runbooks tell a responder which
-        fields diagnose a BTC timeout and where the per-leg rows are; neither
-        alert FILTER pages on them — `call_roll_leg_settled` and
-        `call_roll_stc_timeout_canceled` are informational, and
-        `call_roll_btc_timeout_canceled` stays un-paged (a clean no-op)."""
+        """FC-120 T-14. Both roll runbooks tell a responder which fields
+        diagnose a BTC timeout, where the per-leg rows are, and (PR-2) how a
+        re-price, an STO miss and a budget misconfiguration read; neither alert
+        FILTER pages on the informational rows — `call_roll_leg_settled`,
+        `call_roll_stc_timeout_canceled`, `call_roll_btc_repriced` — and
+        `call_roll_btc_timeout_canceled` stays un-paged (a clean no-op).
+        `roll_cycle_budget_misconfigured` is the one name in BOTH: it pages.
+
+        PR-2 applied DD-8's text byte-exact, which no longer names
+        `limit_on_tick` / `cancel_quote_ask` (PR-1's needles): the cap forced
+        the paragraph shorter, and both fields are on every row it names.
+
+        Review finding F7: `btc_rejected` joins the price-protection
+        signature line (the cap allowed it: CC 3,980 B) and is deliberately
+        NOT added to either filter — a rejected BTC leaves the position
+        covered, nothing live."""
         doc = self._doc(name)
         content = doc["documentation"]["content"]
         for needle in ("quote_drift", "call_roll_leg_settled", "quote_age_s",
-                       "limit_on_tick", "cancel_quote_ask"):
+                       "call_roll_btc_repriced", "rung_kind",
+                       "reprice_skipped_reason",
+                       "roll_cycle_budget_misconfigured",
+                       "btc_rejected, or naked_exposure after stc_rejected"):
             assert needle in content, (name, needle)
+        # The Monitoring API caps documentation.content at 4000 UTF-8 BYTES,
+        # and a PATCH over it silently keeps the OLD text.
+        assert len(content.encode("utf-8")) <= 4000, name
         for condition in doc["conditions"]:
             f = (condition.get("conditionMatchedLog") or {})["filter"]
             for informational in ("call_roll_leg_settled",
                                   "call_roll_stc_timeout_canceled",
                                   "call_roll_btc_timeout_canceled",
+                                  "call_roll_btc_repriced",
                                   "call_roll_quote_refresh_failed",
                                   "call_roll_quote_sample",
                                   "call_roll_instrumentation_failed"):
                 assert informational not in f, (name, informational)
+            assert "btc_rejected" not in f, (name, "F7: never paged")
+            assert "roll_cycle_budget_misconfigured" in f, name
 
     @pytest.mark.parametrize("name", ("cc_roll_executed_alert_policy.json",
                                       "roll_executed_alert_policy.json"))
     def test_the_conditions_are_mains(self, name):
-        """FC-120 T-14: a runbook edit must not touch a condition. Compared
-        with main's file via git; skipped where git or the ref is absent (the
-        CI image has no git)."""
+        """FC-120 T-14: a runbook edit must not touch a condition — except
+        PR-2's ONE clause. The expected conditions are main's (read via git,
+        byte-exact) with `roll_cycle_budget_misconfigured` spliced into the
+        fourth OR group (the error family) before its closing `))`, both
+        payload shapes plus the text match, exactly as its siblings are
+        matched. Once PR-2 is on main the clause is already there and the
+        expectation is main's verbatim. Skipped where git or the ref is absent
+        (the CI image has no git)."""
         import shutil
         import subprocess
         if shutil.which("git") is None:
@@ -535,4 +563,15 @@ class TestTheCCAlertPolicies:
                 break
         else:
             pytest.skip("main's policy file is not reachable via git")
-        assert self._doc(name)["conditions"] == json.loads(proc.stdout)["conditions"]
+        expected = json.loads(proc.stdout)["conditions"]
+        clause = ('jsonPayload.error_type="roll_cycle_budget_misconfigured" OR '
+                  'jsonPayload.event_type="roll_cycle_budget_misconfigured" OR '
+                  'textPayload:"roll_cycle_budget_misconfigured"')
+        assert len(expected) == 1
+        main_filter = expected[0]["conditionMatchedLog"]["filter"]
+        if clause not in main_filter:
+            assert main_filter.endswith("))")
+            assert "call_roll_execution_error" in main_filter.rsplit(") OR (", 1)[1]
+            expected[0]["conditionMatchedLog"]["filter"] = (
+                main_filter[:-2] + " OR " + clause + "))")
+        assert self._doc(name)["conditions"] == expected
