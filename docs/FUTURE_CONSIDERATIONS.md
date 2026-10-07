@@ -1172,23 +1172,6 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Links:** FC-117 (`docs/plans/fc-117.md` §Risks, §Rollout step 4), FC-013 (live earnings gate), FC-042 Track C (dividends).
 
 
-### FC-120: live roller — the buy-to-close limit at the snapshot ask did not fill (execution quality of the roll's first leg)
-
-**Status:** PR-1 (#135) MERGED `f4f12fa` 2026-10-02 and live on both bot services (first `call_roll_leg_settled` / `call_roll_quote_sample` rows 10-02 and 10-05; measured quote age at placement 3–6 s). PR-2 plan amendment rev 6 (2026-10-06, after two plan reviews: STC rung 1 with a 30 s window then the floor — escalation rungs off by default; BTC 3×40 s re-price only after the roller's own cancel-settle; buffer 0.10; min_net_credit 0.20 $/contract; measured 567 s per-position budget in a leaf module; ENGINE_VERSION bump) — APPROVED rev 7 (2026-10-06, confirmation pass + byte-exact runbook fix); PR-2 build next. Operator-only step still open: the CC log sink (`gcloud logging sinks create covered-call-logs …`; dataset + grant done).
-**Scope:** `src/strategy/call_roller.py` BTC pricing / timeout handling; observability of the quote the limit was priced from.
-**Size estimate:** S–M (study first: how stale/wide was the quote; then either re-price once at timeout, use a marketable buffer above the ask, or widen `btc_fill_timeout_seconds`).
-**Owner:** unassigned.
-
-**Problem:** 2026-09-17 15:30 ET, GOOGL260918C00345000 (deep ITM, expiring the next day): `call_roll_btc_placed` at 3.38 — `round(ask, 2)` from the service's snapshot — sat unfilled for the full 120 s and was cancelled (`btc_timeout_canceled`). A marketable limit at the ask should fill immediately in a liquid name; that it did not says the snapshot ask was stale (delayed feed?) or the real market had moved up. Consequence: the roll is abandoned for the day and, on expiry day, the position is called away instead of rolled — the exact outcome the roller exists to avoid. The sim (FC-116) fills this leg at the ask by construction, so this is a live-vs-sim gap in the sim's favour.
-
-**Open questions:** (1) What quote source feeds `get_option_quote` on the CC service, and its delay? (2) Log the bid/ask/timestamp the limit was priced from on `call_roll_btc_placed` so the next occurrence is diagnosable. (3) Policy: one re-price at timeout (fresh ask) vs a buffer (`ask + k·spread`) vs a longer timeout — bounded by the FC-113 per-position budget. (4) Should expiry-day rolls run earlier than 15:30?
-
-**Observation 2026-09-18 (expiry-day cycle):** the BTC at the snapshot ask (6.94) filled in 20 s, but the STC at the snapshot bid (9.03) then sat unfilled for the full 120 s and only the second placement (6.90) filled — net credit still $205. Two marketable-on-paper limits unfilled for 120 s on consecutive days, on both sides of the book, points at the QUOTE (delay/staleness), not the ladder. Diagnostic (2) above is the first step.
-
-**Week 1 tally (09-17 → 09-25):** four BTC attempts on GOOGL (C345 9/18 ×2, C350 10/02 ×2) — three timed out at the snapshot ask (09-17, 09-21, 09-22), one filled (09-18, expiry day) and that roll's STC needed a second placement. 09-23: `open_order_conflict` on a new GOOGL C352.5 9/25. Roll success rate on the first leg: 1 of 4. Every other cycle: `not_itm_enough`. No error terminals, never uncovered.
-
-**Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
-
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
 
 **Status:** Plan published — `docs/plans/fc-121.md` Approved rev 1 (2026-10-02). Operator decisions signed 2026-10-02: **D-1 keep `backtest_runs`**, **D-2 delete the Job + scheduler**, **D-3 full removal in two PRs** (PR-1 outside `src/**`; PR-2 inside it, moves `engine_identity` once). Plan rev 3 (rollout rewritten from the reviews). **PR-1 MERGED 2026-10-02 (#136, squash `4d6a611`), deployed and verified** — two adversarial reviews (both REQUEST_CHANGES on docs/rollout text; code verified safe), fix commit, confirmation pass CONFIRMED-CLEAN. Operator deleted Job `backtest-screen` and schedulers `monthly-performance-review` / `options-wheel-roll-friday` before the merge. **PR-1 rollout complete 2026-10-06 (R-1 policy re-apply verified; R-0 passed over the Fri 10-02 + Mon 10-05 sessions, 261 scheduler requests, zero non-2xx). **PR-2 MERGED 2026-10-06 (#137, squash `5587cc6`), deployed; R-3a passed (sim-service identity `905ce7564d0973ed`). Pending: R-3b (console sim), R-4 (Sat 10-10 battery), R-5 (`/regression` 10-07) → then Completed.** Reviews: A APPROVE, B REQUEST_CHANGES (T-4) → fix → confirmation found one LOW test-strength regression → fixed → 14/14 mutants re-verified. Filed 2026-10-02 at operator request, immediately after the screen was retired (FC-091 closeout; `docs/BACKTEST_ENGINE.md` §Track D).
@@ -1432,6 +1415,23 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ---
 
 ## Completed
+
+### FC-120: live roller — the buy-to-close limit at the snapshot ask did not fill (execution quality of the roll's first leg)
+
+**Status:** COMPLETED 2026-10-06 — PR-1 #135 (`f4f12fa`, instrumentation) and PR-2 #138 (`653b07f`, marketable tick-legal limits, BTC re-price after the roller's own cancel, STC rung 1 + floor, measured 567 s budget, ENGINE_VERSION `fc-120-marketable-roll-limits`) merged and deployed on both bot services; roll alert policies re-applied. Supervised first live cycle Wed 2026-10-07 15:30 ET (recorded in the plan). Follow-ups: FC-127 (post-hoc truth for misses), FC-131 (order-plane breaker inert), FC-132 (health check vs invalid profile); real-money gates: OPRA before real money (Q1), exchange price protection on far-through rungs (Q7). Plan `docs/plans/fc-120.md` Done.
+**Scope:** `src/strategy/call_roller.py` BTC pricing / timeout handling; observability of the quote the limit was priced from.
+**Size estimate:** S–M (study first: how stale/wide was the quote; then either re-price once at timeout, use a marketable buffer above the ask, or widen `btc_fill_timeout_seconds`).
+**Owner:** unassigned.
+
+**Problem:** 2026-09-17 15:30 ET, GOOGL260918C00345000 (deep ITM, expiring the next day): `call_roll_btc_placed` at 3.38 — `round(ask, 2)` from the service's snapshot — sat unfilled for the full 120 s and was cancelled (`btc_timeout_canceled`). A marketable limit at the ask should fill immediately in a liquid name; that it did not says the snapshot ask was stale (delayed feed?) or the real market had moved up. Consequence: the roll is abandoned for the day and, on expiry day, the position is called away instead of rolled — the exact outcome the roller exists to avoid. The sim (FC-116) fills this leg at the ask by construction, so this is a live-vs-sim gap in the sim's favour.
+
+**Open questions:** (1) What quote source feeds `get_option_quote` on the CC service, and its delay? (2) Log the bid/ask/timestamp the limit was priced from on `call_roll_btc_placed` so the next occurrence is diagnosable. (3) Policy: one re-price at timeout (fresh ask) vs a buffer (`ask + k·spread`) vs a longer timeout — bounded by the FC-113 per-position budget. (4) Should expiry-day rolls run earlier than 15:30?
+
+**Observation 2026-09-18 (expiry-day cycle):** the BTC at the snapshot ask (6.94) filled in 20 s, but the STC at the snapshot bid (9.03) then sat unfilled for the full 120 s and only the second placement (6.90) filled — net credit still $205. Two marketable-on-paper limits unfilled for 120 s on consecutive days, on both sides of the book, points at the QUOTE (delay/staleness), not the ladder. Diagnostic (2) above is the first step.
+
+**Week 1 tally (09-17 → 09-25):** four BTC attempts on GOOGL (C345 9/18 ×2, C350 10/02 ×2) — three timed out at the snapshot ask (09-17, 09-21, 09-22), one filled (09-18, expiry day) and that roll's STC needed a second placement. 09-23: `open_order_conflict` on a new GOOGL C352.5 9/25. Roll success rate on the first leg: 1 of 4. Every other cycle: `not_itm_enough`. No error terminals, never uncovered.
+
+**Links:** `docs/plans/fc-100.md` §Rollout complete (first live cycle); FC-113 (roller time accounting); FC-116 (sim fills at the ask).
 
 ### FC-091: chain lake merge-on-put — a window-thrashed symbol stays cold forever under the coverage-monotone guard
 
