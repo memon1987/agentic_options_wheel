@@ -509,13 +509,19 @@ class TestTheCCAlertPolicies:
 
         PR-2 applied DD-8's text byte-exact, which no longer names
         `limit_on_tick` / `cancel_quote_ask` (PR-1's needles): the cap forced
-        the paragraph shorter, and both fields are on every row it names."""
+        the paragraph shorter, and both fields are on every row it names.
+
+        Review finding F7: `btc_rejected` joins the price-protection
+        signature line (the cap allowed it: CC 3,980 B) and is deliberately
+        NOT added to either filter — a rejected BTC leaves the position
+        covered, nothing live."""
         doc = self._doc(name)
         content = doc["documentation"]["content"]
         for needle in ("quote_drift", "call_roll_leg_settled", "quote_age_s",
                        "call_roll_btc_repriced", "rung_kind",
                        "reprice_skipped_reason",
-                       "roll_cycle_budget_misconfigured"):
+                       "roll_cycle_budget_misconfigured",
+                       "btc_rejected, or naked_exposure after stc_rejected"):
             assert needle in content, (name, needle)
         # The Monitoring API caps documentation.content at 4000 UTF-8 BYTES,
         # and a PATCH over it silently keeps the OLD text.
@@ -530,6 +536,7 @@ class TestTheCCAlertPolicies:
                                   "call_roll_quote_sample",
                                   "call_roll_instrumentation_failed"):
                 assert informational not in f, (name, informational)
+            assert "btc_rejected" not in f, (name, "F7: never paged")
             assert "roll_cycle_budget_misconfigured" in f, name
 
     @pytest.mark.parametrize("name", ("cc_roll_executed_alert_policy.json",

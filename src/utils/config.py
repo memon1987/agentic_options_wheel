@@ -403,9 +403,16 @@ class Config:
         The cross-key bound runs only when all five timing keys are themselves
         valid: it computes ``roll_budget.per_position_budget_seconds`` on the
         raw values and refuses a profile whose worst case exceeds
-        ``roll_budget.MAX_PER_POSITION_BUDGET_SECONDS`` — the service then does
-        not start, and the canary's /health smoke fails the build before any
-        traffic shifts. ``roll_budget`` is a leaf module, so there is no cycle.
+        ``roll_budget.MAX_PER_POSITION_BUDGET_SECONDS`` — ``Config()`` raises.
+        That is fail-closed AT CONSTRUCTION, not at deploy (review finding F3):
+        the bot services build ``Config`` lazily (``strategy_config()`` in
+        ``deploy/cloud_run_server.py``, on the first request that needs it),
+        the canary smoke only polls the revision's Ready condition, ``/``
+        never builds it and ``/health`` builds it but answers 200 even when it
+        fails — so a refused profile deploys GREEN and every trading endpoint
+        (``/scan``, ``/run``, ``/monitor``, ``/roll``) fails on its first
+        request. FC-132 owns the deploy-path decision. ``roll_budget`` is a
+        leaf module, so there is no cycle.
         """
         from ..strategy import roll_budget
 

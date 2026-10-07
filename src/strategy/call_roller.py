@@ -38,13 +38,14 @@ them and still exactly one terminal. ``call_roll_stc_timeout_canceled`` and
 reason. All three are informational and never alert-wired.
 
 FC-120 PR-2 — the pricing rule (docs/plans/fc-120.md DD-3/DD-4). Base-mode
-limits are MARKETABLE and TICK-LEGAL by construction, priced from a bounded
-quote read immediately before each order: the buy-to-close at
-``snap_up(max(ask + buffer, parity + 0.01))`` (parity from the IEX stock bid),
-the sell-to-open at ``snap_down(bid - buffer)``, never below the floor
-``snap_up(btc_fill + min_credit)``. Imminence keeps its pad on each leg's FIRST
-placement; every re-price is base-mode. The credit invariant is tested on the
-buffered, snapped limits at every site, so a filled roll still cannot net a
+limits are buffered THROUGH the quoted side and TICK-LEGAL by construction,
+priced from a bounded quote read immediately before each order: the
+buy-to-close at ``snap_up(max(ask + buffer, parity + 0.01))`` (parity from the
+IEX stock bid — a lower bound, never below intrinsic, not a marketability
+guarantee), the sell-to-open at ``snap_down(bid - buffer)``, never below the
+floor ``snap_up(btc_fill + min_credit)``. Imminence keeps its pad on each leg's
+FIRST placement; every re-price is base-mode. The credit invariant is tested on
+the buffered, snapped limits at every site, so a filled roll still cannot net a
 debit. Before any order exists, both limits come from fresh execute-time reads;
 an unusable new-symbol read is ``credit_gone_at_execution``, as on main — the
 pre-BTC screen is never priced off the chain row (review finding F5). A
@@ -676,12 +677,14 @@ class CallRoller:
         Base: ``snap_up(max(ask + buffer_multiple x buffer, parity + 0.01))``.
         Imminence: ``snap_up(max(mid + 0.05, parity + 0.01))`` — the pad does
         not stack with the buffer (imminence already crosses half the spread),
-        but the parity floor DOES apply: it is a marketability floor, not a pad.
-        ``parity = stock_bid - strike`` from the IEX stock bid: a call's true
-        ask cannot sit below intrinsic, so ``parity + 0.01`` is marketable even
-        when the indicative ask is quoted below parity. A missing stock bid
-        omits the term. The tick is decided from the UNSNAPPED value. Every
-        operand is an exact decimal (``_dec``); never ``Decimal(float)``.
+        but the parity floor DOES apply: it is a floor, not a pad.
+        ``parity = stock_bid - strike`` from the IEX stock bid. ``parity +
+        0.01`` is a LOWER BOUND — the limit is never below intrinsic at the
+        IEX bid, where no ask could ever match it — not a marketability
+        guarantee (F7): the true ask also carries time value, so it binds
+        usefully when the indicative ask is quoted below parity. A missing
+        stock bid omits the term. The tick is decided from the UNSNAPPED value.
+        Every operand is an exact decimal (``_dec``); never ``Decimal(float)``.
 
         None when ``ask <= 0`` in base mode, or there is no mid in imminence.
         This static and ``_stc_limit_from_quote`` are the named monkeypatch
@@ -2592,9 +2595,14 @@ def _quote_fields(quote: Optional[Dict[str, Any]], limit: Any, side: str,
     ">= 0" always means the same thing: ``limit_vs_quote`` is ``limit - ask``
     on a buy and ``bid - limit`` on a sell (>= 0 = at or through the quoted
     side). ``intrinsic_at_placement`` is ``max(0, stock_bid - strike)`` from
-    the EVALUATION-time IEX stock bid (its stamp is ``stock_bid_ts``; PR-1
-    makes no stock re-read before an order) — a BTC limit below it is one no
-    NBBO ask could match.
+    the EVALUATION-time IEX stock bid (its stamp is ``stock_bid_ts``) — a BTC
+    limit below it is one no NBBO ask could match. FC-120 PR-2 ALSO reads the
+    stock quote before each BTC placement (execute time, and each re-price)
+    to price the parity term, so a BTC row carries two stock bids (review
+    finding F7): ``stock_bid`` — this evaluation-time one, from
+    ``_stock_fields`` — and ``parity_stock_bid``, the execute-time / re-price
+    bid, from ``_btc_pricing_fields``. They are different reads at different
+    times; neither is a re-read of the other.
 
     The roller's limits are deliberately NOT priced through ``limit_pricing``
     (docs/CLAUDE.md); only ``_dec`` / ``tick_size`` / ``quote_age_seconds`` are
@@ -2658,8 +2666,11 @@ def _reread_fields(quote: Any, reread: Any, side: str) -> Dict[str, Any]:
 
 
 def _stock_fields(stock_bid: Any, stock_ask: Any, stock_quote_ts: Any) -> Dict[str, Any]:
-    """The evaluation-time IEX stock quote, its age computed NOW from its own
-    stored broker stamp — the same time base as ``quote_age_s``."""
+    """The EVALUATION-time IEX stock quote, its age computed NOW from its own
+    stored broker stamp — the same time base as ``quote_age_s``. On a BTC row
+    this ``stock_bid`` is NOT the bid that priced the parity term: that one is
+    ``parity_stock_bid`` (execute-time or re-price read; ``_btc_pricing_fields``
+    — F7)."""
     ts = _iso(stock_quote_ts)
     return {'stock_bid': _pos(stock_bid), 'stock_ask': _pos(stock_ask),
             'stock_quote_ts': ts, 'stock_quote_age_s': _age_s(ts),
@@ -2686,9 +2697,15 @@ def _evaluation_quote_set(quote: Any, limit: Any, underlying: Any, strike: Any,
 # --------------------------------------------------------------------------- #
 
 def _parity_floor(stock_bid: Any, strike: Any) -> Optional[Decimal]:
-    """``stock_bid - strike + 0.01``: a call's true ask cannot sit below
-    intrinsic, so a buy limit one cent above parity is marketable whatever the
-    feed says. None when either input is absent (the term is omitted)."""
+    """``stock_bid - strike + 0.01``: a LOWER BOUND on the buy limit — never
+    below intrinsic at the IEX stock bid — not a marketability guarantee
+    (review finding F7). A call's true ask cannot sit below intrinsic, so a
+    limit under parity could never fill; but the true ask carries time value
+    above parity, so a limit AT parity + 0.01 is marketable only when the
+    contract trades at (or within a cent of) intrinsic. It binds when the
+    indicative ask is quoted below parity — the modified-quote failure a
+    buffer cannot bound. None when either input is absent (the term is
+    omitted)."""
     stock, k = _pos(stock_bid), _pos(strike)
     if stock is None or k is None:
         return None
@@ -2772,6 +2789,12 @@ def _chain_row_quote(opportunity: Any) -> Optional[Dict[str, Any]]:
 def _btc_pricing_fields(pricing: Any) -> Dict[str, Any]:
     """The log-only fields on every BTC row (R6-R): which reads priced it.
 
+    A BTC row carries TWO IEX stock bids (review finding F7): ``stock_bid``
+    (``_stock_fields``) is the EVALUATION-time bid — the one
+    ``intrinsic_at_placement`` is computed from — while ``parity_stock_bid``
+    here is the EXECUTE-time (attempt 0) or RE-PRICE (attempt n >= 1) bid that
+    priced this limit's parity term, from the read ``stock_quote_source``
+    names (null with ``"none"``: the term was omitted).
     ``improvement_floor_applied`` (F1) is true when a re-price's strict step
     (prior limit + one tick), not the formula, set the limit; null on attempt
     0, which replaces nothing."""
