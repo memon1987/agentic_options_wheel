@@ -1320,7 +1320,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-129: `engine_identity` hashes comment bytes, and `ENGINE_VERSION` is still byte-pinned in two places
 
-**Status:** Filed 2026-10-06 (FC-121 PR-2 reviews A + B, plan critiques)
+**Status:** Filed 2026-10-06 (FC-121 PR-2 reviews A + B, plan critiques). **2026-10-12 — the unpinned file broke CI on a docs-only commit:** pyarrow 26.0.0 (released 10-09) requires NumPy 2 against the file's `numpy<2`; 188 parquet tests red; hotfix PR #139 pinned `pyarrow<26`. A fully pinned `requirements.txt` (or a lock file) is now overdue, not just an identity-hygiene nicety.
 **Scope:** shared (backtest engine identity; dashboard image)
 **Size estimate:** S–M (digest change = a deliberate one-time invalidation; dashboard copy = a Dockerfile `COPY` + test deletions)
 **Owner:** unassigned
