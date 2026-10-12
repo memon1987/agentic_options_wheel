@@ -35,7 +35,7 @@ cryptography>=42.0.0,<47.0.0
 pandas>=2.0.0,<3.0.0
 numpy>=1.24.0,<2.0.0
 scipy>=1.11.0,<2.0.0
-pyarrow>=14.0.0  # parquet chain cache for backtesting (FC-032)
+pyarrow>=14.0.0,<26  # parquet chain cache for backtesting (FC-032). <26: pyarrow 26.0.0 (2026-10-09) requires NumPy>=2 and this file pins numpy<2 — `import pyarrow` fails and pandas loses its parquet engine (188 tests red on main, 2026-10-12)
 
 # Configuration and environment management
 pyyaml>=6.0,<7.0.0
