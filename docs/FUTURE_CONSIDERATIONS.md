@@ -1382,6 +1382,22 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-133: the chain lake refuses a narrower strike window instead of widening it — a symbol whose price ran rebuilds from the vendor every Saturday
+
+**Status:** Filed 2026-10-12 (observed on four consecutive battery Saturdays; FC-117 §Execution)
+**Scope:** backtest engine (`src/backtesting/data/chain_store.py` merge/`_covers`; the `data-backfill` Job's wheel half)
+**Size estimate:** S–M (merge rule + a test; one-time widen of the affected objects) — changes persisted lake objects → plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the lake's merge-on-put refuses an incoming object whose strike window is narrower than the stored one (`chain_lake_merge_refused`), and `_covers` rejects a read whose strike window is wider than the stored one. A symbol whose price has run outside the stored ±25 % window therefore misses the lake on every battery Saturday, rebuilds from the vendor (AMD: 121 fetches / 452 s on 10-03, 125 / 458 s on 09-25, again on 10-10; AAPL and QQQ to a lesser degree), and the rebuilt object is then refused on merge, so nothing heals. The wheel half of the battery now costs ~800 s of its ~1,300 s on this path.
+
+**Proposal:** on merge, WIDEN the stored strike window to the union of stored and incoming (contracts are additive; DTE must still match), and let `_covers` accept a request inside the union; one-time re-put of the affected symbols' trailing-year objects; a test that a window-thrashed symbol is served from the lake on the second read. Verify on the next two Saturdays: `provider_fetches` on AMD's wheel row → ~1.
+
+**Links:** FC-091 (merge-on-put), FC-117 (§Execution rows for 09-25 / 10-03 / 10-10), FC-130.
+
+---
+
 ## Completed
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
