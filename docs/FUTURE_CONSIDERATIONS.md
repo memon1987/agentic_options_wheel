@@ -1398,6 +1398,43 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-134: explore fine-tuning an open-weight LLM on our execution history, the chain lake, and simulator-generated synthetic data
+
+**Status:** Consideration (filed 2026-10-28 — a rough idea to explore later, not scheduled)
+**Scope:** shared (research track; reads the BigQuery tables, the chain lake, and the scenario runner. Nothing on the live order path until a later plan says so)
+**Size estimate:** L (data assembly + training infra + an evaluation harness). Needs a plan file before any code, and probably a spike/feasibility doc before that
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Opportunity:** after a year of running the wheel and covered-call bots, we have three data sources nobody else has in this combination: (1) **real execution history**, meaning `trades_from_activities` / `wheel_cycles_from_activities`, `decision_events` (the "did we sell, and if not why not" table, FC-065 P4), and roll placements/fills (FC-120); (2) the **chain lake**, which holds point-in-time option chains for the universe; and (3) the **scenario runner/sweep stack**, which can replay any config over any window and so can generate as many labelled synthetic episodes as we pay compute for. The idea is to fine-tune an open-weight model (a 7–14B class model with LoRA/QLoRA, self-hosted on GCP) on this corpus so it can reason about wheel decisions with our context, instead of a general model reasoning from first principles every time.
+
+**What the model would actually do (the first thing to pin down):** candidate roles, roughly in increasing risk order:
+- **Analyst / explainer:** read a cycle, a sweep result, or a day's `decision_events` and explain it ("why did AMD sit uncovered for 9 days", "what changed between these two battery runs"). It is advisory only, so a wrong answer costs a misread and not money.
+- **Config proposer for the sweep stack:** suggest the next sweep arms given past `scenario_runs`. The backtest still grades every suggestion, so the model only searches and never decides.
+- **Ranking prior:** score scanner candidates (strike/expiry) as an extra feature next to the deterministic gates. Any live use would sit behind the existing gates and a shadow period.
+- **Policy:** choose trades directly. This is listed only so we can rule it out for now. It has the weakest data support and the highest blast radius.
+
+**Data reality check (to research before any infra):**
+- **The real data is small.** One year of paper trading is on the order of hundreds of cycles and a few thousand decision rows. That is enough for style and context, not for learning edge. `decision_events` only exists from FC-065 P4 onward, and earlier structured logs aged out of Cloud Logging's 30-day window (the FC-046 sink died 2025-11-22). Inventory exactly what exists, per table and per date range.
+- **Paper fills are not real fills.** The paper engine's silent settlements (FC-021/FC-025) and fill optimism mean labels taken from executions carry broker artefacts. Decide which labels come from fills and which come from post-hoc truth (FC-127).
+- **Synthetic data risks teaching the model our own rules back to us.** Episodes from the simulator encode the engine's own gates and fill model. A model trained to imitate them learns the rule engine, which adds nothing. Synthetic data is useful only if it is labelled by *outcome* across many configs and regimes, not by "what the engine did". The spread model and haircut-from-mid fills (FC-116) bound how trustworthy those outcomes are.
+- **Look-ahead and leakage.** Every training example must be built only from data available at its `run_ts`, using the chain lake's point-in-time objects, the earnings table as known on that date, and so on. Use a strict walk-forward split by date, never a random split.
+- **Regime coverage.** A single year is one market regime. Synthetic sweeps over earlier lake windows can widen the coverage, but only as far back as the lake reaches.
+
+**Open questions:**
+- Which role first? The analyst/explainer looks like the cheapest useful one and needs no live wiring.
+- Does fine-tuning beat the cheap baselines? Compare against (a) a hosted frontier model with retrieval over the same tables and no training, and (b) a gradient-boosted model on tabular features for any ranking role. If neither baseline loses clearly, stop there.
+- Example format: tabular-to-text serialisation of chain snapshots + position state → decision + outcome? How much chain context fits per example?
+- Evaluation: an LLM's output must be gradable by the existing machinery. Explainer: a held-out Q&A set graded against the tables. Proposer: backtest fitness of its suggested arms versus random or grid arms on the same compute. Ranker: walk-forward through the scenario runner, with the battery as the regression gate.
+- Infra and cost: GPU training (Vertex AI vs. a GCE GPU VM), serving (Cloud Run GPU vs. a batch job), and the data-export path out of BigQuery and the lake bucket. What is the monthly cost of keeping it served?
+- Governance: model artefacts and training snapshots need an identity in the same spirit as `engine_identity`/`config_hash`, so any result can be traced to the data and weights that produced it.
+
+**Possible first step (a spike, not a plan):** a one-week feasibility note that (1) inventories the real corpus with row counts and date ranges, (2) builds ~200 point-in-time examples for the explainer role, and (3) runs the no-fine-tune retrieval baseline on them. Fine-tuning is worth planning only if that baseline shows a gap that training plausibly closes.
+
+**Links:** FC-065 (`decision_events`), FC-060 / FC-091 / FC-133 (chain lake), FC-060 scenario runner + FC-096 (sweeps, `scenario_runs`), FC-117 (weekly battery as a regression gate), FC-116 / FC-127 (fill-model fidelity and post-hoc truth), FC-021 / FC-025 (paper-engine artefacts), FC-046 (lost log history), `docs/operations/DECISION_RECORDS.md`, `docs/bigquery/scenario_runs.md`.
+
+---
+
 ## Completed
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
