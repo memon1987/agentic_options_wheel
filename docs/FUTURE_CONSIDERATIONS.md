@@ -1091,7 +1091,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-112: revisit the wheel's roll trigger (`itm_trigger_ratio: 0.98`) with measured evidence
 
 **Scope:** wheel
-**Status:** EXECUTING — PR-1 `989ef78` (wheel replay roll reach 7→21, ENGINE_VERSION fc-112-wheel-roll-reach) and PR-2 `bc029a1` (frozen pre-registered read + diagnostic tool) both merged 2026-09-12. Awaiting operator steps (lake widen, pins, one-shot per PR #133's runbook); the read follows the first Saturday with pin rows. No config change until a verdict.
+**Status:** EXECUTING — PR-1 `989ef78` (wheel replay roll reach 7→21, ENGINE_VERSION fc-112-wheel-roll-reach) and PR-2 `bc029a1` (frozen pre-registered read + diagnostic tool) both merged 2026-09-12. Decision + control pins CREATED 2026-11-09 (`276b579ecdfc4d06`, `c267eb56be7645a3`; plan §Execution); first battery point Sat 2026-11-14; run `tools/diagnostics/fc112_roll_trigger_read.py --pin-id 276b579ecdfc4d06 --pin-id c267eb56be7645a3 --artifacts` on a clean main checkout after it, then `--last 4` through ~12-05. Lake widen / OOS read and `t099` one-shot remain optional operator steps. No config change until a verdict.
 **Size estimate:** S (a simulation study on the console; a config change only if the numbers say so)
 
 **Problem:** the roll trigger fires at 98% of the strike. Both profiles write short-dated calls at 0.15–0.25 delta, which are born at 97–99% of the strike, so the roller can same-day re-write the engine's own call — buy back at the ask, sell a higher strike up to 14 days further out at any delta ≤ 0.60, bypassing every entry gate (delta band, DTE target, premium/spread floors). Live evidence: the wheel's IWM call was rolled on 09-04 and again on 09-08 (+$100 net credit, longer tenor, higher delta). Whether that is defence or churn has never been measured; FC-078 accepted 0.98 on the wheel by analogy, not data.
@@ -1456,6 +1456,29 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Not parity gaps (broken for both strategies; note for the plan):** the dashboard reads a `scans` table with 0 rows and a `call_rolls` view that exists in neither dataset; the direct-write `errors` table has no row since 2026-04-06 (wheel) and none ever (covered call) — error events live only in the log sinks.
 
 **Links:** FC-075 (covered-call strategy), FC-018 / FC-024 / FC-031 (the views), FC-012 (Alpaca as source of truth), FC-108 / FC-111 (regression monitor is roll-blind and its covered-call instance reads the wheel's logs), FC-120 DD-9 (log sink), FC-122 (design-system migration touches the same pages), `docs/releases/RELEASE_2026-11-09.md`.
+
+### FC-136: the lake-freshness "check degraded" nag fires every day for a condition that is by design — the covered-call service is deliberately not the lake's watcher
+
+**Status:** Filed 2026-11-09 (session close-out; operator: entry only). Entry only — not planned, not started.
+**Scope:** monitoring (one alert-policy filter) and/or `tools/testing/regression_monitor.py` `check_lake_freshness`
+**Size estimate:** S (a filter clause in `deploy/monitoring/lake_freshness_degraded_alert_policy.json` + its contract test, or a profile-aware skip in the check) — a deploy/monitoring change, so plan-first despite the size
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `covered-call-engine` emits `lake_freshness_degraded` on every `/regression` run — six times every trading day, every day in the 28-day log window (10-13 → 11-09), payload `check: lake_freshness_unconfigured`, `reason: no_bucket`. The "Chain lake freshness — check degraded (not actually watching)" policy matches both bot services, so it has a permanent trigger. Its 24 h rate limit turns that into one mail a day, for ever, about a service that was never meant to watch the lake. A nag that fires daily for a known, by-design condition is the thing the policy's own runbook says it exists to prevent: a warning nobody reads. It also masks the one case the policy is for — the wheel's check degrading (GCS read error, bucket unset after an out-of-band env edit) would arrive as the same daily mail the operator has learned to ignore.
+
+**This is NOT a missing env var.** `check_lake_freshness`'s docstring (`tools/testing/regression_monitor.py`, "The wheel service is the lake's watcher; the covered-call service is deliberately not") records the omission of `CHAIN_LAKE_BUCKET` on `covered-call-engine` as a decision: the covered-call profile's universe is holdings-derived, so it has no `stocks.symbols` to measure the lake against, and two watchers measuring different universes would produce a second opinion nobody reconciles. Do not "fix" this by adding the bucket to the covered-call deploy step (`cloudbuild.yaml` `deploy-cc-canary`, `--set-env-vars`); that re-opens the decision the docstring closes.
+
+**Doc drift to correct in the same change:** the docstring says the covered-call service "reports a steady `lake_freshness_no_universe` warn"; the live payload is `lake_freshness_unconfigured` / `no_bucket`, because the bucket check runs before the universe check. Same outcome, wrong name in the prose.
+
+**Options for the plan:**
+1. *Narrow the policy* to `resource.labels.service_name="options-wheel-strategy"` (the watcher), leaving the covered-call `/regression` report's `warn` row as the visible record. Smallest change; the contract test on the policy JSON pins it. Downside: if the covered-call service ever becomes a watcher, the policy must be widened again.
+2. *Make the check profile-aware:* when the profile is not the lake's watcher (no `stocks.symbols` universe, or an explicit `lake_watcher: false` in the profile), report a distinct `lake_freshness_not_watching` **pass-with-note** (not `warn`, not `lake_freshness_degraded`), so the degraded event means "a watcher degraded" on every service. Cleaner semantics; touches `tools/testing/regression_monitor.py` (not `src/**`, so engine identity does not move) and its tests.
+3. Both: (2) for semantics, (1) as belt.
+
+**Evidence to carry into the plan:** `gcloud logging read` on `covered-call-engine` / `lake_freshness_degraded`, 28 d: 6 events per trading day, all `no_bucket`; wheel service: 0 such events in the same window. Policy: `deploy/monitoring/lake_freshness_degraded_alert_policy.json` (`notificationRateLimit 86400s`, `autoClose 86400s`). Env: `options-wheel-strategy` has `CHAIN_LAKE_BUCKET=options-wheel-chain-lake` (`cloudbuild.yaml` `deploy-bot-canary`); `covered-call-engine` has none. Not verified: whether the daily notification is actually being delivered (check the notification channel's history before planning — if it is not, option 1 is still right but the urgency drops).
+
+**Links:** FC-096 Phase A (the freshness check and both lake policies), FC-130 (the sweep/battery path lost its run-level lake-degraded warning — the opposite problem: too little signal there, too much here), FC-108 / FC-111 (the covered-call regression instance's other blind spots), FC-125 (deploy config changes redeploy both bots).
 
 ---
 
