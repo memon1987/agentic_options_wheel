@@ -1435,6 +1435,30 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ---
 
+### FC-135: covered-call reporting parity — the dashboard and its analytical views cover only the wheel's account
+
+**Status:** Filed 2026-11-09 (session close-out; operator: "we need parity of reporting and observability between both strategies"). Entry only — not planned, not started.
+**Scope:** dashboard (backend + frontend), BigQuery views, the covered-call service's stock-history ingest
+**Size estimate:** M–L (views with changed share-side logic, a strategy switch across the live pages, one ingest change) — plan-first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the live-trading side of the dashboard shows nothing about the covered-call account. `dashboard/backend/services/bigquery.py` hardcodes `DATASET_ID = "options_wheel"`, and the seven analytical views it reads (`trades_with_outcomes`, `wheel_cycles_from_activities`, `fc018_acb_timeline_per_symbol`, `fc018_acb_per_symbol_current`, `fc018_per_symbol_scorecard`, `fc018_vs_buy_and_hold_per_symbol`, `fc031_monthly_option_cashflow`) exist only in that dataset. The direct-write layer is already at parity (verified 2026-11-09): `trades_from_activities`, `stock_history_from_alpaca`, `equity_history_from_alpaca`, `executions`, `decision_events`, `errors`, `trades` have identical schemas in `options_wheel` and `covered_call` and both are current; the log sink gap closed the same day (`covered-call-logs` → `covered_call_logs`).
+
+**What was measured (read-only, the views' own SQL run against `covered_call` as one WITH-chain; the same harness reproduces the wheel's real view row counts exactly):**
+- *Works as-is:* `trades_with_outcomes` (33 trades), `fc031_monthly_option_cashflow` (2026-09 +$1,734, 10 +$994, 11 −$460 to date), the option side of the scorecard (GOOGL $1,052 realized on 19 trades; UNH $1,039 on 14, one open).
+- *Wrong, not merely missing:* the cost-basis walk and the scorecard's share side build share positions ONLY from option assignments (`OPASN`), the way the wheel acquires shares. The covered-call account buys its lots outright (stock `FILL`s), so the views report 0 shares, no cost basis and $0 share P&L, while the raw fills give 100 shares each at $334.176 (GOOGL) / $396.542 (UNH) — matching the live service's own `decision_events.cost_basis_per_share` (334.176 / 396.541) — plus realized −$987.08 and −$730.00 on the first lots sold 2026-08-31, and GOOGL ~13 % under its basis on 2026-11-09.
+- *Blank:* `fc018_vs_buy_and_hold_per_symbol` — the covered-call dataset's `stock_history_from_alpaca` holds only SPY (303 rows); the wheel's holds the nine traded symbols. This is the one underlying-DATA gap.
+- *Empty by construction:* `wheel_cycles_from_activities` (a cycle starts at a put assignment).
+
+**Proposal (scope for the plan, in dependency order):** (1) ingest price history for held symbols in the covered-call dataset (or point the buy-and-hold view at shared history — decide); (2) create the option-side views in `covered_call` unchanged; (3) teach the share-side views about directly bought and sold stock (correct for both strategies; the wheel output must stay byte-identical where no direct stock fills exist); (4) decide what a "cycle" is for a covered-call lot, or hide the cycle pages for that account; (5) a strategy switch on the dashboard's live pages (dataset per strategy; `strategy_id` already rides on every row). Do NOT copy the legacy `options_wheel_logs` views (FC-046, FC-087).
+
+**Not parity gaps (broken for both strategies; note for the plan):** the dashboard reads a `scans` table with 0 rows and a `call_rolls` view that exists in neither dataset; the direct-write `errors` table has no row since 2026-04-06 (wheel) and none ever (covered call) — error events live only in the log sinks.
+
+**Links:** FC-075 (covered-call strategy), FC-018 / FC-024 / FC-031 (the views), FC-012 (Alpaca as source of truth), FC-108 / FC-111 (regression monitor is roll-blind and its covered-call instance reads the wheel's logs), FC-120 DD-9 (log sink), FC-122 (design-system migration touches the same pages), `docs/releases/RELEASE_2026-11-09.md`.
+
+---
+
 ## Completed
 
 ### FC-121: decommission the retired monthly screen — delete the screen-only code, endpoint, Job and policy references; re-home the constants the sim stack borrows from `screen.py`
