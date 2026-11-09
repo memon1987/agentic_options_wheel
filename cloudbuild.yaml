@@ -38,6 +38,16 @@
 # before this config can deploy anything. The gate fails closed and says so.
 #
 # See docs/plans/fc-084.md (rev 2) and docs/CLAUDE.md §Deploy / CI.
+#
+# BUILD IMAGE PIN (hotfix 2026-11-09). Every cloud-sdk step below is pinned BY DIGEST
+# to 591.0.0 (published 2026-10-27, the image the last green build ran on). The steps
+# used to name the image with no tag, i.e. `latest`. On 2026-11-03 `latest` moved to
+# 592.0.0, which ships no `python3`; `serialize-builds` calls python3 to read its own
+# build record, so the gate failed closed and NO build of main could deploy (first
+# seen on build 6e6d21d0, 2026-11-09). Fourteen script lines in this file call python3.
+# Bumping the image is a deliberate change: pick a version, confirm it has python3
+# (`docker run --rm <image> python3 --version`), change all sixteen lines together.
+# tests/test_cloudbuild_contract.py asserts every cloud-sdk step carries one digest.
 
 steps:
   # Step 1: Run critical tests only (faster)
@@ -154,7 +164,7 @@ steps:
   # step, so nothing else in the graph is delayed. The gate's own cap is derived from
   # the build timeout (startTime + BUILD_TIMEOUT_SECONDS - 90, i.e. ~23.5 min at
   # 1500s), not a flat number, so it always outlasts any legitimate wait.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     env:
       - 'BUILD_ID=$BUILD_ID'
@@ -400,7 +410,7 @@ steps:
   #                 instance scaled in. FC-107. Pinned as a seam invariant from
   #                 the roller's constants + this profile's rolling.* config by
   #                 tests/test_cloudbuild_contract.py.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     env:
       - 'BUILD_ID=$BUILD_ID'
@@ -475,7 +485,7 @@ steps:
   # Cannot curl authenticated Cloud Run from Cloud Build, so verify via API that
   # THIS build's revision is ready. Reads the condition whose type == "Ready":
   # Ready-first ordering in status.conditions is observed, not contractual.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -511,7 +521,7 @@ steps:
   # the --update-env-vars kill switches permanently. Safe because serialize-builds
   # guarantees no other build is deploying, and the equality check below refuses to
   # promote anything this build did not create.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -596,7 +606,7 @@ steps:
   #                 instance scaled in. FC-107. Pinned as a seam invariant from
   #                 the roller's constants + this profile's rolling.* config by
   #                 tests/test_cloudbuild_contract.py.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     env:
       - 'BUILD_ID=$BUILD_ID'
@@ -663,7 +673,7 @@ steps:
   # Verify the covered-call canary revision is ready (same poll-not-sample
   # pattern as the wheel's smoke test — a single-shot check races startup),
   # pinned to this build's revision and reading the type == "Ready" condition.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -691,7 +701,7 @@ steps:
     waitFor: ['deploy-cc-canary']
 
   # Shift traffic to the new covered-call revision (--to-latest; see promote-bot)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -750,7 +760,7 @@ steps:
     waitFor: ['smoke-test-cc']
 
   # Step 9: Deploy dashboard to Cloud Run (canary - no traffic)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     env:
       - 'BUILD_ID=$BUILD_ID'
@@ -873,7 +883,7 @@ steps:
     waitFor: ['push-dashboard-image', 'serialize-builds']
 
   # Step 10: Verify the dashboard canary revision is healthy
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -905,7 +915,7 @@ steps:
     waitFor: ['deploy-dashboard-canary']
 
   # Step 11: Shift traffic to the new dashboard revision (--to-latest; see promote-bot)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -998,7 +1008,7 @@ steps:
   # Same flags as the canary deploy minus the three traffic/naming ones — an
   # `--set-env-vars` drift between the two would leave the bootstrap revision
   # running a different configuration than everything after it.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -1098,7 +1108,7 @@ steps:
   # service whose `Config()` cannot validate — it fails at startup, the smoke test
   # fails, and the build goes red for a reason no log explains. The names are the
   # `backtest-sweep` Job's, verbatim.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     env:
       - 'BUILD_ID=$BUILD_ID'
@@ -1192,7 +1202,7 @@ steps:
   # step 3 must check: grep this step's log for `PASS: /health` and, if it says
   # SMOKE_SIM_HTTP_UNAVAILABLE instead, the HTTP half is a control that is
   # watching nothing and needs its own follow-up.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -1319,7 +1329,7 @@ steps:
     waitFor: ['deploy-sim-canary']
 
   # Shift traffic to the new sim-service revision (--to-latest; see promote-bot)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -1409,7 +1419,7 @@ steps:
   # recorded `failed` row — but only if the timeout is generous enough that
   # hitting it means something is actually wrong. `services/sweeps.py` mirrors
   # this number as JOB_TASK_TIMEOUT_SECONDS; a contract test pins them equal.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
@@ -1484,7 +1494,7 @@ steps:
   # is genuinely wrong. `--max-retries=0` for the sweep Job's reason: a retried
   # execution would re-walk the same days, and every day it already wrote is a
   # lake round-trip paid twice.
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228'
     entrypoint: 'bash'
     args:
       - '-c'
