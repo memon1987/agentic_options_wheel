@@ -1457,6 +1457,29 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 **Links:** FC-075 (covered-call strategy), FC-018 / FC-024 / FC-031 (the views), FC-012 (Alpaca as source of truth), FC-108 / FC-111 (regression monitor is roll-blind and its covered-call instance reads the wheel's logs), FC-120 DD-9 (log sink), FC-122 (design-system migration touches the same pages), `docs/releases/RELEASE_2026-11-09.md`.
 
+### FC-136: the lake-freshness "check degraded" nag fires every day for a condition that is by design — the covered-call service is deliberately not the lake's watcher
+
+**Status:** Filed 2026-11-09 (session close-out; operator: entry only). Entry only — not planned, not started.
+**Scope:** monitoring (one alert-policy filter) and/or `tools/testing/regression_monitor.py` `check_lake_freshness`
+**Size estimate:** S (a filter clause in `deploy/monitoring/lake_freshness_degraded_alert_policy.json` + its contract test, or a profile-aware skip in the check) — a deploy/monitoring change, so plan-first despite the size
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `covered-call-engine` emits `lake_freshness_degraded` on every `/regression` run — six times every trading day, every day in the 28-day log window (10-13 → 11-09), payload `check: lake_freshness_unconfigured`, `reason: no_bucket`. The "Chain lake freshness — check degraded (not actually watching)" policy matches both bot services, so it has a permanent trigger. Its 24 h rate limit turns that into one mail a day, for ever, about a service that was never meant to watch the lake. A nag that fires daily for a known, by-design condition is the thing the policy's own runbook says it exists to prevent: a warning nobody reads. It also masks the one case the policy is for — the wheel's check degrading (GCS read error, bucket unset after an out-of-band env edit) would arrive as the same daily mail the operator has learned to ignore.
+
+**This is NOT a missing env var.** `check_lake_freshness`'s docstring (`tools/testing/regression_monitor.py`, "The wheel service is the lake's watcher; the covered-call service is deliberately not") records the omission of `CHAIN_LAKE_BUCKET` on `covered-call-engine` as a decision: the covered-call profile's universe is holdings-derived, so it has no `stocks.symbols` to measure the lake against, and two watchers measuring different universes would produce a second opinion nobody reconciles. Do not "fix" this by adding the bucket to the covered-call deploy step (`cloudbuild.yaml` `deploy-cc-canary`, `--set-env-vars`); that re-opens the decision the docstring closes.
+
+**Doc drift to correct in the same change:** the docstring says the covered-call service "reports a steady `lake_freshness_no_universe` warn"; the live payload is `lake_freshness_unconfigured` / `no_bucket`, because the bucket check runs before the universe check. Same outcome, wrong name in the prose.
+
+**Options for the plan:**
+1. *Narrow the policy* to `resource.labels.service_name="options-wheel-strategy"` (the watcher), leaving the covered-call `/regression` report's `warn` row as the visible record. Smallest change; the contract test on the policy JSON pins it. Downside: if the covered-call service ever becomes a watcher, the policy must be widened again.
+2. *Make the check profile-aware:* when the profile is not the lake's watcher (no `stocks.symbols` universe, or an explicit `lake_watcher: false` in the profile), report a distinct `lake_freshness_not_watching` **pass-with-note** (not `warn`, not `lake_freshness_degraded`), so the degraded event means "a watcher degraded" on every service. Cleaner semantics; touches `tools/testing/regression_monitor.py` (not `src/**`, so engine identity does not move) and its tests.
+3. Both: (2) for semantics, (1) as belt.
+
+**Evidence to carry into the plan:** `gcloud logging read` on `covered-call-engine` / `lake_freshness_degraded`, 28 d: 6 events per trading day, all `no_bucket`; wheel service: 0 such events in the same window. Policy: `deploy/monitoring/lake_freshness_degraded_alert_policy.json` (`notificationRateLimit 86400s`, `autoClose 86400s`). Env: `options-wheel-strategy` has `CHAIN_LAKE_BUCKET=options-wheel-chain-lake` (`cloudbuild.yaml` `deploy-bot-canary`); `covered-call-engine` has none. Not verified: whether the daily notification is actually being delivered (check the notification channel's history before planning — if it is not, option 1 is still right but the urgency drops).
+
+**Links:** FC-096 Phase A (the freshness check and both lake policies), FC-130 (the sweep/battery path lost its run-level lake-degraded warning — the opposite problem: too little signal there, too much here), FC-108 / FC-111 (the covered-call regression instance's other blind spots), FC-125 (deploy config changes redeploy both bots).
+
 ---
 
 ## Completed
