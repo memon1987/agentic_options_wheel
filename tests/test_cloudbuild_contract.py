@@ -2119,3 +2119,25 @@ def test_a_real_creation_failure_fails_the_build(tmp_path, by_id):
     assert code == 1
     assert "FAIL: could not create sim-service" in out
     assert marker is None
+
+
+# --- build-image pin (hotfix 2026-11-09) -------------------------------------------
+
+CLOUD_SDK_IMAGE = "gcr.io/google.com/cloudsdktool/cloud-sdk"
+
+
+def test_every_cloud_sdk_step_is_pinned_to_one_digest(steps):
+    """A floating cloud-sdk tag stopped every deploy on 2026-11-09.
+
+    The steps named the image with no tag. `latest` moved from 591.0.0 to 592.0.0,
+    which ships no `python3`; `serialize-builds` calls it and failed closed. The image
+    must be pinned by digest, and every step must use the same digest so a bump is one
+    deliberate change rather than a drift.
+    """
+    images = [s["name"] for s in steps if s["name"].startswith(CLOUD_SDK_IMAGE)]
+    assert images, "no cloud-sdk steps found: the image name changed, update this test"
+    pinned = re.compile(re.escape(CLOUD_SDK_IMAGE) + r"@sha256:[0-9a-f]{64}")
+    floating = sorted({i for i in images if not pinned.fullmatch(i)})
+    assert not floating, f"cloud-sdk step(s) not pinned by digest: {floating}"
+    assert len(set(images)) == 1, (
+        f"cloud-sdk steps use different digests: {sorted(set(images))}")
