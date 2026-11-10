@@ -24,9 +24,17 @@ from tools import plans_index as pi
 
 def test_index_section_is_current():
     plans = pi.load_plans()
-    assert pi.problems(plans, pi.fc_sections()) == []
-    assert pi.render_readme(plans) == pi.README.read_text(), (
+    entries = pi.read_fc_entries(plans)
+    assert pi.problems(plans, pi.fc_sections()) + pi.fc_problems(entries) == []
+    assert pi.render_readme(plans, entries=entries) == pi.README.read_text(), (
         "docs/plans/README.md's '## Index' section is stale — run: python tools/plans_index.py")
+
+
+def test_every_fc_entry_is_classified_and_consistent_with_its_plans():
+    entries = pi.read_fc_entries(pi.load_plans())
+    assert len(entries) > 100, "the FC index parse found suspiciously few entries"
+    assert pi.fc_problems(entries) == []
+    assert all(e.group is not None for e in entries)
 
 
 def test_every_plan_has_a_recognised_status():
@@ -81,21 +89,6 @@ def _plan(name, status, title="T"):
     return pi.Plan(name, "FC-" + name[3:6], title, status, pi.classify(status))
 
 
-def test_render_groups_in_fixed_order_with_counts_and_snippets():
-    plans = [
-        _plan("fc-001.md", "Done — shipped"),
-        _plan("fc-002.md", "Executing — PR open", title="two"),
-        _plan("fc-003.md", "Draft"),
-    ]
-    out = pi.render_index(plans)
-    heads = re.findall(r"^### (.+?) \((\d+)\)$", out, re.M)
-    assert heads == [("In progress", "1"), ("Open", "1"), ("Done", "1"), ("Shelved", "0")]
-    assert "### Shelved (0)\n\n_none_" in out
-    # Done rows carry the title only; open/in-progress rows carry the status snippet.
-    assert "- [fc-001.md](fc-001.md) — FC-001 — T\n" in out
-    assert "- [fc-002.md](fc-002.md) — FC-002 — two — _Executing — PR open_" in out
-
-
 def test_snippet_truncates_and_closes_a_split_code_span():
     long = "Executing — " + "`abc` " * 40
     s = pi._snippet(long)
@@ -119,3 +112,74 @@ def test_render_readme_replaces_only_the_index_section():
     out = pi.render_readme([_plan("fc-001.md", "Done")], current=current)
     assert out.startswith("# Plans\n\nintro text stays\n\n## Index\n")
     assert "old rows" not in out and "fc-001.md" in out
+
+
+# --- FC-level classification and rendering ----------------------------------------
+
+@pytest.mark.parametrize("section, status, group", [
+    ("Completed", "", "Done"),
+    ("Completed", "anything at all", "Done"),
+    ("Active Considerations", "EXECUTING — PR-1 merged", "In progress"),
+    ("Active Considerations", "Plan published", "Planned"),
+    ("Active Considerations", "Planned — fc-020.md rev 2", "Planned"),
+    ("Active Considerations", "Filed 2026-09-03 (review)", "Filed"),
+    ("Active Considerations", "Consideration — high value", "Filed"),
+    ("Active Considerations", "Deferred (operator decision)", "Shelved"),
+    ("Active Considerations", "On hold — by operator decision", "Shelved"),
+    ("Active Considerations", "Plan is being discussed", None),       # 'Plan' alone is not a status
+    ("Active Considerations", "Blockers RESOLVED; code fix open", None),  # the real FC-058 wording, pre-fix
+    ("Active Considerations", "", None),
+])
+def test_classify_fc(section, status, group):
+    assert pi.classify_fc(section, status) == group
+
+
+def _entry(fc, section, status, plans=()):
+    return pi.FcEntry(fc, "t", section, status, tuple(plans), pi.classify_fc(section, status))
+
+
+def test_fc_problems_catch_the_two_lies_and_an_unknown_word():
+    plan = _plan("fc-050.md", "Done")
+    out = pi.fc_problems([
+        _entry("FC-050", "Active Considerations", "Filed 2026-01-01", plans=(plan,)),  # plan exists, says Filed
+        _entry("FC-051", "Active Considerations", "Planned"),                           # says Planned, no plan
+        _entry("FC-052", "Active Considerations", "Blockers resolved"),                # unknown word
+        _entry("FC-053", "Active Considerations", "Consideration"),                    # fine
+        _entry("FC-054", "Completed", ""),                                             # fine
+        _entry("FC-055", "Deferred Pile", "Filed"),                                    # unknown section
+    ])
+    assert any("FC-050" in m and "start its Status with 'Planned' or 'Executing'" in m for m in out)
+    assert any("FC-051" in m and "no docs/plans/fc-051*.md" in m for m in out)
+    assert any("FC-052" in m and "recognised word" in m for m in out)
+    assert any("FC-055" in m and "sits under 'Deferred Pile'" in m for m in out)
+    assert not any("FC-053" in m or "FC-054" in m for m in out)
+
+
+def test_render_index_groups_every_fc_and_collapses_done():
+    plans = [_plan("fc-001.md", "Done"), _plan("fc-003.md", "Executing — PR open")]
+    entries = [
+        _entry("FC-001", "Completed", "", plans=(plans[0],)),
+        _entry("FC-002", "Active Considerations", "Filed 2026-11-09 (review)"),
+        _entry("FC-003", "Active Considerations", "Executing — PR-1 merged", plans=(plans[1],)),
+        _entry("FC-004", "Active Considerations", "Deferred (operator)"),
+    ]
+    out = pi.render_index(plans, entries)
+    assert "**In progress 1 · Planned 0 · Filed 1 · Shelved 1 · Done 1** — 4 FCs, 2 plan files." in out
+    heads = re.findall(r"^### (.+?) \((\d+)\)$", out, re.M)
+    assert [h[0].split(" — ")[0] for h in heads] == ["In progress", "Planned", "Filed", "Shelved"]
+    assert "### Planned — plan drafted, nothing built (0)\n\n_none_" in out
+    # Done is collapsed, rows carry plan links, pending rows carry the status snippet
+    assert "<summary><strong>Done (1)</strong></summary>" in out
+    assert "- **FC-001** — t — [fc-001.md](fc-001.md)\n" in out
+    assert "- **FC-003** — t — [fc-003.md](fc-003.md) — _Executing — PR-1 merged_" in out
+    assert "- **FC-002** — t — _Filed 2026-11-09 (review)_" in out
+
+
+def test_read_fc_entries_reads_the_live_index_shape():
+    entries = pi.read_fc_entries(pi.load_plans())
+    by = {e.fc: e for e in entries}
+    assert by["FC-112"].group == "In progress" and by["FC-112"].plans
+    assert by["FC-120"].group == "Done" and len(by["FC-120"].plans) == 1
+    assert by["FC-060"].group == "Done" and len(by["FC-060"].plans) == 3
+    # a plan file whose FC is missing from the index would be a parse hole, not a Done
+    assert all(p.fc in by for p in pi.load_plans())

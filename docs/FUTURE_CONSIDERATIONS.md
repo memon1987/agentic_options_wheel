@@ -12,6 +12,8 @@ A running list of things we want to **research and write a plan for** before cod
 5. Archived        →  moved to "Completed" below with a link to the plan + PR
 ```
 
+**Where things stand:** `docs/plans/README.md` §Index is a generated status board of every FC here (in progress / planned / filed / shelved / done) — regenerate it with `python tools/plans_index.py` after editing a Status line or moving an entry; the build fails if it is stale.
+
 **Rule of thumb:** nothing graduates from this file into code until step 3 is done. See `docs/CLAUDE.md` ("Plan-First Development") for the enforcement rule.
 
 ---
@@ -573,7 +575,7 @@ The shortfall is **slightly worse where the sim can match the expiry**. Do not r
 
 ### FC-058: Track D blockers — wrong image registry, and the Secret Manager fallback is probably dead
 
-**Status:** Blockers RESOLVED (Track D shipped 2026-07-30); **the code fix remains open**. The deploy was unblocked by reading the live service rather than by changing code: credentials are wired as **`secretKeyRef`** to Secret Manager, so Cloud Run injects the env var directly and the application-level fallback is never exercised. That means the `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT_ID` vs `GCP_PROJECT` mismatch is **dead code, not a live outage** — but it is still wrong, and the bare `except Exception: pass` around credential resolution still means a silently empty credential. Fix both when convenient.
+**Status:** Filed — blockers RESOLVED (Track D shipped 2026-07-30); **the code fix remains open**. The deploy was unblocked by reading the live service rather than by changing code: credentials are wired as **`secretKeyRef`** to Secret Manager, so Cloud Run injects the env var directly and the application-level fallback is never exercised. That means the `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT_ID` vs `GCP_PROJECT` mismatch is **dead code, not a live outage** — but it is still wrong, and the bare `except Exception: pass` around credential resolution still means a silently empty credential. Fix both when convenient.
 **Size estimate:** S once verified; verification needs `gcloud auth`
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1156,7 +1158,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-122: migrate the dashboard to the Options Wheel design system — tokens, contrast fixes, provenance chips
 
-**Status:** Consideration — **ON HOLD by operator decision (2026-10-01)**. The design system itself is signed off; only the migration waits.
+**Status:** On hold — by operator decision (2026-10-01). The design system itself is signed off; only the migration waits.
 **Scope:** shared (dashboard frontend — serves both strategies)
 **Size estimate:** L (touches most of the ~70 components under `dashboard/frontend/src/components/v2` and `pages/v2`, plus `tailwind.config.js`, `index.css`, `utils/format.ts`)
 **Owner:** zeshan + Claude
