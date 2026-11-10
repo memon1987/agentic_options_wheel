@@ -9,16 +9,31 @@ of the Status lines, and ``tests/test_plans_index.py`` fails CI when the README 
 stale, a status word is unrecognised, or a plan disagrees with its FC entry's
 section. Nothing here moves files: paths stay flat so every link keeps working.
 
+The index covers EVERY FC entry in docs/FUTURE_CONSIDERATIONS.md, not only the ones
+with a plan file (most pending FCs have none yet): In progress, Planned (a plan
+exists, nothing built), Filed (no plan yet), Shelved, Done — each row linking the
+FC's plan files when it has them.
+
 Usage:
     python tools/plans_index.py          # rewrite the README's "## Index" section
     python tools/plans_index.py --check  # exit 1 if the README would change
 
-Status vocabulary (first word of the Status line, bold markers ignored):
+Status vocabulary (first word of the Status line, bold markers ignored).
+Plan files:
     Done / Completed                      -> Done
     Executing / In progress / Building    -> In progress
     Draft / Approved / Ready / Published  -> Open
     Deferred / Superseded / Withdrawn /
     Abandoned / Shelved / On hold         -> Shelved
+FC entries under "## Active Considerations":
+    Executing                             -> In progress
+    Planned / Plan published              -> Planned
+    Filed / Consideration / Proposed /
+    Idea                                  -> Filed (no plan yet)
+    Deferred / Superseded / Withdrawn /
+    On hold                               -> Shelved
+Entries under "## Completed" are Done whatever their wording (the older ones use
+a compact `- Plan: / - PR: / - Closed:` format with no Status line).
 """
 from __future__ import annotations
 
@@ -123,6 +138,98 @@ def problems(plans: list[Plan], sections: dict[str, str]) -> list[str]:
     return out
 
 
+FC_GROUPS = ("In progress", "Planned", "Filed", "Shelved", "Done")
+FC_GROUP_TITLES = {
+    "In progress": "In progress — plan executing",
+    "Planned": "Planned — plan drafted, nothing built",
+    "Filed": "Filed — no plan yet",
+    "Shelved": "Shelved — deferred / on hold / superseded",
+    "Done": "Done",
+}
+_FC_WORDS = {
+    "executing": "In progress",
+    "planned": "Planned", "plan": "Planned",
+    "filed": "Filed", "consideration": "Filed", "proposed": "Filed", "idea": "Filed",
+    "deferred": "Shelved", "superseded": "Shelved", "withdrawn": "Shelved", "on": "Shelved",
+}
+ACTIVE_SECTION = "Active Considerations"
+DONE_SECTION = "Completed"
+
+
+@dataclass(frozen=True)
+class FcEntry:
+    fc: str
+    title: str
+    section: str
+    status: str
+    plans: tuple[Plan, ...]
+    group: str | None
+
+
+def classify_fc(section: str, status: str) -> str | None:
+    if section == DONE_SECTION:
+        return "Done"
+    words = _strip(status).lower().split()
+    if not words:
+        return None
+    first = words[0].strip(".,;:—-()")
+    if first == "plan" and not (len(words) > 1 and words[1].startswith("published")):
+        return None
+    if first == "on" and not (len(words) > 1 and words[1].startswith("hold")):
+        return None
+    return _FC_WORDS.get(first)
+
+
+def read_fc_entries(plans: list[Plan]) -> list[FcEntry]:
+    by_fc: dict[str, list[Plan]] = {}
+    for p in plans:
+        by_fc.setdefault(p.fc, []).append(p)
+    out: list[FcEntry] = []
+    section = ""
+    cur: dict | None = None
+
+    def close():
+        if cur is not None:
+            out.append(FcEntry(cur["fc"], cur["title"], cur["section"], cur["status"],
+                               tuple(by_fc.get(cur["fc"], ())),
+                               classify_fc(cur["section"], cur["status"])))
+
+    for line in FC_INDEX.read_text().splitlines():
+        if line.startswith("## "):
+            close(); cur = None
+            section = line[3:].strip()
+            continue
+        m = re.match(r"^### (FC-\d{3})\s*[:：]?\s*(.*)$", line)
+        if m:
+            close()
+            cur = {"fc": m.group(1), "title": _strip(m.group(2)), "section": section, "status": ""}
+            continue
+        if cur is not None and line.startswith("**Status:**") and not cur["status"]:
+            cur["status"] = _strip(line[len("**Status:**"):])
+    close()
+    seen: set[str] = set()
+    return [e for e in out if not (e.fc in seen or seen.add(e.fc))]
+
+
+def fc_problems(entries: list[FcEntry]) -> list[str]:
+    """What the test refuses at FC level: unknown status words, a plan nobody filed."""
+    out = []
+    for e in entries:
+        if e.section not in (ACTIVE_SECTION, DONE_SECTION):
+            out.append(f"{e.fc}: sits under '{e.section}', expected '{ACTIVE_SECTION}' or '{DONE_SECTION}'")
+            continue
+        if e.group is None:
+            out.append(f"{e.fc}: Status line under Active does not start with a recognised word "
+                       f"(got {e.status[:60]!r}); see tools/plans_index.py docstring")
+            continue
+        if e.group == "Filed" and e.plans:
+            out.append(f"{e.fc}: says {e.status.split()[0]!r} but has plan file(s) "
+                       f"{[p.name for p in e.plans]} — start its Status with 'Planned' or 'Executing'")
+        if e.group in ("Planned", "In progress") and not e.plans:
+            out.append(f"{e.fc}: says {e.status.split()[0]!r} but no docs/plans/fc-{e.fc[3:]}*.md exists")
+    return out
+
+
 def _snippet(status: str) -> str:
     s = status if len(status) <= SNIPPET_CHARS else status[:SNIPPET_CHARS - 1].rstrip() + "…"
     if s.count("`") % 2:          # truncation split a code span; close it
@@ -130,43 +237,61 @@ def _snippet(status: str) -> str:
     return s.replace("|", "/")
 
 
-def render_index(plans: list[Plan]) -> str:
+def _plan_links(plans: tuple[Plan, ...] | list[Plan]) -> str:
+    return ", ".join(f"[{p.name}]({p.name})" for p in plans)
+
+
+def render_index(plans: list[Plan], entries: list[FcEntry] | None = None) -> str:
+    entries = read_fc_entries(plans) if entries is None else entries
+    counts = {g: sum(1 for e in entries if e.group == g) for g in FC_GROUPS}
     lines = [INDEX_HEADING, "",
-             "_Generated by `python tools/plans_index.py` from each plan's `**Status:**` line; "
-             "`tests/test_plans_index.py` fails when this section is stale or a plan "
-             "disagrees with its FC entry's section. Do not edit by hand._", ""]
-    for g in GROUPS:
-        rows = [p for p in plans if p.group == g]
-        lines.append(f"### {g} ({len(rows)})")
-        lines.append("")
+             "_Generated by `python tools/plans_index.py` from every FC entry's `**Status:**` line in "
+             "`docs/FUTURE_CONSIDERATIONS.md` and every plan file's; `tests/test_plans_index.py` fails "
+             "when this section is stale, a status word is unrecognised, or a plan and its FC disagree. "
+             "Do not edit by hand._", "",
+             "**" + " · ".join(f"{g} {counts[g]}" for g in FC_GROUPS) + f"** — {len(entries)} FCs, "
+             f"{len(plans)} plan files.", ""]
+    for g in FC_GROUPS:
+        rows = [e for e in entries if e.group == g]
+        head = f"### {FC_GROUP_TITLES[g]} ({len(rows)})"
+        if g == "Done":
+            lines += ["<details>", f"<summary><strong>{FC_GROUP_TITLES[g]} ({len(rows)})</strong></summary>", ""]
+        else:
+            lines += [head, ""]
         if not rows:
             lines.append("_none_")
-        for p in rows:
-            row = f"- [{p.name}]({p.name}) — {p.fc} — {p.title}"
+        for e in rows:
+            row = f"- **{e.fc}** — {e.title}"
+            if e.plans:
+                row += f" — {_plan_links(e.plans)}"
             if g != "Done":
-                row += f" — _{_snippet(p.status)}_"
+                row += f" — _{_snippet(e.status)}_"
             lines.append(row)
+        if g == "Done":
+            lines += ["", "</details>"]
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def render_readme(plans: list[Plan], current: str | None = None) -> str:
+def render_readme(plans: list[Plan], current: str | None = None,
+                  entries: list[FcEntry] | None = None) -> str:
     text = current if current is not None else README.read_text()
     i = text.find("\n" + INDEX_HEADING)
     if i < 0:
         raise SystemExit(f"{README}: no '{INDEX_HEADING}' heading")
-    return text[: i + 1] + render_index(plans)
+    return text[: i + 1] + render_index(plans, entries)
 
 
 def main(argv: list[str]) -> int:
     plans = load_plans()
-    bad = problems(plans, fc_sections())
+    entries = read_fc_entries(plans)
+    bad = problems(plans, fc_sections()) + fc_problems(entries)
     if bad:
         print("plans_index: refusing to generate —")
         for b in bad:
             print("  -", b)
         return 2
-    new = render_readme(plans)
+    new = render_readme(plans, entries=entries)
     if "--check" in argv:
         if new != README.read_text():
             print("docs/plans/README.md index is stale; run: python tools/plans_index.py")
@@ -174,7 +299,7 @@ def main(argv: list[str]) -> int:
         print("docs/plans/README.md index is current")
         return 0
     README.write_text(new)
-    counts = {g: sum(1 for p in plans if p.group == g) for g in GROUPS}
+    counts = {g: sum(1 for e in entries if e.group == g) for g in FC_GROUPS}
     print("wrote", README.relative_to(REPO_ROOT), counts)
     return 0
 
