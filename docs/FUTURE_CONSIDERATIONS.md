@@ -714,24 +714,6 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
-### FC-075: Standalone covered-call strategy — separate account, shared machinery
-
-**Scope:** covered_call (tagged retroactively 2026-08-27)
-**Status:** LIVE (paper) 2026-08-24 — Phases 0–3 DONE. Seam 4 merged+deployed 08-22 (PR #90 `cebb09b`; R1–R6 complete, `docs/plans/fc-075-seam-4.md`); Phase 3 provisioned + **interlock drill PASSED** 08-23 (`covered-call-engine` live, own dataset/bucket/schedulers, no `/roll`); go-live 08-24: first lots GOOGL 100 @ 348.02 + UNH 100 @ 398.08 in `PA37XLNWDLB3`, first cycle = clean fully-explained no-trade (`below_cost_basis` dominant — spot ≈ day-one basis; then premium/delta/OI). **First covered call pending qualifying strikes** (compressed shadow was an operator decision, recorded in `fc-075.md`). **08-27 update:** tunables v2 (`call_target_dte` 14, PR #91) + CC auto-deploy chain MERGED+DEPLOYED (`7430ed5`, rev 00003-waz — image pinning gone); CC alert policies live (4, FC-030 channel); `cc-regression-hourly` created (FC-082). Remaining: first written call (organic — verify `dte_too_high` collapse next scan), band-cliff `dte_bands` retune from live exits (OQ-1), Phase 4 backtest (optional, pre-real-money).
-**Size estimate:** L
-**Owner:** zeshan
-**Plan file:** `docs/plans/fc-075.md`
-
-**Problem / opportunity:** Owner wants covered calls written in a **separate Alpaca account** (paper `PA37XLNWDLB3`, provisioned 2026-07-18) isolated from the wheel, by **reusing mechanical components** (FC-038 two-pool share ledger, FC-050/FC-065 cost-basis floor, OCC utils) rather than duplicating the engine, with **its own tunable parameters** (`config/covered_call.yaml`) and **separate backtests**. Architecture settled by two adversarial reviews: separate account per strategy (no tagging — the wheel's `reconcile_positions` adopts any untracked position), one repo/one image/N config-selected Cloud Run services. Plan ships Phase 1 (isolation seams: strategy-keyed opportunity store, `STRATEGY_CONFIG` accessor + account-number interlock, profile-aware config, BQ dataset threading) now; Phases 2/4 (engine + backtest) are design-gated on FC-068 + FC-069 landing. Supersedes the abandoned plan formerly renumbered FC-032→037→038 (collided with merged two-pool FC-038).
-
-**Open questions:**
-- Post-FC-068/069: reuse `OptionsScanner.scan_for_call_opportunities` with a holdings-derived list, or a thinner holdings-first scanner? (blocking, decided in the Phase 2 design pass)
-- Initial tunables for `covered_call.yaml` (delta band, DTE, min premium, validator thresholds) — operator to set before first sale (non-blocking)
-
-**Links:** `docs/plans/fc-075.md`; gates: FC-068, FC-069; prerequisites/risks: FC-067 (journal put-labeling), FC-061 (ledger vs open orders), FC-056 (backtest call pricing 0.676×), FC-062/FC-066 (roller excluded from scope).
-
----
-
 ### FC-080: roller duration drift — consecutive rolls compound the horizon; evaluate roll-count and absolute-DTE controls
 
 **Status:** Consideration — **bookmark filed 2026-08-04 by operator** after the first live occurrence; revisit deliberately, not presumed a bug
@@ -828,7 +810,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 ### FC-088: the roller's and `/monitor`'s limit prices are still off-tick above $3 — rejected on a live account
 
 **Scope:** shared
-**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews). **Narrowed by FC-120 PR-2 (done when it merges): the roller's STO and BTC limits are tick-legal** (`limit_pricing.snap_limit`, toward marketable — buys up, sells down); what remains is `/monitor`'s buy-to-close.
+**Status:** Filed 2026-08-28 (FC-072 rev 2 reviews). **Narrowed by FC-120 PR-2 (merged 2026-10-06, `653b07f`): the roller's STO and BTC limits are tick-legal** (`limit_pricing.snap_limit`, toward marketable — buys up, sells down); what remains is `/monitor`'s buy-to-close.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1131,7 +1113,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 ### FC-115: `Config` validates no bound on `rolling.itm_trigger_ratio` (or `enabled`, `btc_fill_timeout_seconds`, `fallback_strike_attempts`)
 
 **Scope:** shared
-**Status:** Filed 2026-09-08 (found by the FC-100 PR review). **Narrowed by FC-120 PR-2 (done when it merges): `btc_fill_timeout_seconds` (`5 x (btc_reprice_attempts + 1)` .. 600) and `fallback_strike_attempts` (0 .. 5) are bounded at load, with PR-2's four new keys and a cross-key budget bound** (FC-120 DD-7); `itm_trigger_ratio` and `enabled` remain here.
+**Status:** Filed 2026-09-08 (found by the FC-100 PR review). **Narrowed by FC-120 PR-2 (merged 2026-10-06, `653b07f`): `btc_fill_timeout_seconds` (`5 x (btc_reprice_attempts + 1)` .. 600) and `fallback_strike_attempts` (0 .. 5) are bounded at load, with PR-2's four new keys and a cross-key budget bound** (FC-120 DD-7); `itm_trigger_ratio` and `enabled` remain here.
 **Size estimate:** S
 
 **Problem:** `src/utils/config.py` validates four rolling knobs and not the trigger: a `10.0` typo silently makes every position `not_itm_enough` (the roller looks alive and never rolls); `0.5` makes every call eligible. The only guard today is the shipped-value test (`test_config.py` T-1), which catches drift in the repo, not a live `--update-env-vars` or a hand-edited profile.
@@ -1320,7 +1302,7 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 
 ### FC-129: `engine_identity` hashes comment bytes, and `ENGINE_VERSION` is still byte-pinned in two places
 
-**Status:** Filed 2026-10-06 (FC-121 PR-2 reviews A + B, plan critiques). **2026-10-12 — the unpinned file broke CI on a docs-only commit:** pyarrow 26.0.0 (released 10-09) requires NumPy 2 against the file's `numpy<2`; 188 parquet tests red; hotfix PR #139 pinned `pyarrow<26`. A fully pinned `requirements.txt` (or a lock file) is now overdue, not just an identity-hygiene nicety.
+**Status:** Filed 2026-10-06 (FC-121 PR-2 reviews A + B, plan critiques). **2026-10-12 — the unpinned file broke CI on a docs-only commit:** pyarrow 26.0.0 (released 10-09) requires NumPy 2 against the file's `numpy<2`; 188 parquet tests red; hotfix PR #139 pinned `pyarrow<26`. A fully pinned `requirements.txt` (or a lock file) is now overdue, not just an identity-hygiene nicety. 2026-11-09 — third instance, the build image this time: all 16 `cloud-sdk` steps in `cloudbuild.yaml` were untagged (`latest`); 592.0.0 dropped `python3` and every main build failed at `serialize-builds` for six days unnoticed (no push in between). Hotfix #141 (`4e7e57d`) pinned them by digest with a contract test; `python:3.11-slim` and `gcr.io/cloud-builders/docker` are still floating and belong in this FC's scope.
 **Scope:** shared (backtest engine identity; dashboard image)
 **Size estimate:** S–M (digest change = a deliberate one-time invalidation; dashboard copy = a Dockerfile `COPY` + test deletions)
 **Owner:** unassigned
@@ -1620,6 +1602,24 @@ Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design
 **Proposal:** a per-order-kind fill mode — roll legs fill at the placed limit (or not at all within the leg's timeout, mirroring `_poll_order_fill`), entry legs keep the haircut — behind a config key on the sim spec so the wheel golden can be re-baselined deliberately in one PR (new golden fixtures, engine identity moves once); the report footer then drops the "credits biased up" clause. Decide whether FC-112's wheel trigger study should wait for this (it should: the study's roll-credit metric is exactly what this fixes).
 
 **Links:** FC-096 Phase C (PR #129 body, deviation 1), FC-100 §Phase C hand-off, FC-112.
+
+### FC-075: Standalone covered-call strategy — separate account, shared machinery
+
+**Scope:** covered_call (tagged retroactively 2026-08-27)
+**Status:** COMPLETED — closed 2026-11-09 at the FC audit; the entry below had not been updated since 08-27. Live (paper) since 2026-08-24; first covered call written 2026-09-01 once PR #107 (`c0dc2fd`) fixed the three zero-call defects; roller live 2026-09-17 (FC-100); by 11-09: calls written every week it had qualifying strikes, three live rolls, own dataset + log sink (`covered_call_logs`). Plans: `docs/plans/fc-075.md`, `fc-075-phase-2.md`, `fc-075-seam-4.md`, `fc-075-cc-deploy-step.md` (all Done). Follow-ups carried as their own FCs: FC-097/098/099 (PR #107 review), FC-135 (reporting parity), FC-136 (lake-freshness nag). Earlier status, kept for lineage: LIVE (paper) 2026-08-24 — Phases 0–3 DONE. Seam 4 merged+deployed 08-22 (PR #90 `cebb09b`; R1–R6 complete, `docs/plans/fc-075-seam-4.md`); Phase 3 provisioned + **interlock drill PASSED** 08-23 (`covered-call-engine` live, own dataset/bucket/schedulers, no `/roll`); go-live 08-24: first lots GOOGL 100 @ 348.02 + UNH 100 @ 398.08 in `PA37XLNWDLB3`, first cycle = clean fully-explained no-trade (`below_cost_basis` dominant — spot ≈ day-one basis; then premium/delta/OI). **First covered call pending qualifying strikes** (compressed shadow was an operator decision, recorded in `fc-075.md`). **08-27 update:** tunables v2 (`call_target_dte` 14, PR #91) + CC auto-deploy chain MERGED+DEPLOYED (`7430ed5`, rev 00003-waz — image pinning gone); CC alert policies live (4, FC-030 channel); `cc-regression-hourly` created (FC-082). Remaining: first written call (organic — verify `dte_too_high` collapse next scan), band-cliff `dte_bands` retune from live exits (OQ-1), Phase 4 backtest (optional, pre-real-money).
+**Size estimate:** L
+**Owner:** zeshan
+**Plan file:** `docs/plans/fc-075.md`
+
+**Problem / opportunity:** Owner wants covered calls written in a **separate Alpaca account** (paper `PA37XLNWDLB3`, provisioned 2026-07-18) isolated from the wheel, by **reusing mechanical components** (FC-038 two-pool share ledger, FC-050/FC-065 cost-basis floor, OCC utils) rather than duplicating the engine, with **its own tunable parameters** (`config/covered_call.yaml`) and **separate backtests**. Architecture settled by two adversarial reviews: separate account per strategy (no tagging — the wheel's `reconcile_positions` adopts any untracked position), one repo/one image/N config-selected Cloud Run services. Plan ships Phase 1 (isolation seams: strategy-keyed opportunity store, `STRATEGY_CONFIG` accessor + account-number interlock, profile-aware config, BQ dataset threading) now; Phases 2/4 (engine + backtest) are design-gated on FC-068 + FC-069 landing. Supersedes the abandoned plan formerly renumbered FC-032→037→038 (collided with merged two-pool FC-038).
+
+**Open questions:**
+- Post-FC-068/069: reuse `OptionsScanner.scan_for_call_opportunities` with a holdings-derived list, or a thinner holdings-first scanner? (blocking, decided in the Phase 2 design pass)
+- Initial tunables for `covered_call.yaml` (delta band, DTE, min premium, validator thresholds) — operator to set before first sale (non-blocking)
+
+**Links:** `docs/plans/fc-075.md`; gates: FC-068, FC-069; prerequisites/risks: FC-067 (journal put-labeling), FC-061 (ledger vs open orders), FC-056 (backtest call pricing 0.676×), FC-062/FC-066 (roller excluded from scope).
+
+---
 
 ### FC-096: simulation studio — interactive sim service, weekly data backfill, two universes, covered-call sims, PM console behind IAP
 
