@@ -66,9 +66,11 @@ VIEWER = "someone.else@example.com"
 #: allowlist of human operators.
 SCHEDULER_SA = "799970961417-compute@developer.gserviceaccount.com"
 #: The automation service account. It IS an operator (FC-096 Phase D PR-2,
-#: review round 1 F4): `POST /sims/run`, `POST /sims/pins` and
-#: `DELETE /sims/pins/{id}` have no frontend caller, so after the bearer token
-#: is retired an impersonated id-token for this SA is their only credential.
+#: review round 1 F4): the bearer token is retired, so an impersonated id-token
+#: for this SA is the supported programmatic credential for all four write
+#: routes. `POST /sims/run` and `POST /sims/pins` have had frontend callers
+#: since FC-096 Phase E PR-4 (#124); `DELETE /sims/pins/{id}` has none, by
+#: design, so un-pinning has no browser path at all.
 AUTOMATION_SA = "claude-operator@gen-lang-client-0607444019.iam.gserviceaccount.com"
 
 
@@ -1525,19 +1527,25 @@ class TestTheDeployConfigCarriesTheRolesEnv:
         assert OPERATOR in value.split()
 
     def test_the_automation_service_account_is_an_operator(self, env):
-        """`POST /sims/run` and the two pin routes have NO frontend caller.
+        """The automation SA is the supported PROGRAMMATIC write identity.
 
-        They are curl-only surfaces. Once PR-2 retires the SWEEP_SUBMIT_TOKEN
-        bearer, an impersonated id-token for this service account is the ONLY
-        credential that can reach them - so dropping it from OPERATORS is not a
-        tidy-up, it makes three write routes unreachable by anything. (The SA
-        must ALSO hold roles/iap.httpsResourceAccessor on the service; that is
-        an IAM grant, not a repo artifact, and it is step 1 of the PR body's
-        operator sequence.)
+        PR-2 retired the SWEEP_SUBMIT_TOKEN bearer, so an impersonated id-token
+        for this service account is how any non-browser caller reaches the
+        four write routes (docs/CLAUDE.md, "The supported programmatic path is
+        IMPERSONATION"). `POST /sims/run` and `POST /sims/pins` also have
+        frontend callers (the /sims tweak bar, FC-096 Phase E PR-4), but
+        `DELETE /sims/pins/{id}` has none, by design - un-pinning has no
+        browser path at all. So dropping the SA from OPERATORS is not a
+        tidy-up: every write made as the SA becomes a 403, and un-pinning loses
+        its only supported route. (The SA must ALSO hold
+        roles/iap.httpsResourceAccessor on the service; that is an IAM grant,
+        not a repo artifact, and it is step 1 of the PR body's operator
+        sequence.)
         """
         assert AUTOMATION_SA in env[A.OPERATORS_ENV].split(), (
-            f"{AUTOMATION_SA} must be in OPERATORS: it is the only identity "
-            f"that can call the three curl-only write routes post-retirement")
+            f"{AUTOMATION_SA} must be in OPERATORS: it is the supported "
+            "programmatic write identity, and DELETE /sims/pins/{id} "
+            "(un-pinning) has no browser path")
 
     def test_the_multi_operator_value_survives_the_bash_line_it_lives_in(self, env):
         """A value with a space MUST be inside the `^;^` quoted form.
