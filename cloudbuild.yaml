@@ -797,10 +797,15 @@ steps:
           #
           # >>> THE SECOND OPERATOR IS ALREADY HERE. <<<
           # It is `claude-operator@`, the automation service account, and it is
-          # not a convenience: `POST /sims/run`, `POST /sims/pins` and
-          # `DELETE /sims/pins/{id}` have NO frontend caller at all, so once the
-          # `SWEEP_SUBMIT_TOKEN` bearer dies an impersonated id-token for that SA
-          # is the ONLY credential that can reach them. It must ALSO hold
+          # not a convenience. The `SWEEP_SUBMIT_TOKEN` bearer is retired
+          # (FC-096 Phase D PR-2), so an impersonated id-token for that SA is
+          # the supported way any programmatic caller reaches the four write
+          # routes (recipe: docs/CLAUDE.md, "The supported programmatic path is
+          # IMPERSONATION"). Of the three sim writes, `POST /sims/run` and
+          # `POST /sims/pins` have had frontend callers since FC-096 Phase E
+          # PR-4 (#124), both on the /sims console's tweak bar, but
+          # `DELETE /sims/pins/{id}` has none, by design: un-pinning has no
+          # browser path at all. The SA must ALSO hold
           # `roles/iap.httpsResourceAccessor` on this service (an operator IAM
           # grant, made before this deploy) - `OPERATORS` decides who may write
           # once IAP has already let them in the door, never who gets in.
